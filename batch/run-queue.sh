@@ -765,10 +765,35 @@ _issue_writeback() {
   local plan add rm; plan=$(_writeback_plan "$outcome"); IFS='|' read -r add rm _ <<EOF
 $plan
 EOF
-  gh issue comment "$issue" --repo "$REPO" \
-    --body "bircher: outcome=$outcome ci_first=${ci_first:-na} review=${review:-na} rounds=${rounds:-?} pr=${pr:+#$pr}" >/dev/null 2>&1 || true
+  # #6: build the comment from only the fields that have a value, so a noop/
+  # escalated write-back reads "bircher: outcome=noop" instead of a malformed
+  # "... rounds=? pr=" with bare/empty tails.
+  local body="bircher: outcome=$outcome"
+  [ -n "$ci_first" ] && body="$body ci_first=$ci_first"
+  [ -n "$review" ]   && body="$body review=$review"
+  [ -n "$rounds" ]   && body="$body rounds=$rounds"
+  [ -n "$pr" ]       && body="$body pr=#$pr"
+  gh issue comment "$issue" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
   [ -n "$rm" ]  && gh issue edit "$issue" --repo "$REPO" --remove-label "$rm"  >/dev/null 2>&1 || true
   [ -n "$add" ] && gh issue edit "$issue" --repo "$REPO" --add-label "$add"    >/dev/null 2>&1 || true
+}
+
+# _ensure_issue_closed <issue> <pr>: safety-net for the `Closes #N` auto-close
+# (bircher #3). After a CONFIRMED PR merge, GitHub normally closes the linked
+# issue via `Closes #N` in the PR body -- but occasionally it does not fire
+# (observed on muesli #33/#35). Wait a grace period for GitHub's own close, then
+# close the issue ourselves if it is still open. Idempotent, and gated on the PR
+# actually being MERGED so it never closes a deferred/failed item.
+_ensure_issue_closed() {
+  local issue="$1" pr="$2"
+  [ -n "$issue" ] && [ -n "$pr" ] || return 0
+  [ "${BIRCHER_ISSUE_WRITEBACK:-1}" = "1" ] || return 0
+  [ "$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)" = "MERGED" ] || return 0
+  sleep "${BIRCHER_AUTOCLOSE_GRACE_S:-5}"
+  [ "$(gh issue view "$issue" --repo "$REPO" --json state -q '.state' 2>/dev/null)" = "OPEN" ] || return 0
+  gh issue close "$issue" --repo "$REPO" \
+    --comment "Safety-net close: PR #$pr merged but GitHub did not auto-close this issue via \`Closes #$issue\`; the work is on main (bircher #3)." >/dev/null 2>&1 || true
+  echo "[batch] safety-net: closed issue #$issue after PR #$pr merged (auto-close missed)" >&2
 }
 
 # preflight_auth -> rc 0 if BOTH providers respond to a trivial call; rc 1 else.
@@ -1059,6 +1084,9 @@ EOF
   mkdir -p "$(dirname "$SCORECARD")"
   json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" >> "$SCORECARD"
   _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"
+  # #3: guarantee the issue closes when its PR actually merged (backstops a
+  # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
+  [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
   echo "[batch] $item -> outcome=$outcome pr=${pr:-none} review=${review:-na} rounds=${rounds:-?} bound=$bound_outcome"
   mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
   return "$merge_rc"
@@ -1285,6 +1313,37 @@ SH
   [ "$(_writeback_plan escalated)" = "bircher:escalated|bircher:running|escalated" ] || { echo "FAIL wbplan esc"; exit 1; }
   [ "$(_writeback_plan failed)"    = "bircher:escalated|bircher:running|failed" ]    || { echo "FAIL wbplan failed"; exit 1; }
   echo "_item_issue + _writeback_plan OK"
+  # --- #6 + #3: write-back comment shape + safety-net issue close --------------
+  local wbdir; wbdir=$(mktemp -d)
+  cat >"$wbdir/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "issue" ] && [ "$2" = "comment" ]; then
+  while [ $# -gt 0 ]; do [ "$1" = "--body" ] && { echo "$2" >> "${WB_LOG:-/dev/null}"; break; }; shift; done; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "${FAKE_PR_STATE:-MERGED}"; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "close" ]; then echo "CLOSED $3" >> "${WB_CLOSE_LOG:-/dev/null}"; exit 0; fi
+exit 0
+SH
+  chmod +x "$wbdir/gh"
+  local wbc="$wbdir/comment.log"; : >"$wbc"
+  ( PATH="$wbdir:$PATH" REPO=demo/demo WB_LOG="$wbc" _issue_writeback 42 noop "" "" "" "" )
+  grep -qx 'bircher: outcome=noop' "$wbc" || { echo "FAIL #6 noop comment: [$(cat "$wbc")]"; exit 1; }
+  : >"$wbc"
+  ( PATH="$wbdir:$PATH" REPO=demo/demo WB_LOG="$wbc" _issue_writeback 42 ready 7 codex:pass 1 true )
+  { grep -q 'outcome=ready' "$wbc" && grep -q 'review=codex:pass' "$wbc" && grep -q 'pr=#7' "$wbc"; } \
+    || { echo "FAIL #6 ready comment: [$(cat "$wbc")]"; exit 1; }
+  echo "_issue_writeback comment (#6) OK"
+  local wbcl="$wbdir/close.log"; : >"$wbcl"
+  ( PATH="$wbdir:$PATH" REPO=demo/demo BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_PR_STATE=MERGED FAKE_ISSUE_STATE=OPEN WB_CLOSE_LOG="$wbcl" _ensure_issue_closed 42 7 )
+  grep -q 'CLOSED 42' "$wbcl" || { echo "FAIL #3: merged+open issue not closed"; exit 1; }
+  : >"$wbcl"
+  ( PATH="$wbdir:$PATH" REPO=demo/demo BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_PR_STATE=OPEN FAKE_ISSUE_STATE=OPEN WB_CLOSE_LOG="$wbcl" _ensure_issue_closed 42 7 )
+  [ -s "$wbcl" ] && { echo "FAIL #3: closed issue for an unmerged PR"; exit 1; }
+  : >"$wbcl"
+  ( PATH="$wbdir:$PATH" REPO=demo/demo BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_PR_STATE=MERGED FAKE_ISSUE_STATE=CLOSED WB_CLOSE_LOG="$wbcl" _ensure_issue_closed 42 7 )
+  [ -s "$wbcl" ] && { echo "FAIL #3: redundant close on already-closed issue"; exit 1; }
+  rm -rf "$wbdir"
+  echo "_ensure_issue_closed (#3) OK"
   # --- Task 2 (#346): _main_ci_verdict pure re-run/decision helper ------------
   [ "$(_main_ci_verdict green "")"     = continue ]    || { echo "FAIL verdict green"; exit 1; }
   [ "$(_main_ci_verdict red green)"    = continue ]    || { echo "FAIL verdict red,green"; exit 1; }
