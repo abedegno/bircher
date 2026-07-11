@@ -803,7 +803,16 @@ _ensure_issue_closed() {
 # before launching the queue, instead of letting every item time out.
 # Skip with SKIP_PREFLIGHT=1; tune the per-probe timeout with PREFLIGHT_TIMEOUT.
 preflight_auth() {
-  [ -n "${SKIP_PREFLIGHT:-}" ] && { echo "[batch] preflight: skipped (SKIP_PREFLIGHT set)"; return 0; }
+  # #5: honor SKIP_PREFLIGHT only for an ATTENDED (interactive TTY) invocation.
+  # An unattended/detached run (no controlling TTY -- the overnight launch runs
+  # with stdin </dev/null and stdout to a log) MUST probe: a stale codex/claude
+  # auth would otherwise silently waste the whole batch (the 2026-06-22 ~30h loss).
+  if [ -n "${SKIP_PREFLIGHT:-}" ]; then
+    if [ -t 0 ] || [ -t 1 ]; then
+      echo "[batch] preflight: skipped (SKIP_PREFLIGHT set, attended TTY)"; return 0
+    fi
+    echo "[batch] preflight: SKIP_PREFLIGHT IGNORED on an unattended run (no TTY) -> probing anyway" >&2
+  fi
   local t="${PREFLIGHT_TIMEOUT:-60}" ok=1
   echo "[batch] preflight: probing claude + codex auth (timeout ${t}s each)..."
   # Claude (claude-sdk coordinator brain + worker): trivial headless call.
@@ -827,15 +836,20 @@ preflight_auth() {
   echo "[batch] preflight OK -> both providers healthy"
 }
 
-# json_row item pr outcome ci_first review rounds wall note bound
+# json_row item pr outcome ci_first review rounds wall note bound [implementer]
+# #4: implementer is optional (last arg) so pre-launch call sites can omit it;
+# recording it makes the cross-vendor pairing (implementer vs review) auditable.
 json_row() {
   python3 - "$@" <<'PY'
 import json,sys,datetime
-item,pr,outcome,ci_first,review,rounds,wall,note,bound=sys.argv[1:10]
+a=sys.argv[1:]
+item,pr,outcome,ci_first,review,rounds,wall,note,bound=a[:9]
+implementer=a[9] if len(a)>9 else ""
 print(json.dumps({
  "ts": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
  "item": item, "pr": int(pr) if pr.isdigit() else None, "outcome": outcome,
- "ci_pass_first_try": ci_first=="true", "review": review or None,
+ "implementer": implementer or None, "review": review or None,
+ "ci_pass_first_try": ci_first=="true",
  "rounds": int(rounds) if rounds.isdigit() else None,
  "wall_seconds": int(wall) if wall.isdigit() else None, "cost": None,
  "bound": bound or None, "note": note}))
@@ -1021,7 +1035,7 @@ ${prompt}"
     local nnote; nnote=$(head -c 300 "$NOOP_DIR/$code.noop" 2>/dev/null | tr '\n' ' ')
     rm -f "$NOOP_DIR/$code.noop"
     mkdir -p "$(dirname "$SCORECARD")"
-    json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" >> "$SCORECARD"
+    json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=noop (no change needed)"
     _issue_writeback "$(_item_issue "$prompt")" "noop" "" "" "" ""
     mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
@@ -1035,7 +1049,7 @@ ${prompt}"
     local enote; enote=$(head -c 300 "$NOOP_DIR/$code.escalated" 2>/dev/null | tr '\n' ' ')
     rm -f "$NOOP_DIR/$code.escalated"
     mkdir -p "$(dirname "$SCORECARD")"
-    json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" >> "$SCORECARD"
+    json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=escalated (no PR; reason: ${enote:-n/a})"
     _issue_writeback "$(_item_issue "$prompt")" "escalated" "${pr:-}" "" "" ""
     mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
@@ -1082,7 +1096,7 @@ EOF
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" >> "$SCORECARD"
+  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
   _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"
   # #3: guarantee the issue closes when its PR actually merged (backstops a
   # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
@@ -1101,8 +1115,8 @@ self_test() {
   m=$(parse_marker 'Ready for merge.\nbircher-status: outcome=ready ci=green ci_first=true review=claude_code:pass rounds=1 note="txt export"')
   [ "$m" = "ready|green|true|claude_code:pass|1|txt export" ] || { echo "FAIL parse literal-\\n: '$m'"; exit 1; }
   m=$(parse_marker "no marker here") && { echo "FAIL: expected rc1"; exit 1; }
-  local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok)
-  printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok", d; print("json_row OK")'
+  local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
+  printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)
   printf '%s' "$row2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["bound"]=="failed" and d["pr"] is None, d; print("json_row bound=failed OK")'
   # RC-1: _is_blank gates the empty-prompt guard.
@@ -1113,7 +1127,7 @@ self_test() {
   echo "_is_blank OK"
   # RC-1: a skipped item produces a valid scorecard row.
   local row3; row3=$(json_row demo3 "" skipped false "" "" 0 "empty/blank prompt; not launched" "n/a")
-  printf '%s' "$row3" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="skipped" and d["pr"] is None and d["wall_seconds"]==0 and d["bound"]=="n/a", d; print("json_row skipped OK")'
+  printf '%s' "$row3" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="skipped" and d["pr"] is None and d["wall_seconds"]==0 and d["bound"]=="n/a" and d["implementer"] is None, d; print("json_row skipped OK (implementer omitted -> null)")'
   # --- Layer-2 recovery: pure decision helpers -------------------------------
   RECOVERY_REVIEWER=codex   # make the asserts deterministic regardless of env
   [ "$(_extract_verdict $'note\nVERDICT: FAIL\nmore prose\nVERDICT: PASS')" = "PASS" ] \
