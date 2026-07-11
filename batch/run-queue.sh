@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Bircher batch runner: work agents/bircher/queue/*.md one at a time through a
+# Bircher batch runner: work queue/*.md one at a time through a
 # fresh Bircher session each, detect completion via the PR's bircher-status
 # marker, append a scorecard row, then move on. Sequential by design (M4).
 set -uo pipefail
 
+# _derive_bundle_dir <script-path> -> the bundle root (the checkout containing batch/,
+# skills/, agents/, config.yaml): the parent of the script's dir. Works flattened
+# (/workspaces/bircher/batch/run-queue.sh -> /workspaces/bircher) and nested
+# (.../agents/bircher/batch/run-queue.sh -> .../agents/bircher). PURE-ish (needs the dir to exist).
+_derive_bundle_dir() { ( cd "$(dirname "$1")/.." && pwd ); }
+
 REPO="${BIRCHER_REPO:-abedegno/muesli}"
-WORKDIR="${WORKDIR:-/workspaces/muesli}"
-QUEUE="$WORKDIR/agents/bircher/queue"
+WORKDIR="${WORKDIR:-/workspaces/muesli}"                        # the WORK repo (target app)
+BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  # the bircher checkout
+QUEUE="${QUEUE:-$BUNDLE_DIR/queue}"
 PROCESSED="$QUEUE/processed"
-SCORECARD="${SCORECARD:-$WORKDIR/docs/agent-runs/scorecard.jsonl}"
+SCORECARD="${SCORECARD:-$BUNDLE_DIR/.run/scorecard.jsonl}"
 # No-op signal dir: the coordinator drops <code>.noop here when an item is
 # already satisfied (no product change needed) so the runner records a `noop`
 # and advances instantly instead of polling out the full ITEM_TIMEOUT (gap #3).
@@ -570,7 +577,7 @@ recover_from_ground_truth() {
       local prompt rlog
       prompt=$(_recovery_review_prompt "$pr")
       rlog="/tmp/recover-$item.log"
-      ( cd "$WORKDIR" && omnigent run "agents/bircher/agents/$RECOVERY_REVIEWER" \
+      ( cd "$BUNDLE_DIR" && omnigent run "agents/$RECOVERY_REVIEWER" \
           --server "$SERVER" -p "$prompt" ) >"$rlog" 2>&1 || true
       reviewer_out=$(cat "$rlog" 2>/dev/null)
       verdict=$(_extract_verdict "$reviewer_out")
@@ -1256,6 +1263,21 @@ SH
   [ "$(printf '%s\n' "$out" | sed -n '3p')" = "$mdir2/i1-c.md" ]  || { echo "FAIL manifest order 3 (must preserve file order, NOT sort)"; exit 1; }
   rm -rf "$mdir2"
   echo "_manifest_items OK"
+  # --- decoupling: BUNDLE_DIR derivation (from script location) + path defaults ---
+  local bdt; bdt=$(mktemp -d); mkdir -p "$bdt/batch"; : > "$bdt/batch/run-queue.sh"
+  [ "$(_derive_bundle_dir "$bdt/batch/run-queue.sh")" = "$bdt" ] || { echo "FAIL bundle-dir derive"; exit 1; }
+  # QUEUE/SCORECARD are already-bound globals (set at top of file), so a subshell
+  # inherits them; `unset` them here so the ${VAR:-default} expansions actually
+  # exercise the DEFAULT. Check the subshell exit status so a failure aborts
+  # self_test (a bare `( ... )` would swallow the inner `exit 1`).
+  ( unset QUEUE SCORECARD; BUNDLE_DIR=/tmp/xbundle
+    [ "${QUEUE:-$BUNDLE_DIR/queue}" = "/tmp/xbundle/queue" ] || exit 1
+    [ "${SCORECARD:-$BUNDLE_DIR/.run/scorecard.jsonl}" = "/tmp/xbundle/.run/scorecard.jsonl" ] || exit 1
+    QUEUE=/tmp/override
+    [ "${QUEUE:-$BUNDLE_DIR/queue}" = "/tmp/override" ] || exit 1
+  ) || { echo "FAIL bundle-dir path defaults/override"; exit 1; }
+  rm -rf "$bdt"
+  echo "_bundle_dir OK"
   echo "self-test OK"
 }
 
@@ -1303,7 +1325,7 @@ main() {
   # REST launch: upload the agent bundle ONCE to mint a fresh session-scoped
   # agent (config edits activate here); every item's run session binds to it.
   local holder
-  holder=$(_upload_bundle "$WORKDIR/agents/bircher" "bircher bundle upload")
+  holder=$(_upload_bundle "$BUNDLE_DIR" "bircher bundle upload")
   [ -n "$holder" ] || { echo "[batch] FATAL: bundle upload failed" >&2; exit 3; }
   AGENT_ID=$(_get_agent_id "$holder")
   [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
@@ -1312,7 +1334,7 @@ main() {
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then
     echo "[batch] source=issues: generating queue from bircher:queued issues" >&2
-    bash "$WORKDIR/agents/bircher/batch/issues-to-queue.sh" || { echo "[batch] issue->queue generation failed" >&2; exit 3; }
+    bash "$BUNDLE_DIR/batch/issues-to-queue.sh" || { echo "[batch] issue->queue generation failed" >&2; exit 3; }
   fi
   local items
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ] && [ -f "$QUEUE/.manifest" ]; then
