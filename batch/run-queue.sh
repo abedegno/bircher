@@ -429,23 +429,25 @@ _prune_session() {
     || echo "[batch] WARN: prune of session $1 failed" >&2
 }
 
-# _bot_approve_pr <item> <pr> -> post a bircher-bot GitHub approval so a repo whose
-# branch protection requires an approving review (e.g. public abedegno/muesli) can
-# self-merge. Only called from merge_ready_pr, which the caller reaches ONLY on an
-# outcome=ready item (cross-vendor review PASS), so the "approve only on PASS" guard
-# is inherent. Gated on BIRCHER_BOT_TOKEN: unset -> skip (merge then defers on a
-# protected repo exactly as before - backward compatible). The token MUST be a
-# DIFFERENT GitHub identity than the PR author (the runner opens PRs as its own
-# account, and GitHub blocks approving your own PR). Best-effort: a failed approval
-# just falls through to the merge attempt (which defers cleanly on a protected repo).
-_bot_approve_pr() {
-  local item="$1" pr="$2"
-  [ -n "${BIRCHER_BOT_TOKEN:-}" ] || return 0
-  if GH_TOKEN="$BIRCHER_BOT_TOKEN" gh pr review "$pr" --repo "$REPO" --approve \
-       --body "Cross-vendor review PASS - Bircher automated approval (bircher-bot)." >/dev/null 2>&1; then
-    echo "[batch:merge] $item: bircher-bot approval posted on PR #$pr" >&2
+# _post_cross_review_status <item> <pr> -> mark the PR's head commit with a
+# `bircher/cross-review` = success commit status, so a repo whose branch protection
+# REQUIRES that check (in lieu of an approving review) can self-merge. Only called
+# from merge_ready_pr, which the caller reaches ONLY on an outcome=ready item
+# (cross-vendor review PASS) - so the status is only ever posted on a genuine PASS.
+# Posted as the runner's own identity: setting a commit status is NOT a self-approval,
+# so (unlike `gh pr review --approve`) it needs no second GitHub account. On a repo
+# WITHOUT that required check the status is harmless. Best-effort: a failed post just
+# falls through to the merge (which defers cleanly if the gate is unmet).
+_post_cross_review_status() {
+  local item="$1" pr="$2" sha
+  sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+  [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 0; }
+  if gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+       -f context=bircher/cross-review \
+       -f description="cross-vendor review PASS (Bircher)" >/dev/null 2>&1; then
+    echo "[batch:merge] $item: posted bircher/cross-review=success on ${sha:0:7}" >&2
   else
-    echo "[batch:merge] WARN $item: bircher-bot approval FAILED on PR #$pr (token / collaborator / same-identity?) -> merge may defer" >&2
+    echo "[batch:merge] WARN $item: failed to post bircher/cross-review status on PR #$pr -> merge may defer" >&2
   fi
 }
 
@@ -472,10 +474,18 @@ merge_ready_pr() {
     echo "[batch:merge] $item: PR #$pr not mergeable ($m) -> left open for the human" >&2
     return 0
   fi
-  # #10: satisfy a required-review branch protection with a distinct-identity
-  # bircher-bot approval before merging (no-op without BIRCHER_BOT_TOKEN).
-  _bot_approve_pr "$item" "$pr"
-  if ! gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then
+  # #10: satisfy a required-check branch protection (bircher/cross-review) so a
+  # protected repo self-merges without an approving review. No-op on repos that
+  # don't require the check.
+  _post_cross_review_status "$item" "$pr"
+  # Merge, retrying briefly: the status just posted needs a moment to propagate to
+  # the protected-branch merge gate (a single early attempt can still see BLOCKED).
+  local merged=0 mt=0
+  while [ "$mt" -lt 30 ]; do
+    if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then merged=1; break; fi
+    sleep 5; mt=$((mt + 5))
+  done
+  if [ "$merged" != 1 ]; then
     MERGE_NOTE="merge deferred: gh pr merge failed"
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
     return 0
@@ -1230,14 +1240,19 @@ SH
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
 #!/usr/bin/env bash
-# fake gh for merge_ready_pr: behavior keyed on $FAKE_MERGEABLE.
+# fake gh for merge_ready_pr: $FAKE_MERGEABLE controls mergeability; FAKE_GH_LOG records status posts.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  if printf '%s\n' "$@" | grep -q 'mergeCommit'; then echo "deadbeefsha"; else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
+  if printf '%s\n' "$@" | grep -q 'headRefOid'; then echo "headsha1234567"
+  elif printf '%s\n' "$@" | grep -q 'mergeCommit'; then echo "deadbeefsha"
+  else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
   exit 0
 fi
-if [ "$1" = "pr" ] && [ "$2" = "review" ]; then echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit 0; fi
-if [ "$1" = "api" ]; then printf 'completed|success\ncompleted|success\n'; exit 0; fi
+if [ "$1" = "api" ]; then
+  # a statuses POST -> record it; a check-runs GET -> report main CI green
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"; exit 0; fi
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
 exit 0
 SH
   chmod +x "$mdir/gh"
@@ -1248,17 +1263,15 @@ SH
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
-  # #10 bot-approval: with BIRCHER_BOT_TOKEN set, a --approve is posted before the merge
-  local alog="$mdir/approvals.log"; : >"$alog"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 BIRCHER_BOT_TOKEN=xxx FAKE_GH_LOG="$alog" \
-      merge_ready_pr demo 7 >/dev/null 2>&1 )
-  grep -q 'pr review 7 .*--approve' "$alog" || { echo "FAIL merge_ready_pr: bot approval not posted"; exit 1; }
-  # ...and WITHOUT a token, no approval is attempted (backward compatible)
-  : >"$alog"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$alog" merge_ready_pr demo 7 >/dev/null 2>&1 )
-  [ -s "$alog" ] && { echo "FAIL merge_ready_pr: approved without a bot token"; exit 1; }
+  # #10 cross-review status: a ready item posts bircher/cross-review=success before merging
+  local slog="$mdir/status.log"; : >"$slog"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" merge_ready_pr demo 7 >/dev/null 2>&1 )
+  grep -q 'repos/demo/demo/statuses/headsha' "$slog" \
+    && grep -q 'state=success' "$slog" \
+    && grep -q 'context=bircher/cross-review' "$slog" \
+    || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
   rm -rf "$mdir"
-  echo "merge_ready_pr OK (incl. #10 bot-approval)"
+  echo "merge_ready_pr OK (incl. #10 cross-review status)"
   # --- _render_issue_item: pure queue-file renderer ---------------------------
   r=$(_render_issue_item 301 "People / attendees" $'## Summary\nDo the thing.\n## Verify\nno db tests')
   printf '%s\n' "$r" | grep -q '^Issue: #301$'            || { echo "FAIL render: Issue header"; exit 1; }
