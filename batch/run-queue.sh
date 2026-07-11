@@ -429,6 +429,26 @@ _prune_session() {
     || echo "[batch] WARN: prune of session $1 failed" >&2
 }
 
+# _bot_approve_pr <item> <pr> -> post a bircher-bot GitHub approval so a repo whose
+# branch protection requires an approving review (e.g. public abedegno/muesli) can
+# self-merge. Only called from merge_ready_pr, which the caller reaches ONLY on an
+# outcome=ready item (cross-vendor review PASS), so the "approve only on PASS" guard
+# is inherent. Gated on BIRCHER_BOT_TOKEN: unset -> skip (merge then defers on a
+# protected repo exactly as before - backward compatible). The token MUST be a
+# DIFFERENT GitHub identity than the PR author (the runner opens PRs as its own
+# account, and GitHub blocks approving your own PR). Best-effort: a failed approval
+# just falls through to the merge attempt (which defers cleanly on a protected repo).
+_bot_approve_pr() {
+  local item="$1" pr="$2"
+  [ -n "${BIRCHER_BOT_TOKEN:-}" ] || return 0
+  if GH_TOKEN="$BIRCHER_BOT_TOKEN" gh pr review "$pr" --repo "$REPO" --approve \
+       --body "Cross-vendor review PASS - Bircher automated approval (bircher-bot)." >/dev/null 2>&1; then
+    echo "[batch:merge] $item: bircher-bot approval posted on PR #$pr" >&2
+  else
+    echo "[batch:merge] WARN $item: bircher-bot approval FAILED on PR #$pr (token / collaborator / same-identity?) -> merge may defer" >&2
+  fi
+}
+
 # merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
 # deferral) | rc 2 (HALT the run: main went red and the merge was reverted, or
 # main CI never resolved). B-1 in-run merge: merging each ready PR before the
@@ -452,6 +472,9 @@ merge_ready_pr() {
     echo "[batch:merge] $item: PR #$pr not mergeable ($m) -> left open for the human" >&2
     return 0
   fi
+  # #10: satisfy a required-review branch protection with a distinct-identity
+  # bircher-bot approval before merging (no-op without BIRCHER_BOT_TOKEN).
+  _bot_approve_pr "$item" "$pr"
   if ! gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then
     MERGE_NOTE="merge deferred: gh pr merge failed"
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
@@ -1212,6 +1235,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   if printf '%s\n' "$@" | grep -q 'mergeCommit'; then echo "deadbeefsha"; else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
   exit 0
 fi
+if [ "$1" = "pr" ] && [ "$2" = "review" ]; then echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"; exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit 0; fi
 if [ "$1" = "api" ]; then printf 'completed|success\ncompleted|success\n'; exit 0; fi
 exit 0
@@ -1224,8 +1248,17 @@ SH
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
+  # #10 bot-approval: with BIRCHER_BOT_TOKEN set, a --approve is posted before the merge
+  local alog="$mdir/approvals.log"; : >"$alog"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 BIRCHER_BOT_TOKEN=xxx FAKE_GH_LOG="$alog" \
+      merge_ready_pr demo 7 >/dev/null 2>&1 )
+  grep -q 'pr review 7 .*--approve' "$alog" || { echo "FAIL merge_ready_pr: bot approval not posted"; exit 1; }
+  # ...and WITHOUT a token, no approval is attempted (backward compatible)
+  : >"$alog"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$alog" merge_ready_pr demo 7 >/dev/null 2>&1 )
+  [ -s "$alog" ] && { echo "FAIL merge_ready_pr: approved without a bot token"; exit 1; }
   rm -rf "$mdir"
-  echo "merge_ready_pr OK"
+  echo "merge_ready_pr OK (incl. #10 bot-approval)"
   # --- _render_issue_item: pure queue-file renderer ---------------------------
   r=$(_render_issue_item 301 "People / attendees" $'## Summary\nDo the thing.\n## Verify\nno db tests')
   printf '%s\n' "$r" | grep -q '^Issue: #301$'            || { echo "FAIL render: Issue header"; exit 1; }
