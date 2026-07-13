@@ -281,22 +281,59 @@ _claude_usage() {
   printf '%s\n' "$tup"
 }
 
-# _codex_usage -> same tuple, from the LAST rate_limits snapshot in the NEWEST
-# codex rollout file (every `codex exec` - incl. the preflight probe - writes
-# one; verified populated on codex-cli 0.142.5). primary=5h, secondary=weekly.
+# _parse_codex_rate_limits: read ONE codex rollout JSONL line on stdin, emit
+# "5h_pct|5h_reset|7d_pct|7d_reset" (percent 0-100, resets as epochs; "-" for an
+# absent window). The whole line is parsed as JSON and searched for a rate_limits
+# object; each present window (primary/secondary) is classified by window_minutes
+# -- <=360 -> 5h bucket, >=1440 -> weekly bucket -- because the labels are
+# plan-dependent (codex-cli 0.144.x "prolite" exposes only a weekly primary with
+# secondary:null; legacy plans had a 5h primary + a weekly secondary). Prints
+# nothing on any parse failure so callers degrade to the default vendor.
+_parse_codex_rate_limits() {
+  python3 -c '
+import json,sys
+line=sys.stdin.read().strip()
+def find_rl(o):
+    if isinstance(o,dict):
+        rl=o.get("rate_limits")
+        if isinstance(rl,dict): return rl
+        for v in o.values():
+            r=find_rl(v)
+            if r: return r
+    elif isinstance(o,list):
+        for v in o:
+            r=find_rl(v)
+            if r: return r
+    return None
+try:
+    rl=find_rl(json.loads(line))
+except Exception:
+    sys.exit(0)
+if not isinstance(rl,dict): sys.exit(0)
+five=("-","-"); week=("-","-")
+for w in (rl.get("primary"), rl.get("secondary")):
+    if not isinstance(w,dict): continue
+    up=w.get("used_percent")
+    if up is None: continue
+    rs=w.get("resets_at"); rs="-" if rs is None else rs
+    wm=w.get("window_minutes")
+    if isinstance(wm,(int,float)) and wm<=360: five=(up,rs)
+    elif isinstance(wm,(int,float)) and wm>=1440: week=(up,rs)
+print("%s|%s|%s|%s" % (five[0],five[1],week[0],week[1]))
+'
+}
+
+# _codex_usage -> "5h_pct|5h_reset|7d_pct|7d_reset" from the LAST rate_limits
+# snapshot in the NEWEST codex rollout file (every `codex exec` - incl. the
+# preflight probe - writes one). Non-zero when no rollout / no snapshot so
+# callers degrade to the default vendor.
 _codex_usage() {
-  local f
+  local f line
   f=$(ls -t "$CODEX_SESSIONS_DIR"/*/*/*/rollout-*.jsonl 2>/dev/null | head -1)
   [ -n "$f" ] || return 1
-  grep -o '"rate_limits":{[^}]*}[^}]*}[^}]*}' "$f" 2>/dev/null | tail -1 | python3 -c '
-import json,sys
-raw=sys.stdin.read().strip()
-try:
-    d=json.loads("{"+raw+"}")["rate_limits"]
-    p=d.get("primary") or {}; s=d.get("secondary") or {}
-    print("%s|%s|%s|%s" % (p.get("used_percent","-"), p.get("resets_at","-"),
-                           s.get("used_percent","-"), s.get("resets_at","-")))
-except Exception: pass' 2>/dev/null
+  line=$(grep '"rate_limits"' "$f" 2>/dev/null | tail -1)
+  [ -n "$line" ] || return 1
+  printf '%s' "$line" | _parse_codex_rate_limits
 }
 
 # _session_died <status> <err_code> -> "died" | "alive"
@@ -1278,6 +1315,16 @@ SH
   [ "$(_pick_implementer -  -   -   -  -   -  1000)" = "claude_code" ] || { echo "FAIL pick no-signal default"; exit 1; }
   [ "$(_pick_implementer 50 100 40  -  -   -  1000)" = "codex" ]       || { echo "FAIL pick missing-codex-eligible"; exit 1; }
   echo "_pick_implementer OK"
+  # --- _parse_codex_rate_limits: current "prolite" weekly-only schema, legacy
+  #     dual-window schema, and garbage all parse correctly (regression for the
+  #     codex-cli 0.144.x schema drift that silently pinned every item to codex) -
+  local pl lg
+  pl='{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":6.0,"window_minutes":10080,"resets_at":1784488480},"secondary":null,"credits":null,"plan_type":"prolite"}}'
+  [ "$(printf '%s' "$pl" | _parse_codex_rate_limits)" = "-|-|6.0|1784488480" ] || { echo "FAIL codex prolite (weekly-only) parse"; exit 1; }
+  lg='{"rate_limits":{"primary":{"used_percent":30,"window_minutes":300,"resets_at":111},"secondary":{"used_percent":55,"window_minutes":10080,"resets_at":222}}}'
+  [ "$(printf '%s' "$lg" | _parse_codex_rate_limits)" = "30|111|55|222" ] || { echo "FAIL codex legacy dual-window parse"; exit 1; }
+  [ -z "$(printf '%s' 'not json at all' | _parse_codex_rate_limits)" ]    || { echo "FAIL codex garbage -> empty"; exit 1; }
+  echo "_codex_usage parse OK"
   # --- B-1: merge_ready_pr via fake gh (merged + deferred paths) ---------------
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
