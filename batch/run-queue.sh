@@ -1420,6 +1420,16 @@ SH
   else
     echo "WARN: commit-msg hook not executable at $hook" >&2
   fi
+  # --- _install_work_git_config forces the operator identity over codex's Codex
+  #     author (the real source of the squash Co-authored-by trailer) ------------
+  local gdir; gdir=$(mktemp -d)
+  ( cd "$gdir" && git init -q && git config user.name Codex && git config user.email codex@example.com )
+  _install_work_git_config "$gdir"
+  [ "$(git -C "$gdir" config user.name)"  = "Abedegno" ]               || { echo "FAIL identity name not overridden"; rm -rf "$gdir"; exit 1; }
+  [ "$(git -C "$gdir" config user.email)" = "jon@jonwilliams.org.uk" ] || { echo "FAIL identity email not overridden"; rm -rf "$gdir"; exit 1; }
+  BIRCHER_GIT_AUTHOR_NAME=Custom BIRCHER_GIT_AUTHOR_EMAIL=c@x.io _install_work_git_config "$gdir"
+  [ "$(git -C "$gdir" config user.name)"  = "Custom" ]                 || { echo "FAIL identity env override"; rm -rf "$gdir"; exit 1; }
+  rm -rf "$gdir"; echo "_install_work_git_config OK"
   # --- B-1: merge_ready_pr via fake gh (merged + deferred paths) ---------------
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
@@ -1542,6 +1552,24 @@ SH
   echo "self-test OK"
 }
 
+# _install_work_git_config <workdir>: prepare the work repo before a run so no AI
+# attribution reaches muesli/bircher/homelab history.
+# (1) Commit identity: codex writes user.name=Codex / user.email=codex@example.com
+#     into the work repo's LOCAL git config, and the squash merge turns that
+#     branch-commit AUTHOR into a "Co-authored-by: Codex <...>" trailer on main.
+#     Force the operator identity (matching the merge author, so GitHub derives no
+#     co-author). Env-overridable via BIRCHER_GIT_AUTHOR_NAME/_EMAIL.
+# (2) core.hooksPath -> the bundle commit-msg hook (defense in depth against any
+#     message-level AI trailer). Absolute path so it covers every worktree.
+_install_work_git_config() {
+  local wd="$1"
+  git -C "$wd" config user.name  "${BIRCHER_GIT_AUTHOR_NAME:-Abedegno}"                2>/dev/null || true
+  git -C "$wd" config user.email "${BIRCHER_GIT_AUTHOR_EMAIL:-jon@jonwilliams.org.uk}" 2>/dev/null || true
+  if [ -x "$BUNDLE_DIR/githooks/commit-msg" ]; then
+    git -C "$wd" config core.hooksPath "$BUNDLE_DIR/githooks" 2>/dev/null || true
+  fi
+}
+
 main() {
   [ "${1:-}" = "--self-test" ] && { self_test; exit 0; }
   # Standalone auth check (no queue run): verify both providers, then exit.
@@ -1592,18 +1620,11 @@ main() {
   [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
   echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
 
-  # Install the AI-attribution-stripping commit-msg hook on the work repo so
-  # codex's default "Co-authored-by: Codex <...>" trailer never reaches muesli
-  # history (no AI attribution in muesli/bircher/homelab). Absolute hooksPath ->
-  # applies to every worktree the implementers create; squash merge aggregates
-  # the now-clean branch commits, so main stays clean too.
-  if [ -x "$BUNDLE_DIR/githooks/commit-msg" ]; then
-    if git -C "$WORKDIR" config core.hooksPath "$BUNDLE_DIR/githooks" 2>/dev/null; then
-      echo "[batch] installed attribution-strip commit-msg hook on $WORKDIR" >&2
-    else
-      echo "[batch] WARN: could not set core.hooksPath on $WORKDIR" >&2
-    fi
-  fi
+  # Force the operator commit identity (codex's default Codex author otherwise
+  # becomes a squash Co-authored-by trailer) + install the attribution-strip
+  # commit-msg hook. No AI attribution in muesli/bircher/homelab.
+  _install_work_git_config "$WORKDIR"
+  echo "[batch] work-repo git identity + attribution hook set on $WORKDIR (author=${BIRCHER_GIT_AUTHOR_NAME:-Abedegno})" >&2
 
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then
