@@ -1325,6 +1325,19 @@ SH
   [ "$(printf '%s' "$lg" | _parse_codex_rate_limits)" = "30|111|55|222" ] || { echo "FAIL codex legacy dual-window parse"; exit 1; }
   [ -z "$(printf '%s' 'not json at all' | _parse_codex_rate_limits)" ]    || { echo "FAIL codex garbage -> empty"; exit 1; }
   echo "_codex_usage parse OK"
+  # --- commit-msg hook: strips AI-attribution trailers, keeps body + human co-authors
+  local hook="$BUNDLE_DIR/githooks/commit-msg" hmf
+  if [ -x "$hook" ]; then
+    hmf=$(mktemp)
+    printf 'feat: real change\n\nExplains the change.\nCo-authored-by: Real Human <human@team.org>\nCo-authored-by: Codex <codex@example.com>\n' > "$hmf"
+    "$hook" "$hmf"
+    grep -q 'Explains the change.' "$hmf" || { echo "FAIL hook dropped the body"; rm -f "$hmf"; exit 1; }
+    grep -q 'Real Human' "$hmf"           || { echo "FAIL hook dropped a human co-author"; rm -f "$hmf"; exit 1; }
+    grep -qi 'codex' "$hmf"               && { echo "FAIL hook kept the codex trailer"; rm -f "$hmf"; exit 1; }
+    rm -f "$hmf"; echo "commit-msg hook OK"
+  else
+    echo "WARN: commit-msg hook not executable at $hook" >&2
+  fi
   # --- B-1: merge_ready_pr via fake gh (merged + deferred paths) ---------------
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
@@ -1496,6 +1509,19 @@ main() {
   AGENT_ID=$(_get_agent_id "$holder")
   [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
   echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
+
+  # Install the AI-attribution-stripping commit-msg hook on the work repo so
+  # codex's default "Co-authored-by: Codex <...>" trailer never reaches muesli
+  # history (no AI attribution in muesli/bircher/homelab). Absolute hooksPath ->
+  # applies to every worktree the implementers create; squash merge aggregates
+  # the now-clean branch commits, so main stays clean too.
+  if [ -x "$BUNDLE_DIR/githooks/commit-msg" ]; then
+    if git -C "$WORKDIR" config core.hooksPath "$BUNDLE_DIR/githooks" 2>/dev/null; then
+      echo "[batch] installed attribution-strip commit-msg hook on $WORKDIR" >&2
+    else
+      echo "[batch] WARN: could not set core.hooksPath on $WORKDIR" >&2
+    fi
+  fi
 
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then

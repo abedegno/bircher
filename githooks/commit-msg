@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Bircher commit-msg hook: strip AI-attribution trailers so no AI attribution
+# lands in muesli/bircher/homelab history. codex-cli adds a default
+# "Co-authored-by: Codex <codex@example.com>" trailer to every commit it authors;
+# the squash merge then carries it onto main. Installed via core.hooksPath by
+# run-queue.sh (absolute path, so it applies to the work repo AND every worktree
+# the implementers create). Edits the message in place, keeps the body and any
+# human co-authors, and never fails or blanks a commit.
+msg="${1:-}"
+[ -n "$msg" ] && [ -f "$msg" ] || exit 0
+tmp="$msg.bircher"
+grep -viE 'co-authored-by:.*(codex|claude|copilot|cursor|openai|anthropic|gpt|assistant)|generated with .*(codex|claude|copilot|cursor)' "$msg" > "$tmp" 2>/dev/null
+# Overwrite only if we kept real content (guards against a grep error blanking
+# the whole message); drop trailing blank lines left where a trailer was removed.
+if [ -s "$tmp" ]; then
+  awk '{a[NR]=$0} END{last=NR; while(last>0 && a[last] ~ /^[[:space:]]*$/) last--; for(i=1;i<=last;i++) print a[i]}' "$tmp" > "$msg" 2>/dev/null || true
+fi
+rm -f "$tmp"
+exit 0
