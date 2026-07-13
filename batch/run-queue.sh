@@ -612,6 +612,38 @@ Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is 
 EOF
 }
 
+# _reconcile_item_pr <code> <tracked_pr> -> the open PR number to act on.
+# A coordinator that opens a fresh branch/PR for a CI-red retry (run #20: item
+# i141 left #178 red + #179 green, both open) leaves run-queue tracking only the
+# FIRST PR it discovered, so recovery buried a green fix as failed. Re-scan every
+# open PR whose head branch carries the item code; if a DIFFERENT one is CI-green
+# adopt it and close the non-adopted siblings as superseded (so they do not
+# orphan). Prints the tracked pr unchanged when there is nothing better to pick.
+_reconcile_item_pr() {
+  local code="$1" tracked="$2" matches count m green=""
+  local chosen="$tracked"
+  [ -n "$code" ] || { echo "$tracked"; return; }
+  matches=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
+    -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | .[].number" 2>/dev/null)
+  count=$(printf '%s\n' "$matches" | grep -c .)
+  [ "${count:-0}" -le 1 ] && { echo "$tracked"; return; }
+  for m in $matches; do
+    if [ "$(_normalize_ci "$(gh pr checks "$m" --repo "$REPO" --json bucket -q '.[].bucket' 2>/dev/null)")" = green ]; then
+      green="$m"; break
+    fi
+  done
+  # Only reshuffle when a CI-green sibling exists; if all are red leave them for
+  # the normal failed/re-queue path (never close a PR we did not supersede).
+  [ -z "$green" ] && { echo "$tracked"; return; }
+  chosen="$green"
+  for m in $matches; do
+    [ "$m" = "$chosen" ] && continue
+    gh pr close "$m" --repo "$REPO" \
+      --comment "Superseded by #$chosen (Bircher recovery: item $code opened multiple PRs after a CI-red retry; adopting the CI-green one)." >/dev/null 2>&1 || true
+  done
+  echo "$chosen"
+}
+
 # recover_from_ground_truth <item> <code> <pr>
 # Called when a coordinator ended (idle-reaper ~30 min) before posting its
 # marker. Derives a truthful outcome from the PR and, for a CI-green PR, an
@@ -620,6 +652,15 @@ EOF
 recover_from_ground_truth() {
   local item="$1" code="$2" pr="$3"
   local ci="na" verdict="" reviewer_out=""
+  # Reconcile a CI-red-retry that opened a second branch/PR before the
+  # coordinator died (run #20 #141): adopt the CI-green sibling if there is one.
+  if [ -n "$pr" ]; then
+    local _rp; _rp=$(_reconcile_item_pr "$code" "$pr")
+    if [ -n "$_rp" ] && [ "$_rp" != "$pr" ]; then
+      echo "[batch:recover] $item: adopted CI-green sibling PR #$_rp (was tracking #$pr)" >&2
+      pr="$_rp"
+    fi
+  fi
   if [ -n "$pr" ]; then
     local buckets
     buckets=$(gh pr checks "$pr" --repo "$REPO" --json bucket -q '.[].bucket' 2>/dev/null)
@@ -1241,6 +1282,47 @@ SH
     || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "recover_from_ground_truth OK"
+  # --- Fix C: _reconcile_item_pr adopts a CI-green sibling + closes the loser --
+  local rdir; rdir=$(mktemp -d)
+  cat >"$rdir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh: two open PRs for the item; 179 green, 178 red; record closes.
+case "$2" in
+  list)   printf '178\n179\n' ;;
+  checks) case "$3" in 179) printf 'pass\npass\n' ;; *) printf 'fail\npass\n' ;; esac ;;
+  close)  echo "$3" >> "$GH_CLOSED" ;;
+esac
+exit 0
+SH
+  chmod +x "$rdir/gh"
+  : > "$rdir/closed.txt"
+  local rchosen
+  rchosen=$(PATH="$rdir:$PATH" REPO=demo/demo GH_CLOSED="$rdir/closed.txt" _reconcile_item_pr i141 178)
+  [ "$rchosen" = 179 ]                       || { echo "FAIL reconcile chose '$rchosen' not 179"; rm -rf "$rdir"; exit 1; }
+  grep -qx 178 "$rdir/closed.txt"            || { echo "FAIL reconcile did not close loser 178"; rm -rf "$rdir"; exit 1; }
+  grep -qx 179 "$rdir/closed.txt" 2>/dev/null && { echo "FAIL reconcile closed winner 179"; rm -rf "$rdir"; exit 1; }
+  # single match -> unchanged, closes nothing
+  cat >"$rdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$2" in list) printf '200\n' ;; checks) printf 'pass\npass\n' ;; close) echo "$3" >> "$GH_CLOSED" ;; esac
+exit 0
+SH
+  : > "$rdir/closed.txt"
+  rchosen=$(PATH="$rdir:$PATH" REPO=demo/demo GH_CLOSED="$rdir/closed.txt" _reconcile_item_pr i200 200)
+  [ "$rchosen" = 200 ]        || { echo "FAIL reconcile single-match '$rchosen'"; rm -rf "$rdir"; exit 1; }
+  [ ! -s "$rdir/closed.txt" ] || { echo "FAIL reconcile single-match closed something"; rm -rf "$rdir"; exit 1; }
+  # two matches, both red -> keep tracked, close nothing
+  cat >"$rdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$2" in list) printf '301\n302\n' ;; checks) printf 'fail\npass\n' ;; close) echo "$3" >> "$GH_CLOSED" ;; esac
+exit 0
+SH
+  : > "$rdir/closed.txt"
+  rchosen=$(PATH="$rdir:$PATH" REPO=demo/demo GH_CLOSED="$rdir/closed.txt" _reconcile_item_pr i301 301)
+  [ "$rchosen" = 301 ]        || { echo "FAIL reconcile all-red '$rchosen'"; rm -rf "$rdir"; exit 1; }
+  [ ! -s "$rdir/closed.txt" ] || { echo "FAIL reconcile all-red closed something"; rm -rf "$rdir"; exit 1; }
+  rm -rf "$rdir"
+  echo "_reconcile_item_pr OK"
   # --- RC2: _session_died (idle is NOT death) --------------------------------
   [ "$(_session_died running '')"   = "alive" ] || { echo "FAIL _session_died running";  exit 1; }
   [ "$(_session_died idle '')"      = "alive" ] || { echo "FAIL _session_died idle";     exit 1; }
