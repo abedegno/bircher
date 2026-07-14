@@ -597,6 +597,55 @@ merge_ready_pr() {
   esac
 }
 
+# recover_pr_cmd <code> <pr> [reviewer_vendor] -> STANDALONE recovery of ONE
+# orphaned PR: bring a BEHIND branch up to date, run the genuine cross-vendor
+# recovery review, and (on PASS + green CI) merge it -- no coordinator session,
+# no re-implementation. First-class entry point for the failure the 2026-07-14
+# overnight run exposed: a GitHub-infra CI flake outlasted recovery's reruns and
+# buried 3 CI-green PRs as `escalated`, orphaning a 4th. A plain re-queue does
+# NOT fix that class: the coordinator's opening step would no-op ("a sibling PR
+# already did it" -> leaves the PR unmerged) or re-implement it (duplicate PR);
+# this adopts and lands the EXISTING PR. The runner posts
+# bircher/cross-review=success ONLY after a real review PASS, and merges WITHOUT
+# --admin (the branch is up to date by then) -- so no self-approval and no
+# branch-protection bypass. rc mirrors merge_ready_pr (0 = merged or left open
+# with a marker; 2 = merged but main-CI HALT). Reviewer defaults to claude_code
+# (the overnight implementer was codex; the reviewer must be the opposite vendor).
+recover_pr_cmd() {
+  local code="${1:?usage: --recover-pr <code> <pr> [reviewer_vendor]}"
+  local pr="${2:?usage: --recover-pr <code> <pr> [reviewer_vendor]}"
+  RECOVERY_REVIEWER="${3:-claude_code}"
+  local item="recover-$code"
+  echo "[batch:recover-pr] $code: adopting PR #$pr (reviewer=$RECOVERY_REVIEWER)" >&2
+  # Strict branch protection blocks a BEHIND branch from merging. Normal runs
+  # dodge this by creating PRs sequentially off fresh main; a stale orphan must
+  # be brought up to date first. update-branch re-triggers the required checks on
+  # the new head, which recover_from_ground_truth's CI-wait then settles before
+  # the review -- so the subsequent (non-admin) merge sees a green, up-to-date PR.
+  local mss
+  mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
+  if [ "$mss" = "BEHIND" ]; then
+    echo "[batch:recover-pr] $code: PR #$pr is BEHIND main -> update-branch" >&2
+    gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
+      || echo "[batch:recover-pr] WARN $code: update-branch call failed (already updating or up to date)" >&2
+  fi
+  # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
+  _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
+  local rec r_outcome r_review r_note
+  rec=$(recover_from_ground_truth "$item" "$code" "$pr")
+  IFS='|' read -r r_outcome r_review r_note <<EOF
+$rec
+EOF
+  echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note" >&2
+  if [ "$r_outcome" = "ready" ]; then
+    merge_ready_pr "$item" "$pr"; local mrc=$?
+    echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}" >&2
+    return $mrc
+  fi
+  echo "[batch:recover-pr] $code: NOT ready (outcome=$r_outcome) -> PR left open with marker for human" >&2
+  return 0
+}
+
 # _recovery_review_prompt <pr> -> the read-only reviewer sub-agent input.
 # Mirrors the cross-review skill's reviewer template: fetch the PR branch,
 # read whole files, run gates each with an inline PATH export, end with an
@@ -1505,6 +1554,51 @@ SH
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
+  # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
+  local prdir; prdir=$(mktemp -d)
+  cat >"$prdir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh for recover_pr_cmd end-to-end (recovery review + merge_ready_pr).
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { echo "${FAKE_MSS:-CLEAN}"; exit 0; }
+  printf '%s\n' "$@" | grep -q 'headRefOid'       && { echo "headsha1234567"; exit 0; }
+  printf '%s\n' "$@" | grep -q 'mergeCommit'      && { echo ""; exit 0; }  # empty sha -> merge_ready_pr skips the slow main-CI watch (covered by the merge_ready_pr test)
+  echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
+fi
+[ "$1" = "pr" ] && [ "$2" = "checks" ]  && { printf 'pass\npass\n'; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "comment" ] && { echo "https://x/pull/9#c1"; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "list" ]    && { exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "merge" ]   && { echo "merge $3" >> "${PR_LOG:-/dev/null}"; exit 0; }
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q 'update-branch' && { echo "update-branch" >> "${PR_LOG:-/dev/null}"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/statuses/'    && { echo "status $*" >> "${PR_LOG:-/dev/null}"; exit 0; }
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  cat >"$prdir/omnigent" <<'SH'
+#!/usr/bin/env bash
+printf 'Recovery review of the adopted PR.\nVERDICT: PASS\n'
+exit 0
+SH
+  chmod +x "$prdir/gh" "$prdir/omnigent"
+  # up-to-date green PR: review PASS -> cross-review status + NON-admin merge; no update-branch
+  ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=CLEAN \
+      recover_pr_cmd rdemo 9 codex >/dev/null 2>&1
+    rc=$?; [ $rc -eq 0 ] ) || { echo "FAIL recover_pr_cmd happy rc"; rm -rf "$prdir"; exit 1; }
+  grep -q 'context=bircher/cross-review' "$prdir/log" || { echo "FAIL recover_pr_cmd: cross-review status not posted"; rm -rf "$prdir"; exit 1; }
+  grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: PR not merged"; rm -rf "$prdir"; exit 1; }
+  grep -q 'update-branch' "$prdir/log" && { echo "FAIL recover_pr_cmd: update-branch run for an up-to-date PR"; rm -rf "$prdir"; exit 1; }
+  # BEHIND PR: update-branch FIRST, then review + merge
+  : > "$prdir/log"
+  ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=BEHIND \
+      recover_pr_cmd rdemo 9 codex >/dev/null 2>&1 )
+  grep -q 'update-branch' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND did not update-branch"; rm -rf "$prdir"; exit 1; }
+  grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND path did not merge"; rm -rf "$prdir"; exit 1; }
+  rm -rf "$prdir"
+  echo "recover_pr_cmd (--recover-pr) OK"
   # --- _render_issue_item: pure queue-file renderer ---------------------------
   r=$(_render_issue_item 301 "People / attendees" $'## Summary\nDo the thing.\n## Verify\nno db tests')
   printf '%s\n' "$r" | grep -q '^Issue: #301$'            || { echo "FAIL render: Issue header"; exit 1; }
@@ -1626,6 +1720,13 @@ main() {
     echo "pick  : $(_pick_implementer "$(echo "$cu" | cut -d'|' -f1)" "$(echo "$cu" | cut -d'|' -f2)" "$(echo "$cu" | cut -d'|' -f3)" \
                                       "$(echo "$xu" | cut -d'|' -f1)" "$(echo "$xu" | cut -d'|' -f2)" "$(echo "$xu" | cut -d'|' -f3)" "$now") (FIVEH_MAX=$FIVEH_MAX)"
     exit 0
+  fi
+
+  # Standalone single-PR recovery (no queue run): adopt an existing orphaned PR,
+  # run the cross-vendor recovery review, and merge on PASS. See recover_pr_cmd.
+  #   run-queue.sh --recover-pr <code> <pr> [reviewer_vendor]
+  if [ "${1:-}" = "--recover-pr" ]; then
+    recover_pr_cmd "${2:-}" "${3:-}" "${4:-}"; exit $?
   fi
 
   # RC-1 singleton: only one batch may drain the queue at a time. The 2026-06-22
