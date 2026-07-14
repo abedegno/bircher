@@ -56,14 +56,33 @@ an independent different-vendor reviewer. Work in /workspaces/muesli.
   names. If there is no directive line, default the implementer to `claude_code`
   (reviewer `codex`). Never set a model or model_override in the dispatch args.
 - Dispatch `implement` to a coding sub-agent with the acceptance contract. Tell
-  it the item CODE (e.g. `a06`, from the task heading) and require an ISOLATED
-  worktree branched from a freshly-fetched `origin/main` (never the shared
-  checkout's HEAD), with a branch name STARTING with that lowercase code. This
-  keeps each PR's diff clean (no leaked sibling changes) and lets the batch
-  runner map the PR to this item by code.
-- The sub-agent makes the change, runs local fast checks (`go build ./...`,
-  `go vet ./...`; for client work `tsc --noEmit` and `vitest run`; targeted
-  NON-DB tests only), pushes its branch, and opens its own PR. Tell the
+  it the item CODE — this is ALWAYS the `i<N>` token at the very START of the
+  task heading (`# i<N>: <title>`); e.g. heading `# i230: Hosted install (A6):
+  release assets v2` -> code `i230`. NEVER substitute any other label: an
+  epic/category tag like `A6` in the title is NOT the item code even though it
+  looks similar (run #24, 2026-07-14: an implementer branched
+  `a06-release-assets-v2` and wrote `a06.pr` for item i230; the batch runner
+  tracks strictly by `i<N>`, so the wrong-coded PR was invisible to it and
+  stalled the run ~45min). Require an ISOLATED worktree branched from a
+  freshly-fetched `origin/main` (never the shared checkout's HEAD), with a branch
+  name STARTING with `i<N>` (the real item code, lowercase). This keeps each PR's
+  diff clean (no leaked sibling changes) and lets the batch runner map the PR to
+  this item by code.
+- The sub-agent makes the change, runs local fast checks, pushes its branch, and
+  opens its own PR. LOCAL CHECKS before pushing (a CI red on any of these is pure
+  waste - the implementer can and MUST green them locally first; run #24 had
+  ~48% of PRs miss CI on first try, much of it formatting):
+  - ALWAYS, for EVERY change regardless of type (code, docs, YAML, config):
+    `npx prettier --write .` then `npm run format:check` (must exit 0).
+    `client (node)`'s format:check runs `prettier --check .` REPO-WIDE, so a
+    docs-only or YAML-only PR fails it exactly like a `src/` change - this
+    red-gated #262/#263/#258 on markdown. `.prettierignore` excludes `src/` and
+    `web/admin/src/`, so `prettier --write .` is safe/inert on the React tree.
+  - For any Go change: `go build ./...`, `go vet ./...`, and `gofmt -w .` then
+    `gofmt -l .` (must print NOTHING - `server (go)` gates on gofmt).
+  - For client (`src/**`) work, additionally: `npx eslint src/ --fix` then
+    `npm run lint` (0 errors; pre-existing warnings pass), `tsc --noEmit`, and
+    `vitest run`; targeted NON-DB tests only. Tell the
   implementer it must NEVER run ANY database-backed test on the runner - not
   the full `go test ./...` suite and not a "targeted" DB-backed package like
   `internal/api` or `internal/store`, and never fabricate a TEST_DATABASE_URL
@@ -85,11 +104,15 @@ an independent different-vendor reviewer. Work in /workspaces/muesli.
   into the review.
 - AS SOON AS you have the PR number, RECORD IT for the batch runner so it maps
   the PR to this item deterministically (do not rely on the branch name — an
-  implementer that copies an example code into its branch name breaks the
-  runner's fallback match; B-6 / CAL06):
-  `printf '%s' <PR_NUMBER> > /workspaces/.bircher-noop/<code>.pr`
-  (`<code>` = THIS item's lowercase code from the task heading, e.g. `cal06` —
-  never an example code). Do this before waiting on CI.
+  implementer that copies an example code, OR an epic/category tag from the
+  title, into its branch name breaks the runner's code match; B-6 / CAL06 /
+  run #24 a06-vs-i230):
+  `printf '%s' <PR_NUMBER> > /workspaces/.bircher-noop/i<N>.pr`
+  (`i<N>` = THIS item's code, taken ONLY from the `# i<N>: ...` task heading —
+  never an example code from this document, never an epic/category tag from the
+  title). Do this before waiting on CI. (The batch runner also falls back to
+  mapping the PR by `Closes #N` in the body, but this `i<N>.pr` signal is the
+  fast, deterministic path — write it with the correct code.)
 - ISSUE WRITE-BACK: the backlog now lives in GitHub Issues. If the queue item
   names a tracked issue (a line like `Issue: #NNN` or `Closes: #NNN` in the task
   body), the implementer MUST put `Closes #NNN` in the PR BODY so that merging to
