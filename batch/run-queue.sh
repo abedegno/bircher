@@ -693,13 +693,15 @@ _reconcile_item_pr() {
   echo "$chosen"
 }
 
-# recover_from_ground_truth <item> <code> <pr>
+# recover_from_ground_truth <item> <code> <pr> [issue]
 # Called when a coordinator ended (idle-reaper ~30 min) before posting its
 # marker. Derives a truthful outcome from the PR and, for a CI-green PR, an
 # out-of-band cross-vendor review. Posts a self-describing bircher-status
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
+# `issue` (optional) enables the issue-linkage PR fallback when both signal and
+# branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
 recover_from_ground_truth() {
-  local item="$1" code="$2" pr="$3"
+  local item="$1" code="$2" pr="$3" issue="${4:-}"
   local ci="na" verdict="" reviewer_out=""
   # If discovery missed the PR (coordinator opened it, then died before run-queue
   # saw it -- overnight i230 opened #250 but was recorded "no PR"), re-scan for an
@@ -711,6 +713,22 @@ recover_from_ground_truth() {
     if [ -n "$_disc" ]; then
       echo "[batch:recover] $item: discovery had no PR; found open PR #$_disc by code -> adopting" >&2
       pr="$_disc"
+    fi
+  fi
+  # Branch-code discovery ALSO missed it -> fall back to issue linkage (`Closes
+  # #N` in the PR body). Only a SINGLE unambiguous match auto-adopts; 2+ matches
+  # are left for a human (recovery has no live escalation channel like the poll
+  # loop). Recovers the run #24 a06-vs-i230 class where branch AND signal used
+  # the wrong code but the body write-back was still correct.
+  if [ -z "$pr" ] && [ -n "$issue" ]; then
+    local _im _ic
+    _im=$(_discover_pr_by_issue "$issue")
+    _ic=$(printf '%s\n' "$_im" | grep -c .)
+    if [ "${_ic:-0}" -eq 1 ]; then
+      pr="$_im"
+      echo "[batch:recover] $item: no PR by code; found #$pr via issue #$issue linkage -> adopting" >&2
+    elif [ "${_ic:-0}" -gt 1 ]; then
+      echo "[batch:recover] $item: multiple PRs link issue #$issue ($_im) -- leaving for a human (ambiguous)" >&2
     fi
   fi
   # Reconcile a CI-red-retry that opened a second branch/PR before the
@@ -882,6 +900,31 @@ _select_pr_candidate() {
 # _item_issue <prompt-text> -> the issue number from an `Issue: #<n>` header, or empty.
 _item_issue() {
   printf '%s\n' "$1" | grep -iE '^Issue:[[:space:]]*#[0-9]+' | head -1 | grep -oE '[0-9]+' | head -1
+}
+
+# _discover_pr_by_issue <issue_num> -> open-PR number(s), one per line ("" if none).
+# LAST-RESORT PR->item mapping: fires ONLY when neither the coordinator's explicit
+# <code>.pr signal nor a branch-name code match found the PR. Every issue-driven
+# item is REQUIRED (muesli-loop step 3) to put `Closes #N` (or Fixes/Resolves #N)
+# in its PR body, so this recovers a PR whose branch AND signal were named after
+# the WRONG code -- run #24 (2026-07-14): item i230's implementer branched
+# `a06-release-assets-v2` and wrote `a06.pr` after the "A6" epic tag in the title,
+# so `_pr_signal i230` + the i230 branch match both missed the (green, ready) PR
+# and the run stalled ~45min. Matching by the issue linkage is code-name-agnostic.
+_discover_pr_by_issue() {
+  local issue="$1"
+  [ -n "$issue" ] || return 0
+  gh pr list --repo "$REPO" --state open --search "$issue in:body" \
+    --json number,body 2>/dev/null | python3 -c '
+import json, re, sys
+try: prs = json.load(sys.stdin)
+except Exception: sys.exit(0)
+issue = sys.argv[1]
+pat = re.compile(r"(?i)\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*:?\s*#" + re.escape(issue) + r"\b")
+for pr in prs:
+    if pat.search(pr.get("body") or ""):
+        print(pr["number"])
+' "$issue"
 }
 
 # _writeback_plan <outcome> -> "add_label|remove_label|verb" for the issue write-back.
@@ -1104,12 +1147,19 @@ ${prompt}"
       pr_signal=$(_pr_signal "$code")
       if [ -n "$pr_signal" ]; then
         pr="$pr_signal"
+        rm -f "$NOOP_DIR/$code.pr" 2>/dev/null  # consume-once: a stale signal must not misattribute to a later same-coded item
       else
         # Match THIS item's PR by its code in the head branch - STRICT match only.
         # The old "newest new PR" fallback misattributed twice (2026-06-28 H03
         # latched #64; 2026-07-05 SUM02 credited to SUM03), so it was removed.
         pr_matches=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
           -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | .[].number" 2>/dev/null)
+        # Branch match empty too -> last-resort issue-linkage fallback (run #24
+        # a06-vs-i230: branch+signal named after the epic tag, not the item code).
+        if [ -z "$pr_matches" ] && [ -n "$_iss" ]; then
+          pr_matches=$(_discover_pr_by_issue "$_iss")
+          [ -n "$pr_matches" ] && echo "[batch] $item: no signal/branch code match; mapped PR via issue #$_iss linkage (Closes #$_iss)" >&2
+        fi
         pr_decision=$(_select_pr_candidate "" "$pr_matches")
         case "$pr_decision" in
           use-the-one-match\|*) pr=${pr_decision#use-the-one-match|} ;;
@@ -1220,7 +1270,7 @@ EOF
     # here instead of recording a bare timeout that re-balloons the item.
     echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
     local rec
-    rec=$(recover_from_ground_truth "$item" "$code" "$pr")
+    rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
     IFS='|' read -r outcome review note <<EOF
 $rec
 EOF
@@ -1370,6 +1420,61 @@ SH
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
+  # --- issue-linkage fallback: branch AND signal used the WRONG code (run #24
+  #     a06-vs-i230), but the PR body carries Closes #N -> map/adopt by issue ----
+  local idir; idir=$(mktemp -d)
+  cat >"$idir/gh" <<'SH'
+#!/usr/bin/env bash
+# branch-code discovery + reconcile -> NO match (empty); the --search issue query
+# returns PR #305 whose body carries "Closes #307"; CI green.
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s ' "$@" | grep -q -- '--search' && { printf '[{"number":305,"body":"Impl. Closes #307 done"}]\n'; exit 0; }
+  exit 0
+fi
+[ "$2" = "checks" ]  && { printf 'pass\npass\n'; exit 0; }
+[ "$2" = "comment" ] && { echo "https://x/pull/305#c1"; exit 0; }
+exit 0
+SH
+  cat >"$idir/omnigent" <<'SH'
+#!/usr/bin/env bash
+printf 'Recovery review.\nVERDICT: PASS\n'
+exit 0
+SH
+  chmod +x "$idir/gh" "$idir/omnigent"
+  [ "$(PATH="$idir:$PATH" REPO=demo/demo _discover_pr_by_issue 307)" = "305" ] \
+    || { echo "FAIL _discover_pr_by_issue: expected 305"; rm -rf "$idir"; exit 1; }
+  [ -z "$(PATH="$idir:$PATH" REPO=demo/demo _discover_pr_by_issue '')" ] \
+    || { echo "FAIL _discover_pr_by_issue: empty issue must return nothing"; rm -rf "$idir"; exit 1; }
+  # a body that mentions #307 but does NOT close it must NOT match (search returns it; regex rejects)
+  cat >"$idir/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s ' "$@" | grep -q -- '--search' && { printf '[{"number":999,"body":"see also #307 for context"}]\n'; exit 0; }
+fi
+exit 0
+SH
+  chmod +x "$idir/gh"
+  [ -z "$(PATH="$idir:$PATH" REPO=demo/demo _discover_pr_by_issue 307)" ] \
+    || { echo "FAIL _discover_pr_by_issue: bare #307 mention must not match (needs a closing keyword)"; rm -rf "$idir"; exit 1; }
+  # end-to-end: recover with a wrong code (no branch match) but the issue param adopts #305
+  cat >"$idir/gh" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s ' "$@" | grep -q -- '--search' && { printf '[{"number":305,"body":"Impl. Closes #307 done"}]\n'; exit 0; }
+  exit 0
+fi
+[ "$2" = "checks" ]  && { printf 'pass\npass\n'; exit 0; }
+[ "$2" = "comment" ] && { echo "https://x/pull/305#c1"; exit 0; }
+exit 0
+SH
+  chmod +x "$idir/gh"
+  local rec_iss
+  rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
+            RECOVERY_REVIEWER=codex recover_from_ground_truth iwrong iwrong "" 307)
+  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
+    || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
+  rm -rf "$idir"
+  echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
   # --- Fix C: _reconcile_item_pr adopts a CI-green sibling + closes the loser --
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/gh" <<'SH'
