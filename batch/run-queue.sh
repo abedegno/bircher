@@ -652,6 +652,18 @@ _reconcile_item_pr() {
 recover_from_ground_truth() {
   local item="$1" code="$2" pr="$3"
   local ci="na" verdict="" reviewer_out=""
+  # If discovery missed the PR (coordinator opened it, then died before run-queue
+  # saw it -- overnight i230 opened #250 but was recorded "no PR"), re-scan for an
+  # open PR whose head branch carries the item code before concluding "no PR".
+  if [ -z "$pr" ] && [ -n "$code" ]; then
+    local _disc
+    _disc=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
+      -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | (.[0].number // empty)" 2>/dev/null)
+    if [ -n "$_disc" ]; then
+      echo "[batch:recover] $item: discovery had no PR; found open PR #$_disc by code -> adopting" >&2
+      pr="$_disc"
+    fi
+  fi
   # Reconcile a CI-red-retry that opened a second branch/PR before the
   # coordinator died (run #20 #141): adopt the CI-green sibling if there is one.
   if [ -n "$pr" ]; then
@@ -677,7 +689,9 @@ recover_from_ground_truth() {
     # B-5 part 1: a red CI may be a transient GitHub infra failure (runner not
     # acquired / cancelled with no real failed step) rather than a real test
     # failure. Classify and re-run rather than burying a green PR as failed.
-    local _rr=0 _rrmax="${BIRCHER_CI_RERUN_MAX:-2}"
+    # 2026-07-14: an overnight GitHub-infra flake outlasted 2 reruns and buried 3
+    # green PRs as failed -> default raised to 4 (each rerun already waits for CI).
+    local _rr=0 _rrmax="${BIRCHER_CI_RERUN_MAX:-4}"
     while [ "$ci" = red ] && [ "$_rr" -lt "$_rrmax" ] && [ "$(_ci_failure_kind "$pr")" = infra ]; do
       _rr=$((_rr + 1))
       echo "[batch:recover] $item: PR #$pr CI red but INFRA (no failed step) -> re-running CI (attempt $_rr/$_rrmax)" >&2
@@ -1282,6 +1296,31 @@ SH
     || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "recover_from_ground_truth OK"
+  # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
+  local ddir; ddir=$(mktemp -d)
+  cat >"$ddir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh: an open PR #300 for the item; CI green; record the marker comment.
+case "$2" in
+  list)    printf '%s\n' '300' ;;
+  checks)  printf 'pass\npass\n' ;;
+  comment) echo "https://github.com/demo/demo/pull/300#issuecomment-1" ;;
+esac
+exit 0
+SH
+  cat >"$ddir/omnigent" <<'SH'
+#!/usr/bin/env bash
+printf 'Recovery review of the adopted PR.\nVERDICT: PASS\n'
+exit 0
+SH
+  chmod +x "$ddir/gh" "$ddir/omnigent"
+  local rec_disc
+  rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
+             RECOVERY_REVIEWER=codex recover_from_ground_truth i300 i300 "")
+  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
+    || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
+  rm -rf "$ddir"
+  echo "recover discovery-adopt (1b) OK"
   # --- Fix C: _reconcile_item_pr adopts a CI-green sibling + closes the loser --
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/gh" <<'SH'
