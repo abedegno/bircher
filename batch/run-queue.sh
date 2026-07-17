@@ -542,10 +542,12 @@ merge_ready_pr() {
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
   if ! _post_cross_review_status "$item" "$pr"; then
-    MERGE_NOTE="ready but cross-review status post failed -> human merge"
+    # Best-effort: attempt the merge anyway. On a repo that REQUIRES the check the
+    # merge below is BLOCKED and defers (retry-eligible); on a repo that does NOT
+    # require it the merge still succeeds. Let branch protection decide rather than
+    # pre-empting an otherwise-mergeable PR.
     MERGE_RETRY_ELIGIBLE=1
-    echo "[batch:merge] $item: PR #$pr READY but status-post failed -> left open for the human" >&2
-    return 0
+    echo "[batch:merge] $item: PR #$pr cross-review status unconfirmed -> attempting merge anyway (branch protection decides)" >&2
   fi
   # Merge, retrying briefly: the status just posted needs a moment to propagate to
   # the protected-branch merge gate (a single early attempt can still see BLOCKED).
@@ -631,16 +633,16 @@ merge_ready_pr() {
   esac
 }
 
-# _record_deferred_ready <item> <pr> <merge_rc>: append (item,pr) to
+# _record_deferred_ready <item> <pr> <merge_rc> [issue]: append (item,pr,issue) to
 # DEFERRED_READY_FILE iff the PR deferred on a transient/retry-eligible class, so
 # the end-of-run sweep can re-drive it by its EXACT pr number (no re-discovery ->
-# no GOTCHA-1 mapping blind spot). No-op for a clean merge or a human-hand-off
-# deferral (CONFLICTING/DIRTY/reverted).
+# no GOTCHA-1 mapping blind spot) and close its issue on merge. No-op for a clean
+# merge or a human-hand-off deferral (CONFLICTING/DIRTY/reverted).
 _record_deferred_ready() {
-  local item="$1" pr="$2" mrc="$3"
+  local item="$1" pr="$2" mrc="$3" issue="${4:-}"
   [ "$mrc" = 0 ] && [ -n "$MERGE_NOTE" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" = 1 ] || return 0
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"
-  printf '%s\t%s\n' "$item" "$pr" >> "$DEFERRED_READY_FILE"
+  printf '%s\t%s\t%s\n' "$item" "$pr" "$issue" >> "$DEFERRED_READY_FILE"
 }
 
 # reconcile_deferred_ready -> end-of-run self-heal: re-drive every ready PR that a
@@ -651,8 +653,11 @@ _record_deferred_ready() {
 # loud escalation scorecard row for the (now rare) human hand-off. NEVER --admin.
 reconcile_deferred_ready() {
   echo "[batch:sweep] reconciling ready-but-open PRs deferred by transient failures" >&2
-  local item pr st mss ci mrc
-  sort -u "$DEFERRED_READY_FILE" | while IFS=$'\t' read -r item pr; do
+  local item pr issue st mss ci mrc w
+  # awk dedup PRESERVES the original append order (queue/manifest order); `sort -u`
+  # would reorder lexicographically (i10 before i2) and reintroduce the merge-order
+  # conflicts the sequential runner avoids.
+  awk '!seen[$0]++' "$DEFERRED_READY_FILE" | while IFS=$'\t' read -r item pr issue; do
     [ -n "$pr" ] || continue
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
     case "$st" in
@@ -674,8 +679,15 @@ reconcile_deferred_ready() {
       echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch + settle re-triggered CI" >&2
       gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
         || echo "[batch:sweep] WARN $item: update-branch call failed (already updating or up to date)" >&2
-      # update-branch re-triggers the required checks; only merge once they're GREEN.
-      # Red/pending after the refresh -> escalate, never merge on unconfirmed CI.
+      # update-branch is ASYNC: wait for the new head to land (mss leaves BEHIND)
+      # before trusting CI, else _wait_ci reads the OLD head's stale-green checks.
+      w=0
+      while [ "$mss" = "BEHIND" ] && [ "$w" -lt "${BIRCHER_UPDATE_BRANCH_WAIT:-120}" ]; do
+        [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
+        w=$((w + 5))
+        mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
+      done
+      # only merge once the re-triggered CI on the NEW head is GREEN; red/pending -> escalate.
       ci=$(_wait_ci "$pr" 2>/dev/null)
       if [ "$ci" != green ]; then
         echo "[batch:sweep] $item: PR #$pr CI '${ci:-pending}' after update-branch -> NOT merging, escalate for human" >&2
@@ -688,7 +700,10 @@ reconcile_deferred_ready() {
     case "$mrc:$MERGE_NOTE" in
       0:|0:merged*)
         echo "[batch:sweep] $item: PR #$pr merged by sweep" >&2
-        json_row "$item" "$pr" ready true sweep 0 0 "merged by end-of-run reconciliation sweep" ok >> "$SCORECARD" ;;
+        json_row "$item" "$pr" ready true sweep 0 0 "merged by end-of-run reconciliation sweep" ok >> "$SCORECARD"
+        # #3 safety-net: close an issue-backed PR's issue if GitHub's `Closes #N`
+        # auto-close missed (run_item's close ran while this PR was still open -> no-op).
+        _ensure_issue_closed "$issue" "$pr" ;;
       2:*)
         # rc 2 = merge_ready_pr merged then main CI went red (reverted or halted).
         # STOP the sweep: do NOT merge further PRs onto a possibly-red main -- the
@@ -1390,7 +1405,7 @@ EOF
   if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
     merge_ready_pr "$item" "$pr"; merge_rc=$?
     [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
-    _record_deferred_ready "$item" "$pr" "$merge_rc"
+    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss"
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
@@ -1807,32 +1822,42 @@ SH
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
-  # Task 3: status-post gives up -> retry-eligible defer, NO merge attempt
+  # Task 3 (codex P2-1): status-post unconfirmed -> BEST-EFFORT merge (let branch
+  # protection decide), not a pre-emptive defer.
   local sdir; sdir=$(mktemp -d)
   cat >"$sdir/gh" <<'SH'
 #!/usr/bin/env bash
-# fake gh where the cross-review status NEVER verifies (read-back empty); a merge
-# would be logged if (wrongly) attempted.
+# cross-review status NEVER verifies (read-back empty); `pr merge` exits $FAKE_MERGE_RC.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  printf '%s\n' "$@" | grep -q 'headRefOid' && { echo "headsha1234567"; exit 0; }
+  printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo "headsha1234567"; exit 0; }
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
-[ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}"; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/statuses/' && exit 0   # POST "ok" but never persists
-  printf '%s\n' "$@" | grep -q '/status'    && exit 0   # read-back empty
+  printf '%s\n' "$@" | grep -q '/status'    && exit 0   # read-back empty -> _post fails
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
 SH
   chmod +x "$sdir/gh"; : > "$sdir/pmlog"
-  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 PMLOG="$sdir/pmlog" \
+  # (a) protected repo: merge BLOCKED while status unconfirmed -> merge ATTEMPTED, deferred, retry-eligible
+  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 PMLOG="$sdir/pmlog" \
       merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?
-    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "ready but"*) true;; *) false;; esac ) \
-    || { echo "FAIL merge_ready_pr: status-post fail not retry-eligible"; rm -rf "$sdir"; exit 1; }
-  [ ! -s "$sdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite unposted status"; rm -rf "$sdir"; exit 1; }
-  rm -rf "$sdir"; echo "merge_ready_pr status-post-fail OK (retry-eligible, no merge)"
+    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
+    || { echo "FAIL merge_ready_pr: status-unconfirmed+blocked not deferred/eligible"; rm -rf "$sdir"; exit 1; }
+  grep -qx 'merge 7' "$sdir/pmlog" || { echo "FAIL merge_ready_pr: merge not attempted despite unconfirmed status"; rm -rf "$sdir"; exit 1; }
+  # (b) unprotected repo: merge SUCCEEDS while status unconfirmed -> merged (best-effort)
+  : > "$sdir/pmlog"
+  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=0 PMLOG="$sdir/pmlog" \
+      merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && case "$MERGE_NOTE" in ""|merged*) true;; *) false;; esac ) \
+    || { echo "FAIL merge_ready_pr: status-unconfirmed best-effort merge did not succeed"; rm -rf "$sdir"; exit 1; }
+  grep -qx 'merge 7' "$sdir/pmlog" || { echo "FAIL merge_ready_pr: best-effort merge not attempted"; rm -rf "$sdir"; exit 1; }
+  rm -rf "$sdir"; echo "merge_ready_pr status-unconfirmed OK (best-effort merge; blocked->defer, open->merge)"
   # Task 3b (codex P2-B): a transient EMPTY mergeable lookup is retry-eligible (not stranded)
   local edir; edir=$(mktemp -d)
   cat >"$edir/gh" <<'SH'
@@ -1853,32 +1878,41 @@ SH
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
   local rdir; rdir=$(mktemp -d)
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
-    _record_deferred_ready itemA 11 0
+    _record_deferred_ready itemA 11 0 77
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemB 12 0
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="merge deferred: mergeable=CONFLICTING" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemC 13 0
-  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11')" ] \
+  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77')" ] \
     || { echo "FAIL _record_deferred_ready: wrong contents"; cat "$rdir/deferred.tsv"; rm -rf "$rdir"; exit 1; }
   echo "_record_deferred_ready OK"
   cat >"$rdir/gh" <<'SH'
 #!/usr/bin/env bash
-# fake gh for the sweep. MSSDIR/<pr> drives mergeStateStatus (default CLEAN);
-# STATEDIR/<pr> drives pr view state (default OPEN); empty mergeCommit skips the
-# main-CI watch; STORE models the post->read-back for _post; `pr checks` -> green
-# so _wait_ci settles instantly.
+# stateful fake gh for the sweep: update-branch flips mss BEHIND->CLEAN (UPDATED/<pr>);
+# merge flips pr state OPEN->MERGED (MERGEDDIR/<pr>); MSSDIR/<pr> seeds mergeStateStatus
+# (default CLEAN); STATEDIR/<pr> seeds state (default OPEN); CHECKSDIR/<pr> seeds
+# `pr checks` (default green); STORE models the status post->read-back.
+_pr(){ for a in "$@"; do case "$a" in [0-9]*) printf '%s' "$a"; return;; esac; done; }
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  # 'mergeStateStatus' contains 'state', so it MUST be matched before 'state'.
-  printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { pr=""; for a in "$@"; do case "$a" in [0-9]*) pr="$a";; esac; done; cat "$MSSDIR/$pr" 2>/dev/null || echo CLEAN; exit 0; }
-  printf '%s\n' "$@" | grep -q 'state'       && { pr=""; for a in "$@"; do case "$a" in [0-9]*) pr="$a";; esac; done; cat "$STATEDIR/$pr" 2>/dev/null || echo OPEN; exit 0; }
+  p=$(_pr "$@")
+  if printf '%s\n' "$@" | grep -q 'mergeStateStatus'; then   # contains 'state' -> match FIRST
+    { [ -n "$UPDATED" ] && [ -f "$UPDATED/$p" ]; } && { echo CLEAN; exit 0; }
+    cat "$MSSDIR/$p" 2>/dev/null || echo CLEAN; exit 0
+  fi
+  if printf '%s\n' "$@" | grep -q 'state'; then
+    { [ -n "$MERGEDDIR" ] && [ -f "$MERGEDDIR/$p" ]; } && { echo MERGED; exit 0; }
+    cat "$STATEDIR/$p" 2>/dev/null || echo OPEN; exit 0
+  fi
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo "headsha1234567"; exit 0; }
   printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
-[ "$1" = "pr" ] && [ "$2" = "checks" ] && { cpr=""; for a in "$@"; do case "$a" in [0-9]*) cpr="$a";; esac; done; cat "$CHECKSDIR/$cpr" 2>/dev/null || printf 'pass\npass\n'; exit 0; }
-[ "$1" = "pr" ] && [ "$2" = "merge" ]  && { echo "merge $3" >> "$PMLOG"; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "checks" ] && { cat "$CHECKSDIR/$(_pr "$@")" 2>/dev/null || printf 'pass\npass\n'; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "merge" ]  && { echo "merge $3" >> "$PMLOG"; [ -n "$MERGEDDIR" ] && touch "$MERGEDDIR/$3"; exit 0; }
+[ "$1" = "issue" ] && [ "$2" = "view" ]  && { echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; }
+[ "$1" = "issue" ] && [ "$2" = "close" ] && { echo "close $3" >> "$PMLOG"; exit 0; }
 if [ "$1" = "api" ]; then
-  printf '%s\n' "$@" | grep -q 'update-branch' && { printf 'update-branch %s\n' "$*" >> "$PMLOG"; exit 0; }
+  if printf '%s\n' "$@" | grep -q 'update-branch'; then up=$(printf '%s' "$2" | sed 's#.*/pulls/##; s#/.*##'); [ -n "$UPDATED" ] && touch "$UPDATED/$up"; printf 'update-branch %s\n' "$*" >> "$PMLOG"; exit 0; fi
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
   printf '%s\n' "$@" | grep -q '/status'    && { cat "$STORE" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
@@ -1886,45 +1920,54 @@ fi
 exit 0
 SH
   chmod +x "$rdir/gh"
-  mkdir -p "$rdir/states" "$rdir/mss"; echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"
-  printf 'sweepA\t7\nsweepB\t8\n' > "$rdir/deferred.tsv"
+  mkdir -p "$rdir/states" "$rdir/mss" "$rdir/checks" "$rdir/updated" "$rdir/merged"
+  echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"
+  # 4b: OPEN PR #7 (issue #77) merges + its issue is closed; MERGED PR #8 is skipped
+  printf 'sweepA\t7\t77\nsweepB\t8\t\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
-  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_ISSUE_STATE=OPEN \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
-      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" UPDATED="$rdir/updated" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -qx 'merge 7' "$rdir/pmlog"            || { echo "FAIL sweep: OPEN PR #7 not merged"; rm -rf "$rdir"; exit 1; }
   grep -q  'merge 8' "$rdir/pmlog"            && { echo "FAIL sweep: non-OPEN PR #8 was merged"; rm -rf "$rdir"; exit 1; }
   grep -q 'reconciliation sweep' "$rdir/scorecard.jsonl" || { echo "FAIL sweep: no merged scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'close 77' "$rdir/pmlog"           || { echo "FAIL sweep: issue #77 not closed after sweep merge"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready merge+issue-close OK"
   # Task 4c: a PR that won't merge is escalated (NOT merged), sweep continues (rc 0)
   echo OPEN > "$rdir/states/9"
-  printf 'sweepC\t9\n' > "$rdir/deferred.tsv"
+  printf 'sweepC\t9\t\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGEABLE=CONFLICTING \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
-      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" UPDATED="$rdir/updated" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -q 'merge 9' "$rdir/pmlog"                         && { echo "FAIL sweep-escalate: CONFLICTING PR #9 was merged"; rm -rf "$rdir"; exit 1; }
   grep -q 'sweep could not merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-escalate: no escalation scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready escalate OK"
-  # Task 4d (codex P2-2): a BEHIND-but-ready PR is brought up to date then merged
+  # Task 4d (codex P2-2/P2-3): a BEHIND PR is update-branched, waits for the async
+  # update to LAND (mss BEHIND->CLEAN) + CI green, then merged.
   echo OPEN > "$rdir/states/10"; echo BEHIND > "$rdir/mss/10"
-  printf 'sweepD\t10\n' > "$rdir/deferred.tsv"
+  printf 'sweepD\t10\t\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
-      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" UPDATED="$rdir/updated" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -q 'pulls/10/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind: BEHIND PR #10 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -qx 'merge 10' "$rdir/pmlog"              || { echo "FAIL sweep-behind: BEHIND PR #10 not merged after update"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready behind OK"
   # Task 4e (codex P2-A): a BEHIND PR whose re-triggered CI is RED is escalated, NOT merged
-  mkdir -p "$rdir/checks"; echo OPEN > "$rdir/states/11"; echo BEHIND > "$rdir/mss/11"; printf 'fail\npass\n' > "$rdir/checks/11"
-  printf 'sweepE\t11\n' > "$rdir/deferred.tsv"
+  echo OPEN > "$rdir/states/11"; echo BEHIND > "$rdir/mss/11"; printf 'fail\npass\n' > "$rdir/checks/11"
+  printf 'sweepE\t11\t\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
-      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" UPDATED="$rdir/updated" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -q 'merge 11' "$rdir/pmlog"                            && { echo "FAIL sweep-behind-red: PR #11 merged on red CI"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -q 'after update-branch' "$rdir/scorecard.jsonl"       || { echo "FAIL sweep-behind-red: no CI-red escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
