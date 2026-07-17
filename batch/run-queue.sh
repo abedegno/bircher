@@ -711,14 +711,18 @@ reconcile_deferred_ready() {
       json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; update-branched, needs re-review before merge (human)" ok >> "$SCORECARD"
       continue
     fi
-    if [ -z "$mss" ] || [ "$mss" = "UNKNOWN" ]; then
-      # Can't PROVE the PR is up to date -> fail closed (symmetric with the head check).
-      # A behind PR reviewed against an older base must not auto-merge on a repo that
-      # does not enforce up-to-date branches.
-      echo "[batch:sweep] $item: PR #$pr mergeStateStatus '${mss:-unknown}' unverifiable -> escalate for human" >&2
-      json_row "$item" "$pr" ready false sweep 0 0 "sweep: mergeStateStatus '${mss:-unknown}' unverifiable; human merge" ok >> "$SCORECARD"
-      continue
-    fi
+    # Allow-list: only ATTEMPT the merge from states we can vouch are safe. CLEAN /
+    # HAS_HOOKS are healthy; BLOCKED is the NORMAL deferred state (missing our
+    # bircher/cross-review status, which merge_ready_pr posts -- other required checks
+    # still gate the real merge). Anything else -- UNSTABLE (a check went red since the
+    # PASS), DIRTY, DRAFT, UNKNOWN, empty -- is unverifiable/unsafe -> fail closed.
+    case "$mss" in
+      CLEAN|HAS_HOOKS|BLOCKED) : ;;
+      *)
+        echo "[batch:sweep] $item: PR #$pr mergeStateStatus '${mss:-unknown}' not safe to auto-merge -> escalate for human" >&2
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep: mergeStateStatus '${mss:-unknown}' not safe to auto-merge; human merge" ok >> "$SCORECARD"
+        continue ;;
+    esac
     # Up to date AND head-verified: merging lands exactly the reviewed code.
     echo "[batch:sweep] $item: retrying merge of verified ready PR #$pr" >&2
     merge_ready_pr "$item" "$pr" "$sha"; mrc=$?
@@ -1431,7 +1435,7 @@ EOF
     # Capture the head the review PASS covered BEFORE merge_ready_pr's status/merge
     # retries: a push during that ~60s window must not be recorded as the reviewed sha.
     local reviewed_sha; reviewed_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
-    merge_ready_pr "$item" "$pr"; merge_rc=$?
+    merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
     [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
     _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
   fi
@@ -1978,8 +1982,9 @@ exit 0
 SH
   chmod +x "$rdir/gh"
   mkdir -p "$rdir/states" "$rdir/mss" "$rdir/head" "$rdir/merged"
-  echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"
-  # 4b: head-verified + up-to-date PR #7 (issue #77) merges + its issue is closed; MERGED PR #8 skipped
+  echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"; echo BLOCKED > "$rdir/mss/7"
+  # 4b: head-verified PR #7 (mss=BLOCKED = the NORMAL deferred state, missing our status)
+  # merges (pinned) + its issue is closed; MERGED PR #8 skipped
   printf 'sweepA\t7\t77\theadsha1234567\nsweepB\t8\t\theadsha1234567\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_ISSUE_STATE=OPEN \
@@ -2053,8 +2058,20 @@ SH
       PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -q 'merge 14' "$rdir/pmlog"                                && { echo "FAIL sweep-mss-unknown: PR #14 merged on unverifiable mergeStateStatus"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
-  grep -q 'mergeStateStatus.*unverifiable' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unknown: no mss-unverifiable escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  grep -q 'mergeStateStatus.*not safe to auto-merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unknown: no mss-unsafe escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready mss-unverifiable OK"
+  # 4i (codex round 9): UNSTABLE (a check went red since the PASS) -> fail closed (escalate, NOT merged)
+  echo OPEN > "$rdir/states/15"; echo UNSTABLE > "$rdir/mss/15"
+  printf 'sweepI\t15\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 15' "$rdir/pmlog"                                && { echo "FAIL sweep-mss-unstable: PR #15 merged on UNSTABLE mergeStateStatus"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'mergeStateStatus.*not safe to auto-merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unstable: no mss-unsafe escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready mss-unstable OK"
   rm -rf "$rdir"; echo "reconcile_deferred_ready OK"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
