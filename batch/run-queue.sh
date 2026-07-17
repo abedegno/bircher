@@ -516,9 +516,11 @@ _post_cross_review_status() {
 # worktree; never touches the shared working tree) and halt; on timeout, halt
 # without reverting (conservative).
 MERGE_NOTE=""
+MERGE_RETRY_ELIGIBLE=""
 merge_ready_pr() {
   local item="$1" pr="$2"
   MERGE_NOTE=""
+  MERGE_RETRY_ELIGIBLE=0
   # Wait out GitHub's mergeability recompute, then merge.
   local m=UNKNOWN t=0
   while [ "$m" = "UNKNOWN" ] && [ "$t" -lt 60 ]; do
@@ -527,22 +529,30 @@ merge_ready_pr() {
   done
   if [ "$m" != "MERGEABLE" ]; then
     MERGE_NOTE="merge deferred: mergeable=$m"
+    [ "$m" = "UNKNOWN" ] && MERGE_RETRY_ELIGIBLE=1
     echo "[batch:merge] $item: PR #$pr not mergeable ($m) -> left open for the human" >&2
     return 0
   fi
   # #10: satisfy a required-check branch protection (bircher/cross-review) so a
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
-  _post_cross_review_status "$item" "$pr"
+  if ! _post_cross_review_status "$item" "$pr"; then
+    MERGE_NOTE="ready but cross-review status post failed -> human merge"
+    MERGE_RETRY_ELIGIBLE=1
+    echo "[batch:merge] $item: PR #$pr READY but status-post failed -> left open for the human" >&2
+    return 0
+  fi
   # Merge, retrying briefly: the status just posted needs a moment to propagate to
   # the protected-branch merge gate (a single early attempt can still see BLOCKED).
   local merged=0 mt=0
   while [ "$mt" -lt 30 ]; do
     if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then merged=1; break; fi
-    sleep 5; mt=$((mt + 5))
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
+    mt=$((mt + 5))
   done
   if [ "$merged" != 1 ]; then
     MERGE_NOTE="merge deferred: gh pr merge failed"
+    MERGE_RETRY_ELIGIBLE=1
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
     return 0
   fi
@@ -1708,7 +1718,7 @@ SH
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 >/dev/null 2>&1
-    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] ) \
+    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
   # #10 cross-review status: a ready item posts bircher/cross-review=success before merging
   local slog="$mdir/status.log"; : >"$slog"
@@ -1719,6 +1729,32 @@ SH
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
+  # Task 3: status-post gives up -> retry-eligible defer, NO merge attempt
+  local sdir; sdir=$(mktemp -d)
+  cat >"$sdir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh where the cross-review status NEVER verifies (read-back empty); a merge
+# would be logged if (wrongly) attempted.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid' && { echo "headsha1234567"; exit 0; }
+  echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
+fi
+[ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit 0; }
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q '/statuses/' && exit 0   # POST "ok" but never persists
+  printf '%s\n' "$@" | grep -q '/status'    && exit 0   # read-back empty
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$sdir/gh"; : > "$sdir/pmlog"
+  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 PMLOG="$sdir/pmlog" \
+      merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "ready but"*) true;; *) false;; esac ) \
+    || { echo "FAIL merge_ready_pr: status-post fail not retry-eligible"; rm -rf "$sdir"; exit 1; }
+  [ ! -s "$sdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite unposted status"; rm -rf "$sdir"; exit 1; }
+  rm -rf "$sdir"; echo "merge_ready_pr status-post-fail OK (retry-eligible, no merge)"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
   cat >"$prdir/gh" <<'SH'
