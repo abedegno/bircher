@@ -481,13 +481,17 @@ _prune_session() {
 # rc 1 = gave up after retries (caller escalates + records for the end-of-run sweep,
 # not a silent defer).
 _post_cross_review_status() {
-  local item="$1" pr="$2" sha attempt err
-  # Head sha, with a few retries (gh pr view can transiently fail too).
-  for attempt in 1 2 3; do
-    sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
-    [ -n "$sha" ] && break
-    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
-  done
+  local item="$1" pr="$2" sha="${3:-}" attempt err
+  # Head sha: the caller may PIN it (the sweep pins the reviewed head so the status
+  # is never posted on an unreviewed push); otherwise fetch the current head, with a
+  # few retries (gh pr view can transiently fail too).
+  if [ -z "$sha" ]; then
+    for attempt in 1 2 3; do
+      sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+      [ -n "$sha" ] && break
+      [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
+    done
+  fi
   [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 1; }
   # Post, then read the status back to confirm it landed. Retry both with
   # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
@@ -520,7 +524,7 @@ _post_cross_review_status() {
 MERGE_NOTE=""
 MERGE_RETRY_ELIGIBLE=""
 merge_ready_pr() {
-  local item="$1" pr="$2"
+  local item="$1" pr="$2" expected_sha="${3:-}"
   MERGE_NOTE=""
   MERGE_RETRY_ELIGIBLE=0
   # Wait out GitHub's mergeability recompute, then merge. A transient gh failure
@@ -541,7 +545,7 @@ merge_ready_pr() {
   # #10: satisfy a required-check branch protection (bircher/cross-review) so a
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
-  if ! _post_cross_review_status "$item" "$pr"; then
+  if ! _post_cross_review_status "$item" "$pr" "$expected_sha"; then
     # Best-effort: attempt the merge anyway. On a repo that REQUIRES the check the
     # merge below is BLOCKED and defers (retry-eligible); on a repo that does NOT
     # require it the merge still succeeds. Let branch protection decide rather than
@@ -551,9 +555,16 @@ merge_ready_pr() {
   fi
   # Merge, retrying briefly: the status just posted needs a moment to propagate to
   # the protected-branch merge gate (a single early attempt can still see BLOCKED).
+  # When the caller PINNED the reviewed head (the sweep), merge ATOMICALLY against
+  # it: --match-head-commit makes gh refuse the merge if a push moved the head after
+  # review, so a race can never land unreviewed code.
   local merged=0 mt=0
   while [ "$mt" -lt 30 ]; do
-    if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then merged=1; break; fi
+    if [ -n "$expected_sha" ]; then
+      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
+    else
+      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1 && { merged=1; break; }
+    fi
     [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
     mt=$((mt + 5))
   done
@@ -702,7 +713,7 @@ reconcile_deferred_ready() {
     fi
     # Up to date AND head-verified: merging lands exactly the reviewed code.
     echo "[batch:sweep] $item: retrying merge of verified ready PR #$pr" >&2
-    merge_ready_pr "$item" "$pr"; mrc=$?
+    merge_ready_pr "$item" "$pr" "$sha"; mrc=$?
     case "$mrc:$MERGE_NOTE" in
       0:|0:merged*)
         echo "[batch:sweep] $item: PR #$pr merged by sweep" >&2
@@ -1884,6 +1895,35 @@ SH
     [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "merge deferred: mergeable="*) true;; *) false;; esac ) \
     || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
   rm -rf "$edir"; echo "merge_ready_pr empty-mergeable OK (retry-eligible)"
+  # codex round 7: a PINNED reviewed sha that no longer matches the head -> merge REFUSED (atomic)
+  local mhdir; mhdir=$(mktemp -d)
+  cat >"$mhdir/gh" <<'SH'
+#!/usr/bin/env bash
+# current head is headsha1234567; a --match-head-commit != that -> merge refused.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo headsha1234567; exit 0; }
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  echo MERGEABLE; exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  nx=""; mh=""; for a in "$@"; do [ "$nx" = 1 ] && { mh="$a"; nx=""; }; [ "$a" = "--match-head-commit" ] && nx=1; done
+  [ -n "$mh" ] && [ "$mh" != headsha1234567 ] && exit 1
+  echo "merge $3" >> "${PMLOG:-/dev/null}"; exit 0
+fi
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$mhdir/gh"; : > "$mhdir/pmlog"; : > "$mhdir/store"
+  ( PATH="$mhdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 PMLOG="$mhdir/pmlog" STORE="$mhdir/store" \
+      merge_ready_pr demo 7 OTHERSHA000 >/dev/null 2>&1
+    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
+    || { echo "FAIL merge_ready_pr: stale pinned head not refused"; rm -rf "$mhdir"; exit 1; }
+  [ ! -s "$mhdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite stale pinned head"; cat "$mhdir/pmlog"; rm -rf "$mhdir"; exit 1; }
+  rm -rf "$mhdir"; echo "merge_ready_pr pinned-head-mismatch OK (atomic refuse)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
   local rdir; rdir=$(mktemp -d)
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
@@ -1913,7 +1953,11 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
-[ "$1" = "pr" ] && [ "$2" = "merge" ]  && { echo "merge $3" >> "$PMLOG"; [ -n "$MERGEDDIR" ] && touch "$MERGEDDIR/$3"; exit 0; }
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  nx=""; mh=""; for a in "$@"; do [ "$nx" = 1 ] && { mh="$a"; nx=""; }; [ "$a" = "--match-head-commit" ] && nx=1; done
+  if [ -n "$mh" ]; then cur=$(cat "$HEADDIR/$3" 2>/dev/null || echo headsha1234567); [ "$mh" = "$cur" ] || exit 1; echo "matchhead $3" >> "$PMLOG"; fi
+  echo "merge $3" >> "$PMLOG"; [ -n "$MERGEDDIR" ] && touch "$MERGEDDIR/$3"; exit 0
+fi
 [ "$1" = "issue" ] && [ "$2" = "view" ]  && { echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; }
 [ "$1" = "issue" ] && [ "$2" = "close" ] && { echo "close $3" >> "$PMLOG"; exit 0; }
 if [ "$1" = "api" ]; then
@@ -1936,6 +1980,7 @@ SH
       PMLOG="$rdir/pmlog" STORE="$rdir/store" \
       reconcile_deferred_ready >/dev/null 2>&1 )
   grep -qx 'merge 7' "$rdir/pmlog"            || { echo "FAIL sweep: verified PR #7 not merged"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'matchhead 7' "$rdir/pmlog"        || { echo "FAIL sweep: merge not pinned to reviewed head (--match-head-commit)"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -q  'merge 8' "$rdir/pmlog"            && { echo "FAIL sweep: non-OPEN PR #8 was merged"; rm -rf "$rdir"; exit 1; }
   grep -q 'reconciliation sweep' "$rdir/scorecard.jsonl" || { echo "FAIL sweep: no merged scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   grep -qx 'close 77' "$rdir/pmlog"           || { echo "FAIL sweep: issue #77 not closed after sweep merge"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
