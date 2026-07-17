@@ -496,8 +496,9 @@ _post_cross_review_status() {
     err=$(gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
             -f context=bircher/cross-review \
             -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
-    if gh api "repos/$REPO/commits/$sha/status" -q '.statuses[].context' 2>/dev/null \
-         | grep -qx 'bircher/cross-review'; then
+    if gh api "repos/$REPO/commits/$sha/status" \
+         -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
+         | grep -qx 'success'; then
       echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
       return 0
     fi
@@ -522,16 +523,19 @@ merge_ready_pr() {
   local item="$1" pr="$2"
   MERGE_NOTE=""
   MERGE_RETRY_ELIGIBLE=0
-  # Wait out GitHub's mergeability recompute, then merge.
+  # Wait out GitHub's mergeability recompute, then merge. A transient gh failure
+  # yields an EMPTY $m (not UNKNOWN); treat empty like UNKNOWN so a hiccup keeps
+  # polling and, if it persists, is flagged retry-eligible for the sweep instead
+  # of stranding a ready PR.
   local m=UNKNOWN t=0
-  while [ "$m" = "UNKNOWN" ] && [ "$t" -lt 60 ]; do
+  while { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && [ "$t" -lt 60 ]; do
     m=$(gh pr view "$pr" --repo "$REPO" --json mergeable -q '.mergeable' 2>/dev/null)
-    [ "$m" = "UNKNOWN" ] && { sleep 5; t=$((t + 5)); }
+    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5; t=$((t + 5)); }
   done
   if [ "$m" != "MERGEABLE" ]; then
-    MERGE_NOTE="merge deferred: mergeable=$m"
-    [ "$m" = "UNKNOWN" ] && MERGE_RETRY_ELIGIBLE=1
-    echo "[batch:merge] $item: PR #$pr not mergeable ($m) -> left open for the human" >&2
+    MERGE_NOTE="merge deferred: mergeable=${m:-unknown}"
+    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && MERGE_RETRY_ELIGIBLE=1
+    echo "[batch:merge] $item: PR #$pr not mergeable (${m:-unknown}) -> left open for the human" >&2
     return 0
   fi
   # #10: satisfy a required-check branch protection (bircher/cross-review) so a
@@ -647,7 +651,7 @@ _record_deferred_ready() {
 # loud escalation scorecard row for the (now rare) human hand-off. NEVER --admin.
 reconcile_deferred_ready() {
   echo "[batch:sweep] reconciling ready-but-open PRs deferred by transient failures" >&2
-  local item pr st mss mrc
+  local item pr st mss ci mrc
   sort -u "$DEFERRED_READY_FILE" | while IFS=$'\t' read -r item pr; do
     [ -n "$pr" ] || continue
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
@@ -670,7 +674,14 @@ reconcile_deferred_ready() {
       echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch + settle re-triggered CI" >&2
       gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
         || echo "[batch:sweep] WARN $item: update-branch call failed (already updating or up to date)" >&2
-      _wait_ci "$pr" >/dev/null 2>&1 || true
+      # update-branch re-triggers the required checks; only merge once they're GREEN.
+      # Red/pending after the refresh -> escalate, never merge on unconfirmed CI.
+      ci=$(_wait_ci "$pr" 2>/dev/null)
+      if [ "$ci" != green ]; then
+        echo "[batch:sweep] $item: PR #$pr CI '${ci:-pending}' after update-branch -> NOT merging, escalate for human" >&2
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; CI '${ci:-pending}' after update-branch (human merge)" ok >> "$SCORECARD"
+        continue
+      fi
     fi
     echo "[batch:sweep] $item: retrying merge of ready PR #$pr" >&2
     merge_ready_pr "$item" "$pr"; mrc=$?
@@ -1729,7 +1740,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "headsha1234567"; exit 0; fi
 if [ "$1" = "api" ]; then
   if printf '%s\n' "$@" | grep -q '/statuses/'; then
     n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CNT"
-    [ "$n" -ge "${LAND_AT:-1}" ] && printf 'bircher/cross-review\n' >> "$STORE"
+    [ "$n" -ge "${LAND_AT:-1}" ] && printf 'success\n' >> "$STORE"
     exit 0
   fi
   if printf '%s\n' "$@" | grep -q '/status'; then cat "$STORE" 2>/dev/null; exit 0; fi
@@ -1771,7 +1782,7 @@ if [ "$1" = "api" ]; then
   # a check-runs GET -> report main CI green.
   if printf '%s\n' "$@" | grep -q '/statuses/'; then
     echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"
-    printf 'bircher/cross-review\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
+    printf 'success\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
     exit 0
   fi
   if printf '%s\n' "$@" | grep -q '/status'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
@@ -1822,6 +1833,23 @@ SH
     || { echo "FAIL merge_ready_pr: status-post fail not retry-eligible"; rm -rf "$sdir"; exit 1; }
   [ ! -s "$sdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite unposted status"; rm -rf "$sdir"; exit 1; }
   rm -rf "$sdir"; echo "merge_ready_pr status-post-fail OK (retry-eligible, no merge)"
+  # Task 3b (codex P2-B): a transient EMPTY mergeable lookup is retry-eligible (not stranded)
+  local edir; edir=$(mktemp -d)
+  cat >"$edir/gh" <<'SH'
+#!/usr/bin/env bash
+# every mergeable lookup returns EMPTY (simulated transient gh failure).
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid' && { echo "headsha1234567"; exit 0; }
+  echo ""; exit 0
+fi
+exit 0
+SH
+  chmod +x "$edir/gh"
+  ( PATH="$edir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "merge deferred: mergeable="*) true;; *) false;; esac ) \
+    || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
+  rm -rf "$edir"; echo "merge_ready_pr empty-mergeable OK (retry-eligible)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
   local rdir; rdir=$(mktemp -d)
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
@@ -1847,11 +1875,11 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
-[ "$1" = "pr" ] && [ "$2" = "checks" ] && { printf 'pass\npass\n'; exit 0; }
+[ "$1" = "pr" ] && [ "$2" = "checks" ] && { cpr=""; for a in "$@"; do case "$a" in [0-9]*) cpr="$a";; esac; done; cat "$CHECKSDIR/$cpr" 2>/dev/null || printf 'pass\npass\n'; exit 0; }
 [ "$1" = "pr" ] && [ "$2" = "merge" ]  && { echo "merge $3" >> "$PMLOG"; exit 0; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q 'update-branch' && { printf 'update-branch %s\n' "$*" >> "$PMLOG"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'bircher/cross-review\n' >> "$STORE"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
   printf '%s\n' "$@" | grep -q '/status'    && { cat "$STORE" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
@@ -1890,6 +1918,17 @@ SH
   grep -q 'pulls/10/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind: BEHIND PR #10 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -qx 'merge 10' "$rdir/pmlog"              || { echo "FAIL sweep-behind: BEHIND PR #10 not merged after update"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready behind OK"
+  # Task 4e (codex P2-A): a BEHIND PR whose re-triggered CI is RED is escalated, NOT merged
+  mkdir -p "$rdir/checks"; echo OPEN > "$rdir/states/11"; echo BEHIND > "$rdir/mss/11"; printf 'fail\npass\n' > "$rdir/checks/11"
+  printf 'sweepE\t11\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 11' "$rdir/pmlog"                            && { echo "FAIL sweep-behind-red: PR #11 merged on red CI"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'after update-branch' "$rdir/scorecard.jsonl"       || { echo "FAIL sweep-behind-red: no CI-red escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready behind-red OK"
   rm -rf "$rdir"; echo "reconcile_deferred_ready OK"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
@@ -1908,7 +1947,7 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ]   && { echo "merge $3" >> "${PR_LOG:-/dev/null}"; exit 0; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q 'update-branch' && { echo "update-branch" >> "${PR_LOG:-/dev/null}"; exit 0; }
-  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'bircher/cross-review\n' >> "${STORE:-/dev/null}"; exit 0; fi
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; fi
   printf '%s\n' "$@" | grep -q '/status' && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
