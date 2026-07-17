@@ -16,6 +16,7 @@ BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  #
 QUEUE="${QUEUE:-$BUNDLE_DIR/queue}"
 PROCESSED="$QUEUE/processed"
 SCORECARD="${SCORECARD:-$BUNDLE_DIR/.run/scorecard.jsonl}"
+DEFERRED_READY_FILE="${DEFERRED_READY_FILE:-$BUNDLE_DIR/.run/deferred-ready.tsv}"
 # No-op signal dir: the coordinator drops <code>.noop here when an item is
 # already satisfied (no product change needed) so the runner records a `noop`
 # and advances instantly instead of polling out the full ITEM_TIMEOUT (gap #3).
@@ -466,26 +467,50 @@ _prune_session() {
     || echo "[batch] WARN: prune of session $1 failed" >&2
 }
 
-# _post_cross_review_status <item> <pr> -> mark the PR's head commit with a
-# `bircher/cross-review` = success commit status, so a repo whose branch protection
+# _post_cross_review_status <item> <pr> -> post + VERIFY a `bircher/cross-review`
+# = success commit status on the PR's head commit, so a repo whose branch protection
 # REQUIRES that check (in lieu of an approving review) can self-merge. Only called
 # from merge_ready_pr, which the caller reaches ONLY on an outcome=ready item
 # (cross-vendor review PASS) - so the status is only ever posted on a genuine PASS.
 # Posted as the runner's own identity: setting a commit status is NOT a self-approval,
 # so (unlike `gh pr review --approve`) it needs no second GitHub account. On a repo
-# WITHOUT that required check the status is harmless. Best-effort: a failed post just
-# falls through to the merge (which defers cleanly if the gate is unmet).
+# WITHOUT that required check the status is harmless. Retries transient GitHub API
+# failures (5xx / secondary rate limit) and reads the status back to confirm it landed;
+# a single swallowed hiccup here previously stranded a reviewed, CI-green PR until a
+# human merged it. Contract: rc 0 = status confirmed present on the head sha;
+# rc 1 = gave up after retries (caller escalates + records for the end-of-run sweep,
+# not a silent defer).
 _post_cross_review_status() {
-  local item="$1" pr="$2" sha
-  sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
-  [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 0; }
-  if gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
-       -f context=bircher/cross-review \
-       -f description="cross-vendor review PASS (Bircher)" >/dev/null 2>&1; then
-    echo "[batch:merge] $item: posted bircher/cross-review=success on ${sha:0:7}" >&2
-  else
-    echo "[batch:merge] WARN $item: failed to post bircher/cross-review status on PR #$pr -> merge may defer" >&2
+  local item="$1" pr="$2" sha="${3:-}" attempt err
+  # Head sha: the caller may PIN it (the sweep pins the reviewed head so the status
+  # is never posted on an unreviewed push); otherwise fetch the current head, with a
+  # few retries (gh pr view can transiently fail too).
+  if [ -z "$sha" ]; then
+    for attempt in 1 2 3; do
+      sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+      [ -n "$sha" ] && break
+      [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
+    done
   fi
+  [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 1; }
+  # Post, then read the status back to confirm it landed. Retry both with
+  # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
+  # non-transient cause is diagnosable next time.
+  for attempt in 1 2 3 4 5; do
+    err=$(gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+            -f context=bircher/cross-review \
+            -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
+    if gh api "repos/$REPO/commits/$sha/status" \
+         -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
+         | grep -qx 'success'; then
+      echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
+      return 0
+    fi
+    echo "[batch:merge] WARN $item: cross-review status not confirmed on ${sha:0:7} (attempt $attempt/5)${err:+: $err}" >&2
+    [ "$attempt" -lt 5 ] && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * attempt * 2)); }
+  done
+  echo "[batch:merge] ERROR $item: could NOT post bircher/cross-review on PR #$pr after 5 attempts -> ESCALATE (ready, needs human merge)" >&2
+  return 1
 }
 
 # merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
@@ -497,33 +522,55 @@ _post_cross_review_status() {
 # worktree; never touches the shared working tree) and halt; on timeout, halt
 # without reverting (conservative).
 MERGE_NOTE=""
+MERGE_RETRY_ELIGIBLE=""
 merge_ready_pr() {
-  local item="$1" pr="$2"
+  local item="$1" pr="$2" expected_sha="${3:-}"
   MERGE_NOTE=""
-  # Wait out GitHub's mergeability recompute, then merge.
+  MERGE_RETRY_ELIGIBLE=0
+  # Wait out GitHub's mergeability recompute, then merge. A transient gh failure
+  # yields an EMPTY $m (not UNKNOWN); treat empty like UNKNOWN so a hiccup keeps
+  # polling and, if it persists, is flagged retry-eligible for the sweep instead
+  # of stranding a ready PR.
   local m=UNKNOWN t=0
-  while [ "$m" = "UNKNOWN" ] && [ "$t" -lt 60 ]; do
+  while { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && [ "$t" -lt 60 ]; do
     m=$(gh pr view "$pr" --repo "$REPO" --json mergeable -q '.mergeable' 2>/dev/null)
-    [ "$m" = "UNKNOWN" ] && { sleep 5; t=$((t + 5)); }
+    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5; t=$((t + 5)); }
   done
   if [ "$m" != "MERGEABLE" ]; then
-    MERGE_NOTE="merge deferred: mergeable=$m"
-    echo "[batch:merge] $item: PR #$pr not mergeable ($m) -> left open for the human" >&2
+    MERGE_NOTE="merge deferred: mergeable=${m:-unknown}"
+    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && MERGE_RETRY_ELIGIBLE=1
+    echo "[batch:merge] $item: PR #$pr not mergeable (${m:-unknown}) -> left open for the human" >&2
     return 0
   fi
   # #10: satisfy a required-check branch protection (bircher/cross-review) so a
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
-  _post_cross_review_status "$item" "$pr"
+  if ! _post_cross_review_status "$item" "$pr" "$expected_sha"; then
+    # Best-effort: attempt the merge anyway. On a repo that REQUIRES the check the
+    # merge below is BLOCKED and defers (retry-eligible); on a repo that does NOT
+    # require it the merge still succeeds. Let branch protection decide rather than
+    # pre-empting an otherwise-mergeable PR.
+    MERGE_RETRY_ELIGIBLE=1
+    echo "[batch:merge] $item: PR #$pr cross-review status unconfirmed -> attempting merge anyway (branch protection decides)" >&2
+  fi
   # Merge, retrying briefly: the status just posted needs a moment to propagate to
   # the protected-branch merge gate (a single early attempt can still see BLOCKED).
+  # When the caller PINNED the reviewed head (the sweep), merge ATOMICALLY against
+  # it: --match-head-commit makes gh refuse the merge if a push moved the head after
+  # review, so a race can never land unreviewed code.
   local merged=0 mt=0
   while [ "$mt" -lt 30 ]; do
-    if gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1; then merged=1; break; fi
-    sleep 5; mt=$((mt + 5))
+    if [ -n "$expected_sha" ]; then
+      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
+    else
+      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1 && { merged=1; break; }
+    fi
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
+    mt=$((mt + 5))
   done
   if [ "$merged" != 1 ]; then
     MERGE_NOTE="merge deferred: gh pr merge failed"
+    MERGE_RETRY_ELIGIBLE=1
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
     return 0
   fi
@@ -595,6 +642,109 @@ merge_ready_pr() {
       MERGE_NOTE="merged; unexpected CI verdict '$decision' -> halted (fail-closed)"
       return 2 ;;
   esac
+}
+
+# _record_deferred_ready <item> <pr> <merge_rc> [issue] [reviewed_sha]: append
+# (item,pr,issue,reviewed_sha) to DEFERRED_READY_FILE iff the PR deferred on a
+# transient/retry-eligible class, so the end-of-run sweep can re-drive it by its
+# EXACT pr number (no re-discovery -> no GOTCHA-1 mapping blind spot), close its
+# issue on merge, and refuse to merge a head that changed since review. The caller
+# passes the head the PASS covered, captured BEFORE merge_ready_pr's retry window --
+# a push landing during that window must NOT be recorded as the reviewed head.
+# No-op for a clean merge or a human-hand-off deferral (CONFLICTING/DIRTY/reverted).
+_record_deferred_ready() {
+  local item="$1" pr="$2" mrc="$3" issue="${4:-}" sha="${5:-}"
+  [ "$mrc" = 0 ] && [ -n "$MERGE_NOTE" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" = 1 ] || return 0
+  mkdir -p "$(dirname "$DEFERRED_READY_FILE")"
+  printf '%s\t%s\t%s\t%s\n' "$item" "$pr" "$issue" "$sha" >> "$DEFERRED_READY_FILE"
+}
+
+# reconcile_deferred_ready -> end-of-run self-heal: re-drive every ready PR that a
+# TRANSIENT failure left open (recorded in DEFERRED_READY_FILE). By end-of-run the
+# startup gh burst is long gone, so re-posting bircher/cross-review + merging
+# overwhelmingly succeeds. Reuses merge_ready_pr UNCHANGED, so its post+verify gate
+# and main-CI-watch/revert safety still apply. Anything still unmergeable becomes a
+# loud escalation scorecard row for the (now rare) human hand-off. NEVER --admin.
+reconcile_deferred_ready() {
+  echo "[batch:sweep] reconciling ready-but-open PRs deferred by transient failures" >&2
+  local line rest item pr issue sha st cur mss mrc
+  # awk dedup PRESERVES the original append order (queue/manifest order); `sort -u`
+  # would reorder lexicographically (i10 before i2) and reintroduce the merge-order
+  # conflicts the sequential runner avoids.
+  awk '!seen[$0]++' "$DEFERRED_READY_FILE" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # Split on TAB by hand: `IFS=$'\t' read` collapses consecutive tabs (tab is
+    # IFS-whitespace), which would drop an EMPTY issue field and misalign sha.
+    item=${line%%$'\t'*}; rest=${line#*$'\t'}
+    pr=${rest%%$'\t'*};   rest=${rest#*$'\t'}
+    issue=${rest%%$'\t'*}; sha=${rest#*$'\t'}
+    [ -n "$pr" ] || continue
+    st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
+    case "$st" in
+      MERGED|CLOSED)
+        echo "[batch:sweep] $item: PR #$pr already $st -> skip" >&2
+        continue ;;
+    esac
+    # The cross-review PASS covers a SPECIFIC head sha. Auto-merge ONLY when we can
+    # PROVE the current head is still that reviewed head. Fail CLOSED: a missing
+    # recorded sha, a failed head lookup, or a changed head -> escalate, never
+    # re-stamp bircher/cross-review on unreviewed code.
+    cur=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    if [ -z "$sha" ] || [ -z "$cur" ]; then
+      echo "[batch:sweep] $item: PR #$pr cannot verify reviewed head (recorded='${sha}' current='${cur}') -> escalate for human" >&2
+      json_row "$item" "$pr" ready false sweep 0 0 "sweep: unverifiable reviewed head (recorded='${sha:-?}' current='${cur:-?}'); human merge" ok >> "$SCORECARD"
+      continue
+    fi
+    if [ "$cur" != "$sha" ]; then
+      echo "[batch:sweep] $item: PR #$pr head changed since review ($sha -> $cur) -> escalate for re-review" >&2
+      json_row "$item" "$pr" ready false sweep 0 0 "sweep: head changed since review ($sha -> $cur); needs re-review (human)" ok >> "$SCORECARD"
+      continue
+    fi
+    # Head PROVEN == reviewed head. But merging a BEHIND PR needs update-branch, which
+    # REWRITES the head -> the PASS would no longer cover the merged code. Tee it up
+    # (update-branch) but ESCALATE; a human / re-review must land a rebased head.
+    mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
+    if [ "$mss" = "BEHIND" ]; then
+      echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch + escalate (no auto-merge of a rebased head)" >&2
+      gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
+        || echo "[batch:sweep] WARN $item: update-branch call failed (already updating or up to date)" >&2
+      json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; update-branched, needs re-review before merge (human)" ok >> "$SCORECARD"
+      continue
+    fi
+    # Allow-list: only ATTEMPT the merge from states we can vouch are safe. CLEAN /
+    # HAS_HOOKS are healthy; BLOCKED is the NORMAL deferred state (missing our
+    # bircher/cross-review status, which merge_ready_pr posts -- other required checks
+    # still gate the real merge). Anything else -- UNSTABLE (a check went red since the
+    # PASS), DIRTY, DRAFT, UNKNOWN, empty -- is unverifiable/unsafe -> fail closed.
+    case "$mss" in
+      CLEAN|HAS_HOOKS|BLOCKED) : ;;
+      *)
+        echo "[batch:sweep] $item: PR #$pr mergeStateStatus '${mss:-unknown}' not safe to auto-merge -> escalate for human" >&2
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep: mergeStateStatus '${mss:-unknown}' not safe to auto-merge; human merge" ok >> "$SCORECARD"
+        continue ;;
+    esac
+    # Up to date AND head-verified: merging lands exactly the reviewed code.
+    echo "[batch:sweep] $item: retrying merge of verified ready PR #$pr" >&2
+    merge_ready_pr "$item" "$pr" "$sha"; mrc=$?
+    case "$mrc:$MERGE_NOTE" in
+      0:|0:merged*)
+        echo "[batch:sweep] $item: PR #$pr merged by sweep" >&2
+        json_row "$item" "$pr" ready true sweep 0 0 "merged by end-of-run reconciliation sweep" ok >> "$SCORECARD"
+        # #3 safety-net: close an issue-backed PR's issue if GitHub's `Closes #N`
+        # auto-close missed (run_item's close ran while this PR was still open -> no-op).
+        _ensure_issue_closed "$issue" "$pr" ;;
+      2:*)
+        # rc 2 = merge_ready_pr merged then main CI went red (reverted or halted).
+        # STOP the sweep: do NOT merge further PRs onto a possibly-red main -- the
+        # same halt safety the main item loop honors on an rc-2 merge.
+        echo "[batch:sweep] !!!! $item: PR #$pr sweep merge triggered a main-CI HALT (rc=2; $MERGE_NOTE) -> stopping sweep !!!!" >&2
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep merge halted the run (rc=2): ${MERGE_NOTE:-unknown}" ok >> "$SCORECARD"
+        break ;;
+      *)
+        echo "[batch:sweep] $item: PR #$pr STILL not merged (rc=$mrc; $MERGE_NOTE) -> escalate for human" >&2
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep could not merge (rc=$mrc): ${MERGE_NOTE:-unknown}" ok >> "$SCORECARD" ;;
+    esac
+  done
 }
 
 # recover_pr_cmd <code> <pr> [reviewer_vendor] -> STANDALONE recovery of ONE
@@ -1282,8 +1432,12 @@ EOF
   # a red/unresolved main after merge HALTS the run (rc 2 propagates to main).
   local merge_rc=0
   if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
-    merge_ready_pr "$item" "$pr"; merge_rc=$?
+    # Capture the head the review PASS covered BEFORE merge_ready_pr's status/merge
+    # retries: a push during that ~60s window must not be recorded as the reviewed sha.
+    local reviewed_sha; reviewed_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
     [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
+    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
@@ -1623,6 +1777,40 @@ SH
   BIRCHER_GIT_AUTHOR_NAME=Custom BIRCHER_GIT_AUTHOR_EMAIL=c@x.io _install_work_git_config "$gdir"
   [ "$(git -C "$gdir" config user.name)"  = "Custom" ]                 || { echo "FAIL identity env override"; rm -rf "$gdir"; exit 1; }
   rm -rf "$gdir"; echo "_install_work_git_config OK"
+  # --- Layer-1: _post_cross_review_status retry + verify -----------------------
+  local pdir; pdir=$(mktemp -d)
+  cat >"$pdir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh for _post_cross_review_status. CNT counts statuses POSTs; the posted
+# context only "lands" (becomes visible to the read-back) from POST attempt >= $LAND_AT.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "headsha1234567"; exit 0; fi
+if [ "$1" = "api" ]; then
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then
+    n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CNT"
+    [ "$n" -ge "${LAND_AT:-1}" ] && printf 'success\n' >> "$STORE"
+    exit 0
+  fi
+  if printf '%s\n' "$@" | grep -q '/status'; then cat "$STORE" 2>/dev/null; exit 0; fi
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$pdir/gh"
+  # retry-then-success: lands only on POST attempt 2 -> rc 0, verified on attempt 2
+  ( PATH="$pdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      CNT="$pdir/cnt" STORE="$pdir/store" LAND_AT=2 \
+      _post_cross_review_status demo 7 2>"$pdir/err"; rc=$?; [ $rc -eq 0 ] ) \
+    && grep -q 'posted+verified .* (attempt 2)' "$pdir/err" \
+    || { echo "FAIL _post retry-then-success"; cat "$pdir/err"; rm -rf "$pdir"; exit 1; }
+  # never-confirms (covers both a hard POST failure and a 2xx that never persists,
+  # since _post trusts the read-back, not the POST rc): rc 1 + ESCALATE line
+  : > "$pdir/cnt"; : > "$pdir/store"
+  ( PATH="$pdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      CNT="$pdir/cnt" STORE="$pdir/store" LAND_AT=999 \
+      _post_cross_review_status demo 7 2>"$pdir/err"; rc=$?; [ $rc -eq 1 ] ) \
+    && grep -q 'ESCALATE (ready, needs human merge)' "$pdir/err" \
+    || { echo "FAIL _post never-confirms -> rc1+escalate"; cat "$pdir/err"; rm -rf "$pdir"; exit 1; }
+  rm -rf "$pdir"; echo "_post_cross_review_status OK (retry+verify)"
   # --- B-1: merge_ready_pr via fake gh (merged + deferred paths) ---------------
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
@@ -1636,29 +1824,255 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit 0; fi
 if [ "$1" = "api" ]; then
-  # a statuses POST -> record it; a check-runs GET -> report main CI green
-  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"; exit 0; fi
+  # a statuses POST -> record it (log + make it visible to the read-back);
+  # a commits/<sha>/status GET -> return the recorded contexts (verify);
+  # a check-runs GET -> report main CI green.
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then
+    echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"
+    printf 'success\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
+    exit 0
+  fi
+  if printf '%s\n' "$@" | grep -q '/status'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
 SH
   chmod +x "$mdir/gh"
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
-  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING merge_ready_pr demo 7 >/dev/null 2>&1
-    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] ) \
+  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
   # #10 cross-review status: a ready item posts bircher/cross-review=success before merging
   local slog="$mdir/status.log"; : >"$slog"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" merge_ready_pr demo 7 >/dev/null 2>&1 )
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" FAKE_STATUS_STORE="$mdir/s3" merge_ready_pr demo 7 >/dev/null 2>&1 )
   grep -q 'repos/demo/demo/statuses/headsha' "$slog" \
     && grep -q 'state=success' "$slog" \
     && grep -q 'context=bircher/cross-review' "$slog" \
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
+  # Task 3 (codex P2-1): status-post unconfirmed -> BEST-EFFORT merge (let branch
+  # protection decide), not a pre-emptive defer.
+  local sdir; sdir=$(mktemp -d)
+  cat >"$sdir/gh" <<'SH'
+#!/usr/bin/env bash
+# cross-review status NEVER verifies (read-back empty); `pr merge` exits $FAKE_MERGE_RC.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo "headsha1234567"; exit 0; }
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
+fi
+[ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}"; }
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q '/statuses/' && exit 0   # POST "ok" but never persists
+  printf '%s\n' "$@" | grep -q '/status'    && exit 0   # read-back empty -> _post fails
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$sdir/gh"; : > "$sdir/pmlog"
+  # (a) protected repo: merge BLOCKED while status unconfirmed -> merge ATTEMPTED, deferred, retry-eligible
+  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 PMLOG="$sdir/pmlog" \
+      merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
+    || { echo "FAIL merge_ready_pr: status-unconfirmed+blocked not deferred/eligible"; rm -rf "$sdir"; exit 1; }
+  grep -qx 'merge 7' "$sdir/pmlog" || { echo "FAIL merge_ready_pr: merge not attempted despite unconfirmed status"; rm -rf "$sdir"; exit 1; }
+  # (b) unprotected repo: merge SUCCEEDS while status unconfirmed -> merged (best-effort)
+  : > "$sdir/pmlog"
+  ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=0 PMLOG="$sdir/pmlog" \
+      merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && case "$MERGE_NOTE" in ""|merged*) true;; *) false;; esac ) \
+    || { echo "FAIL merge_ready_pr: status-unconfirmed best-effort merge did not succeed"; rm -rf "$sdir"; exit 1; }
+  grep -qx 'merge 7' "$sdir/pmlog" || { echo "FAIL merge_ready_pr: best-effort merge not attempted"; rm -rf "$sdir"; exit 1; }
+  rm -rf "$sdir"; echo "merge_ready_pr status-unconfirmed OK (best-effort merge; blocked->defer, open->merge)"
+  # Task 3b (codex P2-B): a transient EMPTY mergeable lookup is retry-eligible (not stranded)
+  local edir; edir=$(mktemp -d)
+  cat >"$edir/gh" <<'SH'
+#!/usr/bin/env bash
+# every mergeable lookup returns EMPTY (simulated transient gh failure).
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid' && { echo "headsha1234567"; exit 0; }
+  echo ""; exit 0
+fi
+exit 0
+SH
+  chmod +x "$edir/gh"
+  ( PATH="$edir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 merge_ready_pr demo 7 >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "merge deferred: mergeable="*) true;; *) false;; esac ) \
+    || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
+  rm -rf "$edir"; echo "merge_ready_pr empty-mergeable OK (retry-eligible)"
+  # codex round 7: a PINNED reviewed sha that no longer matches the head -> merge REFUSED (atomic)
+  local mhdir; mhdir=$(mktemp -d)
+  cat >"$mhdir/gh" <<'SH'
+#!/usr/bin/env bash
+# current head is headsha1234567; a --match-head-commit != that -> merge refused.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo headsha1234567; exit 0; }
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  echo MERGEABLE; exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  nx=""; mh=""; for a in "$@"; do [ "$nx" = 1 ] && { mh="$a"; nx=""; }; [ "$a" = "--match-head-commit" ] && nx=1; done
+  [ -n "$mh" ] && [ "$mh" != headsha1234567 ] && exit 1
+  echo "merge $3" >> "${PMLOG:-/dev/null}"; exit 0
+fi
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$mhdir/gh"; : > "$mhdir/pmlog"; : > "$mhdir/store"
+  ( PATH="$mhdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 PMLOG="$mhdir/pmlog" STORE="$mhdir/store" \
+      merge_ready_pr demo 7 OTHERSHA000 >/dev/null 2>&1
+    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
+    || { echo "FAIL merge_ready_pr: stale pinned head not refused"; rm -rf "$mhdir"; exit 1; }
+  [ ! -s "$mhdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite stale pinned head"; cat "$mhdir/pmlog"; rm -rf "$mhdir"; exit 1; }
+  rm -rf "$mhdir"; echo "merge_ready_pr pinned-head-mismatch OK (atomic refuse)"
+  # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
+  local rdir; rdir=$(mktemp -d)
+  DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
+    _record_deferred_ready itemA 11 0 77 headsha1234567
+  DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="" MERGE_RETRY_ELIGIBLE=0 \
+    _record_deferred_ready itemB 12 0
+  DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="merge deferred: mergeable=CONFLICTING" MERGE_RETRY_ELIGIBLE=0 \
+    _record_deferred_ready itemC 13 0
+  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77\theadsha1234567')" ] \
+    || { echo "FAIL _record_deferred_ready: wrong contents"; cat "$rdir/deferred.tsv"; rm -rf "$rdir"; exit 1; }
+  echo "_record_deferred_ready OK"
+  cat >"$rdir/gh" <<'SH'
+#!/usr/bin/env bash
+# stateful fake gh for the sweep: merge flips pr state OPEN->MERGED (MERGEDDIR/<pr>);
+# MSSDIR/<pr> seeds mergeStateStatus (default CLEAN); STATEDIR/<pr> seeds state
+# (default OPEN); HEADDIR/<pr> seeds headRefOid (default headsha1234567; an EMPTY
+# file models a failed head lookup); STORE models the status post->read-back.
+_pr(){ for a in "$@"; do case "$a" in [0-9]*) printf '%s' "$a"; return;; esac; done; }
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  p=$(_pr "$@")
+  printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { cat "$MSSDIR/$p" 2>/dev/null || echo CLEAN; exit 0; }   # contains 'state' -> match FIRST
+  printf '%s\n' "$@" | grep -q 'headRefOid'  && { cat "$HEADDIR/$p" 2>/dev/null || echo headsha1234567; exit 0; }
+  if printf '%s\n' "$@" | grep -q 'state'; then
+    { [ -n "$MERGEDDIR" ] && [ -f "$MERGEDDIR/$p" ]; } && { echo MERGED; exit 0; }
+    cat "$STATEDIR/$p" 2>/dev/null || echo OPEN; exit 0
+  fi
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  nx=""; mh=""; for a in "$@"; do [ "$nx" = 1 ] && { mh="$a"; nx=""; }; [ "$a" = "--match-head-commit" ] && nx=1; done
+  if [ -n "$mh" ]; then cur=$(cat "$HEADDIR/$3" 2>/dev/null || echo headsha1234567); [ "$mh" = "$cur" ] || exit 1; echo "matchhead $3" >> "$PMLOG"; fi
+  echo "merge $3" >> "$PMLOG"; [ -n "$MERGEDDIR" ] && touch "$MERGEDDIR/$3"; exit 0
+fi
+[ "$1" = "issue" ] && [ "$2" = "view" ]  && { echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; }
+[ "$1" = "issue" ] && [ "$2" = "close" ] && { echo "close $3" >> "$PMLOG"; exit 0; }
+if [ "$1" = "api" ]; then
+  printf '%s\n' "$@" | grep -q 'update-branch' && { printf 'update-branch %s\n' "$*" >> "$PMLOG"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { cat "$STORE" 2>/dev/null; exit 0; }
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$rdir/gh"
+  mkdir -p "$rdir/states" "$rdir/mss" "$rdir/head" "$rdir/merged"
+  echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"; echo BLOCKED > "$rdir/mss/7"
+  # 4b: head-verified PR #7 (mss=BLOCKED = the NORMAL deferred state, missing our status)
+  # merges (pinned) + its issue is closed; MERGED PR #8 skipped
+  printf 'sweepA\t7\t77\theadsha1234567\nsweepB\t8\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_ISSUE_STATE=OPEN \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -qx 'merge 7' "$rdir/pmlog"            || { echo "FAIL sweep: verified PR #7 not merged"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'matchhead 7' "$rdir/pmlog"        || { echo "FAIL sweep: merge not pinned to reviewed head (--match-head-commit)"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q  'merge 8' "$rdir/pmlog"            && { echo "FAIL sweep: non-OPEN PR #8 was merged"; rm -rf "$rdir"; exit 1; }
+  grep -q 'reconciliation sweep' "$rdir/scorecard.jsonl" || { echo "FAIL sweep: no merged scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'close 77' "$rdir/pmlog"           || { echo "FAIL sweep: issue #77 not closed after sweep merge"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready merge+issue-close OK"
+  # 4c: head-verified, mergeable=CONFLICTING -> escalate (NOT merged), sweep continues
+  echo OPEN > "$rdir/states/9"
+  printf 'sweepC\t9\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGEABLE=CONFLICTING \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 9' "$rdir/pmlog"                         && { echo "FAIL sweep-escalate: CONFLICTING PR #9 was merged"; rm -rf "$rdir"; exit 1; }
+  grep -q 'sweep could not merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-escalate: no escalation scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready escalate OK"
+  # 4d (codex round 5): a BEHIND PR is update-branched but ESCALATED, NOT auto-merged
+  # (update-branch rewrites the head -> the PASS no longer covers the merged code).
+  echo OPEN > "$rdir/states/10"; echo BEHIND > "$rdir/mss/10"
+  printf 'sweepD\t10\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'pulls/10/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind: BEHIND PR #10 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'merge 10' "$rdir/pmlog"               && { echo "FAIL sweep-behind: BEHIND PR #10 auto-merged (rebased head unreviewed)"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'needs re-review before merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-behind: no BEHIND escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready behind-escalate OK"
+  # 4f (codex round 4): a PR whose head changed since review is escalated, NOT merged
+  echo OPEN > "$rdir/states/12"
+  printf 'sweepF\t12\t\tOLDSHA999\n' > "$rdir/deferred.tsv"   # recorded sha != current head (headsha1234567)
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 12' "$rdir/pmlog"                      && { echo "FAIL sweep-headchanged: PR #12 merged on an unreviewed head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'head changed since review' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-headchanged: no head-changed escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready head-changed OK"
+  # 4g (codex round 5): FAIL CLOSED when the reviewed head sha is unknown -> escalate, NOT merged
+  echo OPEN > "$rdir/states/13"
+  printf 'sweepG\t13\t\t\n' > "$rdir/deferred.tsv"   # recorded sha EMPTY -> cannot prove reviewed head
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 13' "$rdir/pmlog"                            && { echo "FAIL sweep-failclosed: PR #13 merged with unknown reviewed head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'unverifiable reviewed head' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-failclosed: no fail-closed escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready fail-closed OK"
+  # 4h (codex round 8): unverifiable mergeStateStatus -> fail closed (escalate, NOT merged)
+  echo OPEN > "$rdir/states/14"; echo UNKNOWN > "$rdir/mss/14"
+  printf 'sweepH\t14\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 14' "$rdir/pmlog"                                && { echo "FAIL sweep-mss-unknown: PR #14 merged on unverifiable mergeStateStatus"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'mergeStateStatus.*not safe to auto-merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unknown: no mss-unsafe escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready mss-unverifiable OK"
+  # 4i (codex round 9): UNSTABLE (a check went red since the PASS) -> fail closed (escalate, NOT merged)
+  echo OPEN > "$rdir/states/15"; echo UNSTABLE > "$rdir/mss/15"
+  printf 'sweepI\t15\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 15' "$rdir/pmlog"                                && { echo "FAIL sweep-mss-unstable: PR #15 merged on UNSTABLE mergeStateStatus"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'mergeStateStatus.*not safe to auto-merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unstable: no mss-unsafe escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready mss-unstable OK"
+  rm -rf "$rdir"; echo "reconcile_deferred_ready OK"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
   cat >"$prdir/gh" <<'SH'
@@ -1676,7 +2090,8 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ]   && { echo "merge $3" >> "${PR_LOG:-/dev/null}"; exit 0; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q 'update-branch' && { echo "update-branch" >> "${PR_LOG:-/dev/null}"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/statuses/'    && { echo "status $*" >> "${PR_LOG:-/dev/null}"; exit 0; }
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; fi
+  printf '%s\n' "$@" | grep -q '/status' && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -1689,16 +2104,16 @@ SH
   chmod +x "$prdir/gh" "$prdir/omnigent"
   # up-to-date green PR: review PASS -> cross-review status + NON-admin merge; no update-branch
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
-      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=CLEAN \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" STORE="$prdir/store" FAKE_MSS=CLEAN \
       recover_pr_cmd rdemo 9 codex >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] ) || { echo "FAIL recover_pr_cmd happy rc"; rm -rf "$prdir"; exit 1; }
   grep -q 'context=bircher/cross-review' "$prdir/log" || { echo "FAIL recover_pr_cmd: cross-review status not posted"; rm -rf "$prdir"; exit 1; }
   grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: PR not merged"; rm -rf "$prdir"; exit 1; }
   grep -q 'update-branch' "$prdir/log" && { echo "FAIL recover_pr_cmd: update-branch run for an up-to-date PR"; rm -rf "$prdir"; exit 1; }
   # BEHIND PR: update-branch FIRST, then review + merge
-  : > "$prdir/log"
+  : > "$prdir/log"; : > "$prdir/store"
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
-      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=BEHIND \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" STORE="$prdir/store" FAKE_MSS=BEHIND \
       recover_pr_cmd rdemo 9 codex >/dev/null 2>&1 )
   grep -q 'update-branch' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND did not update-branch"; rm -rf "$prdir"; exit 1; }
   grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND path did not merge"; rm -rf "$prdir"; exit 1; }
@@ -1884,6 +2299,7 @@ main() {
     items=("$QUEUE"/*.md)
   fi
   if [ ${#items[@]} -eq 0 ]; then echo "[batch] queue empty"; exit 0; fi
+  mkdir -p "$(dirname "$DEFERRED_READY_FILE")"; : > "$DEFERRED_READY_FILE"
   for f in "${items[@]}"; do
     local halt=0
     while :; do
@@ -1933,6 +2349,9 @@ main() {
       break
     fi
   done
+  if [ "${halt:-0}" != 1 ] && [ -s "$DEFERRED_READY_FILE" ]; then
+    reconcile_deferred_ready
+  fi
   # Deliberately NO holder prune here: deleting the holder cascade-deletes the
   # whole run's sessions (#1388) - run #11b's history was destroyed this way.
   # Holders accumulate (one per run) and are pruned manually only when a run's
