@@ -466,26 +466,45 @@ _prune_session() {
     || echo "[batch] WARN: prune of session $1 failed" >&2
 }
 
-# _post_cross_review_status <item> <pr> -> mark the PR's head commit with a
-# `bircher/cross-review` = success commit status, so a repo whose branch protection
+# _post_cross_review_status <item> <pr> -> post + VERIFY a `bircher/cross-review`
+# = success commit status on the PR's head commit, so a repo whose branch protection
 # REQUIRES that check (in lieu of an approving review) can self-merge. Only called
 # from merge_ready_pr, which the caller reaches ONLY on an outcome=ready item
 # (cross-vendor review PASS) - so the status is only ever posted on a genuine PASS.
 # Posted as the runner's own identity: setting a commit status is NOT a self-approval,
 # so (unlike `gh pr review --approve`) it needs no second GitHub account. On a repo
-# WITHOUT that required check the status is harmless. Best-effort: a failed post just
-# falls through to the merge (which defers cleanly if the gate is unmet).
+# WITHOUT that required check the status is harmless. Retries transient GitHub API
+# failures (5xx / secondary rate limit) and reads the status back to confirm it landed;
+# a single swallowed hiccup here previously stranded a reviewed, CI-green PR until a
+# human merged it. Contract: rc 0 = status confirmed present on the head sha;
+# rc 1 = gave up after retries (caller escalates + records for the end-of-run sweep,
+# not a silent defer).
 _post_cross_review_status() {
-  local item="$1" pr="$2" sha
-  sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
-  [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 0; }
-  if gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
-       -f context=bircher/cross-review \
-       -f description="cross-vendor review PASS (Bircher)" >/dev/null 2>&1; then
-    echo "[batch:merge] $item: posted bircher/cross-review=success on ${sha:0:7}" >&2
-  else
-    echo "[batch:merge] WARN $item: failed to post bircher/cross-review status on PR #$pr -> merge may defer" >&2
-  fi
+  local item="$1" pr="$2" sha attempt err
+  # Head sha, with a few retries (gh pr view can transiently fail too).
+  for attempt in 1 2 3; do
+    sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    [ -n "$sha" ] && break
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
+  done
+  [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 1; }
+  # Post, then read the status back to confirm it landed. Retry both with
+  # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
+  # non-transient cause is diagnosable next time.
+  for attempt in 1 2 3 4 5; do
+    err=$(gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+            -f context=bircher/cross-review \
+            -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
+    if gh api "repos/$REPO/commits/$sha/status" -q '.statuses[].context' 2>/dev/null \
+         | grep -qx 'bircher/cross-review'; then
+      echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
+      return 0
+    fi
+    echo "[batch:merge] WARN $item: cross-review status not confirmed on ${sha:0:7} (attempt $attempt/5)${err:+: $err}" >&2
+    [ "$attempt" -lt 5 ] && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * attempt * 2)); }
+  done
+  echo "[batch:merge] ERROR $item: could NOT post bircher/cross-review on PR #$pr after 5 attempts -> ESCALATE (ready, needs human merge)" >&2
+  return 1
 }
 
 # merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
@@ -1623,6 +1642,40 @@ SH
   BIRCHER_GIT_AUTHOR_NAME=Custom BIRCHER_GIT_AUTHOR_EMAIL=c@x.io _install_work_git_config "$gdir"
   [ "$(git -C "$gdir" config user.name)"  = "Custom" ]                 || { echo "FAIL identity env override"; rm -rf "$gdir"; exit 1; }
   rm -rf "$gdir"; echo "_install_work_git_config OK"
+  # --- Layer-1: _post_cross_review_status retry + verify -----------------------
+  local pdir; pdir=$(mktemp -d)
+  cat >"$pdir/gh" <<'SH'
+#!/usr/bin/env bash
+# fake gh for _post_cross_review_status. CNT counts statuses POSTs; the posted
+# context only "lands" (becomes visible to the read-back) from POST attempt >= $LAND_AT.
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "headsha1234567"; exit 0; fi
+if [ "$1" = "api" ]; then
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then
+    n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CNT"
+    [ "$n" -ge "${LAND_AT:-1}" ] && printf 'bircher/cross-review\n' >> "$STORE"
+    exit 0
+  fi
+  if printf '%s\n' "$@" | grep -q '/status'; then cat "$STORE" 2>/dev/null; exit 0; fi
+  printf 'completed|success\ncompleted|success\n'; exit 0
+fi
+exit 0
+SH
+  chmod +x "$pdir/gh"
+  # retry-then-success: lands only on POST attempt 2 -> rc 0, verified on attempt 2
+  ( PATH="$pdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      CNT="$pdir/cnt" STORE="$pdir/store" LAND_AT=2 \
+      _post_cross_review_status demo 7 2>"$pdir/err"; rc=$?; [ $rc -eq 0 ] ) \
+    && grep -q 'posted+verified .* (attempt 2)' "$pdir/err" \
+    || { echo "FAIL _post retry-then-success"; cat "$pdir/err"; rm -rf "$pdir"; exit 1; }
+  # never-confirms (covers both a hard POST failure and a 2xx that never persists,
+  # since _post trusts the read-back, not the POST rc): rc 1 + ESCALATE line
+  : > "$pdir/cnt"; : > "$pdir/store"
+  ( PATH="$pdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      CNT="$pdir/cnt" STORE="$pdir/store" LAND_AT=999 \
+      _post_cross_review_status demo 7 2>"$pdir/err"; rc=$?; [ $rc -eq 1 ] ) \
+    && grep -q 'ESCALATE (ready, needs human merge)' "$pdir/err" \
+    || { echo "FAIL _post never-confirms -> rc1+escalate"; cat "$pdir/err"; rm -rf "$pdir"; exit 1; }
+  rm -rf "$pdir"; echo "_post_cross_review_status OK (retry+verify)"
   # --- B-1: merge_ready_pr via fake gh (merged + deferred paths) ---------------
   local mdir; mdir=$(mktemp -d)
   cat >"$mdir/gh" <<'SH'
@@ -1636,23 +1689,30 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit 0; fi
 if [ "$1" = "api" ]; then
-  # a statuses POST -> record it; a check-runs GET -> report main CI green
-  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"; exit 0; fi
+  # a statuses POST -> record it (log + make it visible to the read-back);
+  # a commits/<sha>/status GET -> return the recorded contexts (verify);
+  # a check-runs GET -> report main CI green.
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then
+    echo "$@" >> "${FAKE_GH_LOG:-/dev/null}"
+    printf 'bircher/cross-review\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
+    exit 0
+  fi
+  if printf '%s\n' "$@" | grep -q '/status'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
 SH
   chmod +x "$mdir/gh"
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
-  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
   # #10 cross-review status: a ready item posts bircher/cross-review=success before merging
   local slog="$mdir/status.log"; : >"$slog"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" merge_ready_pr demo 7 >/dev/null 2>&1 )
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" FAKE_STATUS_STORE="$mdir/s3" merge_ready_pr demo 7 >/dev/null 2>&1 )
   grep -q 'repos/demo/demo/statuses/headsha' "$slog" \
     && grep -q 'state=success' "$slog" \
     && grep -q 'context=bircher/cross-review' "$slog" \
@@ -1676,7 +1736,8 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ]   && { echo "merge $3" >> "${PR_LOG:-/dev/null}"; exit 0; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q 'update-branch' && { echo "update-branch" >> "${PR_LOG:-/dev/null}"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/statuses/'    && { echo "status $*" >> "${PR_LOG:-/dev/null}"; exit 0; }
+  if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'bircher/cross-review\n' >> "${STORE:-/dev/null}"; exit 0; fi
+  printf '%s\n' "$@" | grep -q '/status' && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -1689,16 +1750,16 @@ SH
   chmod +x "$prdir/gh" "$prdir/omnigent"
   # up-to-date green PR: review PASS -> cross-review status + NON-admin merge; no update-branch
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
-      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=CLEAN \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" STORE="$prdir/store" FAKE_MSS=CLEAN \
       recover_pr_cmd rdemo 9 codex >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] ) || { echo "FAIL recover_pr_cmd happy rc"; rm -rf "$prdir"; exit 1; }
   grep -q 'context=bircher/cross-review' "$prdir/log" || { echo "FAIL recover_pr_cmd: cross-review status not posted"; rm -rf "$prdir"; exit 1; }
   grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: PR not merged"; rm -rf "$prdir"; exit 1; }
   grep -q 'update-branch' "$prdir/log" && { echo "FAIL recover_pr_cmd: update-branch run for an up-to-date PR"; rm -rf "$prdir"; exit 1; }
   # BEHIND PR: update-branch FIRST, then review + merge
-  : > "$prdir/log"
+  : > "$prdir/log"; : > "$prdir/store"
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
-      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" FAKE_MSS=BEHIND \
+      MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" STORE="$prdir/store" FAKE_MSS=BEHIND \
       recover_pr_cmd rdemo 9 codex >/dev/null 2>&1 )
   grep -q 'update-branch' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND did not update-branch"; rm -rf "$prdir"; exit 1; }
   grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: BEHIND path did not merge"; rm -rf "$prdir"; exit 1; }
