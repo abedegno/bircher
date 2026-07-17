@@ -633,16 +633,20 @@ merge_ready_pr() {
   esac
 }
 
-# _record_deferred_ready <item> <pr> <merge_rc> [issue]: append (item,pr,issue) to
-# DEFERRED_READY_FILE iff the PR deferred on a transient/retry-eligible class, so
+# _record_deferred_ready <item> <pr> <merge_rc> [issue]: append (item,pr,issue,sha)
+# to DEFERRED_READY_FILE iff the PR deferred on a transient/retry-eligible class, so
 # the end-of-run sweep can re-drive it by its EXACT pr number (no re-discovery ->
-# no GOTCHA-1 mapping blind spot) and close its issue on merge. No-op for a clean
-# merge or a human-hand-off deferral (CONFLICTING/DIRTY/reverted).
+# no GOTCHA-1 mapping blind spot), close its issue on merge, and refuse to merge a
+# head that changed since review. No-op for a clean merge or a human-hand-off
+# deferral (CONFLICTING/DIRTY/reverted).
 _record_deferred_ready() {
-  local item="$1" pr="$2" mrc="$3" issue="${4:-}"
+  local item="$1" pr="$2" mrc="$3" issue="${4:-}" sha
   [ "$mrc" = 0 ] && [ -n "$MERGE_NOTE" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" = 1 ] || return 0
+  # Record the REVIEWED head sha: the sweep must refuse to auto-merge (and re-stamp
+  # cross-review on) a head that got another commit since this PASS.
+  sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"
-  printf '%s\t%s\t%s\n' "$item" "$pr" "$issue" >> "$DEFERRED_READY_FILE"
+  printf '%s\t%s\t%s\t%s\n' "$item" "$pr" "$issue" "$sha" >> "$DEFERRED_READY_FILE"
 }
 
 # reconcile_deferred_ready -> end-of-run self-heal: re-drive every ready PR that a
@@ -653,11 +657,17 @@ _record_deferred_ready() {
 # loud escalation scorecard row for the (now rare) human hand-off. NEVER --admin.
 reconcile_deferred_ready() {
   echo "[batch:sweep] reconciling ready-but-open PRs deferred by transient failures" >&2
-  local item pr issue st mss ci mrc w
+  local line rest item pr issue sha st cur mss ci mrc w
   # awk dedup PRESERVES the original append order (queue/manifest order); `sort -u`
   # would reorder lexicographically (i10 before i2) and reintroduce the merge-order
   # conflicts the sequential runner avoids.
-  awk '!seen[$0]++' "$DEFERRED_READY_FILE" | while IFS=$'\t' read -r item pr issue; do
+  awk '!seen[$0]++' "$DEFERRED_READY_FILE" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # Split on TAB by hand: `IFS=$'\t' read` collapses consecutive tabs (tab is
+    # IFS-whitespace), which would drop an EMPTY issue field and misalign sha.
+    item=${line%%$'\t'*}; rest=${line#*$'\t'}
+    pr=${rest%%$'\t'*};   rest=${rest#*$'\t'}
+    issue=${rest%%$'\t'*}; sha=${rest#*$'\t'}
     [ -n "$pr" ] || continue
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
     case "$st" in
@@ -670,6 +680,15 @@ reconcile_deferred_ready() {
           # re-checks mergeability and records a scorecard row either way.
         echo "[batch:sweep] $item: PR #$pr state unresolved ('${st}') -> attempting anyway" >&2 ;;
     esac
+    # Revalidate the reviewed head: an EXTERNAL commit since deferral means the
+    # cross-review PASS no longer covers the current code. Refuse to auto-merge (and
+    # re-stamp cross-review on) an unreviewed head; escalate for a human/re-review.
+    cur=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    if [ -n "$sha" ] && [ -n "$cur" ] && [ "$cur" != "$sha" ]; then
+      echo "[batch:sweep] $item: PR #$pr head changed since review ($sha -> $cur) -> NOT auto-merging, escalate for re-review" >&2
+      json_row "$item" "$pr" ready false sweep 0 0 "sweep: head changed since review ($sha -> $cur); needs re-review (human)" ok >> "$SCORECARD"
+      continue
+    fi
     # Strict branch protection: a PR deferred early in the run is likely BEHIND by
     # end-of-run (later items merged to main). merge_ready_pr does NOT update-branch,
     # so bring it up to date + settle the re-triggered CI first (mirrors recover_pr_cmd),
@@ -1876,14 +1895,15 @@ SH
     || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
   rm -rf "$edir"; echo "merge_ready_pr empty-mergeable OK (retry-eligible)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
-  local rdir; rdir=$(mktemp -d)
-  DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
+  local rdir; rdir=$(mktemp -d); mkdir -p "$rdir/ghbin"
+  printf '#!/usr/bin/env bash\necho headsha1234567\n' > "$rdir/ghbin/gh"; chmod +x "$rdir/ghbin/gh"
+  PATH="$rdir/ghbin:$PATH" DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
     _record_deferred_ready itemA 11 0 77
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemB 12 0
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="merge deferred: mergeable=CONFLICTING" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemC 13 0
-  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77')" ] \
+  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77\theadsha1234567')" ] \
     || { echo "FAIL _record_deferred_ready: wrong contents"; cat "$rdir/deferred.tsv"; rm -rf "$rdir"; exit 1; }
   echo "_record_deferred_ready OK"
   cat >"$rdir/gh" <<'SH'
@@ -1923,7 +1943,7 @@ SH
   mkdir -p "$rdir/states" "$rdir/mss" "$rdir/checks" "$rdir/updated" "$rdir/merged"
   echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"
   # 4b: OPEN PR #7 (issue #77) merges + its issue is closed; MERGED PR #8 is skipped
-  printf 'sweepA\t7\t77\nsweepB\t8\t\n' > "$rdir/deferred.tsv"
+  printf 'sweepA\t7\t77\theadsha1234567\nsweepB\t8\t\theadsha1234567\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 BIRCHER_AUTOCLOSE_GRACE_S=0 FAKE_ISSUE_STATE=OPEN \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
@@ -1937,7 +1957,7 @@ SH
   echo "reconcile_deferred_ready merge+issue-close OK"
   # Task 4c: a PR that won't merge is escalated (NOT merged), sweep continues (rc 0)
   echo OPEN > "$rdir/states/9"
-  printf 'sweepC\t9\t\n' > "$rdir/deferred.tsv"
+  printf 'sweepC\t9\t\theadsha1234567\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGEABLE=CONFLICTING \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
@@ -1950,7 +1970,7 @@ SH
   # Task 4d (codex P2-2/P2-3): a BEHIND PR is update-branched, waits for the async
   # update to LAND (mss BEHIND->CLEAN) + CI green, then merged.
   echo OPEN > "$rdir/states/10"; echo BEHIND > "$rdir/mss/10"
-  printf 'sweepD\t10\t\n' > "$rdir/deferred.tsv"
+  printf 'sweepD\t10\t\theadsha1234567\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
@@ -1962,7 +1982,7 @@ SH
   echo "reconcile_deferred_ready behind OK"
   # Task 4e (codex P2-A): a BEHIND PR whose re-triggered CI is RED is escalated, NOT merged
   echo OPEN > "$rdir/states/11"; echo BEHIND > "$rdir/mss/11"; printf 'fail\npass\n' > "$rdir/checks/11"
-  printf 'sweepE\t11\t\n' > "$rdir/deferred.tsv"
+  printf 'sweepE\t11\t\theadsha1234567\n' > "$rdir/deferred.tsv"
   : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
   ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
@@ -1972,6 +1992,18 @@ SH
   grep -q 'merge 11' "$rdir/pmlog"                            && { echo "FAIL sweep-behind-red: PR #11 merged on red CI"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -q 'after update-branch' "$rdir/scorecard.jsonl"       || { echo "FAIL sweep-behind-red: no CI-red escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready behind-red OK"
+  # Task 4f (codex round 4): a PR whose head changed since review is NOT auto-merged
+  echo OPEN > "$rdir/states/12"
+  printf 'sweepF\t12\t\tOLDSHA999\n' > "$rdir/deferred.tsv"   # recorded sha != current head (headsha1234567)
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" CHECKSDIR="$rdir/checks" UPDATED="$rdir/updated" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 12' "$rdir/pmlog"                      && { echo "FAIL sweep-headchanged: PR #12 merged on an unreviewed head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'head changed since review' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-headchanged: no head-changed escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready head-changed OK"
   rm -rf "$rdir"; echo "reconcile_deferred_ready OK"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
