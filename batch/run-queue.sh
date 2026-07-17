@@ -633,18 +633,17 @@ merge_ready_pr() {
   esac
 }
 
-# _record_deferred_ready <item> <pr> <merge_rc> [issue]: append (item,pr,issue,sha)
-# to DEFERRED_READY_FILE iff the PR deferred on a transient/retry-eligible class, so
-# the end-of-run sweep can re-drive it by its EXACT pr number (no re-discovery ->
-# no GOTCHA-1 mapping blind spot), close its issue on merge, and refuse to merge a
-# head that changed since review. No-op for a clean merge or a human-hand-off
-# deferral (CONFLICTING/DIRTY/reverted).
+# _record_deferred_ready <item> <pr> <merge_rc> [issue] [reviewed_sha]: append
+# (item,pr,issue,reviewed_sha) to DEFERRED_READY_FILE iff the PR deferred on a
+# transient/retry-eligible class, so the end-of-run sweep can re-drive it by its
+# EXACT pr number (no re-discovery -> no GOTCHA-1 mapping blind spot), close its
+# issue on merge, and refuse to merge a head that changed since review. The caller
+# passes the head the PASS covered, captured BEFORE merge_ready_pr's retry window --
+# a push landing during that window must NOT be recorded as the reviewed head.
+# No-op for a clean merge or a human-hand-off deferral (CONFLICTING/DIRTY/reverted).
 _record_deferred_ready() {
-  local item="$1" pr="$2" mrc="$3" issue="${4:-}" sha
+  local item="$1" pr="$2" mrc="$3" issue="${4:-}" sha="${5:-}"
   [ "$mrc" = 0 ] && [ -n "$MERGE_NOTE" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" = 1 ] || return 0
-  # Record the REVIEWED head sha: the sweep must refuse to auto-merge (and re-stamp
-  # cross-review on) a head that got another commit since this PASS.
-  sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"
   printf '%s\t%s\t%s\t%s\n' "$item" "$pr" "$issue" "$sha" >> "$DEFERRED_READY_FILE"
 }
@@ -1410,9 +1409,12 @@ EOF
   # a red/unresolved main after merge HALTS the run (rc 2 propagates to main).
   local merge_rc=0
   if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
+    # Capture the head the review PASS covered BEFORE merge_ready_pr's status/merge
+    # retries: a push during that ~60s window must not be recorded as the reviewed sha.
+    local reviewed_sha; reviewed_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
     merge_ready_pr "$item" "$pr"; merge_rc=$?
     [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
-    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss"
+    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
@@ -1883,10 +1885,9 @@ SH
     || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
   rm -rf "$edir"; echo "merge_ready_pr empty-mergeable OK (retry-eligible)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
-  local rdir; rdir=$(mktemp -d); mkdir -p "$rdir/ghbin"
-  printf '#!/usr/bin/env bash\necho headsha1234567\n' > "$rdir/ghbin/gh"; chmod +x "$rdir/ghbin/gh"
-  PATH="$rdir/ghbin:$PATH" DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
-    _record_deferred_ready itemA 11 0 77
+  local rdir; rdir=$(mktemp -d)
+  DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
+    _record_deferred_ready itemA 11 0 77 headsha1234567
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemB 12 0
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="merge deferred: mergeable=CONFLICTING" MERGE_RETRY_ELIGIBLE=0 \
