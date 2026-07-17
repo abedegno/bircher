@@ -711,6 +711,14 @@ reconcile_deferred_ready() {
       json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; update-branched, needs re-review before merge (human)" ok >> "$SCORECARD"
       continue
     fi
+    if [ -z "$mss" ] || [ "$mss" = "UNKNOWN" ]; then
+      # Can't PROVE the PR is up to date -> fail closed (symmetric with the head check).
+      # A behind PR reviewed against an older base must not auto-merge on a repo that
+      # does not enforce up-to-date branches.
+      echo "[batch:sweep] $item: PR #$pr mergeStateStatus '${mss:-unknown}' unverifiable -> escalate for human" >&2
+      json_row "$item" "$pr" ready false sweep 0 0 "sweep: mergeStateStatus '${mss:-unknown}' unverifiable; human merge" ok >> "$SCORECARD"
+      continue
+    fi
     # Up to date AND head-verified: merging lands exactly the reviewed code.
     echo "[batch:sweep] $item: retrying merge of verified ready PR #$pr" >&2
     merge_ready_pr "$item" "$pr" "$sha"; mrc=$?
@@ -2035,6 +2043,18 @@ SH
   grep -q 'merge 13' "$rdir/pmlog"                            && { echo "FAIL sweep-failclosed: PR #13 merged with unknown reviewed head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -q 'unverifiable reviewed head' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-failclosed: no fail-closed escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready fail-closed OK"
+  # 4h (codex round 8): unverifiable mergeStateStatus -> fail closed (escalate, NOT merged)
+  echo OPEN > "$rdir/states/14"; echo UNKNOWN > "$rdir/mss/14"
+  printf 'sweepH\t14\t\theadsha1234567\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
+      STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      PMLOG="$rdir/pmlog" STORE="$rdir/store" \
+      reconcile_deferred_ready >/dev/null 2>&1 )
+  grep -q 'merge 14' "$rdir/pmlog"                                && { echo "FAIL sweep-mss-unknown: PR #14 merged on unverifiable mergeStateStatus"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'mergeStateStatus.*unverifiable' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-mss-unknown: no mss-unverifiable escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "reconcile_deferred_ready mss-unverifiable OK"
   rm -rf "$rdir"; echo "reconcile_deferred_ready OK"
   # --- --recover-pr: standalone adopt+review+merge of one orphaned PR ----------
   local prdir; prdir=$(mktemp -d)
