@@ -1201,6 +1201,22 @@ _local_host_id() {
   grep -m1 'host_id:' "$cfg" | awk '{print $2}'
 }
 
+# _host_ids_match <session_host_id> <local_host_id> -> yes|no   (PURE, self-tested)
+#
+# The two sides report the same host in different shapes: the runner's
+# config.yaml stores the PREFIXED form (host_<uuid>) while omnigent v0.6.0's
+# GET /v1/sessions/<id> returns the BARE <uuid>. A literal comparison therefore
+# never matched on v0.6.0 and every item was scored bound=failed -- an alarm
+# that always fires detects nothing (#26). Compare on the normalized form so a
+# genuine mismatch is still caught whichever shape either side sends.
+#
+# An empty/unknown session host is NOT a match: an unverifiable binding must
+# stay a failure, not be waved through.
+_host_ids_match() {
+  local a="${1#host_}" b="${2#host_}"
+  if [ -n "$a" ] && [ "$a" = "$b" ]; then echo "yes"; else echo "no"; fi
+}
+
 run_item() {
   local f="$1"; local item; item=$(basename "$f" .md)
   local code; code=$(printf '%s' "$item" | cut -d- -f1 | tr 'A-Z' 'a-z')  # item code, e.g. a06
@@ -1262,7 +1278,7 @@ ${prompt}"
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
   # Binding check: we set host_id in create; confirm the session bound to THIS runner.
   local sess_host; sess_host=$(_http_json GET "/v1/sessions/$conv_id" | _json_get host_id)
-  if [ -n "$host_id" ] && [ "$sess_host" != "$host_id" ]; then
+  if [ -n "$host_id" ] && [ "$(_host_ids_match "$sess_host" "$host_id")" != "yes" ]; then
     bound_outcome="failed"
     echo "[batch] !!!! BINDING MISMATCH for $item: session host_id='${sess_host:-<empty>}' != local='$host_id'" >&2
   fi
@@ -1744,6 +1760,18 @@ SH
   [ "$(_pick_implementer -  -   -   -  -   -  1000)" = "claude_code" ] || { echo "FAIL pick no-signal default"; exit 1; }
   [ "$(_pick_implementer 50 100 40  -  -   -  1000)" = "codex" ]       || { echo "FAIL pick missing-codex-eligible"; exit 1; }
   echo "_pick_implementer OK"
+  # --- #26: host_id shapes differ across omnigent versions (config.yaml stores
+  #     host_<uuid>, v0.6.0's session API returns the bare <uuid>). Same host must
+  #     match either way; a different host, or an unknown one, must still fail.
+  [ "$(_host_ids_match 'abc123' 'host_abc123')" = "yes" ] || { echo "FAIL hostmatch bare-vs-prefixed"; exit 1; }
+  [ "$(_host_ids_match 'host_abc123' 'abc123')" = "yes" ] || { echo "FAIL hostmatch prefixed-vs-bare"; exit 1; }
+  [ "$(_host_ids_match 'host_abc123' 'host_abc123')" = "yes" ] || { echo "FAIL hostmatch both-prefixed"; exit 1; }
+  [ "$(_host_ids_match 'abc123' 'abc123')" = "yes" ] || { echo "FAIL hostmatch both-bare"; exit 1; }
+  [ "$(_host_ids_match 'host_abc123' 'host_def456')" = "no" ] || { echo "FAIL hostmatch different-host"; exit 1; }
+  [ "$(_host_ids_match 'abc123' 'host_def456')" = "no" ] || { echo "FAIL hostmatch different-host-mixed"; exit 1; }
+  [ "$(_host_ids_match '' 'host_abc123')" = "no" ] || { echo "FAIL hostmatch empty-session-host"; exit 1; }
+  [ "$(_host_ids_match 'host_' 'host_abc123')" = "no" ] || { echo "FAIL hostmatch prefix-only"; exit 1; }
+  echo "_host_ids_match OK"
   # --- _parse_codex_rate_limits: current "prolite" weekly-only schema, legacy
   #     dual-window schema, and garbage all parse correctly (regression for the
   #     codex-cli 0.144.x schema drift that silently pinned every item to codex) -
