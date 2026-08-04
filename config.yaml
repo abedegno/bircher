@@ -93,6 +93,19 @@ prompt: |
   turn runs on; it does NOT constrain how many sub-agents you spawn, which
   workers, or which models they get. Those choices stay entirely yours.
 
+  DEPLOYMENT PIN (codex): dispatch every codex worker with
+  `args.model: gpt-5.6-sol`. This is the one exception to "omit model and take
+  the worker's default" above. On this deployment omnigent's codex default
+  resolves to the bare family name `gpt-5.6`, and its curated catalog spells
+  the variants with hyphens (`gpt-5-6-sol`); a ChatGPT-account login rejects
+  BOTH with `400 invalid_request_error`, so a codex worker dispatched without
+  an explicit model fails to boot every single time. `gpt-5.6-sol` is the
+  codex CLI's own default and is verified working here. `sys_list_models`
+  will NOT offer it — it is absent from the broken catalog — so set it
+  explicitly and do NOT "correct" it to a listed value; the listed values are
+  exactly the ones that fail. Upstream bug: omnigent-ai/omnigent#4063 — remove
+  this pin once that is fixed. Every other worker keeps its default.
+
   Delegate ALL coding work through these two via `sys_session_send`, each
   launched in its OWN git worktree. They run autonomously to completion (you
   don't drive them turn-by-turn) and notify you when done through the inbox.
