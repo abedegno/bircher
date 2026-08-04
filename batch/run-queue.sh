@@ -873,6 +873,19 @@ _reconcile_item_pr() {
 recover_from_ground_truth() {
   local item="$1" code="$2" pr="$3" issue="${4:-}"
   local ci="na" verdict="" reviewer_out=""
+  # A tracked PR that was CLOSED without merging can never satisfy this item --
+  # drop it and let the discovery below find the real one. See _pr_is_abandoned
+  # for the i506 scratch-PR case this exists for.
+  if [ -n "$pr" ]; then
+    local _st _mg
+    _st=$(gh pr view "$pr" --repo "$REPO" --json state,mergedAt \
+      -q '(.state // "") + "|" + (.mergedAt // "")' 2>/dev/null)
+    _mg="${_st#*|}"; _st="${_st%%|*}"
+    if [ -n "$_st" ] && _pr_is_abandoned "$_st" "$_mg"; then
+      echo "[batch:recover] $item: tracked PR #$pr is CLOSED and unmerged -> discarding and re-discovering" >&2
+      pr=""
+    fi
+  fi
   # If discovery missed the PR (coordinator opened it, then died before run-queue
   # saw it -- overnight i230 opened #250 but was recorded "no PR"), re-scan for an
   # open PR whose head branch carries the item code before concluding "no PR".
@@ -1050,6 +1063,24 @@ _pr_signal() {
   head -c 20 "$NOOP_DIR/$1.pr" 2>/dev/null | tr -cd '0-9'
 }
 
+# _pr_is_abandoned <state> <mergedAt> -> 0 (true) when a PR can NEVER satisfy its
+# item: CLOSED without ever being merged. Pure; the caller owns the gh query.
+#
+# 2026-08-04 (i506): the item's acceptance criteria required PROVING a new CI gate
+# job actually fails, so the implementer opened a deliberately-broken scratch PR
+# (#510, branch `i506-scratch-break-leg`), showed it red, closed it, and then
+# opened the real PR (#511, `i506-plugins-gate`). #510 was open for 3.5 minutes and
+# its branch carries the item code, so branch-code discovery matched it legitimately
+# -- and nothing ever re-evaluated that choice once it closed unmerged. The item
+# tracked a closed PR to the cap and reported `outcome=failed pr=510` while the real
+# PR sat green and mergeable. Any item whose criteria demand a demonstrated failure
+# can reproduce this, so the tracked PR must be re-checked, not trusted once.
+_pr_is_abandoned() {
+  local state="$1" merged="${2:-}"
+  [ "$state" = "CLOSED" ] || return 1
+  [ -z "$merged" ] || [ "$merged" = "null" ]
+}
+
 # _select_pr_candidate <signal_pr> <matching_prs_string> -> one of
 # use-signal|<pr>, use-the-one-match|<pr>, no-match|, ambiguous/escalate|<prs>.
 # Pure selection only: the caller owns any gh query and the .escalated write.
@@ -1188,6 +1219,50 @@ preflight_auth() {
   fi
   [ "$ok" = 1 ] || { echo "[batch] preflight FAILED -> refusing to start the queue; fix auth then re-run" >&2; return 1; }
   echo "[batch] preflight OK -> both providers healthy"
+}
+
+# The model codex workers must be dispatched with. Kept in step with the
+# DEPLOYMENT PIN directive in config.yaml -- change both together.
+BIRCHER_CODEX_MODEL="${BIRCHER_CODEX_MODEL:-gpt-5.6-sol}"
+
+# preflight_dispatch: prove a worker can actually LAUNCH THROUGH THE HARNESS.
+#
+# preflight_auth probes the CLIs directly (`claude -p`, `codex exec`), which is a
+# DIFFERENT question from whether omnigent can dispatch a worker. On 2026-08-04 it
+# reported "codex OK" -- correctly, the CLI was healthy and self-reported
+# `model: gpt-5.6-sol` -- and then all 4 items died at dispatch with
+# `400 ... The 'gpt-5.6' model is not supported when using Codex with a ChatGPT
+# account`: omnigent resolved the bare family name `gpt-5.6`, and its curated
+# catalog spells the variants with hyphens (`gpt-5-6-sol`) where the real IDs use
+# dots. Both spellings 400. A CLI-only probe cannot see any of that.
+# Upstream: omnigent-ai/omnigent#4063.
+preflight_dispatch() {
+  [ -n "${SERVER:-}" ] || { echo "[batch] preflight: no SERVER set -> skipping dispatch probe" >&2; return 0; }
+  local t="${PREFLIGHT_DISPATCH_TIMEOUT:-180}" ok=1
+  local harness spec out attempt
+  for spec in "codex|--model $BIRCHER_CODEX_MODEL" "claude|"; do
+    harness="${spec%%|*}"
+    local extra="${spec#*|}"
+    for attempt in 1 2; do
+      # A cold server can lose the first dispatch to warmup (documented: 2x
+      # `400 Bad Request` on /token then a clean connect ~70s in), so one retry
+      # before calling it a failure -- but never more: a real breakage must not
+      # be retried into a long stall.
+      out=$(timeout "$t" omnigent run --harness "$harness" $extra \
+        -p "reply READY and stop" --server "$SERVER" 2>&1)
+      case "$out" in
+        *READY*) break ;;
+      esac
+      [ "$attempt" = 1 ] && echo "[batch] preflight: $harness dispatch attempt 1 did not return READY (cold server?) -> retrying" >&2
+    done
+    case "$out" in
+      *READY*) echo "[batch] preflight: $harness dispatch OK${extra:+ ($extra)}" ;;
+      *) ok=0
+         echo "[batch] preflight: !!! $harness DISPATCH FAILED${extra:+ ($extra)} -- the CLI may be fine while the harness cannot launch a worker:" >&2
+         printf '%s\n' "$out" | tail -n 4 >&2 ;;
+    esac
+  done
+  [ "$ok" = 1 ] || { echo "[batch] preflight FAILED at dispatch -> refusing to start the queue (every item would die at launch)" >&2; return 1; }
 }
 
 # json_row item pr outcome ci_first review rounds wall note bound [implementer]
@@ -2250,6 +2325,21 @@ SH
   ) || { echo "FAIL bundle-dir path defaults/override"; exit 1; }
   rm -rf "$bdt"
   echo "_bundle_dir OK"
+
+  # --- _pr_is_abandoned: only a CLOSED-and-never-merged PR is abandoned --------
+  # The i506 case: a scratch PR opened to PROVE a CI gate fails, then closed,
+  # while the real PR is opened separately. Tracking the scratch one to the cap
+  # reported outcome=failed against a closed PR while the real one sat green.
+  _pr_is_abandoned "CLOSED" ""      || { echo "FAIL abandoned: closed+unmerged must be abandoned"; exit 1; }
+  _pr_is_abandoned "CLOSED" "null"  || { echo "FAIL abandoned: closed + literal null mergedAt must be abandoned"; exit 1; }
+  _pr_is_abandoned "CLOSED" "2026-08-04T20:42:03Z" && { echo "FAIL abandoned: a MERGED pr must never be abandoned"; exit 1; }
+  _pr_is_abandoned "OPEN"   ""      && { echo "FAIL abandoned: an OPEN pr must never be abandoned"; exit 1; }
+  _pr_is_abandoned "MERGED" "2026-08-04T20:42:03Z" && { echo "FAIL abandoned: MERGED state must never be abandoned"; exit 1; }
+  # Unknown/empty state (gh failed) must NOT be treated as abandoned: discarding a
+  # real PR on a transient gh error would be worse than tracking it one cycle more.
+  _pr_is_abandoned "" ""            && { echo "FAIL abandoned: empty state must not be abandoned"; exit 1; }
+  echo "_pr_is_abandoned OK"
+
   echo "self-test OK"
 }
 
@@ -2273,8 +2363,9 @@ _install_work_git_config() {
 
 main() {
   [ "${1:-}" = "--self-test" ] && { self_test; exit 0; }
-  # Standalone auth check (no queue run): verify both providers, then exit.
-  [ "${1:-}" = "--preflight" ] && { preflight_auth; exit $?; }
+  # Standalone health check (no queue run): verify both providers can auth AND
+  # can actually be dispatched through the harness, then exit.
+  [ "${1:-}" = "--preflight" ] && { preflight_auth && preflight_dispatch; exit $?; }
   # Standalone usage readout (no queue run): print both providers' live signals
   # and the vendor _pick_implementer would choose right now, then exit. Operator
   # sanity check for the B-2/B-3 gate (5h_pct|5h_reset|7d_pct|7d_reset).
@@ -2315,6 +2406,11 @@ main() {
 
   # Item 2: fail fast if either provider's auth is dead/stale before we launch.
   preflight_auth || exit 2
+  # ...and that the HARNESS can actually launch a worker for each vendor. Runs
+  # ONCE here, deliberately not from preflight_auth: the per-item quota gate below
+  # re-invokes preflight_auth before every launch, and a real dispatch probe there
+  # would spawn two extra sessions per item.
+  preflight_dispatch || exit 2
 
   # Clear stale no-op signals from any prior run (gap #3).
   mkdir -p "$NOOP_DIR"; rm -f "$NOOP_DIR"/*.noop "$NOOP_DIR"/*.escalated "$NOOP_DIR"/*.pr 2>/dev/null
