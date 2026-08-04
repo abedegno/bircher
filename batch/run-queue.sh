@@ -417,13 +417,33 @@ except Exception: print("")' "$1" 2>/dev/null
 # _upload_bundle <agent_dir> <title> -> holder session_id ("" on failure).
 # Multipart POST /v1/sessions {metadata, bundle} -> 201 {session_id}.
 _upload_bundle() {
-  local dir="$1" title="$2" tgz resp
+  local dir="$1" title="$2" tgz resp code
   tgz=$(mktemp "/tmp/bircher-bundle-XXXXXX.tgz") || return 1
-  tar czf "$tgz" -C "$dir" . 2>/dev/null || { rm -f "$tgz"; return 1; }
-  resp=$(curl -sf --max-time 60 -X POST "$SERVER/v1/sessions" \
+  # Exclude harness scratch. omnigent's codex harness leaves temp CODEX_HOMEs
+  # under .codex-tmp/ that contain SYMLINKS (auth.json -> /root/.codex/auth.json),
+  # and the server rejects any tarball containing a link — so one failed codex
+  # boot silently breaks every later upload until someone clears the directory.
+  # Never add tar --dereference here: it would inline the real credential into
+  # the uploaded bundle.
+  tar czf "$tgz" -C "$dir" --exclude='./.codex-tmp' . 2>/dev/null || { rm -f "$tgz"; return 1; }
+  # Capture the status and body: a bare `curl -sf ... 2>/dev/null` reports every
+  # failure as an unexplained "bundle upload failed", which costs a diagnosis
+  # round on exactly the errors that carry the reason in the response body.
+  resp=$(curl -s --max-time 60 -w '\n%{http_code}' -X POST "$SERVER/v1/sessions" \
     -F "metadata={\"title\":\"$title\"}" \
-    -F "bundle=@$tgz;type=application/gzip" 2>/dev/null)
+    -F "bundle=@$tgz;type=application/gzip" 2>&1)
   rm -f "$tgz"
+  # Only treat a trailing bare 3-digit line as the status code. Anything else
+  # means no status was appended (e.g. a stubbed curl), so fall through to the
+  # body unchanged rather than eating the first line of the response.
+  code=$(printf '%s' "$resp" | tail -n1)
+  if printf '%s' "$code" | grep -qE '^[0-9]{3}$'; then
+    resp=$(printf '%s' "$resp" | sed '$d')
+    case "$code" in
+      200|201) : ;;
+      *) echo "[batch] bundle upload failed (HTTP $code): ${resp:-no response body}" >&2; return 1 ;;
+    esac
+  fi
   printf '%s' "$resp" | _json_get session_id
 }
 
