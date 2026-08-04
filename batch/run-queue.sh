@@ -1081,6 +1081,30 @@ _pr_is_abandoned() {
   [ -z "$merged" ] || [ "$merged" = "null" ]
 }
 
+# _read_note <file> -> the signal file's text, flattened to one line for JSONL,
+# capped, and EXPLICITLY MARKED when the cap bites.
+#
+# Replaces a bare `head -c 300`, which had two faults. (a) It cut mid-word with no
+# marker, so a scorecard note read as a complete sentence that simply stopped --
+# 2026-08-04 logged two rows at exactly 300 chars ending "...switching vend" and
+# "...waive vendor directive", and the lost text was the operator's only record of
+# WHY an item escalated. (b) `head -c` counts BYTES, so it can split a multi-byte
+# UTF-8 character and emit invalid UTF-8 into the JSONL. Bash ${#s}/${s:0:n} are
+# character-based, so the cut always lands on a character boundary.
+#
+# The cap stays (scorecard rows are one JSONL line each; unbounded notes bloat the
+# file) but is generous, and a truncated note now says so and points at the source.
+_read_note() {
+  local f="$1" cap="${BIRCHER_NOTE_MAX:-1200}" raw
+  [ -f "$f" ] || return 0
+  raw=$(tr '\n' ' ' < "$f" 2>/dev/null)
+  if [ "${#raw}" -gt "$cap" ]; then
+    printf '%s... [truncated %d chars]' "${raw:0:$cap}" "$(( ${#raw} - cap ))"
+  else
+    printf '%s' "$raw"
+  fi
+}
+
 # _select_pr_candidate <signal_pr> <matching_prs_string> -> one of
 # use-signal|<pr>, use-the-one-match|<pr>, no-match|, ambiguous/escalate|<prs>.
 # Pure selection only: the caller owns any gh query and the .escalated write.
@@ -1484,7 +1508,7 @@ ${prompt}"
   # No-op exit: the coordinator signalled "already satisfied; no change needed" ->
   # record a noop (not a false timeout) and advance without forcing a PR (gap #3).
   if [ -f "$NOOP_DIR/$code.noop" ]; then
-    local nnote; nnote=$(head -c 300 "$NOOP_DIR/$code.noop" 2>/dev/null | tr '\n' ' ')
+    local nnote; nnote=$(_read_note "$NOOP_DIR/$code.noop")
     rm -f "$NOOP_DIR/$code.noop"
     mkdir -p "$(dirname "$SCORECARD")"
     json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" "$vendor" >> "$SCORECARD"
@@ -1498,7 +1522,7 @@ ${prompt}"
   # unmet dependency and there is no PR to carry a marker. Record an honest
   # `escalated` row (not a false timeout) and advance (run #13 SRC01b).
   if [ -f "$NOOP_DIR/$code.escalated" ]; then
-    local enote; enote=$(head -c 300 "$NOOP_DIR/$code.escalated" 2>/dev/null | tr '\n' ' ')
+    local enote; enote=$(_read_note "$NOOP_DIR/$code.escalated")
     rm -f "$NOOP_DIR/$code.escalated"
     mkdir -p "$(dirname "$SCORECARD")"
     json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" "$vendor" >> "$SCORECARD"
@@ -2339,6 +2363,39 @@ SH
   # real PR on a transient gh error would be worse than tracking it one cycle more.
   _pr_is_abandoned "" ""            && { echo "FAIL abandoned: empty state must not be abandoned"; exit 1; }
   echo "_pr_is_abandoned OK"
+
+  # --- _read_note: flatten, cap visibly, never split a character ---------------
+  local ndir; ndir=$(mktemp -d)
+  printf 'short reason\nsecond line\n' > "$ndir/a"
+  [ "$(_read_note "$ndir/a")" = "short reason second line " ] \
+    || { echo "FAIL read_note: newlines must flatten to spaces"; exit 1; }
+  [ -z "$(_read_note "$ndir/missing")" ] \
+    || { echo "FAIL read_note: a missing file must yield empty"; exit 1; }
+  # Under the cap -> byte-identical, no marker.
+  python3 -c "open('$ndir/b','w').write('x'*100)"
+  [ "$(BIRCHER_NOTE_MAX=120 _read_note "$ndir/b")" = "$(python3 -c "print('x'*100)")" ] \
+    || { echo "FAIL read_note: under-cap note must pass through unchanged"; exit 1; }
+  # Over the cap -> truncated AND explicitly marked (the old head -c 300 was silent).
+  python3 -c "open('$ndir/c','w').write('y'*500)"
+  local out; out=$(BIRCHER_NOTE_MAX=100 _read_note "$ndir/c")
+  case "$out" in
+    *"[truncated 400 chars]") : ;;
+    *) echo "FAIL read_note: over-cap note must be marked as truncated, got tail: ${out: -40}"; exit 1 ;;
+  esac
+  [ "${#out}" -gt 100 ] || { echo "FAIL read_note: marker must be appended, not counted in the cap"; exit 1; }
+  # Multi-byte safety: cutting 10 chars of a 3-byte-per-char string must not
+  # split a character (`head -c` would have). Round-trip through UTF-8 decode.
+  python3 -c "open('$ndir/d','w',encoding='utf-8').write('世'*50)"
+  BIRCHER_NOTE_MAX=10 _read_note "$ndir/d" > "$ndir/d.out"
+  python3 -c "
+import sys
+d=open('$ndir/d.out','rb').read()
+try: t=d.decode('utf-8')
+except UnicodeDecodeError: print('FAIL read_note: split a multi-byte character'); sys.exit(1)
+assert t.startswith('世'*10), 'expected 10 whole chars, got %r' % t[:14]
+" || exit 1
+  rm -rf "$ndir"
+  echo "_read_note OK"
 
   echo "self-test OK"
 }
