@@ -38,13 +38,13 @@ done
 
 cd "$HERE/.."
 
-# Refuse to start a second wave over a live one. Two runners sharing a queue and
-# a work repo interleave commits and fight over the same PRs.
-if pgrep -f "bash batch/run-queue.sh" >/dev/null 2>&1; then
-  echo "launch: a run-queue.sh is already running — refusing to start a second wave" >&2
-  echo "        (pgrep -fa 'bash batch/run-queue.sh' to see it)" >&2
-  exit 1
-fi
+# NOTE: no "is a wave already running?" check here. run-queue.sh already holds a
+# `flock -n` singleton lock and exits if a second run starts, so a check here
+# would be redundant — and a `pgrep -f "bash batch/run-queue.sh"` version of it is
+# actively wrong: pgrep -f matches any command line CONTAINING that string,
+# including the `sh -c '... bash batch/run-queue.sh ...'` wrapper that invoked
+# this script, so it refuses to launch on the strength of seeing itself. Let the
+# lock do its job and surface what the runner says.
 
 if [ "$FOREGROUND" = 1 ]; then
   exec env BIRCHER_SOURCE="$SOURCE" bash batch/run-queue.sh "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
@@ -60,13 +60,21 @@ command -v setsid >/dev/null 2>&1 || {
 setsid env BIRCHER_SOURCE="$SOURCE" \
   bash batch/run-queue.sh "${PASSTHRU[@]+"${PASSTHRU[@]}"}" > "$LOG" 2>&1 < /dev/null &
 
-# Confirm it actually survived rather than reporting success on a process that is
-# already gone — the exact failure #11 describes looked like a clean launch.
-sleep 2
-if pgrep -f "bash batch/run-queue.sh" >/dev/null 2>&1; then
-  echo "launch: wave started (source=$SOURCE, log=$LOG)"
-else
-  echo "launch: FAILED — no run-queue.sh process 2s after launch. Log tail:" >&2
-  tail -5 "$LOG" >&2 2>/dev/null
+# Confirm it actually survived, rather than reporting success for a process that
+# is already gone — the failure in #11 looked like a clean launch. The tell is the
+# log: a reaped run leaves it 0 bytes ("empty log, no process"), while a live one
+# has printed its preflight banner within a second or two.
+#
+# Deliberately NOT pgrep: `pgrep -f` matches this script's own invoking command
+# line, so it reports success even when nothing started.
+sleep 3
+if [ ! -s "$LOG" ]; then
+  echo "launch: FAILED — log is still empty ${LOG}; the run did not survive detach." >&2
+  echo "        This is the #11 symptom. Check setsid is present and retry." >&2
   exit 1
 fi
+
+# Non-empty log only proves it got far enough to speak. Show the first line so the
+# operator sees which it was: a real start, or run-queue's singleton refusal.
+echo "launch: wave started (source=$SOURCE, log=$LOG)"
+echo "        $(head -1 "$LOG")"
