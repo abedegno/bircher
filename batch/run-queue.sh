@@ -86,7 +86,18 @@ export PATH="/root/bin:$PATH"
 export OMNIGENT_RUNNER="${OMNIGENT_RUNNER:-omnigent-runner-bircher}"
 # -------------------------------------------------------------------------------
 
-# parse_marker <text> -> "outcome|ci|ci_first|review|rounds|note"; rc 1 if no marker
+# _branch_code_filter <code> -> a jq filter selecting PRs whose head branch carries
+# the item code on a token boundary. Single source of truth for a regex that was
+# copy-pasted at three call sites (poll-loop discovery, recover_from_ground_truth,
+# _reconcile_item_pr) — issue #22.
+#
+# The boundary anchors matter: a bare substring test makes `i23` match branch
+# `i230-...`, so an item would adopt its neighbour's PR. Keep them.
+_branch_code_filter() {
+  printf '[.[] | select(.headRefName | ascii_downcase | test("(^|[^a-z0-9])%s([^a-z0-9]|$)"))]' "$1"
+}
+
+# parse_marker <text> -> "outcome|ci|ci_first|review|rounds|note|head"; rc 1 if no marker
 parse_marker() {
   local line
   # Extract the marker WHEREVER it appears, not only at a line start. Coordinators
@@ -98,14 +109,23 @@ parse_marker() {
   # prose mentions it more than once. Portable (no sed newline substitution).
   line=$(printf '%s\n' "$1" | grep -oE 'bircher-status:.*' | tail -1)
   [ -n "$line" ] || { echo "|||||"; return 1; }
-  local o c cf r n note
+  local o c cf r n note head
   o=$(printf '%s' "$line"  | sed -n 's/.*outcome=\([^ ]*\).*/\1/p')
   c=$(printf '%s' "$line"  | sed -n 's/.* ci=\([^ ]*\).*/\1/p')
   cf=$(printf '%s' "$line" | sed -n 's/.* ci_first=\([^ ]*\).*/\1/p')
   r=$(printf '%s' "$line"  | sed -n 's/.*review=\([^ ]*\).*/\1/p')
   n=$(printf '%s' "$line"  | sed -n 's/.*rounds=\([0-9]*\).*/\1/p')
   note=$(printf '%s' "$line" | sed -n 's/.*note="\([^"]*\)".*/\1/p')
-  echo "${o}|${c}|${cf}|${r}|${n}|${note}"
+  # head=<40-hex>: the commit the REVIEWER actually reviewed (issue #24). Optional —
+  # a marker written by an older reviewer has no head= and yields empty, which the
+  # caller must treat as "unverifiable" and fail closed rather than re-deriving it.
+  # Anchored to 7-40 hex so a malformed value yields empty instead of garbage.
+  # No `\|` alternation here: BSD sed (macOS) does not support it in a BRE, so a
+  # boundary group like \([ ]\|$\) silently never matches and every head= is lost.
+  # `\{7,40\}` is POSIX and portable; a shorter or non-hex value simply fails to
+  # match and yields empty, which is the fail-closed case the caller wants.
+  head=$(printf '%s' "$line" | sed -n 's/.*[ ]head=\([0-9a-fA-F]\{7,40\}\).*/\1/p')
+  echo "${o}|${c}|${cf}|${r}|${n}|${note}|${head}"
 }
 
 # _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty).
@@ -843,7 +863,7 @@ _reconcile_item_pr() {
   local chosen="$tracked"
   [ -n "$code" ] || { echo "$tracked"; return; }
   matches=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
-    -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | .[].number" 2>/dev/null)
+    -q "$(_branch_code_filter "$code") | .[].number" 2>/dev/null)
   count=$(printf '%s\n' "$matches" | grep -c .)
   [ "${count:-0}" -le 1 ] && { echo "$tracked"; return; }
   for m in $matches; do
@@ -892,7 +912,7 @@ recover_from_ground_truth() {
   if [ -z "$pr" ] && [ -n "$code" ]; then
     local _disc
     _disc=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
-      -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | (.[0].number // empty)" 2>/dev/null)
+      -q "$(_branch_code_filter "$code") | (.[0].number // empty)" 2>/dev/null)
     if [ -n "$_disc" ]; then
       echo "[batch:recover] $item: discovery had no PR; found open PR #$_disc by code -> adopting" >&2
       pr="$_disc"
@@ -1438,7 +1458,7 @@ ${prompt}"
         # The old "newest new PR" fallback misattributed twice (2026-06-28 H03
         # latched #64; 2026-07-05 SUM02 credited to SUM03), so it was removed.
         pr_matches=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
-          -q "[.[] | select(.headRefName | ascii_downcase | test(\"(^|[^a-z0-9])${code}([^a-z0-9]|\$)\"))] | .[].number" 2>/dev/null)
+          -q "$(_branch_code_filter "$code") | .[].number" 2>/dev/null)
         # Branch match empty too -> last-resort issue-linkage fallback (run #24
         # a06-vs-i230: branch+signal named after the epic tag, not the item code).
         if [ -z "$pr_matches" ] && [ -n "$_iss" ]; then
@@ -1544,7 +1564,7 @@ ${prompt}"
   if [ -n "$marker" ]; then
     # Coordinator posted its own marker -> trust it (existing path).
     local _ci
-    IFS='|' read -r outcome _ci ci_first review rounds note <<EOF
+    IFS='|' read -r outcome _ci ci_first review rounds note marker_head <<EOF
 $marker
 EOF
     : "${outcome:=timeout}" "${ci_first:=false}"
@@ -1567,9 +1587,19 @@ EOF
   # a red/unresolved main after merge HALTS the run (rc 2 propagates to main).
   local merge_rc=0
   if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
-    # Capture the head the review PASS covered BEFORE merge_ready_pr's status/merge
-    # retries: a push during that ~60s window must not be recorded as the reviewed sha.
-    local reviewed_sha; reviewed_sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    # The reviewed head comes from the REVIEWER (marker `head=`), never from a
+    # re-fetch here (issue #24). A `gh pr view` after the PASS would record whatever
+    # the head is NOW — so a push landing between the reviewer's verdict and this
+    # line would be blessed as "reviewed", defeating the --match-head-commit guard
+    # it feeds. Only the reviewer knows which commit it actually read.
+    #
+    # Fail closed when the marker carries no head: leave reviewed_sha empty and let
+    # the sweep's existing "unverifiable reviewed head -> escalate" path hold the PR
+    # for a human. Do NOT substitute a guess.
+    local reviewed_sha="${marker_head:-}"
+    if [ -z "$reviewed_sha" ]; then
+      echo "[batch] $item: marker carries no head= -> reviewed commit unverifiable; not auto-merging (PR #$pr left for a human)" >&2
+    fi
     merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
     [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
     _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
@@ -1588,13 +1618,33 @@ EOF
 
 self_test() {
   local m
+  # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
+  # caller fails closed on that rather than merging an unverified commit.
   m=$(parse_marker $'some prose\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note="wired it in"')
-  [ "$m" = "ready|green|true|codex:pass|0|wired it in" ] || { echo "FAIL parse: '$m'"; exit 1; }
+  [ "$m" = "ready|green|true|codex:pass|0|wired it in|" ] || { echo "FAIL parse: '$m'"; exit 1; }
   # Regression (EXP02, 2026-07-08): marker posted with a LITERAL backslash-n before
   # it (no real newline) must still parse -- single quotes keep \n literal here.
   m=$(parse_marker 'Ready for merge.\nbircher-status: outcome=ready ci=green ci_first=true review=claude_code:pass rounds=1 note="txt export"')
-  [ "$m" = "ready|green|true|claude_code:pass|1|txt export" ] || { echo "FAIL parse literal-\\n: '$m'"; exit 1; }
+  [ "$m" = "ready|green|true|claude_code:pass|1|txt export|" ] || { echo "FAIL parse literal-\\n: '$m'"; exit 1; }
   m=$(parse_marker "no marker here") && { echo "FAIL: expected rc1"; exit 1; }
+  # --- #24: the reviewed head travels in the marker ---------------------------
+  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=a502a88e20f959c908d00871ee7f25572512dd6d note="with head"')
+  [ "$m" = "ready|green|true|codex:pass|1|with head|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+    || { echo "FAIL parse head=: '$m'"; exit 1; }
+  # A malformed head (non-hex / too short) must yield EMPTY, not garbage: better to
+  # fail closed than hand merge_ready_pr a sha that can never match.
+  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=zzz note="bad"')
+  [ "${m##*|}" = "" ] || { echo "FAIL parse head=: malformed head must be empty, got '${m##*|}'"; exit 1; }
+  echo "parse_marker head= OK (#24)"
+  # --- #22: one boundary-anchored branch-code filter, not three copies --------
+  local bf; bf=$(_branch_code_filter i23)
+  case "$bf" in *'(^|[^a-z0-9])i23([^a-z0-9]|$)'*) : ;; *) echo "FAIL branch filter: '$bf'"; exit 1 ;; esac
+  # The anchors are the whole point: i23 must NOT match branch i230-foo.
+  local bfout
+  bfout=$(printf '%s' '[{"headRefName":"i230-foo"},{"headRefName":"i23-bar"}]' \
+    | jq -r "$(_branch_code_filter i23) | .[].headRefName" 2>/dev/null)
+  [ "$bfout" = "i23-bar" ] || { echo "FAIL branch filter: prefix collision, got '$bfout'"; exit 1; }
+  echo "_branch_code_filter OK (#22)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)

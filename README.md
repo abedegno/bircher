@@ -7,6 +7,9 @@ merges. This is the **reference implementation** we run on
 [omnigent](https://github.com/omnigent-ai/omnigent) as the execution substrate and on
 GitHub for the tracker.
 
+- `batch/launch.sh` — start a wave **detached**. Uses `setsid`, so the run survives
+  the exec session that started it, and refuses to start a second wave over a live
+  one. Prefer this to `nohup ... &`, which dies silently inside `docker exec`.
 - `batch/run-queue.sh` — the sequential batch runner (CI gate, in-run merge, recovery).
 - `skills/muesli-loop/` — the top-level procedure (project-specific **example** skill).
 - `skills/cross-review/` — the different-vendor review step.
