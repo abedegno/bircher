@@ -164,8 +164,15 @@ an independent different-vendor reviewer. Work in /workspaces/muesli.
 - After the PR is ready (or you are escalating/failing), post a PR comment whose
   LAST line is exactly this machine-readable marker (the batch runner parses it):
 
-  `bircher-status: outcome=<ready|escalated|failed> ci=<green|red|na> ci_first=<true|false> review=<vendor>:<pass|fail|na> rounds=<n> note="<short>"`
+  `bircher-status: outcome=<ready|escalated|failed> ci=<green|red|na> ci_first=<true|false> review=<vendor>:<pass|fail|na> rounds=<n> head=<sha> note="<short>"`
 
+  - `head=<sha>` is the FULL 40-hex commit the reviewer actually reviewed — take it
+    from the review worktree (`git -C <worktree> rev-parse HEAD`), NOT from a fresh
+    `gh pr view` after the fact. The runner uses this to refuse a merge if the head
+    moved after the review, so a re-derived value would defeat the check it feeds.
+    REQUIRED whenever `outcome=ready`: without it the runner cannot prove which
+    commit was reviewed and will decline to auto-merge, leaving the PR for a human.
+    Omit it (or leave it empty) for `escalated`/`failed`, where nothing merges.
   - `outcome=ready` when CI is green AND cross-review passed.
   - `outcome=escalated` when the confidence gate fired or review did not converge
     in the bounded rounds (leave the PR/draft for the human; reason in `note`).
