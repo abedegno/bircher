@@ -1114,6 +1114,30 @@ _pr_is_abandoned() {
 #
 # The cap stays (scorecard rows are one JSONL line each; unbounded notes bloat the
 # file) but is generous, and a truncated note now says so and points at the source.
+# _merge_gate <had_marker:0|1> <marker_head> -> "pin|<sha>" | "unpinned" | "skip"
+#
+# Decides how (or whether) an outcome=ready item may be merged in-run. Pure, so the
+# three cases can be asserted directly — they are easy to conflate and the failure
+# mode of conflating them is silent.
+#
+#   marker + head=   -> pin      : merge atomically against the reviewed commit.
+#   marker, no head= -> skip     : the reviewer did not say what it reviewed, so the
+#                                  commit is unverifiable. Leave the PR for a human.
+#   no marker        -> unpinned : the ground-truth recovery path. It has no marker
+#                                  BY DEFINITION and never carried a reviewed sha, so
+#                                  failing closed here would break every recovery
+#                                  (including --recover-pr) rather than close a race.
+#
+# The `skip` case is the point of issue #24. It previously passed an empty sha to
+# merge_ready_pr, which silently took its UNPINNED branch and merged anyway while the
+# log claimed the PR had been left for a human.
+_merge_gate() {
+  local had_marker="$1" head="${2:-}"
+  if [ "$had_marker" != "1" ]; then printf 'unpinned'; return 0; fi
+  if [ -n "$head" ]; then printf 'pin|%s' "$head"; return 0; fi
+  printf 'skip'
+}
+
 _read_note() {
   local f="$1" cap="${BIRCHER_NOTE_MAX:-1200}" raw
   [ -f "$f" ] || return 0
@@ -1593,16 +1617,27 @@ EOF
     # line would be blessed as "reviewed", defeating the --match-head-commit guard
     # it feeds. Only the reviewer knows which commit it actually read.
     #
-    # Fail closed when the marker carries no head: leave reviewed_sha empty and let
-    # the sweep's existing "unverifiable reviewed head -> escalate" path hold the PR
-    # for a human. Do NOT substitute a guess.
-    local reviewed_sha="${marker_head:-}"
-    if [ -z "$reviewed_sha" ]; then
-      echo "[batch] $item: marker carries no head= -> reviewed commit unverifiable; not auto-merging (PR #$pr left for a human)" >&2
+    # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
+    # sha to merge_ready_pr does NOT fail closed — it takes the unpinned branch and
+    # merges anyway — so the skip has to happen HERE, before the call.
+    local _had_marker=0; [ -n "$marker" ] && _had_marker=1
+    local _gate; _gate=$(_merge_gate "$_had_marker" "${marker_head:-}")
+    local reviewed_sha=""
+    case "$_gate" in
+      pin\|*)   reviewed_sha="${_gate#pin|}" ;;
+      unpinned) : ;;   # recovery path: no marker, no reviewed sha, as before
+      skip)
+        echo "[batch] $item: marker carries no head= -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
+        MERGE_NOTE="merge skipped: marker carried no head= (reviewed commit unverifiable)"
+        note="${note:+$note; }$MERGE_NOTE"
+        merge_rc=0
+        ;;
+    esac
+    if [ "$_gate" != "skip" ]; then
+      merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
+      [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
+      _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
     fi
-    merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
-    [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
-    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
@@ -1645,6 +1680,21 @@ self_test() {
     | jq -r "$(_branch_code_filter i23) | .[].headRefName" 2>/dev/null)
   [ "$bfout" = "i23-bar" ] || { echo "FAIL branch filter: prefix collision, got '$bfout'"; exit 1; }
   echo "_branch_code_filter OK (#22)"
+  # --- #24 follow-up: the three merge gates must stay distinct ----------------
+  # Regression guard. An earlier cut passed an empty sha to merge_ready_pr believing
+  # that failed closed; merge_ready_pr's else-branch merged UNPINNED while the log
+  # said the PR was left for a human. The skip must be decided before the call.
+  [ "$(_merge_gate 1 a502a88e20f959c908d00871ee7f25572512dd6d)" = "pin|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+    || { echo "FAIL merge_gate: marker+head must pin"; exit 1; }
+  [ "$(_merge_gate 1 '')" = "skip" ] \
+    || { echo "FAIL merge_gate: marker WITHOUT head must skip, never merge unpinned"; exit 1; }
+  [ "$(_merge_gate 0 '')" = "unpinned" ] \
+    || { echo "FAIL merge_gate: no marker (recovery) must still merge unpinned"; exit 1; }
+  # A head arriving with no marker is not a thing; recovery still wins, so that a
+  # stray value can never turn a recovery into a pinned merge against an unreviewed sha.
+  [ "$(_merge_gate 0 deadbeefdeadbeef)" = "unpinned" ] \
+    || { echo "FAIL merge_gate: no-marker must ignore a stray head"; exit 1; }
+  echo "_merge_gate OK (#24 fail-closed)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)
