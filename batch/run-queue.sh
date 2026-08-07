@@ -1058,10 +1058,17 @@ _main_ci_verdict() {
 _revert_git_args() {
   local sha="$1" parents="${2:-1}"
   [ -n "$sha" ] || { echo ""; return; }
+  # NO -q. `git revert` has no --quiet: passing it exits 129 with a usage dump and
+  # reverts nothing, so EVERY auto-revert failed, for every commit shape, for as long
+  # as this function existed. The parent handling below was always right and never got
+  # the chance to matter. Found 2026-08-07 (muesli i520): the run logged git's usage
+  # text alongside "automatic revert FAILED (parents=1)", and the parent count was a
+  # red herring. The old self-test asserted the exact string INCLUDING -q, so it passed
+  # throughout — see the test below, which now runs git rather than matching a string.
   if [ "${parents:-1}" -gt 1 ] 2>/dev/null; then
-    echo "--no-edit -m 1 -q $sha"
+    echo "--no-edit -m 1 $sha"
   else
-    echo "--no-edit -q $sha"
+    echo "--no-edit $sha"
   fi
 }
 
@@ -2457,11 +2464,34 @@ SH
   [ "$(_main_ci_verdict pending pending)" = halt ]     || { echo "FAIL verdict pending,pending"; exit 1; }
   echo "_main_ci_verdict OK"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
-  [ "$(_revert_git_args '' 1)" = "" ]                        || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
-  [ "$(_revert_git_args abc123 1)" = "--no-edit -q abc123" ] || { echo "FAIL revert single-parent"; exit 1; }
-  [ "$(_revert_git_args abc123 2)" = "--no-edit -m 1 -q abc123" ] || { echo "FAIL revert merge-parent (needs -m 1)"; exit 1; }
-  [ "$(_revert_git_args abc123 '')" = "--no-edit -q abc123" ] || { echo "FAIL revert default-parent"; exit 1; }
-  echo "_revert_git_args OK"
+  [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
+  [ "$(_revert_git_args abc123 1)" = "--no-edit abc123" ] || { echo "FAIL revert single-parent"; exit 1; }
+  [ "$(_revert_git_args abc123 2)" = "--no-edit -m 1 abc123" ] || { echo "FAIL revert merge-parent (needs -m 1)"; exit 1; }
+  [ "$(_revert_git_args abc123 '')" = "--no-edit abc123" ] || { echo "FAIL revert default-parent"; exit 1; }
+  # The string assertions above are not enough on their own: they passed for months
+  # while the args contained `-q`, which `git revert` rejects with exit 129 and a usage
+  # dump. So ACTUALLY RUN git with the produced args, on both commit shapes, in a
+  # throwaway repo. This is the test that would have caught it.
+  local rvd; rvd=$(mktemp -d)
+  ( set -e
+    cd "$rvd"; git init -q .
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+    echo one > f; git add f; git -c user.email=t@t -c user.name=t commit -q -m one
+    # single-parent (the squash-merge shape the runner actually produces)
+    sha1=$(git rev-parse HEAD)
+    # shellcheck disable=SC2046
+    git -c user.email=t@t -c user.name=t revert $(_revert_git_args "$sha1" 1) >/dev/null 2>&1
+    # a real merge commit (parents=2)
+    git checkout -q -b side HEAD~1; echo two > g; git add g
+    git -c user.email=t@t -c user.name=t commit -q -m two
+    git checkout -q -; git -c user.email=t@t -c user.name=t merge --no-ff -q side -m merge
+    sham=$(git rev-parse HEAD); pc=$(( $(git rev-list --parents -n1 "$sham" | wc -w) - 1 ))
+    [ "$pc" = 2 ] || exit 9
+    # shellcheck disable=SC2046
+    git -c user.email=t@t -c user.name=t revert $(_revert_git_args "$sham" "$pc") >/dev/null 2>&1
+  ) || { echo "FAIL revert args rejected by git (this is the -q class of bug)"; rm -rf "$rvd"; exit 1; }
+  rm -rf "$rvd"
+  echo "_revert_git_args OK (incl. git actually accepting them)"
   # --- Task 3 (#347): _manifest_items preserves priority-manifest line order --
   local mdir2; mdir2=$(mktemp -d)
   printf '%s\n' "i2-b.md" "i10-a.md" "i1-c.md" > "$mdir2/.manifest"
