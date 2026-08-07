@@ -218,7 +218,19 @@ _ci_failure_kind() {
 _poll_ci() {
   local pr="$1" timeout="${2:-900}" w=0 buckets ci
   while [ "$w" -lt "$timeout" ]; do
-    buckets=$(gh pr checks "$pr" --repo "$REPO" --json bucket -q '.[].bucket' 2>/dev/null)
+    # Fetch NAME too, so non-CI checks are filtered before deciding.
+    # `review-gate` MUST be excluded or this DEADLOCKS: it stays pending until a
+    # cross-vendor review is posted, and the caller of this function is the thing
+    # about to perform that review. Each waits for the other. Seen 2026-08-07 on
+    # muesli PR #549, which hung with every other check green. (Normal waves do
+    # not hit it — the coordinator reviews without waiting on review-gate.)
+    #
+    # Not CI's business regardless: this answers "is the code green?", while
+    # "has it been reviewed" is a separate question that branch protection still
+    # enforces at merge time.
+    buckets=$(gh pr checks "$pr" --repo "$REPO" --json name,bucket \
+                -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)
+    buckets=$(_drop_non_ci_checkruns "$buckets")
     ci=$(_normalize_ci "$buckets")
     [ "$ci" != pending ] && { echo "$ci"; return; }
     sleep 30; w=$((w + 30))
@@ -868,7 +880,7 @@ _reconcile_item_pr() {
   count=$(printf '%s\n' "$matches" | grep -c .)
   [ "${count:-0}" -le 1 ] && { echo "$tracked"; return; }
   for m in $matches; do
-    if [ "$(_normalize_ci "$(gh pr checks "$m" --repo "$REPO" --json bucket -q '.[].bucket' 2>/dev/null)")" = green ]; then
+    if [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$(gh pr checks "$m" --repo "$REPO" --json name,bucket -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)")")" = green ]; then
       green="$m"; break
     fi
   done
@@ -946,7 +958,19 @@ recover_from_ground_truth() {
   fi
   if [ -n "$pr" ]; then
     local buckets
-    buckets=$(gh pr checks "$pr" --repo "$REPO" --json bucket -q '.[].bucket' 2>/dev/null)
+    # Fetch NAME too, so non-CI checks are filtered before deciding.
+    # `review-gate` MUST be excluded or this DEADLOCKS: it stays pending until a
+    # cross-vendor review is posted, and the caller of this function is the thing
+    # about to perform that review. Each waits for the other. Seen 2026-08-07 on
+    # muesli PR #549, which hung with every other check green. (Normal waves do
+    # not hit it — the coordinator reviews without waiting on review-gate.)
+    #
+    # Not CI's business regardless: this answers "is the code green?", while
+    # "has it been reviewed" is a separate question that branch protection still
+    # enforces at merge time.
+    buckets=$(gh pr checks "$pr" --repo "$REPO" --json name,bucket \
+                -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)
+    buckets=$(_drop_non_ci_checkruns "$buckets")
     ci=$(_normalize_ci "$buckets")
     # B-5 part 2: the coordinator often DIES (runner_error) while CI is still
     # running -- CI queue delays (degraded GitHub runner capacity) pushed CI to
@@ -1036,7 +1060,7 @@ _render_issue_item() {
 # BIRCHER_CI_IGNORE_CHECKS (an ERE matched against the check name).
 _drop_non_ci_checkruns() {
   printf '%s\n' "$1" \
-    | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot})\|" \
+    | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|" \
     | sed 's/^[^|]*|//'
 }
 
@@ -1731,7 +1755,26 @@ self_test() {
   cr3='Dependabot Config Check|completed|failure'
   [ -n "$(_drop_non_ci_checkruns "$cr3")" ] \
     || { echo "FAIL drop_non_ci: only an exact name match may be ignored"; exit 1; }
-  echo "_drop_non_ci_checkruns OK (i520 false-red)"
+  # _poll_ci passes "name|bucket", not "name|status|conclusion". Same filter,
+  # different shape — assert it rather than assuming it generalises.
+  #
+  # THE DEADLOCK GUARD: a pending `review-gate` must NOT make CI read pending.
+  # review-gate stays pending until a cross-vendor review is posted, and the code
+  # calling _poll_ci is the thing about to post it — so counting it made the
+  # recovery path wait forever (muesli PR #549, with every other check green).
+  local cr4 cr5 cr6
+  cr4=$(printf '%s\n' 'server (go)|pass' 'review-gate|pending' 'client (node)|pass')
+  [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$cr4")")" = "green" ] \
+    || { echo "FAIL poll_ci filter: a pending review-gate must not block CI (deadlock)"; exit 1; }
+  # ...but a genuinely pending CI check must still read pending.
+  cr5=$(printf '%s\n' 'server (go)|pending' 'review-gate|pending')
+  [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$cr5")")" = "pending" ] \
+    || { echo "FAIL poll_ci filter: real pending CI must still be pending"; exit 1; }
+  # ...and a real CI failure must still read red.
+  cr6=$(printf '%s\n' 'server (go)|fail' 'review-gate|pending')
+  [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$cr6")")" = "red" ] \
+    || { echo "FAIL poll_ci filter: real CI failure must still be red"; exit 1; }
+  echo "_drop_non_ci_checkruns OK (i520 false-red + #549 deadlock)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)
