@@ -623,7 +623,8 @@ merge_ready_pr() {
   while [ "$waited" -lt "$MAIN_CI_TIMEOUT" ]; do
     sleep 30; waited=$((waited + 30))
     lines=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-      -q '.check_runs[] | "\(.status)|\(.conclusion // "")"' 2>/dev/null)
+      -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null)
+    lines=$(_drop_non_ci_checkruns "$lines")
     state=$(_checkrun_state "$lines")
     [ "$state" != "pending" ] && break
   done
@@ -1019,6 +1020,24 @@ _is_blank() { [ -z "${1//[[:space:]]/}" ]; }
 _render_issue_item() {
   local n="$1" title="$2" body="$3"
   printf '# i%s: %s\n\nIssue: #%s\n\n%s\n' "$n" "$title" "$n" "$body"
+}
+
+# _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.
+# Input lines are "name|status|conclusion"; output is "status|conclusion" for
+# _checkrun_state.
+#
+# GitHub reports MORE than CI under a commit's check-runs. Dependabot's update jobs
+# land there too — same app (github-actions), all named "Dependabot" — so the moment
+# .github/dependabot.yml merged, the next main-CI watch saw 28 extra check-runs, 2 of
+# them failed, and declared main red. The run then tried to auto-revert a healthy main
+# and halted with items still queued (2026-08-07, i520). Real CI was green throughout.
+#
+# Filter by name because the producing app does not distinguish them. Override with
+# BIRCHER_CI_IGNORE_CHECKS (an ERE matched against the check name).
+_drop_non_ci_checkruns() {
+  printf '%s\n' "$1" \
+    | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot})\|" \
+    | sed 's/^[^|]*|//'
 }
 
 # _main_ci_verdict <first-state> <second-state> -> continue|revert-halt|halt
@@ -1695,6 +1714,24 @@ self_test() {
   [ "$(_merge_gate 0 deadbeefdeadbeef)" = "unpinned" ] \
     || { echo "FAIL merge_gate: no-marker must ignore a stray head"; exit 1; }
   echo "_merge_gate OK (#24 fail-closed)"
+  # --- non-CI check-runs must not turn main red -------------------------------
+  # Regression guard for 2026-08-07 (i520): merging .github/dependabot.yml added 28
+  # check-runs named "Dependabot" to the merge commit, 2 failed, and the run declared
+  # a green main red — then tried to revert it.
+  cr=$(printf '%s\n' 'Dependabot|completed|failure' 'server (go)|completed|success' 'Dependabot|completed|success')
+  [ "$(_drop_non_ci_checkruns "$cr")" = "completed|success" ] \
+    || { echo "FAIL drop_non_ci: dependabot runs must be filtered, got '$(_drop_non_ci_checkruns "$cr")'"; exit 1; }
+  [ "$(_checkrun_state "$(_drop_non_ci_checkruns "$cr")")" = "green" ] \
+    || { echo "FAIL drop_non_ci: a green CI beside a failed Dependabot run must read green"; exit 1; }
+  # A REAL CI failure must still read red — the filter must not swallow those.
+  cr2=$(printf '%s\n' 'Dependabot|completed|success' 'server (go)|completed|failure')
+  [ "$(_checkrun_state "$(_drop_non_ci_checkruns "$cr2")")" = "red" ] \
+    || { echo "FAIL drop_non_ci: a real CI failure must still be red"; exit 1; }
+  # Names containing the ignored word must NOT be dropped (anchored match).
+  cr3='Dependabot Config Check|completed|failure'
+  [ -n "$(_drop_non_ci_checkruns "$cr3")" ] \
+    || { echo "FAIL drop_non_ci: only an exact name match may be ignored"; exit 1; }
+  echo "_drop_non_ci_checkruns OK (i520 false-red)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)
