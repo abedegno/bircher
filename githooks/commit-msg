@@ -9,7 +9,12 @@
 msg="${1:-}"
 [ -n "$msg" ] && [ -f "$msg" ] || exit 0
 tmp="$msg.bircher"
-grep -viE 'co-authored-by:.*(codex|claude|copilot|cursor|openai|anthropic|gpt|assistant)|generated with .*(codex|claude|copilot|cursor)' "$msg" > "$tmp" 2>/dev/null
+# Anchored to line start, so a commit message that DISCUSSES trailers keeps its
+# prose and only real trailers are removed — this repo has such a commit.
+# `*-session:` is included because the original pattern missed it: stripping the
+# co-author line while leaving a session URL behind removed the attribution and
+# kept the fingerprint, which is the worst of both.
+grep -viE '^[[:space:]]*(co-authored-by:.*(codex|claude|copilot|cursor|openai|anthropic|gpt|assistant)|(claude|codex|copilot)-session:|.?[[:space:]]*generated with .*(codex|claude|copilot|cursor))' "$msg" > "$tmp" 2>/dev/null
 # Overwrite only if we kept real content (guards against a grep error blanking
 # the whole message); drop trailing blank lines left where a trailer was removed.
 if [ -s "$tmp" ]; then
