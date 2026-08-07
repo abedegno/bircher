@@ -4,6 +4,24 @@ description: Codex coding sub-agent — implements, cross-vendor reviews, or exp
 
 executor:
   type: omnigent
+  # PIN THE MODEL HERE, not only in the coordinator's directive.
+  #
+  # omnigent resolves codex's default to the bare family name `gpt-5.6`, which a
+  # ChatGPT-account login rejects outright:
+  #   400 invalid_request_error - The 'gpt-5.6' model is not supported when using
+  #   Codex with a ChatGPT account
+  # (upstream omnigent-ai/omnigent#4063; the curated catalog is no help either —
+  # it spells the variants with hyphens, `gpt-5-6-sol`, which the API also rejects.)
+  #
+  # config.yaml already tells the coordinator to pass `args.model: gpt-5.6-sol` on
+  # every dispatch, and that works right up until a coordinator omits it. Then the
+  # sub-agent boots into the broken default, dies on the 400, and a dispatch is
+  # burned re-trying. Seen 2026-08-07 mid-wave with the directive already in place:
+  # an instruction the model has to remember is not a fix.
+  #
+  # Pinning it in the executor makes it the default for EVERY dispatch of this
+  # agent, whatever the coordinator does or forgets. Remove once #4063 lands.
+  model: gpt-5.6-sol
   config:
     harness: codex
     # First-class codex harness (NOT codex-native). The 2026-06-22 run's
