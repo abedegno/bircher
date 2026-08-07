@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a change to the loop, the review step or the tooling
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What goes wrong today, ideally from a real run rather than in principle.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would change
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - runner (run-queue.sh)
+        - launch / deployment scripts
+        - cross-review step
+        - project skill (muesli-loop or your own)
+        - agent bundles / config.yaml
+        - docs
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on the review gate
+      description: >
+        Does this change what gets merged, or when? Anything that could let code
+        merge without a genuine cross-vendor PASS needs to say so explicitly —
+        that gate is the whole point of the project.
+      placeholder: "No effect on merge behaviour."
+    validations:
+      required: true

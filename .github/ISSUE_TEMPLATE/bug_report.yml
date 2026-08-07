@@ -1,0 +1,64 @@
+name: Bug report
+description: Something went wrong during a run
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful reports come from a real run. `docs/run-forensics-runbook.md`
+        covers how to work out what a run actually did.
+
+        If Bircher **merged something it should not have**, please treat it as a
+        security report instead — see SECURITY.md.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Runner log
+      description: >
+        The relevant part of run.log. The `[batch]` and `[batch:merge]` lines around
+        the failure are usually enough. Please redact anything sensitive.
+      render: text
+
+  - type: textarea
+    id: scorecard
+    attributes:
+      label: Scorecard row
+      description: The matching line from `.run/scorecard.jsonl`, if the item completed.
+      render: json
+
+  - type: input
+    id: outcome
+    attributes:
+      label: Item outcome
+      description: ready / escalated / failed / timeout / noop, if known.
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: |
+        omnigent version, vendor CLIs and versions, OS on the runner, and any
+        BIRCHER_* variables you set.
+      placeholder: |
+        omnigent: v0.8.1
+        claude: ...   codex: ...
+        runner OS: Debian 12 (container)
+        BIRCHER_INRUN_MERGE=0
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: selftest
+    attributes:
+      label: Self-test
+      options:
+        - label: "`bash batch/run-queue.sh --self-test` passes on this checkout"

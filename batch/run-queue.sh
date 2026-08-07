@@ -2519,6 +2519,54 @@ _install_work_git_config() {
 }
 
 main() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'__HELP__'
+run-queue.sh — the Bircher batch runner.
+
+Works a GitHub Issues backlog: for each item it dispatches an implementer, has a
+DIFFERENT vendor review the resulting branch, gates on CI, and merges.
+
+USAGE
+  bash batch/run-queue.sh            Drain the queue (a normal wave). Prefer
+                                     batch/launch.sh, which detaches properly.
+
+  bash batch/run-queue.sh --preflight
+                                     Verify both vendors authenticate AND that
+                                     omnigent can launch a worker for each.
+                                     Different questions: a healthy CLI does not
+                                     prove the harness can dispatch it.
+
+  bash batch/run-queue.sh --usage    Live provider quota, and which vendor would
+                                     be picked right now.
+
+  bash batch/run-queue.sh --recover-pr <code> <pr> [reviewer]
+                                     Adopt an orphaned PR, run a real cross-vendor
+                                     review, merge on PASS. Does NOT write back to
+                                     the issue: close it and drop bircher:escalated
+                                     yourself afterwards.
+
+  bash batch/run-queue.sh --self-test
+                                     Built-in test suite. No network, no side
+                                     effects. Validate on Linux.
+
+  bash batch/run-queue.sh --help     This message.
+
+KEY ENVIRONMENT
+  BIRCHER_REPO         repo to work             (default abedegno/muesli)
+  WORKDIR              local checkout of it     (default /workspaces/muesli)
+  OMNIGENT_SERVER      omnigent server URL      (default http://omnigent:8000)
+  BIRCHER_SOURCE       issues | queue           (default queue)
+  BIRCHER_INRUN_MERGE  0 = review but never merge (default 1)
+
+Issues flow bircher:queued -> bircher:running -> closed on merge, or
+bircher:escalated when the runner declined to finish. Escalation is a normal
+outcome rather than a crash: it means the run would not merge something it could
+not verify.
+
+Docs: https://github.com/abedegno/bircher
+__HELP__
+    exit 0
+  fi
   [ "${1:-}" = "--self-test" ] && { self_test; exit 0; }
   # Standalone health check (no queue run): verify both providers can auth AND
   # can actually be dispatched through the harness, then exit.

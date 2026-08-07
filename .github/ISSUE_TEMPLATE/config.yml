@@ -1,0 +1,12 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/abedegno/bircher/security/advisories/new
+    about: >
+      Report privately if it involves credentials, or a way to merge code without a
+      cross-vendor review. See SECURITY.md.
+  - name: omnigent (the execution substrate)
+    url: https://github.com/omnigent-ai/omnigent/issues
+    about: >
+      If the failure is in session handling, sandboxing, model dispatch or the
+      harness itself, it probably belongs upstream rather than here.

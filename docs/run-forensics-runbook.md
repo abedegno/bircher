@@ -1,16 +1,14 @@
 # Bircher run forensics — evaluation runbook
 
 How to reconstruct and evaluate a Bircher batch run after the fact: what to look at,
-which APIs/scripts to use, and the pitfalls that will waste your time if you don't know
-them. Written from the 2026-07-11 retrospective
-([`2026-07-11-overnight-retro.md`](2026-07-11-overnight-retro.md)).
+which APIs and scripts to use, and the pitfalls that waste time if you don't know them.
 
 ## What you're evaluating (the axes)
 
 1. **Non-clean execution** — halts, reverts, coordinator/sub-agent deaths, CI reruns,
    multi-round reviews, noops.
-2. **Bugs / missing tools** — errors in the batch log and, crucially, in the _sub-agent
-   transcripts_ (skills/tools that failed to resolve).
+2. **Bugs / missing tools**: errors in the batch log, and — the ones people miss — errors
+   in the _sub-agent transcripts_, where skills or tools failed to resolve.
 3. **Deviations from context** — cross-vendor review actually happening, priority order,
    preflight, any protocol the run was supposed to follow.
 4. **Performance** — per-item wall time, inter-item gaps, total span, idle time.
@@ -20,53 +18,65 @@ them. Written from the 2026-07-11 retrospective
 | Source                    | Where                                                                                               | Gives you                                                                                          |
 | ------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | **GitHub** (`gh`)         | issues + PRs + timeline                                                                             | outcomes, timing (labeled→closed), scorecard write-back comments, CI status, merge method          |
-| **Batch log + scorecard** | on the runner: `/workspaces/<repo>/docs/agent-runs/scorecard.jsonl` and `/workspaces/bircher-*.log` | per-item `implementer`/`reviewer`, the halt sequence, recovery, notes, wall time                   |
+| **Batch log + scorecard** | on the runner: `$BUNDLE_DIR/.run/scorecard.jsonl` and the run log (`run.log` by default)             | per-item `implementer`/`reviewer`, the halt sequence, recovery, notes, wall time                   |
 | **omnigent transcripts**  | omnigent REST API (session items)                                                                   | what each coordinator + sub-agent actually did: tool calls, tool/skill errors, assistant narration |
 
-The GitHub layer is self-serve; the other two require reaching the NAS runner and the
+The GitHub layer is self-serve; the other two require reaching the runner host and the
 omnigent server (below).
 
 ## Reaching the runner and the omnigent server
 
-The omnigent server is **not** exposed on the LAN — it's tunnel-only behind an access proxy (browser/Google auth), so plain `curl` from a workstation hits a 302 login wall,
-and `<runner-host>:8000` is **the container manager**, not omnigent. The working path is the
-ops helper, which authenticates to the container manager once and `docker exec`s inside the
-runner container, where `http://omnigent:8000` is reachable on the internal docker
-network with no auth:
+Two of the three evidence sources live on the runner, so you need a way to run commands
+inside the runner container. How you get there depends on your deployment.
+
+If your omnigent server sits behind an authenticating proxy, a plain `curl` from a
+workstation will hit a login redirect rather than the API. The reliable route is to
+execute inside the runner container, where the server is reachable on the internal
+network without going through the proxy at all:
 
 ```bash
-# from the ops checkout — runs <cmd> inside the omnigent runner container
-./omnigent.sh exec "<shell command>"
+# whatever your deployment uses to run a command inside the runner container
+<your-exec-helper> "<shell command>"
+
+# from in there, the server is just:
+curl -s "$OMNIGENT_SERVER/v1/sessions?limit=200&kind=any"
 ```
 
-**Lockout rule:** each `omnigent.sh` invocation re-auths to the container manager, and hammering
-the container manager auth locks it out. **Batch everything into as few `exec` calls as possible**
-(one big script per call), and never loop `omnigent.sh` per item.
+**Batch your commands.** If your exec helper re-authenticates on every invocation — a
+container manager API, for instance — calling it in a loop can trip rate limiting and
+lock you out for a while. Put everything into as few calls as possible: one script per
+call, never one call per item. This is the single most common way to turn a ten-minute
+investigation into an hour.
 
 ### Scorecard + logs (one call)
 
 ```bash
-./omnigent.sh exec 'set +e;
-  echo "@@SCORECARD@@"; cat /workspaces/muesli/docs/agent-runs/scorecard.jsonl;
-  echo "@@LOGS@@";      ls -lt /workspaces/*.log | head -20;
-  echo "@@SESSIONS@@";  curl -s "http://omnigent:8000/v1/sessions?limit=200&kind=any"'
+<your-exec-helper> 'set +e;
+  echo "@@SCORECARD@@"; cat "$BUNDLE_DIR/.run/scorecard.jsonl";
+  echo "@@LOGS@@";      ls -lt "$BUNDLE_DIR"/*.log | head -20;
+  echo "@@SESSIONS@@";  curl -s "$OMNIGENT_SERVER/v1/sessions?limit=200&kind=any"'
 ```
 
 Scorecard row schema (`json_row` in `run-queue.sh`):
-`{ts,item,pr,outcome,ci_pass_first_try,review,rounds,wall_seconds,cost,bound,note}`.
-Note **`bound` is a status flag (`ok`), not a session id** — do not try to map items to
-sessions through it. Note also there is **no `implementer` field** (that's why
-cross-vendor can't be audited from the scorecard — see retro #360). The `note` field
-carries recovery detail (`RECOVERED: coordinator reaped…`) and review-round detail.
+`{ts,item,pr,outcome,ci_pass_first_try,review,rounds,wall_seconds,cost,bound,note,implementer}`.
 
-The batch log (`bircher-overnight*.log`) is the richest single artifact for the halt +
-vendor picks. Grep it for:
+Two things to know about it. **`bound` is a status flag (`ok`), not a session id**, so
+don't try to map items to sessions through it. And `implementer` records the vendor that
+wrote the code, which together with `review` (`<vendor>:<verdict>`) is what makes the
+cross-vendor pairing auditable from the scorecard alone. It is `null` on rows written
+before an implementer was chosen.
+
+The `note` field carries recovery detail (`RECOVERED: coordinator reaped…`) and
+review-round detail.
+
+The run log is the richest single artifact for the halt and the vendor picks. Grep it
+for:
 `_pick_implementer|implementer=|HALT|revert|MAIN CI RED|died|runner_error|preflight|recover`.
 
 ## omnigent REST API (session transcripts)
 
 Reference: `omnigent/server/API.md`. Base is `http://omnigent:8000` **from inside the
-runner** (via `omnigent.sh exec`). No auth on the internal network. Endpoints that
+runner** (via your exec helper). No auth on the internal network. Endpoints that
 matter for forensics:
 
 | Call                                       | Use                                                                                                                      |
@@ -91,7 +101,7 @@ coordinator titled `IMPLEMENTER VENDOR DIRECTIVE: …` plus two children,
   snapshot store text in a different internal shape than the `/items` endpoint's
   `.data` — **extract from `/items` `.data[]`**, whose messages carry
   `content[].text`, function calls carry `name`/`arguments`, outputs carry `output`.
-- **Don't do jq text-extraction _through_ `omnigent.sh exec`.** The
+- **Don't do jq text-extraction _through_ the exec helper.** The
   `exec → the container manager → shell → jq` layering mangles `\"`, `\n`, and `\(...)` and yields
   empty output. **Pull raw JSON out and parse locally** (Python). One `exec` that just
   `curl`s each transcript with an `@@@ID:<id>` delimiter, then a local parser.
@@ -133,12 +143,12 @@ gh pr view <pr> --json mergedAt,closingIssuesReferences
 `gh issue list --label` uses an eventually-consistent search index (lags seconds); for
 exact current state prefer per-issue `gh issue view`.
 
-## Recipe (minimize NAS round-trips)
+## Recipe (minimise round-trips to the runner)
 
 1. **GitHub sweep** (self-serve): outcomes, timing, scorecard comments, per-item CI.
-2. **One `omnigent.sh exec`**: scorecard.jsonl + `ls /workspaces/*.log` + session list.
-3. **One `omnigent.sh exec`**: `cat` both `bircher-overnight*.log` → grep vendor/halt.
-4. **One `omnigent.sh exec`**: `curl … /v1/sessions/{id}/items?limit=1000` for every
+2. **One exec call**: scorecard.jsonl + `ls "$BUNDLE_DIR"/*.log` + session list.
+3. **One exec call**: `cat` the run log(s) → grep vendor/halt.
+4. **One exec call**: `curl … /v1/sessions/{id}/items?limit=1000` for every
    run-window session (delimited raw JSON) → parse + grep **locally**.
 5. Synthesize against the four axes; file issues; write the retro.
 
