@@ -32,9 +32,14 @@ fi
 # ref or fail halfway, and on a runner an uncommitted change is far more likely to
 # be someone debugging live than something worth keeping — losing it silently
 # during a routine deploy would be the worst outcome.
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-  echo "update-bundle: refusing to update — the bundle has uncommitted changes:" >&2
-  git status --short >&2
+# `--untracked-files=no` is deliberate. A runner ALWAYS has untracked artifacts —
+# queue/processed/*.md, run logs, .run/ — and none of them affect a checkout. Only
+# modified TRACKED files can be carried onto another ref or lost, and those are the
+# ones likely to be someone debugging live. Blocking on untracked files made this
+# script refuse to run on a perfectly normal runner.
+if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+  echo "update-bundle: refusing to update — tracked files have uncommitted changes:" >&2
+  git status --short --untracked-files=no >&2
   echo "               Commit, stash or discard them first." >&2
   exit 1
 fi
