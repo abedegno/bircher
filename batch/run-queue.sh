@@ -1158,11 +1158,21 @@ _keep_blocking_checks() {
     printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
     return
   fi
-  printf '%s\n' "$filtered" | while IFS= read -r line; do
+  local kept
+  kept=$(printf '%s\n' "$filtered" | while IFS= read -r line; do
     [ -n "$line" ] || continue
     name="${line%%|*}"
     printf '%s\n' "$required" | grep -Fxq "$name" && printf '%s\n' "${line#*|}"
-  done
+  done)
+  # A required-set that matches NOTHING is a misconfiguration or a naming mismatch
+  # (contexts that never run on this event, a renamed job), not a genuine "no checks".
+  # Returning empty there reads as "CI has not registered yet" -> pending forever, or
+  # worse, hides a red. Fall back to ignore-list-only, which errs toward red.
+  if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
+    printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
+    return
+  fi
+  printf '%s\n' "$kept"
 }
 
 # _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.
@@ -1965,10 +1975,18 @@ self_test() {
   blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'coverage report (informational)|fail')" "")
   [ "$(_normalize_ci "$blk")" = red ] \
     || { echo "FAIL #43: unknown required-set must fail CLOSED (red), got '$(_normalize_ci "$blk")'"; exit 1; }
-  # Allowlist matching is exact, not substring -- "server (go) extra" is a different check.
-  blk=$(_keep_blocking_checks 'server (go) extra|fail' "$req")
-  [ -z "$blk" ] \
-    || { echo "FAIL #43: allowlist must match names exactly, got '$blk'"; exit 1; }
+  # Allowlist matching is exact, not substring -- "server (go) extra" is a different
+  # check. A real required context is present too, so this exercises exact matching
+  # WITHOUT tripping the no-match fallback below (which would legitimately return the
+  # unfiltered set and mask what this is asserting).
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'server (go) extra|fail')" "$req")
+  [ "$(_normalize_ci "$blk")" = green ] \
+    || { echo "FAIL #43: 'server (go) extra' must not match 'server (go)' (got '$(_normalize_ci "$blk")')"; exit 1; }
+  # A required-set matching NO check must not read as "no checks" -- that is pending
+  # forever, or a hidden red. Fall back to ignore-list-only instead.
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|fail')" "$(printf '%s\n' 'totally-different-context')")
+  [ "$(_normalize_ci "$blk")" = red ] \
+    || { echo "FAIL #43: a required-set matching nothing must fall back, not vanish (got '$(_normalize_ci "$blk")')"; exit 1; }
   echo "_keep_blocking_checks OK (#43)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
