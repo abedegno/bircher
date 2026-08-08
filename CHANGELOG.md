@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.1.1 — 2026-08-08
+
+Six fixes, all for bugs that were live in v0.1.0. Three were found by running the
+thing rather than reading it; two were found by cross-vendor review of Bircher's
+own changes.
+
+### Merge safety
+
+- **Auto-revert never worked.** `_revert_git_args` emitted `-q`, which `git revert`
+  does not accept — it exits 129 with a usage dump and reverts nothing. Every
+  auto-revert had failed since the function was written. The self-test asserted the
+  exact argument string *including* `-q`, so it stayed green for months while
+  pinning the defect; there is now a check that runs `git revert` for real against
+  both a squash commit and a true merge commit.
+
+- **Non-CI checks could turn `main` red.** `/commits/<sha>/check-runs` reports more
+  than CI: adding Dependabot to the target repo put 28 check-runs named `Dependabot`
+  on a merge commit, two of them failed, and the runner declared a healthy `main`
+  red, attempted a revert and halted mid-wave. Filtered by name via
+  `_drop_non_ci_checkruns` (`BIRCHER_CI_IGNORE_CHECKS`).
+
+- **A required review gate could deadlock recovery.** Where the target repo gates
+  merges on a status that Bircher itself posts, `--recover-pr` waited for CI to go
+  green while that gate waited for the review the same code was about to perform.
+  Both waited forever. The same filter now excludes it at all three polling sites.
+
+### Dispatch
+
+- **Codex model pinned in the agent spec**, not only in the coordinator's prompt.
+  omnigent resolves codex's default to the bare family name `gpt-5.6`, which a
+  ChatGPT-account login rejects outright, and its curated catalog spells the
+  variants with hyphens, which the API also rejects. A directive the coordinator
+  has to remember is not a fix — it held for several waves, then didn't. Pinning it
+  on the executor makes it the default for every dispatch.
+  Upstream: omnigent-ai/omnigent#4063.
+
+### Tooling
+
+- **`update-bundle.sh` refused to run on a real runner.** Its dirty-tree guard
+  used `git status --porcelain`, which includes untracked files — and a runner
+  always has them (`queue/processed/*.md`, run logs, `.run/`). It blocked routine
+  deploys, including the deploy of its own fix. Now checks tracked files only.
+
+- **The attribution hook was unanchored and missed session trailers**, so it would
+  strip prose that merely mentioned a trailer while leaving a session URL behind:
+  attribution removed, fingerprint kept.
+
+### Known limitations
+
+Unchanged from v0.1.0, and #8 (thin forensic record for codex implementer
+sessions) remains open.
+
 ## v0.1.0 — 2026-08-07
 
 First tagged release. Bircher has been running unattended against a real repository

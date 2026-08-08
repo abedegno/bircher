@@ -91,7 +91,13 @@ batch/run-queue.sh --self-test
 
 batch/update-bundle.sh [ref]
     Update this checkout on the runner and re-run the self-test.
+    Refuses to move a tree with uncommitted TRACKED changes.
 ```
+
+> **First deploy only:** a runner whose checkout predates this script obviously
+> cannot use it to fetch itself, and the same applies after any history rewrite.
+> Bootstrap with `git fetch origin && git checkout -B main origin/main`, then use
+> the script from then on.
 
 ## Layout
 
