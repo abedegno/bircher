@@ -219,6 +219,12 @@ _run_ids_from_check_links() {
 }
 
 # _ci_run_ids <pr> -> the workflow-run IDs backing this PR's CI check runs.
+# NOTE on the exit code: `gh pr checks` exits 1 when checks are FAILING, but only in
+# its human-readable mode. With --json it exits 0 and still emits every row (verified
+# 2026-08-08 against muesli PR #542, 5 failing checks: human mode 1, --json 0, 17 rows).
+# So `|| return 1` below catches real lookup failures — auth, network, unknown PR — and
+# never a red PR. That distinction matters: returning 1 here means `genuine`, so getting
+# it wrong would disable infra recovery entirely.
 _ci_run_ids() {
   local pr="$1" lines
   lines=$(gh pr checks "$pr" --repo "$REPO" --json name,link \
