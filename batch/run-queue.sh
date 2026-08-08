@@ -193,24 +193,66 @@ _classify_ci_failure() {
   [ "${1:-0}" -gt 0 ] 2>/dev/null && echo genuine || echo infra
 }
 
-# _ci_run_id <pr> -> databaseId of the PR head branch's most recent CI run ("" on failure).
-_ci_run_id() {
-  local pr="$1" ref
-  ref=$(gh pr view "$pr" --repo "$REPO" --json headRefName -q .headRefName 2>/dev/null) || return 1
-  [ -n "$ref" ] || return 1
-  gh run list --repo "$REPO" --branch "$ref" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null
+# _run_ids_from_check_links <lines> -> unique workflow-run IDs, one per line. (PURE)
+# Input lines are "name|link" as emitted by `gh pr checks --json name,link`.
+#
+# #41 (2026-08-08): this REPLACED `gh run list --branch <ref> --limit 1`, which took
+# the branch's most recent run across ALL workflows. Once muesli gained a second
+# workflow (`Review Gate`, added 2026-08-07) the two were created in the same second
+# and the ordering between them is not guaranteed. When `Review Gate` came back:
+#   - _ci_failure_kind counted failed steps in a workflow that had SUCCEEDED -> zero
+#     -> a genuine red was reported as `infra`;
+#   - _rerun_and_wait_ci re-ran that same wrong workflow, so the failing one never
+#     re-ran and the recovery could not succeed.
+# Seen on muesli PR #560, then again live on #568.
+#
+# Check LINKS are the right key: they name the run that actually produced each check,
+# so no workflow-name list is needed (and cannot drift). Commit STATUSES — `review-gate`
+# itself among them — carry an empty link and drop out here for free.
+#
+# Non-CI check runs are removed by _drop_non_ci_checkruns, the same filter and the same
+# BIRCHER_CI_IGNORE_CHECKS override used everywhere else, so there is one list, not two.
+_run_ids_from_check_links() {
+  _drop_non_ci_checkruns "$1" \
+    | sed -n 's#.*/actions/runs/\([0-9][0-9]*\)\(/.*\)\{0,1\}$#\1#p' \
+    | sort -u
+}
+
+# _ci_run_ids <pr> -> the workflow-run IDs backing this PR's CI check runs.
+# NOTE on the exit code: `gh pr checks` exits 1 when checks are FAILING, but only in
+# its human-readable mode. With --json it exits 0 and still emits every row (verified
+# 2026-08-08 against muesli PR #542, 5 failing checks: human mode 1, --json 0, 17 rows).
+# So `|| return 1` below catches real lookup failures — auth, network, unknown PR — and
+# never a red PR. That distinction matters: returning 1 here means `genuine`, so getting
+# it wrong would disable infra recovery entirely.
+_ci_run_ids() {
+  local pr="$1" lines
+  lines=$(gh pr checks "$pr" --repo "$REPO" --json name,link \
+            -q '.[] | "\(.name)|\(.link)"' 2>/dev/null) || return 1
+  _run_ids_from_check_links "$lines"
 }
 
 # _ci_failure_kind <pr> -> infra|genuine (best-effort; defaults genuine on any
 # lookup failure so a real red is never mistaken for infra).
+#
+# Sums failed steps across EVERY CI run on the PR, because a repo may legitimately
+# split CI over several workflows; assuming exactly one was the #41 defect.
 _ci_failure_kind() {
-  local pr="$1" rid fsc
-  rid=$(_ci_run_id "$pr") || { echo genuine; return; }
-  [ -n "$rid" ] || { echo genuine; return; }
-  fsc=$(gh run view "$rid" --repo "$REPO" --json jobs \
-    -q '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .steps[]? | select(.conclusion=="failure")] | length' 2>/dev/null)
-  [ -n "$fsc" ] || fsc=1
-  _classify_ci_failure "$fsc"
+  local pr="$1" ids rid fsc total=0
+  ids=$(_ci_run_ids "$pr") || { echo genuine; return; }
+  [ -n "$ids" ] || { echo genuine; return; }
+  while IFS= read -r rid; do
+    [ -n "$rid" ] || continue
+    fsc=$(gh run view "$rid" --repo "$REPO" --json jobs \
+      -q '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .steps[]? | select(.conclusion=="failure")] | length' 2>/dev/null)
+    # A lookup that failed tells us nothing -> fail closed on `genuine` rather than
+    # letting a missing answer read as "no failed steps" (which would mean infra).
+    [ -n "$fsc" ] || { echo genuine; return; }
+    total=$((total + fsc))
+  done <<EOF
+$ids
+EOF
+  _classify_ci_failure "$total"
 }
 
 # _poll_ci <pr> <timeout_s> -> green|red|pending
@@ -247,10 +289,28 @@ _wait_ci() { _poll_ci "$1" "${BIRCHER_CI_WAIT:-1500}"; }
 # _rerun_and_wait_ci <pr> -> final ci state after re-running the failed jobs and
 # polling until CI settles (B-5 part 1; bounded by BIRCHER_CI_RERUN_WAIT).
 _rerun_and_wait_ci() {
-  local pr="$1" rid
-  rid=$(_ci_run_id "$pr") || { echo red; return; }
-  [ -n "$rid" ] || { echo red; return; }
-  gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1
+  local pr="$1" ids rid conc did=0
+  ids=$(_ci_run_ids "$pr") || { echo red; return; }
+  [ -n "$ids" ] || { echo red; return; }
+  while IFS= read -r rid; do
+    [ -n "$rid" ] || continue
+    # Only re-run runs that actually ended badly. #41 re-ran whatever run it had
+    # picked, green ones included; a bare `gh run rerun` on a green run burns CI
+    # minutes and republishes passing checks for no reason.
+    conc=$(gh run view "$rid" --repo "$REPO" --json conclusion -q .conclusion 2>/dev/null)
+    case "$conc" in
+      failure|cancelled|timed_out|startup_failure) : ;;
+      *) continue ;;
+    esac
+    gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
+      || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1
+    did=1
+  done <<EOF
+$ids
+EOF
+  # Nothing re-run means nothing will change; report red rather than sleeping and
+  # re-polling an unchanged state until the caller's attempt budget is gone.
+  [ "$did" = 1 ] || { echo red; return; }
   sleep 20
   _poll_ci "$pr" "${BIRCHER_CI_RERUN_WAIT:-900}"
 }
@@ -1762,6 +1822,43 @@ self_test() {
   cr3='Dependabot Config Check|completed|failure'
   [ -n "$(_drop_non_ci_checkruns "$cr3")" ] \
     || { echo "FAIL drop_non_ci: only an exact name match may be ignored"; exit 1; }
+  # --- #41: CI runs come from check LINKS, never from branch recency ----------
+  # 2026-08-08: `gh run list --branch <ref> --limit 1` returned whichever workflow
+  # sorted first. muesli runs CI and `Review Gate` in the SAME SECOND, so a genuine
+  # red was classified `infra` (steps counted in the workflow that succeeded) and the
+  # wrong run was re-run. Seen on PR #560, then live on #568.
+  local rl ids
+  rl=$(printf '%s\n' \
+    'server (go)|https://github.com/o/r/actions/runs/111/job/9' \
+    'client (node)|https://github.com/o/r/actions/runs/111/job/8' \
+    'review-gate|')
+  ids=$(_run_ids_from_check_links "$rl")
+  [ "$ids" = "111" ] \
+    || { echo "FAIL #41: expected only CI run 111, got '$ids'"; exit 1; }
+  # The exact #560 shape: a SUCCEEDING non-CI workflow must never be the run we
+  # inspect. If 222 leaks through, _ci_failure_kind counts its zero failed steps
+  # and reports a real failure as infra — the whole defect.
+  rl=$(printf '%s\n' \
+    'server (go)|https://github.com/o/r/actions/runs/111/job/9' \
+    'Dependabot|https://github.com/o/r/actions/runs/222/job/7')
+  ids=$(_run_ids_from_check_links "$rl")
+  [ "$ids" = "111" ] \
+    || { echo "FAIL #41: non-CI workflow run must be filtered, got '$ids'"; exit 1; }
+  # Several CI workflows on one PR: keep them all, deduped and stable. Assuming a
+  # single run is what made the old code wrong.
+  rl=$(printf '%s\n' \
+    'server (go)|https://github.com/o/r/actions/runs/300/job/1' \
+    'client (node)|https://github.com/o/r/actions/runs/100/job/2' \
+    'lighthouse|https://github.com/o/r/actions/runs/300/job/3')
+  ids=$(_run_ids_from_check_links "$rl" | tr '\n' ',')
+  [ "$ids" = "100,300," ] \
+    || { echo "FAIL #41: expected deduped 100,300, got '$ids'"; exit 1; }
+  # Commit statuses carry no link; they must not yield a bogus id.
+  [ -z "$(_run_ids_from_check_links 'review-gate|')" ] \
+    || { echo "FAIL #41: a linkless status must yield no run id"; exit 1; }
+  [ -z "$(_run_ids_from_check_links 'some-status|not-a-url')" ] \
+    || { echo "FAIL #41: an unparseable link must yield no run id"; exit 1; }
+  echo "_run_ids_from_check_links OK (#41)"
   # _poll_ci passes "name|bucket", not "name|status|conclusion". Same filter,
   # different shape — assert it rather than assuming it generalises.
   #
