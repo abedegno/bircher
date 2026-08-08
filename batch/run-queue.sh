@@ -258,7 +258,11 @@ EOF
 # _poll_ci <pr> <timeout_s> -> green|red|pending
 # Poll `gh pr checks` until CI settles (not pending) or the timeout elapses.
 _poll_ci() {
-  local pr="$1" timeout="${2:-900}" w=0 buckets ci
+  local pr="$1" timeout="${2:-900}" w=0 buckets ci req
+  # Fetched ONCE, outside the loop. Every call site invokes this inside $( ), so the
+  # cache in _required_contexts lives in a subshell and dies with it -- polling would
+  # re-request branch protection every 30s for the whole timeout.
+  req=$(_required_contexts)
   while [ "$w" -lt "$timeout" ]; do
     # Fetch NAME too, so non-CI checks are filtered before deciding.
     # `review-gate` MUST be excluded or this DEADLOCKS: it stays pending until a
@@ -272,7 +276,7 @@ _poll_ci() {
     # enforces at merge time.
     buckets=$(gh pr checks "$pr" --repo "$REPO" --json name,bucket \
                 -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)
-    buckets=$(_drop_non_ci_checkruns "$buckets")
+        buckets=$(_keep_blocking_checks "$buckets" "$req")
     ci=$(_normalize_ci "$buckets")
     [ "$ci" != pending ] && { echo "$ci"; return; }
     sleep 30; w=$((w + 30))
@@ -691,12 +695,13 @@ merge_ready_pr() {
   echo "[batch:merge] $item: PR #$pr MERGED (${sha:-sha unknown}); watching main CI" >&2
   [ -z "$sha" ] && { MERGE_NOTE="merged; main-CI watch skipped (no merge sha)"; return 0; }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
-  local waited=0 state=pending lines
+  local waited=0 state=pending lines mreq
+  mreq=$(_required_contexts)   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_TIMEOUT" ]; do
     sleep 30; waited=$((waited + 30))
     lines=$(gh api "repos/$REPO/commits/$sha/check-runs" \
       -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null)
-    lines=$(_drop_non_ci_checkruns "$lines")
+    lines=$(_keep_blocking_checks "$lines" "$mreq")
     state=$(_checkrun_state "$lines")
     [ "$state" != "pending" ] && break
   done
@@ -940,7 +945,7 @@ _reconcile_item_pr() {
   count=$(printf '%s\n' "$matches" | grep -c .)
   [ "${count:-0}" -le 1 ] && { echo "$tracked"; return; }
   for m in $matches; do
-    if [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$(gh pr checks "$m" --repo "$REPO" --json name,bucket -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)")")" = green ]; then
+    if [ "$(_normalize_ci "$(_keep_blocking_checks "$(gh pr checks "$m" --repo "$REPO" --json name,bucket -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)" "$(_required_contexts)")")" = green ]; then
       green="$m"; break
     fi
   done
@@ -1030,7 +1035,7 @@ recover_from_ground_truth() {
     # enforces at merge time.
     buckets=$(gh pr checks "$pr" --repo "$REPO" --json name,bucket \
                 -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)
-    buckets=$(_drop_non_ci_checkruns "$buckets")
+        buckets=$(_keep_blocking_checks "$buckets" "$(_required_contexts)")
     ci=$(_normalize_ci "$buckets")
     # B-5 part 2: the coordinator often DIES (runner_error) while CI is still
     # running -- CI queue delays (degraded GitHub runner capacity) pushed CI to
@@ -1104,6 +1109,70 @@ _is_blank() { [ -z "${1//[[:space:]]/}" ]; }
 _render_issue_item() {
   local n="$1" title="$2" body="$3"
   printf '# i%s: %s\n\nIssue: #%s\n\n%s\n' "$n" "$title" "$n" "$body"
+}
+
+# _required_contexts -> the contexts branch protection actually requires, one per
+# line; EMPTY when unknown (no protection, no permission, request failed).
+#
+# #43: the alternative is _drop_non_ci_checkruns' hardcoded denylist, which has to be
+# edited in THIS repo every time the TARGET repo adds a check. It had already grown
+# twice (Dependabot, then review-gate) and muesli's `coverage report (informational)`
+# would have been the third -- discovered only after it silently stalled a merge and
+# left main one poll away from an auto-revert. An allowlist the target repo publishes
+# cannot drift.
+_REQUIRED_CONTEXTS_CACHE=""
+_REQUIRED_CONTEXTS_LOADED=""
+_required_contexts() {
+  if [ -z "$_REQUIRED_CONTEXTS_LOADED" ]; then
+    _REQUIRED_CONTEXTS_LOADED=1
+    _REQUIRED_CONTEXTS_CACHE=$(gh api \
+      "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
+      --jq '.required_status_checks.contexts[]?' 2>/dev/null) || _REQUIRED_CONTEXTS_CACHE=""
+  fi
+  printf '%s' "$_REQUIRED_CONTEXTS_CACHE"
+}
+
+# _keep_blocking_checks <lines> <required> -> lines that actually gate a merge, name
+# stripped. (PURE -- <required> is passed in, never fetched here.)
+#
+# Two filters, and BOTH are load-bearing:
+#
+#   1. The ignore list still applies FIRST. `review-gate` is itself a REQUIRED context,
+#      so an allowlist alone would re-admit it -- and admitting it DEADLOCKS: review-gate
+#      stays pending until a cross-vendor review is posted, and the caller of this
+#      function is the thing about to post it. Each waits for the other (muesli PR #549,
+#      2026-08-07). Filtering required-minus-ignored keeps that guard intact.
+#   2. Then, when <required> is known, keep only those contexts. A failing NON-required
+#      check is not a merge blocker, and treating it as one is what made the wave path
+#      (which asks GitHub `mergeable`, required-only) and the recovery path (which asked
+#      this code, any-check) disagree about the same PR.
+#
+# Unknown <required> falls back to ignore-list-only -- the previous behaviour, which
+# errs toward calling things red. Failing closed matters here: inverting it would make
+# every genuinely red PR look green.
+_keep_blocking_checks() {
+  local lines="$1" required="$2" filtered name
+  filtered=$(printf '%s\n' "$lines" \
+    | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|")
+  if [ -z "$required" ]; then
+    printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
+    return
+  fi
+  local kept
+  kept=$(printf '%s\n' "$filtered" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%|*}"
+    printf '%s\n' "$required" | grep -Fxq "$name" && printf '%s\n' "${line#*|}"
+  done)
+  # A required-set that matches NOTHING is a misconfiguration or a naming mismatch
+  # (contexts that never run on this event, a renamed job), not a genuine "no checks".
+  # Returning empty there reads as "CI has not registered yet" -> pending forever, or
+  # worse, hides a red. Fall back to ignore-list-only, which errs toward red.
+  if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
+    printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
+    return
+  fi
+  printf '%s\n' "$kept"
 }
 
 # _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.
@@ -1879,6 +1948,46 @@ self_test() {
   [ "$(_normalize_ci "$(_drop_non_ci_checkruns "$cr6")")" = "red" ] \
     || { echo "FAIL poll_ci filter: real CI failure must still be red"; exit 1; }
   echo "_drop_non_ci_checkruns OK (i520 false-red + #549 deadlock)"
+  # --- #43: only checks that actually gate a merge may turn CI red --------------
+  # 2026-08-08: muesli`s `coverage report (informational)` is NOT a required context.
+  # The wave path asks GitHub `mergeable` (required-only) and merged; the recovery path
+  # asked this code (any-check) and refused the identical state. Worse, the main-CI
+  # watcher shares this filter, so a non-required red on main was one poll away from
+  # auto-reverting a healthy commit -- exactly i520, with a different check.
+  local req blk
+  req=$(printf '%s\n' 'server (go)' 'client (node)' 'review-gate')
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'coverage report (informational)|fail')" "$req")
+  [ "$(_normalize_ci "$blk")" = green ] \
+    || { echo "FAIL #43: a failing NON-required check must not be red, got '$(_normalize_ci "$blk")'"; exit 1; }
+  # ...and a required one still must be.
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|fail' 'coverage report (informational)|pass')" "$req")
+  [ "$(_normalize_ci "$blk")" = red ] \
+    || { echo "FAIL #43: a failing REQUIRED check must still be red"; exit 1; }
+  # THE DEADLOCK GUARD. review-gate IS a required context, so an allowlist alone would
+  # re-admit it -- and it stays pending until the review this very caller is about to
+  # post. required-MINUS-ignored is what keeps #549 fixed; assert it explicitly.
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'review-gate|pending')" "$req")
+  [ "$(_normalize_ci "$blk")" = green ] \
+    || { echo "FAIL #43: review-gate must stay filtered even though it is required (#549)"; exit 1; }
+  # Unknown required (no protection / no permission / request failed) -> fall back to
+  # the old ignore-list-only behaviour, which reads a stray failure as RED. Fail closed:
+  # inverting this would make every genuinely red PR look green.
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'coverage report (informational)|fail')" "")
+  [ "$(_normalize_ci "$blk")" = red ] \
+    || { echo "FAIL #43: unknown required-set must fail CLOSED (red), got '$(_normalize_ci "$blk")'"; exit 1; }
+  # Allowlist matching is exact, not substring -- "server (go) extra" is a different
+  # check. A real required context is present too, so this exercises exact matching
+  # WITHOUT tripping the no-match fallback below (which would legitimately return the
+  # unfiltered set and mask what this is asserting).
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|pass' 'server (go) extra|fail')" "$req")
+  [ "$(_normalize_ci "$blk")" = green ] \
+    || { echo "FAIL #43: 'server (go) extra' must not match 'server (go)' (got '$(_normalize_ci "$blk")')"; exit 1; }
+  # A required-set matching NO check must not read as "no checks" -- that is pending
+  # forever, or a hidden red. Fall back to ignore-list-only instead.
+  blk=$(_keep_blocking_checks "$(printf '%s\n' 'server (go)|fail')" "$(printf '%s\n' 'totally-different-context')")
+  [ "$(_normalize_ci "$blk")" = red ] \
+    || { echo "FAIL #43: a required-set matching nothing must fall back, not vanish (got '$(_normalize_ci "$blk")')"; exit 1; }
+  echo "_keep_blocking_checks OK (#43)"
   local row; row=$(json_row demo 7 ready true codex:pass 0 800 "ok" ok codex)
   printf '%s' "$row" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["item"]=="demo" and d["pr"]==7 and d["ci_pass_first_try"] is True and d["cost"] is None and d["bound"]=="ok" and d["implementer"]=="codex", d; print("json_row OK (incl. #4 implementer)")'
   local row2; row2=$(json_row demo2 "" timeout false "" "" 900 "" failed)
@@ -2264,6 +2373,10 @@ if [ "$1" = "api" ]; then
     exit 0
   fi
   if printf '%s\n' "$@" | grep -q '/status'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+  # Demo repo has no branch protection -> empty required set, so _keep_blocking_checks
+  # falls back to ignore-list-only. Without this the catch-all below hands back
+  # "completed|success" as though it were a required-contexts list.
+  if printf '%s\n' "$@" | grep -q '/protection'; then exit 0; fi
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
