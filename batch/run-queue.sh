@@ -1127,9 +1127,72 @@ _is_blank() { [ -z "${1//[[:space:]]/}" ]; }
 # _render_issue_item <number> <title> <body> -> the queue-file text for a GitHub
 # issue. First line is the task heading (code i<number>); an `Issue: #<number>`
 # header lets run-queue write back + the coordinator emit `Closes #<number>`.
+# _format_issue_comments <comments_json> [max_comments] [max_chars] -> rendered
+# discussion block, or empty. PURE: takes the JSON, fetches nothing.
+#
+# #46: the queue item was built from title+body only, so a comment was invisible
+# to the implementer. Commenting on an escalated issue and re-queueing it is the
+# obvious way to hand a diagnosis back, and it delivered NOTHING -- the run
+# looked healthy and re-derived its previous conclusion (muesli #621).
+#
+# Bircher's own status comments are dropped: feeding `bircher: outcome=...` back
+# to the next run is noise at best and self-reinforcing at worst. Matched with
+# startswith, not a substring, so a human discussing a marker still gets through.
+_format_issue_comments() {
+  local json="$1"
+  printf '%s' "$json" | MAXC="${2:-20}" MAXCH="${3:-16000}" python3 -c '
+import json, os, sys
+
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.exit(0)
+try:
+    comments = json.loads(raw)
+except ValueError:
+    sys.exit(0)
+if not isinstance(comments, list):
+    sys.exit(0)
+
+def is_bircher_status(body):
+    head = body.lstrip()
+    return head.startswith("bircher: outcome=") or head.startswith("bircher-status:")
+
+kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
+maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])
+
+omitted = max(0, len(kept) - maxc)
+kept = kept[-maxc:]
+if not kept:
+    sys.exit(0)
+
+parts = []
+for c in kept:
+    who = (c.get("author") or {}).get("login") or "unknown"
+    parts.append("### %s (%s)\n\n%s" % (who, c.get("createdAt") or "", (c.get("body") or "").strip()))
+text = "\n\n".join(parts)
+
+notes = []
+if omitted:
+    notes.append("%d older comment(s) omitted" % omitted)
+if len(text) > maxch:
+    # Keep the NEWEST characters: the latest comment is the one most likely to
+    # be the correction this run needs.
+    text = text[-maxch:]
+    notes.append("truncated to the last %d characters" % maxch)
+if notes:
+    text = "> NOTE: %s.\n\n%s" % ("; ".join(notes), text)
+print(text)
+'
+}
+
 _render_issue_item() {
-  local n="$1" title="$2" body="$3"
+  local n="$1" title="$2" body="$3" comments="${4:-}"
   printf '# i%s: %s\n\nIssue: #%s\n\n%s\n' "$n" "$title" "$n" "$body"
+  # `if` rather than `[ -n ... ] &&` so the function still returns 0 when there
+  # are no comments -- the caller runs under `set -e`.
+  if [ -n "$comments" ]; then
+    printf '\n## Discussion (oldest first)\n\nComments on the issue. A later comment may correct an earlier one, and may correct the issue body above -- prefer the most recent statement where they disagree.\n\n%s\n' "$comments"
+  fi
 }
 
 # _required_contexts -> the contexts branch protection actually requires, one per
@@ -2724,7 +2787,39 @@ SH
   printf '%s\n' "$r" | grep -q '^Issue: #301$'            || { echo "FAIL render: Issue header"; exit 1; }
   printf '%s\n' "$r" | grep -q '^## Summary$'             || { echo "FAIL render: body copied"; exit 1; }
   printf '%s\n' "$r" | head -1 | grep -q '^# i301: People / attendees$' || { echo "FAIL render: title heading"; exit 1; }
+  printf '%s\n' "$r" | grep -q '## Discussion' && { echo "FAIL render: discussion heading with no comments"; exit 1; }
   echo "_render_issue_item OK"
+  # --- #46: issue comments reach the implementer ------------------------------
+  # The defect this replaces was silent: guidance posted as a comment simply
+  # never appeared in the queue item, and the run looked entirely healthy.
+  local cj='[
+    {"author":{"login":"abedegno"},"createdAt":"2026-08-10T08:00:00Z","body":"bircher: outcome=escalated ci_first=false review=claude_code:pass rounds=1 pr=#625"},
+    {"author":{"login":"abedegno"},"createdAt":"2026-08-10T09:00:00Z","body":"Root cause is CORS, not CSP. Move the fetch to the request fixture."}
+  ]'
+  local cb; cb=$(_format_issue_comments "$cj")
+  printf '%s\n' "$cb" | grep -q 'Root cause is CORS'  || { echo "FAIL #46: human comment dropped"; exit 1; }
+  printf '%s\n' "$cb" | grep -q 'outcome=escalated'   && { echo "FAIL #46: bircher status comment fed back in"; exit 1; }
+  printf '%s\n' "$cb" | grep -q '^### abedegno (2026-08-10T09:00:00Z)$' || { echo "FAIL #46: attribution heading"; exit 1; }
+  # A comment that merely QUOTES a marker is a human talking, not a status post.
+  local cq; cq=$(_format_issue_comments '[{"author":{"login":"jon"},"createdAt":"t","body":"the bircher: outcome=ready line was stale"}]')
+  printf '%s\n' "$cq" | grep -q 'was stale' || { echo "FAIL #46: startswith must not swallow quoted markers"; exit 1; }
+  # Only status comments -> no block at all, and no bare Discussion heading.
+  [ -z "$(_format_issue_comments '[{"author":{"login":"a"},"createdAt":"t","body":"bircher: outcome=ready x"}]')" ] \
+    || { echo "FAIL #46: status-only should render nothing"; exit 1; }
+  [ -z "$(_format_issue_comments '')" ]      || { echo "FAIL #46: empty input"; exit 1; }
+  [ -z "$(_format_issue_comments 'not json')" ] || { echo "FAIL #46: malformed json must not abort the run"; exit 1; }
+  # Bounding is announced, never silent.
+  local many; many=$(python3 -c 'import json;print(json.dumps([{"author":{"login":"a"},"createdAt":"t","body":"c%d"%i} for i in range(30)]))')
+  local mb; mb=$(_format_issue_comments "$many" 5)
+  printf '%s\n' "$mb" | grep -q '25 older comment(s) omitted' || { echo "FAIL #46: truncation must be stated"; exit 1; }
+  printf '%s\n' "$mb" | grep -q 'c29' || { echo "FAIL #46: newest comment must survive"; exit 1; }
+  local tb; tb=$(_format_issue_comments "$many" 30 200)
+  printf '%s\n' "$tb" | grep -q 'truncated to the last 200 characters' || { echo "FAIL #46: char cap must be stated"; exit 1; }
+  # Rendered into the item under a heading the implementer can find.
+  local rc; rc=$(_render_issue_item 621 "t" "body" "$cb")
+  printf '%s\n' "$rc" | grep -q '^## Discussion (oldest first)$' || { echo "FAIL #46: discussion heading"; exit 1; }
+  printf '%s\n' "$rc" | grep -q 'Root cause is CORS' || { echo "FAIL #46: comments not rendered into the item"; exit 1; }
+  echo "_format_issue_comments OK (#46)"
   # --- Task 4: _item_issue + _writeback_plan pure helpers ----------------------
   [ "$(_item_issue $'# i301: x\n\nIssue: #301\n\nbody')" = "301" ] || { echo "FAIL _item_issue read"; exit 1; }
   [ -z "$(_item_issue 'no issue header here')" ]                   || { echo "FAIL _item_issue absent"; exit 1; }
