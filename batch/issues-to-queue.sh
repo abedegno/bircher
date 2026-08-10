@@ -9,6 +9,7 @@ QUEUE="${QUEUE:-$HERE/../queue}"
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 # shellcheck source=/dev/null
 eval "$(sed -n '/^_render_issue_item()/,/^}/p' "$HERE/run-queue.sh")"
+eval "$(sed -n "/^_format_issue_comments()/,/^}$/p" "$HERE/run-queue.sh")"
 
 slug() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40; }
 
@@ -32,11 +33,15 @@ for n in $queued_nums; do
   is_unblocked "$n" || { echo "skip #$n (blocked)"; continue; }
   title=$(gh issue view "$n" --repo "$REPO" --json title --jq .title)
   body=$(gh issue view "$n" --repo "$REPO" --json body --jq .body)
+  # #46: comments carry the human's corrections. A failure here must not lose the
+  # whole item -- an item without its discussion still beats no item at all.
+  comments_json=$(gh issue view "$n" --repo "$REPO" --json comments --jq .comments 2>/dev/null) || comments_json=""
+  comments=$(_format_issue_comments "$comments_json")
   out="$QUEUE/i${n}-$(slug "$title").md"
   if [ "$DRY" = 1 ]; then
     echo "would write $out"
   else
-    _render_issue_item "$n" "$title" "$body" > "$out"
+    _render_issue_item "$n" "$title" "$body" "$comments" > "$out"
     basename "$out" >> "$QUEUE/.manifest"
     echo "wrote $out"
   fi
