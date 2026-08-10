@@ -128,6 +128,27 @@ parse_marker() {
   echo "${o}|${c}|${cf}|${r}|${n}|${note}|${head}"
 }
 
+# _marker_bodies_since <pr> <since_epoch> -> bodies of PR comments posted at or
+# after <since_epoch>, one per line.
+#
+# Issue #47: a PR keeps every marker any run ever posted. Grepping ALL comment
+# bodies means a re-queued item adopts the PREVIOUS run's verdict on its first
+# poll and breaks out ~one poll interval in, abandoning the session it just
+# launched. muesli #621 burned two full runs this way (wall=45 each, identical
+# note, PR head never moved) and read as "the agent disagrees with you" rather
+# than "your re-queue was ignored" -- which makes human escalation a one-way
+# door, since the documented recovery path is diagnose-and-hand-back.
+#
+# Filtering by timestamp rather than by head= is deliberate: a coordinator that
+# pushes a commit and THEN posts its marker would momentarily disagree with a
+# head comparison, and markers written by older reviewers carry no head= at all.
+_marker_bodies_since() {
+  BIRCHER_MARKER_SINCE="$2" gh pr view "$1" --repo "$REPO" --json comments \
+    -q '.comments[]
+        | select((.createdAt | fromdateiso8601) >= (env.BIRCHER_MARKER_SINCE | tonumber))
+        | .body' 2>/dev/null
+}
+
 # _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty).
 # The cross-review contract puts the verdict on the final line, so the LAST
 # match is authoritative even if the reviewer echoed the token earlier in prose.
@@ -1553,8 +1574,15 @@ ${prompt}"
       fi
     fi
     if [ -n "$pr" ]; then
-      local body; body=$(gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null)
+      # Only markers posted by THIS run count (issue #47). A stale marker from an
+      # earlier run must not short-circuit the session now in flight.
+      local body; body=$(_marker_bodies_since "$pr" "$start")
       if printf '%s' "$body" | grep -q 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
+      if [ "$polls" = 1 ] \
+         && gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null \
+            | grep -q 'bircher-status:'; then
+        echo "[batch] $item: PR #$pr carries a marker predating this run - ignoring it and waiting for a fresh verdict" >&2
+      fi
     fi
     # No-op signal: the coordinator decided the item is already satisfied (gap #3)
     # and dropped a marker here instead of forcing a (garbage) PR.
@@ -1630,7 +1658,10 @@ ${prompt}"
   # poll and now (or as the session ended). Prefer it over recovery so a
   # converged coordinator always wins and we never post a conflicting marker.
   if [ -z "$marker" ] && [ -n "$pr" ]; then
-    local _fb; _fb=$(gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null)
+    # Same freshness rule as the poll loop (issue #47): a marker left by an
+    # earlier run is not this run's verdict, and adopting it here would record a
+    # stale outcome as if the session had produced it.
+    local _fb; _fb=$(_marker_bodies_since "$pr" "$start")
     printf '%s' "$_fb" | grep -q 'bircher-status:' && marker=$(parse_marker "$_fb")
   fi
 
@@ -1721,6 +1752,31 @@ self_test() {
   m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=zzz note="bad"')
   [ "${m##*|}" = "" ] || { echo "FAIL parse head=: malformed head must be empty, got '${m##*|}'"; exit 1; }
   echo "parse_marker head= OK (#24)"
+  # --- #47: marker freshness. A marker from an earlier run must not be adopted -
+  # muesli #621 re-queued twice and each run reported the previous run's verdict
+  # (wall=45, identical note, PR head unmoved) because the poll loop grepped ALL
+  # comment bodies. The stub exercises the REAL jq filter, since that expression
+  # is the thing that was missing.
+  gh() {
+    local q="" prev=""
+    for a in "$@"; do [ "$prev" = "-q" ] && q="$a"; prev="$a"; done
+    printf '%s' '{"comments":[
+      {"createdAt":"2026-08-10T08:02:07Z","body":"old run\nbircher-status: outcome=escalated ci=red ci_first=false review=codex:pass rounds=1 note=\"stale\""},
+      {"createdAt":"2026-08-10T14:44:00Z","body":"this run\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note=\"fresh\""}
+    ]}' | jq -r "$q"
+  }
+  local _mb
+  # since = 14:00Z -> only the fresh marker survives the filter.
+  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T14:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T14:00:00Z' +%s)")
+  [ "$(parse_marker "$_mb" | cut -d'|' -f1)" = "ready" ] \
+    || { echo "FAIL #47: fresh marker should win, got '$(parse_marker "$_mb")'"; exit 1; }
+  printf '%s' "$_mb" | grep -q 'stale' && { echo "FAIL #47: stale marker leaked through the filter"; exit 1; }
+  # since = after BOTH -> nothing survives, so the caller keeps polling instead of
+  # adopting a verdict no run produced.
+  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T23:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T23:00:00Z' +%s)")
+  [ -z "$_mb" ] || { echo "FAIL #47: no marker should survive, got '$_mb'"; exit 1; }
+  unset -f gh
+  echo "_marker_bodies_since OK (#47)"
   # --- #22: one boundary-anchored branch-code filter, not three copies --------
   local bf; bf=$(_branch_code_filter i23)
   case "$bf" in *'(^|[^a-z0-9])i23([^a-z0-9]|$)'*) : ;; *) echo "FAIL branch filter: '$bf'"; exit 1 ;; esac
