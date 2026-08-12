@@ -214,6 +214,83 @@ _classify_ci_failure() {
   [ "${1:-0}" -gt 0 ] 2>/dev/null && echo genuine || echo infra
 }
 
+# _reopen_reverted_issues <pr> -> reopens every issue the merged PR closed
+#
+# A revert restores the code but not the tracker. Without this the merge's
+# `Closes #N` leaves #N closed while the defect is live again, so the backlog
+# claims work that no longer exists -- and anything `blocked_by` #N silently
+# becomes runnable. On 2026-08-12 that chain came within one wave of shipping a
+# broken app: a transient outage reverted a fix, its issue stayed closed, and the
+# dependent issue it was gating unblocked itself.
+#
+# Best-effort and loud: a failure here is reported, never swallowed, because a
+# closed issue for a live defect is worse than a noisy warning.
+_reopen_reverted_issues() {
+	local pr="$1" nums n
+	[ -n "$pr" ] || return 0
+	nums=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
+		-q '.closingIssuesReferences[]?.number' 2>/dev/null)
+	[ -n "$nums" ] || { echo "[batch:merge] revert: PR #$pr closed no issues (nothing to reopen)" >&2; return 0; }
+	while IFS= read -r n; do
+		[ -n "$n" ] || continue
+		if gh issue reopen "$n" --repo "$REPO" \
+			--comment "Reopening: the fix for this was merged in #$pr and then automatically reverted because main CI went red. The defect is live again." >/dev/null 2>&1; then
+			echo "[batch:merge] revert: reopened issue #$n (its fix was reverted)" >&2
+		else
+			echo "[batch:merge] WARN revert: could NOT reopen issue #$n - it still reads as fixed; reopen by hand" >&2
+		fi
+	done <<EOF
+$nums
+EOF
+}
+
+# _is_transient_ci_log <text> -> yes|no   (PURE, self-tested)
+#
+# Recognises a CI failure caused by the network or a provider rather than by the
+# code. _classify_ci_failure only spots the ZERO-failed-steps shape (runner never
+# acquired the job); it cannot see the case that actually bit us, where a step ran
+# and failed because something it downloaded was briefly unavailable.
+#
+# 2026-08-12: three merges were reverted in one afternoon by transient outages --
+# a 503 on the embedded Postgres bundle, then a GitHub-wide episode that broke
+# `npm ci` (socket hang up) and Electron's release downloads (503). Each revert
+# undid a reviewed, green change, left its issue closed (see the reopen below),
+# and once silently unblocked a dependent issue whose fix alone would have shipped
+# a broken app. Reverting cannot fix a provider outage; only waiting can.
+#
+# Deliberately NARROW. These patterns describe transport and availability, never
+# assertions or compiler output, so a genuine failure cannot match. Anything not
+# listed stays `genuine` -- the fail-closed direction, since a missed infra
+# failure costs one spurious revert while a missed genuine failure keeps main red.
+_is_transient_ci_log() {
+	printf '%s' "${1:-}" | grep -qiE \
+		'socket hang up|Service Unavailable|error: 50[234]|Response code 50[234]|curl: \\(22\\)|curl: \\(56\\)|ECONNRESET|ETIMEDOUT|EAI_AGAIN|TLS handshake timeout|TypeError: fetch failed|Connection reset by peer|The requested URL returned error: 50[234]|remote end hung up' \
+		&& echo yes || echo no
+}
+
+# _main_ci_kind <sha> -> infra|genuine
+#
+# Reads the failed-step logs of every failing run on the merge commit and asks
+# _is_transient_ci_log about them. Fails closed on `genuine`: an unreadable log
+# tells us nothing, and treating "unknown" as infra would suppress real reverts.
+_main_ci_kind() {
+	local sha="$1" ids rid log
+	[ -n "$sha" ] || { echo genuine; return; }
+	ids=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+		-q '.check_runs[] | select(.conclusion=="failure") | .details_url' 2>/dev/null \
+		| grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+' | sort -u)
+	[ -n "$ids" ] || { echo genuine; return; }
+	while IFS= read -r rid; do
+		[ -n "$rid" ] || continue
+		log=$(gh run view "$rid" --repo "$REPO" --log-failed 2>/dev/null | tail -c 20000)
+		[ -n "$log" ] || { echo genuine; return; }
+		[ "$(_is_transient_ci_log "$log")" = yes ] || { echo genuine; return; }
+	done <<EOF
+$ids
+EOF
+	echo infra
+}
+
 # _run_ids_from_check_links <lines> -> unique workflow-run IDs, one per line. (PURE)
 # Input lines are "name|link" as emitted by `gh pr checks --json name,link`.
 #
@@ -735,6 +812,15 @@ merge_ready_pr() {
     decision=$(_main_ci_verdict "$state" "$second")
     echo "[batch:merge] $item: re-run main CI -> $second (verdict: $decision)" >&2
   fi
+  # A confirmed-red main that is red because of the NETWORK must not be reverted:
+  # the merge is not the cause, and a revert cannot fix a provider outage. Halt so
+  # the wave stops piling on, and leave main alone so a later re-run settles it.
+  if [ "$decision" = "revert-halt" ] && [ "$(_main_ci_kind "$sha")" = infra ]; then
+    echo "[batch:merge] !!!! $item: main CI red on $sha but the failures are TRANSPORT failures (provider/network) -> NOT reverting; HALTING for a human !!!!" >&2
+    MERGE_NOTE="merged; main CI red on transient infrastructure - not reverted, run halted"
+    return 2
+  fi
+
   case "$decision" in
     continue)
       echo "[batch:merge] $item: main CI green on $sha" >&2
@@ -767,6 +853,7 @@ merge_ready_pr() {
       git -C "$WORKDIR" worktree remove --force "$rw" 2>/dev/null
       # MERGE_NOTE must reflect what ACTUALLY happened (it lands in the scorecard).
       if [ "$reverted" = 1 ]; then
+        _reopen_reverted_issues "$pr"
         MERGE_NOTE="merged then REVERTED: main CI red (confirmed on re-run)"
       else
         MERGE_NOTE="merged; automatic revert FAILED - main RED, fix by hand"
@@ -2133,6 +2220,29 @@ self_test() {
   [ "$(_classify_ci_failure 0)" = infra ]   || { echo "FAIL _classify_ci_failure 0->infra"; exit 1; }
   [ "$(_classify_ci_failure 3)" = genuine ] || { echo "FAIL _classify_ci_failure 3->genuine"; exit 1; }
   [ "$(_classify_ci_failure '')" = infra ]  || { echo "FAIL _classify_ci_failure empty->infra"; exit 1; }
+  # --- #52: transport failures must not be read as genuine ---------------------
+  # The 2026-08-12 reverts: a step DID fail, so _classify_ci_failure said genuine.
+  # These are the actual log lines those runs produced.
+  [ "$(_is_transient_ci_log 'curl: (22) The requested URL returned error: 503')" = yes ] \
+    || { echo "FAIL #52: 503 on an asset download is transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'npm error Error: socket hang up')" = yes ] \
+    || { echo "FAIL #52: npm socket hang up is transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'HTTPError: Response code 503 (Service Unavailable) for https://github.com/electron/electron/releases')" = yes ] \
+    || { echo "FAIL #52: electron 503 is transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'TypeError: fetch failed')" = yes ] \
+    || { echo "FAIL #52: fetch failed is transport"; exit 1; }
+  # And the direction that matters more: a real failure must NEVER read as transport,
+  # or a genuine breakage would sit on main unreverted.
+  [ "$(_is_transient_ci_log '--- FAIL: TestResummarizeGuardReleasedAfterSuccess (0.41s)')" = no ] \
+    || { echo "FAIL #52: a Go test failure must not read as transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'internal/api/admin_health.go:258:19: undefined: syscall.Statfs_t')" = no ] \
+    || { echo "FAIL #52: a compile error must not read as transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'Error: expect(locator).toBeVisible() failed')" = no ] \
+    || { echo "FAIL #52: an assertion failure must not read as transport"; exit 1; }
+  [ "$(_is_transient_ci_log '')" = no ] \
+    || { echo "FAIL #52: empty log must fail closed to genuine"; exit 1; }
+  echo "_is_transient_ci_log OK (#52)"
+
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
   printf '279\n' > "$_std/cal08.pr"
   [ "$(_pr_signal cal08)" = "279" ] || { echo "FAIL _pr_signal read"; exit 1; }
