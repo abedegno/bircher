@@ -270,19 +270,24 @@ _is_transient_ci_log() {
 		&& echo yes || echo no
 }
 
-# _looks_genuine_failure <text> -> yes|no   (PURE, self-tested)
+# _is_setup_step <step-name> -> yes|no   (PURE, self-tested)
 #
-# Positive evidence that code failed: assertions, compiler errors, panics, test
-# summaries. Needed because transport text can appear INSIDE a genuine step -- a
-# test named TestHandles503 asserting "want 503 Service Unavailable" would
-# otherwise read as an outage and suppress a needed revert.
+# A step that only FETCHES things -- downloads, installs, restores caches -- runs
+# no project code, so a transport failure there is unambiguous.
 #
-# Genuine evidence always wins over transport evidence in the same step. The
-# asymmetry is deliberate: erring toward `genuine` costs a spurious revert, erring
-# the other way leaves main broken.
-_looks_genuine_failure() {
-	printf '%s' "${1:-}" | grep -qE \
-		'^--- FAIL:|--- FAIL:|panic:|AssertionError|expect\(|\.go:[0-9]+:[0-9]+:|error TS[0-9]+|✕ |[0-9]+ failed|FAIL [^ ]*\.(ts|tsx|go|py)|Error: expect' \
+# This replaces an earlier attempt that tried to recognise genuine FAILURES
+# instead. That was an unbounded allowlist: it missed Python tracebacks, eslint's
+# marker, prettier, gofmt, `make: *** Error`, `command not found` and more, and
+# any of those beside incidental transport text would have been misread as an
+# outage -- suppressing a revert a real regression needed. Enumerating every way
+# code can fail is not winnable; enumerating the few steps that only fetch is.
+#
+# Consequence, accepted deliberately: a transport failure INSIDE a test step (an
+# asset fetched mid-test) reads as genuine and still reverts. That costs a
+# spurious revert on an outage, which is the safe direction.
+_is_setup_step() {
+	printf '%s' "${1:-}" | grep -qiE \
+		'download|install|npm ci|yarn install|pip install|apt-get|set ?up |setup-|checkout|restore cache|cache |fetch |bundle|toolchain' \
 		&& echo yes || echo no
 }
 
@@ -297,15 +302,18 @@ _looks_genuine_failure() {
 #
 # Fails closed: no parseable step structure -> genuine.
 _classify_failed_steps() {
-	local log="${1:-}" keys key body
+	local log="${1:-}" keys key body step
 	[ -n "${log//[[:space:]]/}" ] || { echo genuine; return; }
 	keys=$(printf '%s\n' "$log" | awk -F'\t' 'NF>=3 {print $1"\t"$2}' | sort -u)
 	[ -n "${keys//[[:space:]]/}" ] || { echo genuine; return; }
 	while IFS= read -r key; do
 		[ -n "$key" ] || continue
 		body=$(printf '%s\n' "$log" | awk -F'\t' -v k="$key" 'NF>=3 && ($1 "\t" $2)==k')
-		# Genuine evidence in a step overrides any transport text it also contains.
-		[ "$(_looks_genuine_failure "$body")" = no ] || { echo genuine; return; }
+		step=${key#*$'\t'}
+		# BOTH must hold: a step that only fetches, AND transport evidence in it.
+		# The name alone is not enough (a bad lockfile fails `npm ci` genuinely);
+		# the evidence alone is not enough (that was the suppression bug).
+		[ "$(_is_setup_step "$step")" = yes ] || { echo genuine; return; }
 		[ "$(_is_transient_ci_log "$body")" = yes ] || { echo genuine; return; }
 	done <<EOF
 $keys
@@ -2310,30 +2318,43 @@ self_test() {
     || { echo "FAIL #52: empty log must fail closed to genuine"; exit 1; }
   echo "_is_transient_ci_log OK (#52)"
 
-  # --- #52: per-STEP classification. One genuine step must dominate a run whose
-  # other steps look transient -- judging the concatenation would suppress a
-  # needed revert, which is the dangerous direction.
+  # --- #52: only FETCH steps may be excused, and only with transport evidence.
+  [ "$(_is_setup_step 'Download embedded Postgres bundle')" = yes ] \
+    || { echo "FAIL #52: a download step is a setup step"; exit 1; }
+  [ "$(_is_setup_step 'Run npm ci')" = yes ] \
+    || { echo "FAIL #52: npm ci is a setup step"; exit 1; }
+  [ "$(_is_setup_step 'Run desktop E2E tests')" = no ] \
+    || { echo "FAIL #52: a test step must never be a setup step"; exit 1; }
+  [ "$(_is_setup_step 'Run go tests with coverage')" = no ] \
+    || { echo "FAIL #52: a go test step must never be a setup step"; exit 1; }
+
   _mklog() { printf '%s\n' "$@"; }
-  local _allinfra _mixed _onestep
+  local _allinfra _mixed _testxport _badlock
   _allinfra=$(_mklog \
-    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:29Z curl: (22)')" \
-    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:30Z The requested URL returned error: 503')" \
+    "$(printf 'e2e\tDownload embedded Postgres bundle\t2026-08-12T19:08:29Z curl: (22)')" \
     "$(printf 'lint\tRun npm ci\t2026-08-12T19:09:00Z npm error Error: socket hang up')")
   [ "$(_classify_failed_steps "$_allinfra")" = infra ] \
-    || { echo "FAIL #52: every failed step transient -> infra"; exit 1; }
+    || { echo "FAIL #52: fetch steps with transport evidence -> infra"; exit 1; }
 
+  # A genuine failure in ANY step dominates, whatever the others look like.
   _mixed=$(_mklog \
-    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:29Z curl: (22) returned error: 503')" \
+    "$(printf 'e2e\tDownload embedded Postgres bundle\t2026-08-12T19:08:29Z curl: (22)')" \
     "$(printf 'server\tRun go tests\t2026-08-12T19:10:00Z --- FAIL: TestThing (0.41s)')")
   [ "$(_classify_failed_steps "$_mixed")" = genuine ] \
-    || { echo "FAIL #52: a genuine step must dominate a transient one"; exit 1; }
+    || { echo "FAIL #52: a non-fetch failed step must dominate"; exit 1; }
 
-  # A genuine failure whose own step ALSO prints transport-looking fixture text.
-  _onestep=$(_mklog \
-    "$(printf 'server\tRun go tests\t2026-08-12T19:10:00Z --- FAIL: TestHandles503 (0.02s)')" \
-    "$(printf 'server\tRun go tests\t2026-08-12T19:10:01Z    want 503 Service Unavailable, got 200')")
-  [ "$(_classify_failed_steps "$_onestep")" = genuine ] \
-    || { echo "FAIL #52: transport text inside a genuine step must not excuse it"; exit 1; }
+  # The case the previous design got wrong: transport text inside a TEST step.
+  # Deliberately genuine -- a spurious revert beats suppressing a real regression.
+  _testxport=$(_mklog \
+    "$(printf 'e2e\tRun desktop E2E tests\t2026-08-12T20:59:59Z Response code 503 (Service Unavailable)')")
+  [ "$(_classify_failed_steps "$_testxport")" = genuine ] \
+    || { echo "FAIL #52: transport text in a TEST step must not excuse it"; exit 1; }
+
+  # A fetch step can fail genuinely too (a bad lockfile is not an outage).
+  _badlock=$(_mklog \
+    "$(printf 'lint\tRun npm ci\t2026-08-12T19:09:00Z npm error `npm ci` can only install with an existing package-lock.json')")
+  [ "$(_classify_failed_steps "$_badlock")" = genuine ] \
+    || { echo "FAIL #52: a fetch step without transport evidence is genuine"; exit 1; }
 
   [ "$(_classify_failed_steps '')" = genuine ] \
     || { echo "FAIL #52: empty log fails closed"; exit 1; }
