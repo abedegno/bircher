@@ -216,21 +216,27 @@ _classify_ci_failure() {
 
 # _reopen_reverted_issues <pr> -> reopens every issue the merged PR closed
 #
-# A revert restores the code but not the tracker. Without this the merge's
-# `Closes #N` leaves #N closed while the defect is live again, so the backlog
-# claims work that no longer exists -- and anything `blocked_by` #N silently
+# A revert restores the code but not the tracker. Without this, `Closes #N` leaves
+# #N closed while the defect is live again -- and anything `blocked_by` #N silently
 # becomes runnable. On 2026-08-12 that chain came within one wave of shipping a
 # broken app: a transient outage reverted a fix, its issue stayed closed, and the
 # dependent issue it was gating unblocked itself.
 #
-# Best-effort and loud: a failure here is reported, never swallowed, because a
-# closed issue for a live defect is worse than a noisy warning.
+# A FAILED lookup must never read as "nothing to reopen": that is the exact silence
+# this exists to remove, so the two are reported differently.
 _reopen_reverted_issues() {
-	local pr="$1" nums n
+	local pr="$1" nums n rc
 	[ -n "$pr" ] || return 0
 	nums=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
-		-q '.closingIssuesReferences[]?.number' 2>/dev/null)
-	[ -n "$nums" ] || { echo "[batch:merge] revert: PR #$pr closed no issues (nothing to reopen)" >&2; return 0; }
+		-q '.closingIssuesReferences[]?.number' 2>/dev/null); rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "[batch:merge] WARN revert: could NOT look up the issues PR #$pr closed (gh rc=$rc) - any are still marked fixed; check by hand" >&2
+		return 0
+	fi
+	if [ -z "${nums//[[:space:]]/}" ]; then
+		echo "[batch:merge] revert: PR #$pr closed no issues (nothing to reopen)" >&2
+		return 0
+	fi
 	while IFS= read -r n; do
 		[ -n "$n" ] || continue
 		if gh issue reopen "$n" --repo "$REPO" \
@@ -246,45 +252,102 @@ EOF
 
 # _is_transient_ci_log <text> -> yes|no   (PURE, self-tested)
 #
-# Recognises a CI failure caused by the network or a provider rather than by the
-# code. _classify_ci_failure only spots the ZERO-failed-steps shape (runner never
-# acquired the job); it cannot see the case that actually bit us, where a step ran
-# and failed because something it downloaded was briefly unavailable.
+# Recognises transport/availability failures. _classify_ci_failure only spots the
+# ZERO-failed-steps shape (runner never acquired the job); it cannot see the case
+# that bit us, where a step ran and failed because a download was unavailable.
 #
 # 2026-08-12: three merges were reverted in one afternoon by transient outages --
 # a 503 on the embedded Postgres bundle, then a GitHub-wide episode that broke
-# `npm ci` (socket hang up) and Electron's release downloads (503). Each revert
-# undid a reviewed, green change, left its issue closed (see the reopen below),
-# and once silently unblocked a dependent issue whose fix alone would have shipped
-# a broken app. Reverting cannot fix a provider outage; only waiting can.
+# `npm ci` and Electron's release downloads. Reverting cannot fix a provider
+# outage; only waiting can.
 #
-# Deliberately NARROW. These patterns describe transport and availability, never
-# assertions or compiler output, so a genuine failure cannot match. Anything not
-# listed stays `genuine` -- the fail-closed direction, since a missed infra
-# failure costs one spurious revert while a missed genuine failure keeps main red.
+# Deliberately NARROW: these describe transport, never assertions or compiler
+# output. Anything unrecognised stays genuine -- a missed infra failure costs one
+# spurious revert, a missed genuine failure leaves main broken.
 _is_transient_ci_log() {
 	printf '%s' "${1:-}" | grep -qiE \
-		'socket hang up|Service Unavailable|error: 50[234]|Response code 50[234]|curl: \\(22\\)|curl: \\(56\\)|ECONNRESET|ETIMEDOUT|EAI_AGAIN|TLS handshake timeout|TypeError: fetch failed|Connection reset by peer|The requested URL returned error: 50[234]|remote end hung up' \
+		'socket hang up|Service Unavailable|Response code 50[234]|curl: \(22\)|curl: \(56\)|curl: \(52\)|ECONNRESET|ETIMEDOUT|EAI_AGAIN|TLS handshake timeout|TypeError: fetch failed|Connection reset by peer|returned error: 50[234]|remote end hung up|Could not resolve host' \
 		&& echo yes || echo no
+}
+
+# _looks_genuine_failure <text> -> yes|no   (PURE, self-tested)
+#
+# Positive evidence that code failed: assertions, compiler errors, panics, test
+# summaries. Needed because transport text can appear INSIDE a genuine step -- a
+# test named TestHandles503 asserting "want 503 Service Unavailable" would
+# otherwise read as an outage and suppress a needed revert.
+#
+# Genuine evidence always wins over transport evidence in the same step. The
+# asymmetry is deliberate: erring toward `genuine` costs a spurious revert, erring
+# the other way leaves main broken.
+_looks_genuine_failure() {
+	printf '%s' "${1:-}" | grep -qE \
+		'^--- FAIL:|--- FAIL:|panic:|AssertionError|expect\(|\.go:[0-9]+:[0-9]+:|error TS[0-9]+|✕ |[0-9]+ failed|FAIL [^ ]*\.(ts|tsx|go|py)|Error: expect' \
+		&& echo yes || echo no
+}
+
+# _classify_failed_steps <log-failed-text> -> infra|genuine   (PURE, self-tested)
+#
+# `gh run view --log-failed` emits "<job>\t<step>\t<timestamp> <text>" per line, so
+# the failed STEP is the right unit -- not the whole run. Grouping matters: a
+# genuine test failure and an incidental "503" in some other step share one run
+# log, and judging the concatenation would let the transport text mask the real
+# failure and SUPPRESS A NEEDED REVERT. Every failed step must independently look
+# transient; one genuine or unrecognised step decides the whole run.
+#
+# Fails closed: no parseable step structure -> genuine.
+_classify_failed_steps() {
+	local log="${1:-}" keys key body
+	[ -n "${log//[[:space:]]/}" ] || { echo genuine; return; }
+	keys=$(printf '%s\n' "$log" | awk -F'\t' 'NF>=3 {print $1"\t"$2}' | sort -u)
+	[ -n "${keys//[[:space:]]/}" ] || { echo genuine; return; }
+	while IFS= read -r key; do
+		[ -n "$key" ] || continue
+		body=$(printf '%s\n' "$log" | awk -F'\t' -v k="$key" 'NF>=3 && ($1 "\t" $2)==k')
+		# Genuine evidence in a step overrides any transport text it also contains.
+		[ "$(_looks_genuine_failure "$body")" = no ] || { echo genuine; return; }
+		[ "$(_is_transient_ci_log "$body")" = yes ] || { echo genuine; return; }
+	done <<EOF
+$keys
+EOF
+	echo infra
+}
+
+# _blocking_red_run_ids <sha> -> workflow-run ids for the checks that made main red
+#
+# Must see EXACTLY the checks the watcher judged, or classification and decision
+# disagree: a failed NON-blocking check could otherwise flip the verdict either way.
+# `_keep_blocking_checks` strips the leading field, so the name is passed twice and
+# comes back intact -- that reuses the watcher's own ignore/required filtering
+# rather than reimplementing it and letting the two drift.
+#
+# Red conclusions match _checkrun_state exactly.
+_blocking_red_run_ids() {
+	local sha="$1" raw kept
+	[ -n "$sha" ] || return 1
+	raw=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+		-q '.check_runs[] | "\(.name)|\(.name)|\(.conclusion // "")|\(.details_url)"' 2>/dev/null) || return 1
+	[ -n "$raw" ] || return 1
+	kept=$(_keep_blocking_checks "$raw" "$(_required_contexts)")
+	printf '%s\n' "$kept" \
+		| awk -F'|' '$2 ~ /^(failure|cancelled|timed_out|action_required|stale)$/ {print $3}' \
+		| grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+' | sort -u
 }
 
 # _main_ci_kind <sha> -> infra|genuine
 #
-# Reads the failed-step logs of every failing run on the merge commit and asks
-# _is_transient_ci_log about them. Fails closed on `genuine`: an unreadable log
-# tells us nothing, and treating "unknown" as infra would suppress real reverts.
+# Every blocking check that made main red must be independently transient. Fails
+# closed on genuine: an unreadable log or a lookup failure tells us nothing, and
+# treating "unknown" as infra would suppress real reverts.
 _main_ci_kind() {
 	local sha="$1" ids rid log
-	[ -n "$sha" ] || { echo genuine; return; }
-	ids=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-		-q '.check_runs[] | select(.conclusion=="failure") | .details_url' 2>/dev/null \
-		| grep -oE '/runs/[0-9]+' | grep -oE '[0-9]+' | sort -u)
-	[ -n "$ids" ] || { echo genuine; return; }
+	ids=$(_blocking_red_run_ids "$sha") || { echo genuine; return; }
+	[ -n "${ids//[[:space:]]/}" ] || { echo genuine; return; }
 	while IFS= read -r rid; do
 		[ -n "$rid" ] || continue
-		log=$(gh run view "$rid" --repo "$REPO" --log-failed 2>/dev/null | tail -c 20000)
-		[ -n "$log" ] || { echo genuine; return; }
-		[ "$(_is_transient_ci_log "$log")" = yes ] || { echo genuine; return; }
+		log=$(gh run view "$rid" --repo "$REPO" --log-failed 2>/dev/null)
+		[ -n "${log//[[:space:]]/}" ] || { echo genuine; return; }
+		[ "$(_classify_failed_steps "$log")" = infra ] || { echo genuine; return; }
 	done <<EOF
 $ids
 EOF
@@ -2221,27 +2284,63 @@ self_test() {
   [ "$(_classify_ci_failure 3)" = genuine ] || { echo "FAIL _classify_ci_failure 3->genuine"; exit 1; }
   [ "$(_classify_ci_failure '')" = infra ]  || { echo "FAIL _classify_ci_failure empty->infra"; exit 1; }
   # --- #52: transport failures must not be read as genuine ---------------------
-  # The 2026-08-12 reverts: a step DID fail, so _classify_ci_failure said genuine.
-  # These are the actual log lines those runs produced.
-  [ "$(_is_transient_ci_log 'curl: (22) The requested URL returned error: 503')" = yes ] \
-    || { echo "FAIL #52: 503 on an asset download is transport"; exit 1; }
+  # The real log lines from the 2026-08-12 reverts. Each is asserted ALONE, so a
+  # broken alternative cannot hide behind another that happens to match the same
+  # fixture (the first version of this test did exactly that and passed with the
+  # curl pattern broken).
+  [ "$(_is_transient_ci_log 'curl: (22)')" = yes ] \
+    || { echo "FAIL #52: bare curl: (22) must match"; exit 1; }
+  [ "$(_is_transient_ci_log 'curl: (56)')" = yes ] \
+    || { echo "FAIL #52: bare curl: (56) must match"; exit 1; }
   [ "$(_is_transient_ci_log 'npm error Error: socket hang up')" = yes ] \
     || { echo "FAIL #52: npm socket hang up is transport"; exit 1; }
-  [ "$(_is_transient_ci_log 'HTTPError: Response code 503 (Service Unavailable) for https://github.com/electron/electron/releases')" = yes ] \
-    || { echo "FAIL #52: electron 503 is transport"; exit 1; }
+  [ "$(_is_transient_ci_log 'HTTPError: Response code 503 (Service Unavailable)')" = yes ] \
+    || { echo "FAIL #52: 503 response code is transport"; exit 1; }
   [ "$(_is_transient_ci_log 'TypeError: fetch failed')" = yes ] \
     || { echo "FAIL #52: fetch failed is transport"; exit 1; }
-  # And the direction that matters more: a real failure must NEVER read as transport,
-  # or a genuine breakage would sit on main unreverted.
+  # The direction that matters more: a real failure must NEVER read as transport,
+  # or a genuine breakage sits on main unreverted.
   [ "$(_is_transient_ci_log '--- FAIL: TestResummarizeGuardReleasedAfterSuccess (0.41s)')" = no ] \
     || { echo "FAIL #52: a Go test failure must not read as transport"; exit 1; }
-  [ "$(_is_transient_ci_log 'internal/api/admin_health.go:258:19: undefined: syscall.Statfs_t')" = no ] \
+  [ "$(_is_transient_ci_log 'admin_health.go:258:19: undefined: syscall.Statfs_t')" = no ] \
     || { echo "FAIL #52: a compile error must not read as transport"; exit 1; }
   [ "$(_is_transient_ci_log 'Error: expect(locator).toBeVisible() failed')" = no ] \
     || { echo "FAIL #52: an assertion failure must not read as transport"; exit 1; }
   [ "$(_is_transient_ci_log '')" = no ] \
     || { echo "FAIL #52: empty log must fail closed to genuine"; exit 1; }
   echo "_is_transient_ci_log OK (#52)"
+
+  # --- #52: per-STEP classification. One genuine step must dominate a run whose
+  # other steps look transient -- judging the concatenation would suppress a
+  # needed revert, which is the dangerous direction.
+  _mklog() { printf '%s\n' "$@"; }
+  local _allinfra _mixed _onestep
+  _allinfra=$(_mklog \
+    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:29Z curl: (22)')" \
+    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:30Z The requested URL returned error: 503')" \
+    "$(printf 'lint\tRun npm ci\t2026-08-12T19:09:00Z npm error Error: socket hang up')")
+  [ "$(_classify_failed_steps "$_allinfra")" = infra ] \
+    || { echo "FAIL #52: every failed step transient -> infra"; exit 1; }
+
+  _mixed=$(_mklog \
+    "$(printf 'e2e\tDownload bundle\t2026-08-12T19:08:29Z curl: (22) returned error: 503')" \
+    "$(printf 'server\tRun go tests\t2026-08-12T19:10:00Z --- FAIL: TestThing (0.41s)')")
+  [ "$(_classify_failed_steps "$_mixed")" = genuine ] \
+    || { echo "FAIL #52: a genuine step must dominate a transient one"; exit 1; }
+
+  # A genuine failure whose own step ALSO prints transport-looking fixture text.
+  _onestep=$(_mklog \
+    "$(printf 'server\tRun go tests\t2026-08-12T19:10:00Z --- FAIL: TestHandles503 (0.02s)')" \
+    "$(printf 'server\tRun go tests\t2026-08-12T19:10:01Z    want 503 Service Unavailable, got 200')")
+  [ "$(_classify_failed_steps "$_onestep")" = genuine ] \
+    || { echo "FAIL #52: transport text inside a genuine step must not excuse it"; exit 1; }
+
+  [ "$(_classify_failed_steps '')" = genuine ] \
+    || { echo "FAIL #52: empty log fails closed"; exit 1; }
+  [ "$(_classify_failed_steps 'no tab structure at all')" = genuine ] \
+    || { echo "FAIL #52: unparseable log fails closed"; exit 1; }
+  unset -f _mklog
+  echo "_classify_failed_steps OK (#52)"
 
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
   printf '279\n' > "$_std/cal08.pr"
