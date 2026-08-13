@@ -731,7 +731,7 @@ merge_ready_pr() {
     decision=$(_main_ci_verdict "$state" "")
   else
     echo "[batch:merge] $item: main CI $state on $sha -> re-running once before deciding (flake check)" >&2
-    local second; second=$(_rerun_main_ci "$sha")
+    local second; second=$(_rerun_main_ci_until_green "$sha")
     decision=$(_main_ci_verdict "$state" "$second")
     echo "[batch:merge] $item: re-run main CI -> $second (verdict: $decision)" >&2
   fi
@@ -1275,6 +1275,43 @@ _drop_non_ci_checkruns() {
   printf '%s\n' "$1" \
     | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|" \
     | sed 's/^[^|]*|//'
+}
+
+# _rerun_main_ci_until_green <sha> [attempts] [delay_s] -> green|red|pending
+#
+# Re-runs main's CI on the SAME commit, several times, spaced out. If it ever goes
+# green with no code change, the earlier red was transient -- that is causal
+# evidence, not a guess about what the logs meant.
+#
+# Replaces an attempt to CLASSIFY failures by log content. Three rounds of review
+# established that it could not be made safe: matching "503" or "socket hang up"
+# in a step proves co-occurrence, never causation, so a genuine regression sharing
+# a log with incidental transport text would have escaped the revert it needed.
+# Re-running asks the question directly and cannot be fooled by wording.
+#
+# 2026-08-12 is the case to beat: three reviewed, green merges were reverted
+# because a provider outage lasted MINUTES. One immediate re-run rode straight
+# into it; spacing the attempts out clears it.
+#
+# The cost is honest: a genuinely broken main now stays red for up to
+# attempts x (CI + delay) before the revert. Kept to three attempts for that
+# reason -- long enough for an outage, short enough that a real breakage is not
+# left standing.
+_rerun_main_ci_until_green() {
+	local sha="$1" attempts="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
+	local i st=red
+	for i in $(seq 1 "$attempts"); do
+		st=$(_rerun_main_ci "$sha")
+		if [ "$st" = green ]; then
+			echo "[batch:merge] main CI went GREEN on re-run $i/$attempts with no code change -> the red was transient" >&2
+			echo green; return
+		fi
+		if [ "$i" -lt "$attempts" ]; then
+			echo "[batch:merge] main CI still $st on re-run $i/$attempts; waiting ${delay}s before retrying (a provider outage outlasts one re-run)" >&2
+			sleep "$delay"
+		fi
+	done
+	echo "$st"
 }
 
 # _main_ci_verdict <first-state> <second-state> -> continue|revert-halt|halt
@@ -2133,6 +2170,49 @@ self_test() {
   [ "$(_classify_ci_failure 0)" = infra ]   || { echo "FAIL _classify_ci_failure 0->infra"; exit 1; }
   [ "$(_classify_ci_failure 3)" = genuine ] || { echo "FAIL _classify_ci_failure 3->genuine"; exit 1; }
   [ "$(_classify_ci_failure '')" = infra ]  || { echo "FAIL _classify_ci_failure empty->infra"; exit 1; }
+  # --- #52: retries prove transience causally, not by reading logs -------------
+  # A provider outage outlasts one re-run; a genuine failure survives all of them.
+  # State lives in a FILE: the helper calls the stub inside $( ), so a variable
+  # mutated there is lost with the subshell and every call would replay the first
+  # answer (which is exactly how the first version of this test fooled itself).
+  local _sq="${TMPDIR:-/tmp}/bircher-st-seq-$$"
+  _rerun_main_ci() {
+    local first rest
+    first=$(head -1 "$_sq"); rest=$(tail -n +2 "$_sq")
+    printf '%s\n' "$rest" > "$_sq"
+    echo "$((`cat "$_sq.n" 2>/dev/null || echo 0` + 1))" > "$_sq.n"
+    printf '%s' "$first"
+  }
+  _seq() { printf '%s\n' "$@" > "$_sq"; : > "$_sq.n"; }
+  _ncalls() { cat "$_sq.n" 2>/dev/null || echo 0; }
+
+  _seq red red green
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: green on a later re-run means transient"; exit 1; }
+
+  _seq red red red
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = red ] \
+    || { echo "FAIL #52: red through every attempt stays red"; exit 1; }
+
+  # Must stop as soon as it is green -- not keep burning CI runs.
+  _seq green red red
+  _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
+  [ "$(_ncalls)" = 1 ] \
+    || { echo "FAIL #52: should stop re-running after green (got $(_ncalls))"; exit 1; }
+
+  # And must actually retry past the first red -- the exact defect of the old
+  # single re-run, which rode straight into the outage.
+  _seq red green red
+  _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
+  [ "$(_ncalls)" = 2 ] \
+    || { echo "FAIL #52: must retry past the first red (got $(_ncalls))"; exit 1; }
+
+  _seq pending pending pending
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = pending ] \
+    || { echo "FAIL #52: a never-settling CI reports pending, not green"; exit 1; }
+  rm -f "$_sq" "$_sq.n"; unset -f _rerun_main_ci _seq _ncalls
+  echo "_rerun_main_ci_until_green OK (#52)"
+
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
   printf '279\n' > "$_std/cal08.pr"
   [ "$(_pr_signal cal08)" = "279" ] || { echo "FAIL _pr_signal read"; exit 1; }
