@@ -766,8 +766,8 @@ merge_ready_pr() {
   if [ "$state" = green ] || [ "${BIRCHER_MAIN_CI_RERUN:-1}" = 0 ]; then
     decision=$(_main_ci_verdict "$state" "")
   else
-    echo "[batch:merge] $item: main CI $state on $sha -> re-running once before deciding (flake check)" >&2
-    local second; second=$(_rerun_main_ci "$sha")
+    echo "[batch:merge] $item: main CI $state on $sha -> re-running before deciding (flake check)" >&2
+    local second; second=$(_rerun_main_ci_until_green "$sha")
     decision=$(_main_ci_verdict "$state" "$second")
     echo "[batch:merge] $item: re-run main CI -> $second (verdict: $decision)" >&2
   fi
@@ -1314,13 +1314,82 @@ _drop_non_ci_checkruns() {
     | sed 's/^[^|]*|//'
 }
 
+# _rerun_main_ci_until_green <sha> [budget] [delay_s] -> green|red|pending|unknown
+#
+# Re-runs main's CI on the SAME commit until it goes green or the budget is spent.
+# A green with no code change is causal evidence the earlier red was transient --
+# unlike reading the logs, which proves only that some words co-occurred. Three
+# rounds of review killed the log-classifying designs for exactly that reason.
+#
+# 2026-08-12 is the case to beat: three reviewed, green merges were reverted
+# because a provider outage lasted MINUTES, and the single immediate re-run rode
+# straight into it.
+#
+# BUDGET COUNTS RE-RUNS, not loop iterations. An earlier version counted
+# iterations while a single iteration could dispatch TWO re-runs (a partial plus
+# its confirmation), so the real worst case was five re-runs against a documented
+# three -- roughly 87 minutes of a broken main going unreverted while the comment
+# promised an hour. The bound now means what it says.
+#
+# A green from a `--failed` re-run is not evidence on its own: the jobs that
+# passed before are never re-run, so only a FULL run's green is accepted. The last
+# re-run the budget can afford is therefore always full, and a partial green with
+# nothing left to confirm it reports `unknown` (no verdict -> halt, never revert).
+#
+# Worst case with the defaults: 3 x (MAIN_CI_TIMEOUT 900s + 20s startup) + 2 x 300s
+# = 56 minutes, ~71 including the initial post-merge watch. That is the ceiling on
+# how long a genuinely broken main stays unreverted; keep it in mind before raising
+# the budget.
+_rerun_main_ci_until_green() {
+	local sha="$1" budget="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
+	local st=unknown mode
+	# A non-numeric or non-positive setting must not silently mean "never retried".
+	case "$budget" in ''|*[!0-9]*) budget=3 ;; esac
+	[ "$budget" -ge 1 ] 2>/dev/null || budget=1
+	while [ "$budget" -gt 0 ]; do
+		# The last re-run we can afford must be full, so a green can be accepted.
+		mode=""; [ "$budget" -eq 1 ] && mode=full
+		st=$(_rerun_main_ci "$sha" "$mode"); budget=$((budget - 1))
+		if [ "$st" = green ]; then
+			if [ "$mode" = full ]; then
+				echo "[batch:merge] main CI went GREEN on a full re-run with no code change -> the red was transient" >&2
+				echo green; return
+			fi
+			# No budget check needed: the last affordable re-run is always full, so a
+			# green from a PARTIAL run always has at least one re-run left to confirm it.
+			echo "[batch:merge] main CI green on a partial re-run -> confirming with a full re-run" >&2
+			st=$(_rerun_main_ci "$sha" full); budget=$((budget - 1))
+			if [ "$st" = green ]; then
+				echo "[batch:merge] full re-run confirmed GREEN -> the red was transient" >&2
+				echo green; return
+			fi
+			echo "[batch:merge] full re-run did NOT confirm ($st) -> the partial green was not evidence" >&2
+		fi
+		[ "$budget" -gt 0 ] && sleep "$delay"
+	done
+	[ "$st" = red ] || echo "[batch:merge] main CI re-runs produced NO verdict ($st) -> will halt without reverting" >&2
+	echo "$st"
+}
+
 # _main_ci_verdict <first-state> <second-state> -> continue|revert-halt|halt
 # first/second are _checkrun_state outputs (green|red|pending). A non-green FIRST
 # is re-checked once (SECOND); only a still-bad SECOND acts. Pending==unresolved.
 _main_ci_verdict() {
   case "$1" in
     green) echo continue ;;
-    red)   [ "${2:-}" = green ] && echo continue || echo "revert-halt" ;;
+    red)
+      # An empty second state means no re-run was ATTEMPTED (the operator disabled
+      # it), so the first red stands. `pending`/`unknown` mean one was attempted and
+      # produced NO VERDICT -- a timeout, a rate limit, a run already in flight.
+      # Reverting on that is reverting on ignorance, which is how a provider outage
+      # destroyed reviewed work on 2026-08-12. Halt instead: the wave still stops,
+      # but nothing good is thrown away.
+      case "${2:-}" in
+        "")      echo "revert-halt" ;;
+        green)   echo continue ;;
+        red)     echo "revert-halt" ;;
+        *)       echo halt ;;
+      esac ;;
     *)     [ "${2:-}" = green ] && echo continue || echo halt ;;
   esac
 }
@@ -1350,12 +1419,19 @@ _revert_git_args() {
 # run for the merge commit ONCE, then re-polls the commit's check-runs. Used to
 # distinguish a flaky red/hung main from a genuine one before reverting/halting.
 _rerun_main_ci() {
-  local sha="$1" rid w=0 lines st
+  local sha="$1" full="${2:-}" rid w=0 lines st
   rid=$(gh run list --repo "$REPO" --branch main --limit 10 --json databaseId,headSha \
         -q ".[] | select(.headSha==\"$sha\") | .databaseId" 2>/dev/null | head -1)
-  [ -n "$rid" ] || { echo red; return; }
-  gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
-    || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo red; return; }
+  # `unknown`, NOT red: no verdict was obtained. Reporting red here would let a
+  # rate limit or "this workflow is already running" masquerade as confirmed
+  # regression evidence and revert a good commit (2026-08-12 hit both).
+  [ -n "$rid" ] || { echo unknown; return; }
+  if [ "$full" = full ]; then
+    gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
+  else
+    gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
+      || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
+  fi
   sleep 20
   while [ "$w" -lt "$MAIN_CI_TIMEOUT" ]; do
     lines=$(gh api "repos/$REPO/commits/$sha/check-runs" \
@@ -2214,6 +2290,92 @@ self_test() {
   unset _GH_ISSUES _GH_LOOKUP_FAILS _GH_REOPEN_FAILS
   echo "_reopen_reverted_issues OK (#50)"
 
+  # _rerun_main_ci itself must report `unknown`, not `red`, when it never obtained a
+  # verdict -- the stub above replaces the whole function, so this exercises its own
+  # dispatch path. `red` here is what let a rate limit read as regression evidence.
+  gh() {
+    case "$*" in
+      *"run list"*)  [ "${_GH_NO_RUN:-0}" = 1 ] && return 0; echo 12345 ;;
+      *"run rerun"*) return "${_GH_RERUN_RC:-0}" ;;
+      *) return 0 ;;
+    esac
+  }
+  # Run in subshells with REPO/MAIN_CI_TIMEOUT scoped in: the function reads both,
+  # and the suite does not set them globally.
+  _out=$( REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=1; _rerun_main_ci deadbeef 2>/dev/null )
+  [ "$_out" = unknown ] \
+    || { echo "FAIL #52: no run found must be unknown, not '$_out'"; exit 1; }
+  _out=$( REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=0 _GH_RERUN_RC=1; _rerun_main_ci deadbeef 2>/dev/null )
+  [ "$_out" = unknown ] \
+    || { echo "FAIL #52: a failed rerun dispatch must be unknown, not '$_out'"; exit 1; }
+  unset -f gh
+
+  # --- #52: retries prove transience causally; no verdict must never revert -----
+  # State lives in a FILE: the helper calls the stub inside $( ), so a variable
+  # mutated there dies with the subshell and every call would replay the first
+  # answer (which is how the first version of this test fooled itself).
+  local _sq="${TMPDIR:-/tmp}/bircher-st-seq-$$"
+  _rerun_main_ci() {
+    local first rest
+    first=$(head -1 "$_sq"); rest=$(tail -n +2 "$_sq")
+    printf '%s\n' "$rest" > "$_sq"
+    printf '%s\n' "${2:-partial}" >> "$_sq.modes"
+    echo "$(( $(cat "$_sq.n" 2>/dev/null || echo 0) + 1 ))" > "$_sq.n"
+    printf '%s' "$first"
+  }
+  _seq() { printf '%s\n' "$@" > "$_sq"; : > "$_sq.n"; : > "$_sq.modes"; }
+  _ncalls() { cat "$_sq.n" 2>/dev/null || echo 0; }
+
+  # budget 3: partial(red), partial(green) + full confirm(green) = 3 re-runs.
+  _seq red green green
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: a confirmed green after a red is transient"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: budget must count re-runs (got $(_ncalls))"; exit 1; }
+
+  _seq red red red
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = red ] \
+    || { echo "FAIL #52: red through the whole budget stays red"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: must not exceed its budget (got $(_ncalls))"; exit 1; }
+
+  # No verdict must propagate as unknown, NOT red -- red would revert.
+  _seq unknown unknown unknown
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = unknown ] \
+    || { echo "FAIL #52: undispatched re-runs must report unknown, not red"; exit 1; }
+
+  # A partial green must be confirmed by a FULL run before it counts.
+  _seq green green
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: a confirmed partial green is accepted"; exit 1; }
+  [ "$(_ncalls)" = 2 ] \
+    || { echo "FAIL #52: a partial green costs a confirming run (got $(_ncalls))"; exit 1; }
+  [ "$(tail -1 "$_sq.modes")" = full ] \
+    || { echo "FAIL #52: the confirming run must be full"; exit 1; }
+
+  # Unconfirmed, and the budget runs out: must NOT be reported green, and the
+  # exact outcome is pinned rather than merely "not green".
+  _seq green red red
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = red ] \
+    || { echo "FAIL #52: an unconfirmed partial green must report the full run's verdict"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: unconfirmed path must respect the budget (got $(_ncalls))"; exit 1; }
+
+  # A partial green with NO budget left to confirm it is not evidence either.
+  _seq green
+  [ "$(_rerun_main_ci_until_green deadbeef 1 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: with budget 1 the single run is full, so its green counts"; exit 1; }
+  [ "$(head -1 "$_sq.modes")" = full ] \
+    || { echo "FAIL #52: a budget of 1 must spend it on a FULL run"; exit 1; }
+
+  # A bad setting must not silently mean "never retried".
+  _seq red green green
+  [ "$(_rerun_main_ci_until_green deadbeef notanumber 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: a non-numeric budget must fall back to a sane default"; exit 1; }
+
+  rm -f "$_sq" "$_sq.n" "$_sq.modes"; unset -f _rerun_main_ci _seq _ncalls
+  echo "_rerun_main_ci_until_green OK (#52)"
+
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
   printf '279\n' > "$_std/cal08.pr"
   [ "$(_pr_signal cal08)" = "279" ] || { echo "FAIL _pr_signal read"; exit 1; }
@@ -2943,7 +3105,13 @@ SH
   [ "$(_main_ci_verdict green "")"     = continue ]    || { echo "FAIL verdict green"; exit 1; }
   [ "$(_main_ci_verdict red green)"    = continue ]    || { echo "FAIL verdict red,green"; exit 1; }
   [ "$(_main_ci_verdict red red)"      = revert-halt ] || { echo "FAIL verdict red,red"; exit 1; }
-  [ "$(_main_ci_verdict red pending)"  = revert-halt ] || { echo "FAIL verdict red,pending"; exit 1; }
+  # CHANGED deliberately (#52). This used to assert revert-halt, i.e. revert when a
+  # re-run never settled. That is reverting on ignorance: on 2026-08-12 a provider
+  # outage produced exactly this shape and destroyed reviewed work. An empty second
+  # state still reverts -- that means no re-run was ATTEMPTED, so the first red stands.
+  [ "$(_main_ci_verdict red pending)"  = halt ]        || { echo "FAIL verdict red,pending must NOT revert (no verdict)"; exit 1; }
+  [ "$(_main_ci_verdict red unknown)"  = halt ]        || { echo "FAIL verdict red,unknown must NOT revert (no verdict)"; exit 1; }
+  [ "$(_main_ci_verdict red "")"       = revert-halt ] || { echo "FAIL verdict red,'' (re-run disabled) still reverts"; exit 1; }
   [ "$(_main_ci_verdict pending green)" = continue ]   || { echo "FAIL verdict pending,green"; exit 1; }
   [ "$(_main_ci_verdict pending red)"  = halt ]        || { echo "FAIL verdict pending,red"; exit 1; }
   [ "$(_main_ci_verdict pending pending)" = halt ]     || { echo "FAIL verdict pending,pending"; exit 1; }
