@@ -214,6 +214,42 @@ _classify_ci_failure() {
   [ "${1:-0}" -gt 0 ] 2>/dev/null && echo genuine || echo infra
 }
 
+# _reopen_reverted_issues <pr> -> reopens every issue the merged PR closed
+#
+# A revert restores the code but not the tracker. Without this, `Closes #N` leaves
+# #N closed while the defect is live again -- and anything `blocked_by` #N silently
+# becomes runnable. On 2026-08-12 that chain came within one wave of shipping a
+# broken app: a transient outage reverted a fix, its issue stayed closed, and the
+# dependent issue it was gating unblocked itself.
+#
+# A FAILED lookup must never read as "nothing to reopen": that is the exact silence
+# this exists to remove, so the two are reported differently.
+_reopen_reverted_issues() {
+	local pr="$1" nums n rc
+	[ -n "$pr" ] || return 0
+	nums=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
+		-q '.closingIssuesReferences[]?.number' 2>/dev/null); rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "[batch:merge] WARN revert: could NOT look up the issues PR #$pr closed (gh rc=$rc) - any are still marked fixed; check by hand" >&2
+		return 0
+	fi
+	if [ -z "${nums//[[:space:]]/}" ]; then
+		echo "[batch:merge] revert: PR #$pr closed no issues (nothing to reopen)" >&2
+		return 0
+	fi
+	while IFS= read -r n; do
+		[ -n "$n" ] || continue
+		if gh issue reopen "$n" --repo "$REPO" \
+			--comment "Reopening: the fix for this was merged in #$pr and then automatically reverted because main CI went red. The defect is live again." >/dev/null 2>&1; then
+			echo "[batch:merge] revert: reopened issue #$n (its fix was reverted)" >&2
+		else
+			echo "[batch:merge] WARN revert: could NOT reopen issue #$n - it still reads as fixed; reopen by hand" >&2
+		fi
+	done <<EOF
+$nums
+EOF
+}
+
 # _run_ids_from_check_links <lines> -> unique workflow-run IDs, one per line. (PURE)
 # Input lines are "name|link" as emitted by `gh pr checks --json name,link`.
 #
@@ -767,6 +803,7 @@ merge_ready_pr() {
       git -C "$WORKDIR" worktree remove --force "$rw" 2>/dev/null
       # MERGE_NOTE must reflect what ACTUALLY happened (it lands in the scorecard).
       if [ "$reverted" = 1 ]; then
+        _reopen_reverted_issues "$pr"
         MERGE_NOTE="merged then REVERTED: main CI red (confirmed on re-run)"
       else
         MERGE_NOTE="merged; automatic revert FAILED - main RED, fix by hand"
@@ -2133,6 +2170,50 @@ self_test() {
   [ "$(_classify_ci_failure 0)" = infra ]   || { echo "FAIL _classify_ci_failure 0->infra"; exit 1; }
   [ "$(_classify_ci_failure 3)" = genuine ] || { echo "FAIL _classify_ci_failure 3->genuine"; exit 1; }
   [ "$(_classify_ci_failure '')" = infra ]  || { echo "FAIL _classify_ci_failure empty->infra"; exit 1; }
+
+  # --- #50: a revert must reopen what its merge closed --------------------------
+  # The silence this removes: a failed LOOKUP previously read the same as "this PR
+  # closed nothing", so a revert could leave a live defect marked fixed while the
+  # log said all was well. 2026-08-12: that also silently unblocked a dependent
+  # issue whose fix alone would have shipped a broken app.
+  gh() {
+    case "$*" in
+      *"--json closingIssuesReferences"*)
+        [ "${_GH_LOOKUP_FAILS:-0}" = 1 ] && return 4
+        printf '%s\n' ${_GH_ISSUES:-} ;;
+      *"issue reopen"*) [ "${_GH_REOPEN_FAILS:-0}" = 1 ] && return 5; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  local _out
+  _GH_ISSUES="41 42" _out=$(_reopen_reverted_issues 99 2>&1)
+  printf '%s' "$_out" | grep -q "reopened issue #41" \
+    || { echo "FAIL #50: did not reopen the first closed issue"; exit 1; }
+  printf '%s' "$_out" | grep -q "reopened issue #42" \
+    || { echo "FAIL #50: did not reopen the second closed issue"; exit 1; }
+
+  _GH_ISSUES="" _out=$(_reopen_reverted_issues 99 2>&1)
+  printf '%s' "$_out" | grep -q "closed no issues" \
+    || { echo "FAIL #50: a PR that closed nothing should say so"; exit 1; }
+  printf '%s' "$_out" | grep -qi "WARN" \
+    && { echo "FAIL #50: closing nothing is not a warning"; exit 1; }
+
+  # The distinction that matters: a lookup FAILURE must not read as "nothing to do".
+  _GH_LOOKUP_FAILS=1 _out=$(_reopen_reverted_issues 99 2>&1)
+  printf '%s' "$_out" | grep -qi "WARN.*could NOT look up" \
+    || { echo "FAIL #50: a failed lookup must warn, not report silence"; exit 1; }
+  printf '%s' "$_out" | grep -q "closed no issues" \
+    && { echo "FAIL #50: a failed lookup must NOT claim the PR closed nothing"; exit 1; }
+
+  # NB: these are assignments, not command prefixes, so they persist between
+  # cases -- reset the previous one explicitly or it leaks into this test.
+  _GH_LOOKUP_FAILS=0 _GH_ISSUES="41" _GH_REOPEN_FAILS=1 _out=$(_reopen_reverted_issues 99 2>&1)
+  printf '%s' "$_out" | grep -qi "WARN.*could NOT reopen issue #41" \
+    || { echo "FAIL #50: a failed reopen must warn"; exit 1; }
+  unset -f gh
+  unset _GH_ISSUES _GH_LOOKUP_FAILS _GH_REOPEN_FAILS
+  echo "_reopen_reverted_issues OK (#50)"
+
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
   printf '279\n' > "$_std/cal08.pr"
   [ "$(_pr_signal cal08)" = "279" ] || { echo "FAIL _pr_signal read"; exit 1; }
