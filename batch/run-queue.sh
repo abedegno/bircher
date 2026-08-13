@@ -1314,54 +1314,58 @@ _drop_non_ci_checkruns() {
     | sed 's/^[^|]*|//'
 }
 
-# _rerun_main_ci_until_green <sha> [attempts] [delay_s] -> green|red|pending|unknown
+# _rerun_main_ci_until_green <sha> [budget] [delay_s] -> green|red|pending|unknown
 #
-# Re-runs main's CI on the SAME commit, spaced out, stopping at the first green. A
-# green with no code change is causal evidence the earlier red was transient --
+# Re-runs main's CI on the SAME commit until it goes green or the budget is spent.
+# A green with no code change is causal evidence the earlier red was transient --
 # unlike reading the logs, which proves only that some words co-occurred. Three
-# rounds of review killed the log-classifying versions for exactly that reason.
+# rounds of review killed the log-classifying designs for exactly that reason.
 #
 # 2026-08-12 is the case to beat: three reviewed, green merges were reverted
 # because a provider outage lasted MINUTES, and the single immediate re-run rode
 # straight into it.
 #
-# The LAST attempt is a full re-run, not `--failed`. Re-running only the failed
-# jobs never revalidates the ones that passed, so a green from it is weaker
-# evidence; with several attempts that matters more, because each extra try is
-# another chance for a genuinely flaky regression to slip through. The final word
-# therefore comes from a run where everything executed.
+# BUDGET COUNTS RE-RUNS, not loop iterations. An earlier version counted
+# iterations while a single iteration could dispatch TWO re-runs (a partial plus
+# its confirmation), so the real worst case was five re-runs against a documented
+# three -- roughly 87 minutes of a broken main going unreverted while the comment
+# promised an hour. The bound now means what it says.
 #
-# Cost, stated: a genuinely broken main stays red for up to attempts x (CI + delay)
-# before the revert. Kept small for that reason.
+# A green from a `--failed` re-run is not evidence on its own: the jobs that
+# passed before are never re-run, so only a FULL run's green is accepted. The last
+# re-run the budget can afford is therefore always full, and a partial green with
+# nothing left to confirm it reports `unknown` (no verdict -> halt, never revert).
+#
+# Worst case with the defaults: 3 x (MAIN_CI_TIMEOUT 900s + 20s startup) + 2 x 300s
+# = 56 minutes, ~71 including the initial post-merge watch. That is the ceiling on
+# how long a genuinely broken main stays unreverted; keep it in mind before raising
+# the budget.
 _rerun_main_ci_until_green() {
-	local sha="$1" attempts="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
-	local i st=unknown mode
+	local sha="$1" budget="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
+	local st=unknown mode
 	# A non-numeric or non-positive setting must not silently mean "never retried".
-	case "$attempts" in ''|*[!0-9]*) attempts=3 ;; esac
-	[ "$attempts" -ge 1 ] 2>/dev/null || attempts=1
-	for i in $(seq 1 "$attempts"); do
-		mode=""; [ "$i" -eq "$attempts" ] && mode=full
-		st=$(_rerun_main_ci "$sha" "$mode")
+	case "$budget" in ''|*[!0-9]*) budget=3 ;; esac
+	[ "$budget" -ge 1 ] 2>/dev/null || budget=1
+	while [ "$budget" -gt 0 ]; do
+		# The last re-run we can afford must be full, so a green can be accepted.
+		mode=""; [ "$budget" -eq 1 ] && mode=full
+		st=$(_rerun_main_ci "$sha" "$mode"); budget=$((budget - 1))
 		if [ "$st" = green ]; then
-			# A green from a `--failed` re-run only says the previously-failing jobs
-			# passed; the ones that passed before were never run again, so it is not
-			# evidence the commit is good. Confirm with a FULL run before accepting.
-			if [ "$mode" != full ]; then
-				echo "[batch:merge] main CI green on partial re-run $i/$attempts -> confirming with a full re-run" >&2
-				st=$(_rerun_main_ci "$sha" full)
-				if [ "$st" != green ]; then
-					echo "[batch:merge] full re-run did NOT confirm ($st) -> the partial green was not evidence" >&2
-					[ "$i" -lt "$attempts" ] && { sleep "$delay"; continue; }
-					echo "$st"; return
-				fi
+			if [ "$mode" = full ]; then
+				echo "[batch:merge] main CI went GREEN on a full re-run with no code change -> the red was transient" >&2
+				echo green; return
 			fi
-			echo "[batch:merge] main CI went GREEN on a full re-run with no code change -> the red was transient" >&2
-			echo green; return
+			# No budget check needed: the last affordable re-run is always full, so a
+			# green from a PARTIAL run always has at least one re-run left to confirm it.
+			echo "[batch:merge] main CI green on a partial re-run -> confirming with a full re-run" >&2
+			st=$(_rerun_main_ci "$sha" full); budget=$((budget - 1))
+			if [ "$st" = green ]; then
+				echo "[batch:merge] full re-run confirmed GREEN -> the red was transient" >&2
+				echo green; return
+			fi
+			echo "[batch:merge] full re-run did NOT confirm ($st) -> the partial green was not evidence" >&2
 		fi
-		if [ "$i" -lt "$attempts" ]; then
-			echo "[batch:merge] main CI still $st on re-run $i/$attempts; waiting ${delay}s (a provider outage outlasts one re-run)" >&2
-			sleep "$delay"
-		fi
+		[ "$budget" -gt 0 ] && sleep "$delay"
 	done
 	[ "$st" = red ] || echo "[batch:merge] main CI re-runs produced NO verdict ($st) -> will halt without reverting" >&2
 	echo "$st"
@@ -2322,64 +2326,54 @@ self_test() {
   _seq() { printf '%s\n' "$@" > "$_sq"; : > "$_sq.n"; : > "$_sq.modes"; }
   _ncalls() { cat "$_sq.n" 2>/dev/null || echo 0; }
 
-  _seq red red green
+  # budget 3: partial(red), partial(green) + full confirm(green) = 3 re-runs.
+  _seq red green green
   [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
-    || { echo "FAIL #52: green on a later re-run means transient"; exit 1; }
+    || { echo "FAIL #52: a confirmed green after a red is transient"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: budget must count re-runs (got $(_ncalls))"; exit 1; }
 
   _seq red red red
   [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = red ] \
-    || { echo "FAIL #52: red through every attempt stays red"; exit 1; }
+    || { echo "FAIL #52: red through the whole budget stays red"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: must not exceed its budget (got $(_ncalls))"; exit 1; }
 
-  # No verdict must propagate as unknown, NOT as red -- red would revert.
+  # No verdict must propagate as unknown, NOT red -- red would revert.
   _seq unknown unknown unknown
   [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = unknown ] \
     || { echo "FAIL #52: undispatched re-runs must report unknown, not red"; exit 1; }
 
-  # CHANGED (review of #56): this used to assert a single call, i.e. that a PARTIAL
-  # green was accepted immediately. That is not evidence -- `--failed` never re-runs
-  # the jobs that passed. A partial green must now be confirmed by a FULL run.
+  # A partial green must be confirmed by a FULL run before it counts.
   _seq green green
-  _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: a confirmed partial green is accepted"; exit 1; }
   [ "$(_ncalls)" = 2 ] \
-    || { echo "FAIL #52: a partial green must be confirmed by a full re-run (calls=$(_ncalls))"; exit 1; }
+    || { echo "FAIL #52: a partial green costs a confirming run (got $(_ncalls))"; exit 1; }
   [ "$(tail -1 "$_sq.modes")" = full ] \
     || { echo "FAIL #52: the confirming run must be full"; exit 1; }
 
-  # A partial green that the full run does NOT confirm must not be accepted.
-  _seq green red green green
-  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
-    || { echo "FAIL #52: unconfirmed partial green must keep trying, then accept a confirmed one"; exit 1; }
+  # Unconfirmed, and the budget runs out: must NOT be reported green, and the
+  # exact outcome is pinned rather than merely "not green".
+  _seq green red red
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = red ] \
+    || { echo "FAIL #52: an unconfirmed partial green must report the full run's verdict"; exit 1; }
+  [ "$(_ncalls)" = 3 ] \
+    || { echo "FAIL #52: unconfirmed path must respect the budget (got $(_ncalls))"; exit 1; }
 
-  # ... and if it is never confirmed, the result is not green. Sequence consumed:
-  # partial green, full-confirm red, partial green, full-confirm red, then the final
-  # attempt (itself full) red.
-  _seq green red green red red
-  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" != green ] \
-    || { echo "FAIL #52: a never-confirmed partial green must not be reported green"; exit 1; }
-
-  # Retries past the first red, then the green on attempt 2 costs a confirming full
-  # run: red, green(partial), green(full confirm) = 3 calls.
-  _seq red green green
-  _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
-  [ "$(_ncalls)" = 3 ] || { echo "FAIL #52: must retry past the first red then confirm (got $(_ncalls))"; exit 1; }
-
-  # The final attempt must be a FULL re-run: `--failed` never revalidates the jobs
-  # that passed, so the deciding green has to come from a run where all of them did.
-  _seq red red red
-  _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
-  [ "$(tail -1 "$_sq.modes")" = full ] \
-    || { echo "FAIL #52: last attempt must be a full re-run (got $(tail -1 "$_sq.modes"))"; exit 1; }
-  [ "$(head -1 "$_sq.modes")" = partial ] \
-    || { echo "FAIL #52: earlier attempts should stay cheap (--failed)"; exit 1; }
+  # A partial green with NO budget left to confirm it is not evidence either.
+  _seq green
+  [ "$(_rerun_main_ci_until_green deadbeef 1 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: with budget 1 the single run is full, so its green counts"; exit 1; }
+  [ "$(head -1 "$_sq.modes")" = full ] \
+    || { echo "FAIL #52: a budget of 1 must spend it on a FULL run"; exit 1; }
 
   # A bad setting must not silently mean "never retried".
-  _seq red red green
+  _seq red green green
   [ "$(_rerun_main_ci_until_green deadbeef notanumber 0 2>/dev/null)" = green ] \
-    || { echo "FAIL #52: non-numeric attempts must fall back to a sane default"; exit 1; }
+    || { echo "FAIL #52: a non-numeric budget must fall back to a sane default"; exit 1; }
 
   rm -f "$_sq" "$_sq.n" "$_sq.modes"; unset -f _rerun_main_ci _seq _ncalls
-
-
   echo "_rerun_main_ci_until_green OK (#52)"
 
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
