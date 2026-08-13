@@ -766,7 +766,7 @@ merge_ready_pr() {
   if [ "$state" = green ] || [ "${BIRCHER_MAIN_CI_RERUN:-1}" = 0 ]; then
     decision=$(_main_ci_verdict "$state" "")
   else
-    echo "[batch:merge] $item: main CI $state on $sha -> re-running once before deciding (flake check)" >&2
+    echo "[batch:merge] $item: main CI $state on $sha -> re-running before deciding (flake check)" >&2
     local second; second=$(_rerun_main_ci_until_green "$sha")
     decision=$(_main_ci_verdict "$state" "$second")
     echo "[batch:merge] $item: re-run main CI -> $second (verdict: $decision)" >&2
@@ -1343,7 +1343,19 @@ _rerun_main_ci_until_green() {
 		mode=""; [ "$i" -eq "$attempts" ] && mode=full
 		st=$(_rerun_main_ci "$sha" "$mode")
 		if [ "$st" = green ]; then
-			echo "[batch:merge] main CI went GREEN on re-run $i/$attempts with no code change -> the red was transient" >&2
+			# A green from a `--failed` re-run only says the previously-failing jobs
+			# passed; the ones that passed before were never run again, so it is not
+			# evidence the commit is good. Confirm with a FULL run before accepting.
+			if [ "$mode" != full ]; then
+				echo "[batch:merge] main CI green on partial re-run $i/$attempts -> confirming with a full re-run" >&2
+				st=$(_rerun_main_ci "$sha" full)
+				if [ "$st" != green ]; then
+					echo "[batch:merge] full re-run did NOT confirm ($st) -> the partial green was not evidence" >&2
+					[ "$i" -lt "$attempts" ] && { sleep "$delay"; continue; }
+					echo "$st"; return
+				fi
+			fi
+			echo "[batch:merge] main CI went GREEN on a full re-run with no code change -> the red was transient" >&2
 			echo green; return
 		fi
 		if [ "$i" -lt "$attempts" ]; then
@@ -2323,13 +2335,33 @@ self_test() {
   [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = unknown ] \
     || { echo "FAIL #52: undispatched re-runs must report unknown, not red"; exit 1; }
 
-  _seq green red red
+  # CHANGED (review of #56): this used to assert a single call, i.e. that a PARTIAL
+  # green was accepted immediately. That is not evidence -- `--failed` never re-runs
+  # the jobs that passed. A partial green must now be confirmed by a FULL run.
+  _seq green green
   _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
-  [ "$(_ncalls)" = 1 ] || { echo "FAIL #52: should stop at the first green (got $(_ncalls))"; exit 1; }
+  [ "$(_ncalls)" = 2 ] \
+    || { echo "FAIL #52: a partial green must be confirmed by a full re-run (calls=$(_ncalls))"; exit 1; }
+  [ "$(tail -1 "$_sq.modes")" = full ] \
+    || { echo "FAIL #52: the confirming run must be full"; exit 1; }
 
-  _seq red green red
+  # A partial green that the full run does NOT confirm must not be accepted.
+  _seq green red green green
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" = green ] \
+    || { echo "FAIL #52: unconfirmed partial green must keep trying, then accept a confirmed one"; exit 1; }
+
+  # ... and if it is never confirmed, the result is not green. Sequence consumed:
+  # partial green, full-confirm red, partial green, full-confirm red, then the final
+  # attempt (itself full) red.
+  _seq green red green red red
+  [ "$(_rerun_main_ci_until_green deadbeef 3 0 2>/dev/null)" != green ] \
+    || { echo "FAIL #52: a never-confirmed partial green must not be reported green"; exit 1; }
+
+  # Retries past the first red, then the green on attempt 2 costs a confirming full
+  # run: red, green(partial), green(full confirm) = 3 calls.
+  _seq red green green
   _rerun_main_ci_until_green deadbeef 3 0 >/dev/null 2>&1
-  [ "$(_ncalls)" = 2 ] || { echo "FAIL #52: must retry past the first red (got $(_ncalls))"; exit 1; }
+  [ "$(_ncalls)" = 3 ] || { echo "FAIL #52: must retry past the first red then confirm (got $(_ncalls))"; exit 1; }
 
   # The final attempt must be a FULL re-run: `--failed` never revalidates the jobs
   # that passed, so the deciding green has to come from a run where all of them did.
