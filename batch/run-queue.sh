@@ -686,6 +686,125 @@ _post_cross_review_status() {
   return 1
 }
 
+# _sha256 -> hex digest of stdin. sha256sum on Linux (the runner), shasum on macOS
+# (where the self-tests also run).
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum
+  else shasum -a 256
+  fi | cut -d' ' -f1
+}
+
+# _pr_delta_digest <base_ref> <head_ref> -> a stable digest of the PR's OWN delta,
+# or rc 1 when that delta cannot be established.
+#
+# GitHub's compare is three-dot, so `base...head` is the change the PR contributes
+# and never the base branch's own commits. That property is what makes the digest
+# comparable across an update-branch: that operation MERGES the base into the head
+# (it does not rebase), so the new head CONTAINS the new base, the merge-base IS
+# the new base, and the compare still yields only the PR's work.
+#
+# rc 1 is NOT "assume equal" - the caller turns it into an escalation. The
+# unprovable cases are real: GitHub caps the changed-file list at 300, omits `patch`
+# for binaries, pure renames and anything over its size limit, and truncates a large
+# tree. Digesting a partial answer would produce a confident wrong one, which here
+# means merging code no reviewer read.
+_pr_delta_digest() {
+  local base="$1" ref="$2" cmp tree count
+  cmp=$(gh api "repos/$REPO/compare/${base}...${ref}" 2>/dev/null) || return 1
+  [ -n "$cmp" ] || return 1
+  count=$(printf '%s' "$cmp" | jq -r '.files | length' 2>/dev/null) || return 1
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  # 0 files = nothing to compare (degenerate, and it would make two unrelated empty
+  # answers look equal); >= 300 = GitHub's documented cap for the changed-file list,
+  # so at exactly 300 it may be truncated.
+  { [ "$count" -ge 1 ] && [ "$count" -lt 300 ]; } || return 1
+  # A file whose patch GitHub withheld leaves a hole in the comparison.
+  printf '%s' "$cmp" | jq -e 'any(.files[]; has("patch") | not)' >/dev/null 2>&1 && return 1
+  # The compare payload carries NO mode and NO type - verified against the API, where
+  # files[] is filename/status/sha/patch plus counts and URLs. That gap is load-bearing
+  # here: git stores a symlink's TARGET as its blob content, so a symlink pointing at
+  # "x" and a regular file containing "x" share a blob sha AND project to an identical
+  # patch. Digesting the compare alone would let a base that changed a path's TYPE
+  # merge as though the PR's delta were untouched. The tree carries mode and type; a
+  # TRUNCATED tree cannot answer for every path, so it fails closed like the rest.
+  tree=$(gh api "repos/$REPO/git/trees/${ref}?recursive=1" 2>/dev/null) || return 1
+  [ -n "$tree" ] || return 1
+  # Require an explicit false. `== true` would PROCEED on an absent or null
+  # `truncated`, i.e. treat an answer we did not get as a reassuring one.
+  printf '%s' "$tree" | jq -e '.truncated == false' >/dev/null 2>&1 || return 1
+  # Note this escalates whenever the base touched a file the PR also touches: the
+  # resulting blob sha (and often the patch context) moves. That is CORRECT rather
+  # than merely cautious - the merged file then combines both changes, and the
+  # reviewer never saw that combination. The feature is for the common case where
+  # the base moved elsewhere in the tree.
+  # Canonical form: sorted by filename, sorted keys, and EVERY field that identifies
+  # the change - path, rename origin, status, resulting blob, patch, and the tree
+  # entry's mode|type. `--slurpfile` rather than `--argjson` keeps a large compare
+  # payload off the command line, where a big PR would hit ARG_MAX.
+  printf '%s' "$tree" \
+    | jq -cS --slurpfile c <(printf '%s' "$cmp") '
+        (.tree | map({key: .path, value: (.mode + "|" + .type)}) | from_entries) as $m
+        | [ $c[0].files
+            | sort_by(.filename)[]
+            | { filename,
+                previous_filename: (.previous_filename // null),
+                status,
+                sha,
+                patch,
+                entry: ($m[.filename] // "ABSENT") } ]' 2>/dev/null \
+    | _sha256
+}
+
+# _restamp_if_delta_unchanged <item> <pr> <reviewed_sha>
+#   -> rc 0 and RESTAMPED_HEAD=<new head> when the updated head provably carries the
+#      SAME change the reviewer passed; rc 1 (caller escalates) otherwise.
+#
+# This is the ONE place bircher posts bircher/cross-review on a sha no reviewer saw,
+# so the bar is a proof rather than a heuristic. update-branch merges the BASE into
+# the head and touches nothing else:
+# if the PR's own three-dot delta is byte-identical before and after, the reviewed
+# CONTENT is unchanged and the PASS still covers exactly what will merge (issue #51).
+#
+# It deliberately does NOT hold when the update touched the PR's own diff - a
+# conflict resolution or a fixup commit - and that is precisely what comparing the
+# digests detects. Every other outcome (API failure, truncated compare, a head that
+# never moved) returns rc 1, leaving the pre-#51 behaviour: escalate to a human.
+RESTAMPED_HEAD=""
+_restamp_if_delta_unchanged() {
+  local item="$1" pr="$2" reviewed="$3" base new attempt old_digest new_digest
+  RESTAMPED_HEAD=""
+  if [ "${BIRCHER_CONTENT_EQUALITY:-1}" = 0 ]; then
+    echo "[batch:sweep] $item: content-equality re-stamp disabled (BIRCHER_CONTENT_EQUALITY=0) -> escalate" >&2
+    return 1
+  fi
+  base=$(gh pr view "$pr" --repo "$REPO" --json baseRefName -q '.baseRefName' 2>/dev/null)
+  [ -n "$base" ] || { echo "[batch:sweep] $item: PR #$pr base branch unknown -> cannot prove delta" >&2; return 1; }
+  # update-branch is ASYNCHRONOUS: wait for the head to actually move off the
+  # reviewed sha. A head that never moves means nothing was updated, so there is
+  # nothing to re-stamp and the earlier BEHIND reading is unexplained.
+  for attempt in 1 2 3 4 5 6; do
+    new=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+    [ -n "$new" ] && [ "$new" != "$reviewed" ] && break
+    new=""
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
+  done
+  [ -n "$new" ] || { echo "[batch:sweep] $item: PR #$pr head never moved after update-branch -> escalate" >&2; return 1; }
+  old_digest=$(_pr_delta_digest "$base" "$reviewed") || old_digest=""
+  new_digest=$(_pr_delta_digest "$base" "$new")      || new_digest=""
+  if [ -z "$old_digest" ] || [ -z "$new_digest" ]; then
+    echo "[batch:sweep] $item: PR #$pr delta not provable (compare failed/truncated/patch withheld) -> escalate" >&2
+    return 1
+  fi
+  if [ "$old_digest" != "$new_digest" ]; then
+    echo "[batch:sweep] $item: PR #$pr delta CHANGED across the update (${reviewed:0:7} -> ${new:0:7}) -> escalate for re-review" >&2
+    return 1
+  fi
+  echo "[batch:sweep] $item: PR #$pr delta PROVEN identical across the update (${reviewed:0:7} -> ${new:0:7}) -> re-stamping the review" >&2
+  _post_cross_review_status "$item" "$pr" "$new" || return 1
+  RESTAMPED_HEAD="$new"
+  return 0
+}
+
 # merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
 # deferral) | rc 2 (HALT the run: main went red and the merge was reverted, or
 # main CI never resolved). B-1 in-run merge: merging each ready PR before the
@@ -877,15 +996,25 @@ reconcile_deferred_ready() {
       continue
     fi
     # Head PROVEN == reviewed head. But merging a BEHIND PR needs update-branch, which
-    # REWRITES the head -> the PASS would no longer cover the merged code. Tee it up
-    # (update-branch) but ESCALATE; a human / re-review must land a rebased head.
+    # REWRITES the head -> the PASS no longer covers the merged sha literally. Re-stamp
+    # ONLY when that update provably left the PR's own delta untouched (#51); every
+    # other case escalates exactly as it did before that check existed.
     mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
     if [ "$mss" = "BEHIND" ]; then
-      echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch + escalate (no auto-merge of a rebased head)" >&2
-      gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
-        || echo "[batch:sweep] WARN $item: update-branch call failed (already updating or up to date)" >&2
-      json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; update-branched, needs re-review before merge (human)" ok >> "$SCORECARD"
-      continue
+      echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch" >&2
+      # expected_head_sha makes GitHub REFUSE the update if the head moved since we
+      # verified it, so a concurrent push cannot be silently folded into the update.
+      gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT -f expected_head_sha="$sha" >/dev/null 2>&1 \
+        || echo "[batch:sweep] WARN $item: update-branch call failed (head moved, already updating, or up to date)" >&2
+      if _restamp_if_delta_unchanged "$item" "$pr" "$sha"; then
+        # Pin every downstream step (the status, --match-head-commit) to the head we
+        # just PROVED carries the reviewed change, never to whatever is current.
+        sha="$RESTAMPED_HEAD"
+        mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
+      else
+        json_row "$item" "$pr" ready false sweep 0 0 "sweep: PR was BEHIND; update-branched, needs re-review before merge (human)" ok >> "$SCORECARD"
+        continue
+      fi
     fi
     # Allow-list: only ATTEMPT the merge from states we can vouch are safe. CLEAN /
     # HAS_HOOKS are healthy; BLOCKED is the NORMAL deferred state (missing our
@@ -2859,10 +2988,14 @@ SH
 # MSSDIR/<pr> seeds mergeStateStatus (default CLEAN); STATEDIR/<pr> seeds state
 # (default OPEN); HEADDIR/<pr> seeds headRefOid (default headsha1234567; an EMPTY
 # file models a failed head lookup); STORE models the status post->read-back.
+# For the #51 content-equality path: NEWHEADDIR/<pr> is the sha update-branch moves
+# the head TO (and it flips mss to BLOCKED, as GitHub does); CMPDIR/<ref> holds the
+# compare JSON for that ref (absent = a compare GitHub could not answer).
 _pr(){ for a in "$@"; do case "$a" in [0-9]*) printf '%s' "$a"; return;; esac; done; }
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   p=$(_pr "$@")
   printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { cat "$MSSDIR/$p" 2>/dev/null || echo CLEAN; exit 0; }   # contains 'state' -> match FIRST
+  printf '%s\n' "$@" | grep -q 'baseRefName' && { echo main; exit 0; }
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { cat "$HEADDIR/$p" 2>/dev/null || echo headsha1234567; exit 0; }
   if printf '%s\n' "$@" | grep -q 'state'; then
     { [ -n "$MERGEDDIR" ] && [ -f "$MERGEDDIR/$p" ]; } && { echo MERGED; exit 0; }
@@ -2879,7 +3012,25 @@ fi
 [ "$1" = "issue" ] && [ "$2" = "view" ]  && { echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; }
 [ "$1" = "issue" ] && [ "$2" = "close" ] && { echo "close $3" >> "$PMLOG"; exit 0; }
 if [ "$1" = "api" ]; then
-  printf '%s\n' "$@" | grep -q 'update-branch' && { printf 'update-branch %s\n' "$*" >> "$PMLOG"; exit 0; }
+  if printf '%s\n' "$@" | grep -q 'update-branch'; then
+    up=$(printf '%s' "$*" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/update-branch.*#\1#p')
+    # GitHub REFUSES the update unless expected_head_sha matches the current head.
+    # Model that, so omitting or mis-sending the field fails a test instead of
+    # passing silently.
+    ehs=$(printf '%s\n' "$@" | sed -n 's/^expected_head_sha=//p')
+    cur=$(cat "$HEADDIR/$up" 2>/dev/null || echo headsha1234567)
+    [ -n "$ehs" ]        || { printf 'update-branch-NOSHA %s\n' "$*" >> "$PMLOG"; exit 1; }
+    [ "$ehs" = "$cur" ]  || { printf 'update-branch-REFUSED %s\n' "$*" >> "$PMLOG"; exit 1; }
+    printf 'update-branch %s\n' "$*" >> "$PMLOG"
+    # GitHub merges the base into the head and the PR stops being BEHIND.
+    [ -n "$up" ] && [ -f "$NEWHEADDIR/$up" ] && { cp "$NEWHEADDIR/$up" "$HEADDIR/$up"; echo BLOCKED > "$MSSDIR/$up"; }
+    exit 0
+  fi
+  # compare/<base>...<ref> -> the PR's own delta for <ref>; absent file = unanswerable
+  cref=$(printf '%s' "$*" | sed -n 's#.*/compare/[^ ]*\.\.\.\([A-Za-z0-9._-]*\).*#\1#p')
+  if [ -n "$cref" ]; then cat "$CMPDIR/$cref" 2>/dev/null || exit 1; exit 0; fi
+  tref=$(printf '%s' "$*" | sed -n 's#.*/git/trees/\([A-Za-z0-9._-]*\).*#\1#p')
+  if [ -n "$tref" ]; then cat "$TREEDIR/$tref" 2>/dev/null || exit 1; exit 0; fi
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
   printf '%s\n' "$@" | grep -q '/status'    && { cat "$STORE" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
@@ -2887,7 +3038,7 @@ fi
 exit 0
 SH
   chmod +x "$rdir/gh"
-  mkdir -p "$rdir/states" "$rdir/mss" "$rdir/head" "$rdir/merged"
+  mkdir -p "$rdir/states" "$rdir/mss" "$rdir/head" "$rdir/merged" "$rdir/newhead" "$rdir/cmp" "$rdir/tree"
   echo OPEN > "$rdir/states/7"; echo MERGED > "$rdir/states/8"; echo BLOCKED > "$rdir/mss/7"
   # 4b: head-verified PR #7 (mss=BLOCKED = the NORMAL deferred state, missing our status)
   # merges (pinned) + its issue is closed; MERGED PR #8 skipped
@@ -2916,20 +3067,97 @@ SH
   grep -q 'merge 9' "$rdir/pmlog"                         && { echo "FAIL sweep-escalate: CONFLICTING PR #9 was merged"; rm -rf "$rdir"; exit 1; }
   grep -q 'sweep could not merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-escalate: no escalation scorecard row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
   echo "reconcile_deferred_ready escalate OK"
-  # 4d (codex round 5): a BEHIND PR is update-branched but ESCALATED, NOT auto-merged
-  # (update-branch rewrites the head -> the PASS no longer covers the merged code).
-  echo OPEN > "$rdir/states/10"; echo BEHIND > "$rdir/mss/10"
-  printf 'sweepD\t10\t\theadsha1234567\n' > "$rdir/deferred.tsv"
-  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
-  ( PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+  # --- #51 content-equality re-stamp on a BEHIND PR --------------------------------
+  # A BEHIND PR must be update-branched. Whether it may then MERGE turns entirely on
+  # whether the update left the PR's own delta untouched; the cases below are
+  # the whole contract. `store` is asserted because the failure that matters is not
+  # "did not merge" but "re-stamped bircher/cross-review on unreviewed code".
+  _sweep_env() {
+    PATH="$rdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
       DEFERRED_READY_FILE="$rdir/deferred.tsv" SCORECARD="$rdir/scorecard.jsonl" \
       STATEDIR="$rdir/states" MSSDIR="$rdir/mss" HEADDIR="$rdir/head" MERGEDDIR="$rdir/merged" \
+      NEWHEADDIR="$rdir/newhead" CMPDIR="$rdir/cmp" TREEDIR="$rdir/tree" \
       PMLOG="$rdir/pmlog" STORE="$rdir/store" \
-      reconcile_deferred_ready >/dev/null 2>&1 )
-  grep -q 'pulls/10/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind: BEHIND PR #10 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
-  grep -q 'merge 10' "$rdir/pmlog"               && { echo "FAIL sweep-behind: BEHIND PR #10 auto-merged (rebased head unreviewed)"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
-  grep -q 'needs re-review before merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-behind: no BEHIND escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
-  echo "reconcile_deferred_ready behind-escalate OK"
+      reconcile_deferred_ready >/dev/null 2>&1
+  }
+  # Fixtures mirror the REAL payload shapes: compare files[] carries
+  # filename/status/sha/patch and NO mode or type; the tree carries mode/type and a
+  # `truncated` flag. Both are needed because the digest spans both.
+  cat > "$rdir/cmp/reviewedsha" <<'J'
+{"files":[{"filename":"a.txt","status":"modified","sha":"blob0000000000000000000000000000000000b1","patch":"@@ -1 +1 @@\n-old\n+new"}]}
+J
+  cat > "$rdir/tree/reviewedsha" <<'J'
+{"truncated":false,"tree":[{"path":"a.txt","mode":"100644","type":"blob","sha":"blob0000000000000000000000000000000000b1"}]}
+J
+  # 4d: the update CHANGED the PR's own delta (conflict resolution / fixup) ->
+  # escalate, do NOT merge and do NOT re-stamp. This is the case that keeps the
+  # pre-#51 guarantee intact.
+  echo OPEN > "$rdir/states/10"; echo BEHIND > "$rdir/mss/10"
+  echo reviewedsha > "$rdir/head/10"; echo rebased10 > "$rdir/newhead/10"
+  cat > "$rdir/cmp/rebased10" <<'J'
+{"files":[{"filename":"a.txt","status":"modified","sha":"blob0000000000000000000000000000000000b2","patch":"@@ -1 +1 @@\n-old\n+SOMETHING ELSE"}]}
+J
+  cat > "$rdir/tree/rebased10" <<'J'
+{"truncated":false,"tree":[{"path":"a.txt","mode":"100644","type":"blob","sha":"blob0000000000000000000000000000000000b2"}]}
+J
+  printf 'sweepD\t10\t\treviewedsha\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( _sweep_env )
+  grep -q 'pulls/10/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind-changed: PR #10 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'merge 10' "$rdir/pmlog"               && { echo "FAIL sweep-behind-changed: PR #10 merged though its delta changed"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  [ -s "$rdir/store" ]                           && { echo "FAIL sweep-behind-changed: cross-review re-stamped on a CHANGED delta"; rm -rf "$rdir"; exit 1; }
+  grep -q 'needs re-review before merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-behind-changed: no escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "sweep BEHIND + delta changed -> escalate OK (#51)"
+  # 4d2: the update left the delta byte-identical -> re-stamp on the NEW head and
+  # merge, pinned to that new head (never to the stale reviewed sha).
+  echo OPEN > "$rdir/states/20"; echo BEHIND > "$rdir/mss/20"
+  echo reviewedsha > "$rdir/head/20"; echo rebased20 > "$rdir/newhead/20"
+  cp "$rdir/cmp/reviewedsha" "$rdir/cmp/rebased20"
+  cp "$rdir/tree/reviewedsha" "$rdir/tree/rebased20"
+  printf 'sweepE\t20\t\treviewedsha\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( _sweep_env )
+  grep -q 'pulls/20/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind-same: PR #20 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'merge 20' "$rdir/pmlog"              || { echo "FAIL sweep-behind-same: identical delta was NOT merged"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -qx 'matchhead 20' "$rdir/pmlog"          || { echo "FAIL sweep-behind-same: merge not pinned to the re-stamped head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'expected_head_sha=reviewedsha' "$rdir/pmlog" || { echo "FAIL sweep-behind-same: update-branch sent without expected_head_sha"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  [ -s "$rdir/store" ]                           || { echo "FAIL sweep-behind-same: cross-review never posted on the new head"; rm -rf "$rdir"; exit 1; }
+  echo "sweep BEHIND + delta identical -> re-stamp + merge OK (#51)"
+  # 4d3: GitHub withheld a file's patch (binary / too large) -> the delta cannot be
+  # PROVEN equal, so fail closed even though nothing looks wrong.
+  echo OPEN > "$rdir/states/21"; echo BEHIND > "$rdir/mss/21"
+  echo reviewedsha > "$rdir/head/21"; echo rebased21 > "$rdir/newhead/21"
+  cat > "$rdir/cmp/rebased21" <<'J'
+{"files":[{"filename":"a.txt","status":"modified","sha":"blob0000000000000000000000000000000000b1","patch":"@@ -1 +1 @@\n-old\n+new"},{"filename":"logo.png","status":"modified","sha":"blob0000000000000000000000000000000000c9"}]}
+J
+  cat > "$rdir/tree/rebased21" <<'J'
+{"truncated":false,"tree":[{"path":"a.txt","mode":"100644","type":"blob","sha":"blob0000000000000000000000000000000000b1"},{"path":"logo.png","mode":"100644","type":"blob","sha":"blob0000000000000000000000000000000000c9"}]}
+J
+  printf 'sweepG\t21\t\treviewedsha\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( _sweep_env )
+  grep -q 'merge 21' "$rdir/pmlog" && { echo "FAIL sweep-behind-withheld: merged on an unprovable delta"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  [ -s "$rdir/store" ]             && { echo "FAIL sweep-behind-withheld: re-stamped on an unprovable delta"; rm -rf "$rdir"; exit 1; }
+  grep -q 'needs re-review before merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-behind-withheld: no escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "sweep BEHIND + patch withheld -> fail closed OK (#51)"
+  # 4d4: the compare payload is byte-IDENTICAL to the reviewed one - same filename,
+  # same status, same blob sha, same patch - but the base turned that path from a
+  # regular file into a SYMLINK. Git stores a symlink's target as its blob content,
+  # so the blob sha genuinely collides; only mode/type distinguishes them. Digesting
+  # the compare alone would merge this as "unchanged". (codex review, 2026-08-14)
+  echo OPEN > "$rdir/states/22"; echo BEHIND > "$rdir/mss/22"
+  echo reviewedsha > "$rdir/head/22"; echo rebased22 > "$rdir/newhead/22"
+  cp "$rdir/cmp/reviewedsha" "$rdir/cmp/rebased22"
+  cat > "$rdir/tree/rebased22" <<'J'
+{"truncated":false,"tree":[{"path":"a.txt","mode":"120000","type":"blob","sha":"blob0000000000000000000000000000000000b1"}]}
+J
+  printf 'sweepM\t22\t\treviewedsha\n' > "$rdir/deferred.tsv"
+  : > "$rdir/pmlog"; : > "$rdir/store"; : > "$rdir/scorecard.jsonl"
+  ( _sweep_env )
+  grep -q 'merge 22' "$rdir/pmlog" && { echo "FAIL sweep-behind-mode: merged a file whose TYPE changed under an identical patch"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  [ -s "$rdir/store" ]             && { echo "FAIL sweep-behind-mode: re-stamped across a type change"; rm -rf "$rdir"; exit 1; }
+  grep -q 'needs re-review before merge' "$rdir/scorecard.jsonl" || { echo "FAIL sweep-behind-mode: no escalation row"; cat "$rdir/scorecard.jsonl"; rm -rf "$rdir"; exit 1; }
+  echo "sweep BEHIND + file TYPE changed -> fail closed OK (#51, codex)"
   # 4f (codex round 4): a PR whose head changed since review is escalated, NOT merged
   echo OPEN > "$rdir/states/12"
   printf 'sweepF\t12\t\tOLDSHA999\n' > "$rdir/deferred.tsv"   # recorded sha != current head (headsha1234567)
