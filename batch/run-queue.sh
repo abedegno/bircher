@@ -491,6 +491,9 @@ _codex_usage() {
 }
 
 # _session_died <status> <err_code> -> "died" | "alive"
+# `unknown` (from a failed lookup) maps to alive DELIBERATELY: one failed poll
+# must never trigger recovery against a session that may still be running. A
+# RUN of them is a different question, handled by the poll loop (#61).
 # The server session is DEAD (recovery may run) only when it has a non-empty
 # last_task_error_code OR a terminal-dead status. It is ALIVE for running AND
 # idle: a coordinator ends its turn and goes idle between turns while a
@@ -506,31 +509,51 @@ _session_died() {
   esac
 }
 
-# _session_state <conv_id> -> "<status>|<err_code>" ("|" on any failure).
+# _session_state <conv_id> -> "<status>|<err_code>"; "unknown|" on any failure.
+#
+# #61: this used to return "|" on failure, which _session_died read as `alive`.
+# A transient 404/5xx/timeout was therefore indistinguishable from a healthy
+# coordinator, so a DEAD one could be waited on to the full cap -- and, worse,
+# a sustained lookup failure against a LIVE coordinator kept bircher blind while
+# it ran. `unknown` keeps the same conservative single-poll behaviour (never
+# recover against a session we cannot confirm dead) while letting the caller
+# SEE the difference and act on a run of them.
 # Reads the server session so run_item can detect death (vs the ambiguous
 # local client process). $SERVER is the omnigent server (e.g. http://omnigent:8000).
 _session_state() {
   local conv_id="$1" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf '|'; return; }
+  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf 'unknown|'; return; }
   printf '%s' "$json" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
 except Exception:
-    print("|"); sys.exit(0)
+    print("unknown|"); sys.exit(0)
 print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.last_task_error_code") or ""))
-' 2>/dev/null || printf '|'
+' 2>/dev/null || printf 'unknown|'
 }
 
 # _last_assistant_text <conv_id> [n] -> concatenated text of the newest n (default
-# 3) assistant messages in the conversation, one blob on stdout ("" on any error).
+# 3) assistant messages, one blob on stdout. rc 0 = we got an answer (possibly
+# empty); rc 1 = the LOOKUP FAILED and the empty output means nothing.
 # Used by the within-item fast limit check (B-2): a young session whose first
 # assistant turn is a provider "hit your limit" message means the implementer
 # vendor's window is exhausted -- fail fast and re-gate rather than idle the cap.
-# (omnigent/server/API.md: GET /v1/conversations/{id}/items.)
+#
+# #60: this called GET /v1/conversations/{id}/items, which omnigent v0.9.0
+# REMOVED. The 404 was swallowed by `curl -sf ... || return 0`, so the check
+# silently answered "no limit message" for a whole release and every exhausted
+# window idled the full ITEM_TIMEOUT instead of re-gating in seconds. The
+# replacement is GET /v1/sessions/{id}/items, same order/limit shape.
+#
+# The rc split exists because that is what made the regression invisible: an
+# empty string meant BOTH "no assistant text yet" and "we could not ask".
 _last_assistant_text() {
   local conv_id="$1" n="${2:-3}" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/conversations/$conv_id/items?order=desc&limit=20" 2>/dev/null) || return 0
+  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id/items?order=desc&limit=20" 2>/dev/null) || {
+    echo "[batch] WARN: session-items lookup failed for $conv_id (limit check cannot run this poll)" >&2
+    return 1
+  }
   printf '%s' "$json" | python3 -c '
 import json,sys
 n=int(sys.argv[1])
@@ -1950,9 +1973,19 @@ ${prompt}"
     bound_outcome="failed"
     echo "[batch] !!!! BINDING MISMATCH for $item: session host_id='${sess_host:-<empty>}' != local='$host_id'" >&2
   fi
-  _send_prompt "$conv_id" "$prompt" || echo "[batch] WARN $item: send_prompt failed" >&2
+  # #61: a failed delivery used to warn and carry on. The session exists but has
+  # NO prompt, so the coordinator idles, ground-truth recovery finds nothing, and
+  # the queue file is moved to processed at the end -- consuming an item that was
+  # never worked. Treat it like the limit-message path: stop the session, leave
+  # the queue file QUEUED, and return rc 3 so main re-gates and retries the SAME
+  # item.
+  if ! _send_prompt "$conv_id" "$prompt"; then
+    echo "[batch] $item: send_prompt FAILED -> stopping session; item stays queued for retry (rc 3)" >&2
+    _stop_session "$conv_id"
+    return 3
+  fi
 
-  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0
+  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0 _unknown_polls=0
   while [ "$elapsed" -lt "$ITEM_TIMEOUT" ]; do
     sleep "$POLL"; elapsed=$(( $(date +%s) - start )); polls=$((polls + 1))
     # B-2 within-item fast limit check: only in the early window (first 2 polls).
@@ -2034,6 +2067,20 @@ ${prompt}"
       if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = died ]; then
         echo "[batch] $item: session $conv_id died (state=$_ss) -> stop waiting" >&2
         break
+      fi
+      # #61: a single failed lookup is not evidence of anything, but a RUN of
+      # them means we are flying blind -- and "alive" was only ever a safe
+      # default for one poll. Stop waiting and let the normal post-loop path
+      # run ground-truth recovery, which reads the PR and CI rather than the
+      # session, so it is safe even if the coordinator is in fact still alive.
+      if [ "${_ss%%|*}" = unknown ]; then
+        _unknown_polls=$((_unknown_polls + 1))
+        if [ "$_unknown_polls" -ge "${BIRCHER_UNKNOWN_POLL_LIMIT:-5}" ]; then
+          echo "[batch] $item: session state unknown for $_unknown_polls consecutive polls (server unreachable?) -> stop waiting and recover from ground truth" >&2
+          break
+        fi
+      else
+        _unknown_polls=0
       fi
     fi
   done
@@ -2697,6 +2744,10 @@ SH
   [ "$(_session_died error '')"     = "died"  ] || { echo "FAIL _session_died error";    exit 1; }
   [ "$(_session_died cancelled '')" = "died"  ] || { echo "FAIL _session_died cancelled";exit 1; }
   [ "$(_session_died idle 'ReadError')" = "died" ] || { echo "FAIL _session_died errcode"; exit 1; }
+  # #61: a failed lookup ("unknown") must still read as alive for a SINGLE poll --
+  # never recover against a session we cannot confirm dead. The run-of-unknowns
+  # escape hatch lives in the poll loop, not here.
+  [ "$(_session_died unknown '')"   = "alive" ] || { echo "FAIL _session_died unknown"; exit 1; }
   echo "_session_died OK"
   # --- RC2: _session_state parse, via fake curl -------
   local ssdir; ssdir=$(mktemp -d)
@@ -2711,8 +2762,52 @@ SH
   [ "$ss" = "running|" ] || { echo "FAIL _session_state running: '$ss'"; exit 1; }
   ss=$(PATH="$ssdir:$PATH" SERVER=http://x FAKE_STATUS=failed FAKE_ERR=ReadError _session_state conv_t)
   [ "$ss" = "failed|ReadError" ] || { echo "FAIL _session_state failed: '$ss'"; exit 1; }
+  # #61: a FAILED lookup must be distinguishable from a healthy session. Before
+  # this it returned "|", which _session_died read as alive -- indistinguishable
+  # from a real answer, which is why the v0.9.0 endpoint removal went unnoticed.
+  cat >"$ssdir/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22          # curl -f on an HTTP error
+SH
+  chmod +x "$ssdir/curl"
+  ss=$(PATH="$ssdir:$PATH" SERVER=http://x _session_state conv_t)
+  [ "$ss" = "unknown|" ] || { echo "FAIL _session_state http-error: expected 'unknown|', got '$ss'"; exit 1; }
+  cat >"$ssdir/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'not json at all'
+SH
+  chmod +x "$ssdir/curl"
+  ss=$(PATH="$ssdir:$PATH" SERVER=http://x _session_state conv_t)
+  [ "$ss" = "unknown|" ] || { echo "FAIL _session_state malformed: expected 'unknown|', got '$ss'"; exit 1; }
   rm -rf "$ssdir"
-  echo "session helpers OK"
+  echo "session helpers OK (incl. #61 unknown-vs-alive)"
+  # --- #60: _last_assistant_text hits the v0.9.0 endpoint and reports failure --
+  local ldir; ldir=$(mktemp -d)
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$URL_LOG"
+printf '{"data":[{"role":"assistant","content":[{"text":"You have hit your usage limit"}]}]}'
+SH
+  chmod +x "$ldir/curl"
+  local ltxt
+  ltxt=$(PATH="$ldir:$PATH" SERVER=http://x URL_LOG="$ldir/urls" _last_assistant_text conv_t 3)
+  grep -q '/v1/sessions/conv_t/items' "$ldir/urls" \
+    || { echo "FAIL _last_assistant_text: wrong endpoint"; cat "$ldir/urls"; rm -rf "$ldir"; exit 1; }
+  grep -q '/v1/conversations/' "$ldir/urls" \
+    && { echo "FAIL _last_assistant_text: still calling the REMOVED conversations endpoint"; rm -rf "$ldir"; exit 1; }
+  [ "$(_is_limit_message "$ltxt")" = yes ] \
+    || { echo "FAIL _last_assistant_text: limit message not detected: '$ltxt'"; rm -rf "$ldir"; exit 1; }
+  # A failed lookup must be rc 1, NOT rc 0 with empty output (the #60 defect).
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: failed lookup returned rc 0 (indistinguishable from 'no text')"; rm -rf "$ldir"; exit 1
+  fi
+  rm -rf "$ldir"
+  echo "_last_assistant_text OK (#60 endpoint + loud failure)"
   # --- REST launch helpers, via fake curl on PATH -----------------------------
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/curl" <<'SH'
