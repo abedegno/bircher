@@ -732,6 +732,11 @@ _pr_delta_digest() {
   # Require an explicit false. `== true` would PROCEED on an absent or null
   # `truncated`, i.e. treat an answer we did not get as a reassuring one.
   printf '%s' "$tree" | jq -e '.truncated == false' >/dev/null 2>&1 || return 1
+  # Note this escalates whenever the base touched a file the PR also touches: the
+  # resulting blob sha (and often the patch context) moves. That is CORRECT rather
+  # than merely cautious - the merged file then combines both changes, and the
+  # reviewer never saw that combination. The feature is for the common case where
+  # the base moved elsewhere in the tree.
   # Canonical form: sorted by filename, sorted keys, and EVERY field that identifies
   # the change - path, rename origin, status, resulting blob, patch, and the tree
   # entry's mode|type. `--slurpfile` rather than `--argjson` keeps a large compare
@@ -3008,8 +3013,15 @@ fi
 [ "$1" = "issue" ] && [ "$2" = "close" ] && { echo "close $3" >> "$PMLOG"; exit 0; }
 if [ "$1" = "api" ]; then
   if printf '%s\n' "$@" | grep -q 'update-branch'; then
-    printf 'update-branch %s\n' "$*" >> "$PMLOG"
     up=$(printf '%s' "$*" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/update-branch.*#\1#p')
+    # GitHub REFUSES the update unless expected_head_sha matches the current head.
+    # Model that, so omitting or mis-sending the field fails a test instead of
+    # passing silently.
+    ehs=$(printf '%s\n' "$@" | sed -n 's/^expected_head_sha=//p')
+    cur=$(cat "$HEADDIR/$up" 2>/dev/null || echo headsha1234567)
+    [ -n "$ehs" ]        || { printf 'update-branch-NOSHA %s\n' "$*" >> "$PMLOG"; exit 1; }
+    [ "$ehs" = "$cur" ]  || { printf 'update-branch-REFUSED %s\n' "$*" >> "$PMLOG"; exit 1; }
+    printf 'update-branch %s\n' "$*" >> "$PMLOG"
     # GitHub merges the base into the head and the PR stops being BEHIND.
     [ -n "$up" ] && [ -f "$NEWHEADDIR/$up" ] && { cp "$NEWHEADDIR/$up" "$HEADDIR/$up"; echo BLOCKED > "$MSSDIR/$up"; }
     exit 0
@@ -3108,6 +3120,7 @@ J
   grep -q 'pulls/20/update-branch' "$rdir/pmlog" || { echo "FAIL sweep-behind-same: PR #20 not update-branched"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -qx 'merge 20' "$rdir/pmlog"              || { echo "FAIL sweep-behind-same: identical delta was NOT merged"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   grep -qx 'matchhead 20' "$rdir/pmlog"          || { echo "FAIL sweep-behind-same: merge not pinned to the re-stamped head"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
+  grep -q 'expected_head_sha=reviewedsha' "$rdir/pmlog" || { echo "FAIL sweep-behind-same: update-branch sent without expected_head_sha"; cat "$rdir/pmlog"; rm -rf "$rdir"; exit 1; }
   [ -s "$rdir/store" ]                           || { echo "FAIL sweep-behind-same: cross-review never posted on the new head"; rm -rf "$rdir"; exit 1; }
   echo "sweep BEHIND + delta identical -> re-stamp + merge OK (#51)"
   # 4d3: GitHub withheld a file's patch (binary / too large) -> the delta cannot be
