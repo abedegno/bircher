@@ -729,7 +729,9 @@ _pr_delta_digest() {
   # TRUNCATED tree cannot answer for every path, so it fails closed like the rest.
   tree=$(gh api "repos/$REPO/git/trees/${ref}?recursive=1" 2>/dev/null) || return 1
   [ -n "$tree" ] || return 1
-  printf '%s' "$tree" | jq -e '.truncated == true' >/dev/null 2>&1 && return 1
+  # Require an explicit false. `== true` would PROCEED on an absent or null
+  # `truncated`, i.e. treat an answer we did not get as a reassuring one.
+  printf '%s' "$tree" | jq -e '.truncated == false' >/dev/null 2>&1 || return 1
   # Canonical form: sorted by filename, sorted keys, and EVERY field that identifies
   # the change - path, rename origin, status, resulting blob, patch, and the tree
   # entry's mode|type. `--slurpfile` rather than `--argjson` keeps a large compare
