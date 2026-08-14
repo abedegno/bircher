@@ -376,6 +376,21 @@ EOF
   _poll_ci "$pr" "${BIRCHER_CI_RERUN_WAIT:-900}"
 }
 
+# _send_retry_decision <fails_so_far> <max> -> retry|give-up   (PURE, self-tested)
+# Bounds the rc-5 prompt-delivery retry. Split out because the rc-5 path lives in
+# run_item, which has no test harness -- but the BUDGET is the part that can loop
+# forever, so it should not be the untested part. A non-numeric or absent max
+# falls back to 2 rather than to "unbounded": the failure this bounds is an
+# infinite session-creating loop.
+_send_retry_decision() {
+  local fails="${1:-0}" max="${2:-2}"
+  case "$max"   in ''|*[!0-9]*) max=2 ;; esac
+  case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+  [ "$max" -lt 1 ] && max=1
+  [ "$fails" -ge "$max" ] && { echo give-up; return; }
+  echo retry
+}
+
 # _is_limit_message <text> -> yes|no. Matches the provider usage-limit
 # signature a coordinator emits as its FIRST message when the window is
 # exhausted (run #11: "You've hit your session limit / resets 6pm ...").
@@ -554,20 +569,32 @@ _last_assistant_text() {
     echo "[batch] WARN: session-items lookup failed for $conv_id (limit check cannot run this poll)" >&2
     return 1
   }
-  printf '%s' "$json" | python3 -c '
+  local out
+  # A 200 carrying malformed or unexpectedly-shaped JSON is ALSO a failed lookup.
+  # The first cut of this fix only handled curl rc, leaving `sys.exit(0)` and
+  # `|| true` to reproduce the very ambiguity it removed (codex review).
+  out=$(printf '%s' "$json" | python3 -c '
 import json,sys
 n=int(sys.argv[1])
-try: data=json.load(sys.stdin).get("data") or []
-except Exception: sys.exit(0)
+try:
+    data=json.load(sys.stdin).get("data")
+except Exception:
+    sys.exit(1)
+if data is None or not isinstance(data, list):
+    sys.exit(1)
 out=[]
 for it in data:
-    if it.get("role")!="assistant": continue
+    if not isinstance(it, dict) or it.get("role")!="assistant": continue
     for c in (it.get("content") or []):
-        t=c.get("text")
+        t=c.get("text") if isinstance(c, dict) else None
         if t: out.append(t)
     if len(out)>=n: break
 print("\n".join(out))
-' "$n" 2>/dev/null || true
+' "$n" 2>/dev/null) || {
+    echo "[batch] WARN: session-items response for $conv_id was unparseable (limit check cannot run this poll)" >&2
+    return 1
+  }
+  printf '%s' "$out"
 }
 
 # --- REST launch helpers (omnigent server API; see omnigent/server/API.md) ----
@@ -1980,9 +2007,15 @@ ${prompt}"
   # the queue file QUEUED, and return rc 3 so main re-gates and retries the SAME
   # item.
   if ! _send_prompt "$conv_id" "$prompt"; then
-    echo "[batch] $item: send_prompt FAILED -> stopping session; item stays queued for retry (rc 3)" >&2
+    # rc 5, NOT rc 3. rc 3 means "usage limit -> re-gate and retry", and its
+    # caller loops on it unboundedly (the quota budget only bounds consecutive
+    # PREFLIGHT failures, and is re-declared each iteration). A deterministic
+    # delivery failure -- server down, bad payload -- would therefore spin
+    # forever creating sessions (codex review). rc 5 carries its own small,
+    # bounded retry budget in the caller.
+    echo "[batch] $item: send_prompt FAILED -> stopping session; item stays queued (rc 5)" >&2
     _stop_session "$conv_id"
-    return 3
+    return 5
   fi
 
   local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0 _unknown_polls=0
@@ -2068,16 +2101,18 @@ ${prompt}"
         echo "[batch] $item: session $conv_id died (state=$_ss) -> stop waiting" >&2
         break
       fi
-      # #61: a single failed lookup is not evidence of anything, but a RUN of
-      # them means we are flying blind -- and "alive" was only ever a safe
-      # default for one poll. Stop waiting and let the normal post-loop path
-      # run ground-truth recovery, which reads the PR and CI rather than the
-      # session, so it is safe even if the coordinator is in fact still alive.
+      # #61: a run of failed lookups means we are flying blind. It is TEMPTING to
+      # break out early and recover -- the first cut of this fix did exactly that
+      # -- but codex review showed it introduces a race: the same unreachable
+      # server that caused the unknowns also makes `_stop_session` fail, so death
+      # can never be CONFIRMED, and ground-truth recovery would then run
+      # concurrently with a coordinator that is still working the PR. Waiting to
+      # the cap is slower but cannot corrupt anything, so keep the old control
+      # flow and make the blindness LOUD instead. Visibility was the real defect.
       if [ "${_ss%%|*}" = unknown ]; then
         _unknown_polls=$((_unknown_polls + 1))
-        if [ "$_unknown_polls" -ge "${BIRCHER_UNKNOWN_POLL_LIMIT:-5}" ]; then
-          echo "[batch] $item: session state unknown for $_unknown_polls consecutive polls (server unreachable?) -> stop waiting and recover from ground truth" >&2
-          break
+        if [ "$_unknown_polls" = "${BIRCHER_UNKNOWN_POLL_LIMIT:-5}" ]; then
+          echo "[batch] WARN $item: session state UNKNOWN for $_unknown_polls consecutive polls (server unreachable?) -- still waiting to the cap; death cannot be confirmed so recovery must not start early" >&2
         fi
       else
         _unknown_polls=0
@@ -2806,8 +2841,46 @@ SH
   if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
     echo "FAIL _last_assistant_text: failed lookup returned rc 0 (indistinguishable from 'no text')"; rm -rf "$ldir"; exit 1
   fi
+  # A 200 carrying junk is ALSO a failed lookup -- the first cut of this fix only
+  # handled curl rc, so a malformed body still returned rc 0 + empty (codex review).
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'this is not json'
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: malformed 200 body returned rc 0"; rm -rf "$ldir"; exit 1
+  fi
+  # ...as is a 200 whose shape is not what the parser expects.
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"items":[{"role":"assistant"}]}'
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: unexpected schema (no .data) returned rc 0"; rm -rf "$ldir"; exit 1
+  fi
+  # But a well-formed response with NO assistant text is a legitimate empty: rc 0.
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"data":[{"role":"user","content":[{"text":"hello"}]}]}'
+SH
+  chmod +x "$ldir/curl"
+  PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1 \
+    || { echo "FAIL _last_assistant_text: legitimate empty must be rc 0, not a failure"; rm -rf "$ldir"; exit 1; }
   rm -rf "$ldir"
   echo "_last_assistant_text OK (#60 endpoint + loud failure)"
+  # --- #61b: the rc-5 delivery-retry budget must actually bound -------------
+  [ "$(_send_retry_decision 0 2)" = retry   ] || { echo "FAIL send-retry 0/2";  exit 1; }
+  [ "$(_send_retry_decision 1 2)" = retry   ] || { echo "FAIL send-retry 1/2";  exit 1; }
+  [ "$(_send_retry_decision 2 2)" = give-up ] || { echo "FAIL send-retry 2/2";  exit 1; }
+  [ "$(_send_retry_decision 9 2)" = give-up ] || { echo "FAIL send-retry 9/2";  exit 1; }
+  # Garbage or absent config must NOT mean unbounded -- that is the loop this
+  # exists to prevent.
+  [ "$(_send_retry_decision 2 '')"    = give-up ] || { echo "FAIL send-retry empty max";  exit 1; }
+  [ "$(_send_retry_decision 2 abc)"   = give-up ] || { echo "FAIL send-retry junk max";   exit 1; }
+  [ "$(_send_retry_decision 1 0)"     = give-up ] || { echo "FAIL send-retry zero max";   exit 1; }
+  echo "_send_retry_decision OK (#61b bounded)"
   # --- REST launch helpers, via fake curl on PATH -----------------------------
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/curl" <<'SH'
@@ -3694,6 +3767,9 @@ __HELP__
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"; : > "$DEFERRED_READY_FILE"
   for f in "${items[@]}"; do
     local halt=0
+    # Bounded across the whole retry loop for THIS item, unlike qwait below,
+    # which is re-declared per iteration and so cannot bound anything.
+    local send_fails=0 send_max="${BIRCHER_SEND_RETRIES:-2}"
     while :; do
       # B-2 quota gate: start-of-run preflight cannot protect a long run
       # (run #11). Probe BOTH providers before each launch (the probes also
@@ -3733,6 +3809,13 @@ __HELP__
       case $? in
         2) halt=1; break ;;
         3) echo "[batch] usage limit hit at item start; re-gating and retrying $f" >&2; continue ;;
+        5) send_fails=$((send_fails + 1))
+           if [ "$(_send_retry_decision "$send_fails" "$send_max")" = give-up ]; then
+             echo "[batch] $f: prompt delivery failed $send_fails times -> giving up on this item; it stays QUEUED for the next run" >&2
+             break
+           fi
+           echo "[batch] $f: prompt delivery failed ($send_fails/$send_max) -> retrying" >&2
+           sleep 30; continue ;;
         *) break ;;
       esac
     done
