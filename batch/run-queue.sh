@@ -386,8 +386,18 @@ _send_retry_decision() {
   local fails="${1:-0}" max="${2:-2}"
   case "$max"   in ''|*[!0-9]*) max=2 ;; esac
   case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+  # Digits-only is NOT enough. A value too large for the shell's integer test
+  # makes `[ ... -ge ... ]` ERROR rather than answer, and an erroring test is
+  # false -- so the guard fell through to `retry` and the budget became
+  # unbounded again, which is the precise failure it exists to prevent
+  # (codex review; reproduced on bash 3.2 with a 30-digit value). Treat an
+  # absurd magnitude as misconfiguration rather than as a very large budget.
+  [ "${#max}"   -gt 4 ] && max=2
+  [ "${#fails}" -gt 4 ] && fails=9999
   [ "$max" -lt 1 ] && max=1
-  [ "$fails" -ge "$max" ] && { echo give-up; return; }
+  # Fail CLOSED: give up unless we can positively establish there is budget
+  # left. Any comparison that cannot be evaluated must bound, never unbound.
+  [ "$fails" -lt "$max" ] 2>/dev/null || { echo give-up; return; }
   echo retry
 }
 
@@ -2003,9 +2013,13 @@ ${prompt}"
   # #61: a failed delivery used to warn and carry on. The session exists but has
   # NO prompt, so the coordinator idles, ground-truth recovery finds nothing, and
   # the queue file is moved to processed at the end -- consuming an item that was
-  # never worked. Treat it like the limit-message path: stop the session, leave
-  # the queue file QUEUED, and return rc 3 so main re-gates and retries the SAME
-  # item.
+  # never worked. Stop the session and leave the queue file QUEUED instead.
+  #
+  # NOTE the budget is per RUN, not persistent: a permanently undeliverable item
+  # keeps its queue file and gets a fresh budget next run. That is deliberate --
+  # losing the item is worse -- but it means a genuinely dead endpoint churns
+  # session create/stop once per run until someone looks. No dead-letter state
+  # exists yet (codex review).
   if ! _send_prompt "$conv_id" "$prompt"; then
     # rc 5, NOT rc 3. rc 3 means "usage limit -> re-gate and retry", and its
     # caller loops on it unboundedly (the quota budget only bounds consecutive
@@ -2880,6 +2894,12 @@ SH
   [ "$(_send_retry_decision 2 '')"    = give-up ] || { echo "FAIL send-retry empty max";  exit 1; }
   [ "$(_send_retry_decision 2 abc)"   = give-up ] || { echo "FAIL send-retry junk max";   exit 1; }
   [ "$(_send_retry_decision 1 0)"     = give-up ] || { echo "FAIL send-retry zero max";   exit 1; }
+  # All-digit but too large for the shell's integer test: the comparison ERRORS,
+  # and an erroring test used to fall through to "retry" = unbounded.
+  [ "$(_send_retry_decision 5 999999999999999999999999999999)" = give-up ] \
+    || { echo "FAIL send-retry oversized max (unbounded retry)"; exit 1; }
+  [ "$(_send_retry_decision 99999999999999999999 2)" = give-up ] \
+    || { echo "FAIL send-retry oversized fails"; exit 1; }
   echo "_send_retry_decision OK (#61b bounded)"
   # --- REST launch helpers, via fake curl on PATH -----------------------------
   local rdir; rdir=$(mktemp -d)
