@@ -45,7 +45,11 @@ build ./...`, `... && go vet ./...`, client `... && npm run typecheck` / `...
    log that the step actually EXECUTED and reported results, and must name in its
    findings every gate it delegated rather than ran. A green check is a claim,
    not evidence — muesli #705 shipped a CI gate that reported success while tests
-   failed, and passed review because the reviewer was told to trust it —
+   failed, and passed review because the reviewer was told to trust it. It must
+   also check FAILURE-path tests for changes that acquire a releasable resource
+   (muesli #666 left a microphone recording when a capture start failed). Keep
+   that scope narrow: broadening it to "any state change" would make almost every
+   PR a blocking finding, and a gate that cries wolf gets overridden —
    and NEVER edit/commit/open a PR (read-only). Pass the PR number + the
    acceptance contract. Example:
    `sys_session_send(agent="claude_code"|"codex", title="review-<task_slug>",
@@ -56,7 +60,19 @@ pull/<PR>/head; git worktree add --detach /tmp/review-<PR> FETCH_HEAD; cd
 verify each contract point — do NOT judge from the diff alone. Run the gates
 you can, each as ONE command prefixed with `export PATH=/root/bin:$PATH &&`
 (e.g. `export PATH=/root/bin:$PATH && go build ./...`) since your shell may not
-persist env between calls. You are READ-ONLY: never edit/commit/open a PR.
+persist env between calls. For any gate you CANNOT run here, do not accept a
+green check as proof: open the run log (`gh pr checks <PR>` to find the run,
+then `gh run view <run-id> --log`) and RECONCILE what it says with the check's
+conclusion — a step can execute, report failing tests, and still be reported
+green if its exit code was swallowed (`|| true`, `continue-on-error`, a wrapper
+that always exits 0). Quote the log line showing the test counts or the failure
+in your findings, and NAME every gate you delegated rather than ran. If you
+cannot reach the log, say so explicitly and treat that gate as UNVERIFIED —
+do not report it as passing. If the
+change acquires a resource that must be released -- a capture device, stream,
+handle, lock or subscription -- verify its FAILURE paths are tested, not just
+the happy path; a missing release-on-error test is a blocking finding.
+You are READ-ONLY: never edit/commit/open a PR.
 Skills are NOT available in your session (do not call load_skill; this prompt
 is your complete instructions). Report blocking / non-blocking / suggestion
 findings, then a FINAL LINE that is exactly VERDICT: PASS or exactly
