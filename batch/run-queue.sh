@@ -168,15 +168,34 @@ _marker_bodies_since() {
 _extract_verdict() {
   local last
   last=$(printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -n1)
-  # Normalise the decoration real agents emit around a final line -- markdown
-  # emphasis, code ticks, a trailing full stop. Without this the anchor is
-  # byte-exact and escalates on `**VERDICT: PASS**`, which is benign output, not
-  # a malformed review. Normalisation only strips ornament: it can never turn a
-  # FAIL into a PASS, so fail-closed is preserved.
-  last=$(printf '%s' "$last" \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-          -e 's/^[*`_]\{1,3\}//'  -e 's/[*`_]\{1,3\}$//' \
-          -e 's/[.![:space:]]*$//')
+  # Normalise the decoration real agents emit around a final line. Byte-exact
+  # matching escalates on `**VERDICT: PASS**`, which is benign output rather than
+  # a malformed review -- but the grammar accepted here must stay NARROW, because
+  # this string authorises an automatic merge.
+  #
+  # Accepted: balanced markdown/code ornament in any order, plus AT MOST ONE
+  # terminal period or exclamation. Rejected (fails closed): `VERDICT: PASS!!!`
+  # and `VERDICT: PASS...`, which are not ornament but non-contractual output.
+  #
+  # Stripping is order-INDEPENDENT and bounded. A first attempt stripped all
+  # decoration then punctuation, which made `` `VERDICT: FAIL`. `` fail while
+  # `` `VERDICT: FAIL.` `` passed -- the trailing tick was never reconsidered.
+  # The loop removes one character per side per pass instead, so interleaving
+  # does not matter, and the bound stops a line of pure decoration ever
+  # normalising into a verdict.
+  local _punct=0 _i=0 _before
+  while [ "$_i" -lt 8 ]; do
+    _before="$last"
+    last="${last#"${last%%[![:space:]]*}"}"
+    last="${last%"${last##*[![:space:]]}"}"
+    case "$last" in [*\`_]*) last="${last#?}" ;; esac
+    case "$last" in
+      *[*\`_]) last="${last%?}" ;;
+      *[.!])    [ "$_punct" -eq 0 ] && { last="${last%?}"; _punct=1; } ;;
+    esac
+    [ "$last" = "$_before" ] && break
+    _i=$((_i + 1))
+  done
   case "$last" in
     "VERDICT: PASS") printf 'PASS' ;;
     "VERDICT: FAIL") printf 'FAIL' ;;
@@ -2533,6 +2552,28 @@ self_test() {
     || { echo "FAIL _extract_verdict: trailing full stop"; exit 1; }
   [ "$(_extract_verdict $'findings\n`VERDICT: PASS`' 2>/dev/null)" = "PASS" ] \
     || { echo "FAIL _extract_verdict: code-ticked verdict"; exit 1; }
+  # Decoration and punctuation COMBINED, in both orders. The first cut stripped
+  # all decoration then punctuation, so `\`VERDICT: FAIL\`.` failed while
+  # `\`VERDICT: FAIL.\`` passed -- no test combined them, so it went unnoticed.
+  [ "$(_extract_verdict $'findings\n`VERDICT: FAIL`.' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: tick-then-period"; exit 1; }
+  [ "$(_extract_verdict $'findings\n`VERDICT: FAIL.`' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: period-inside-ticks"; exit 1; }
+  [ "$(_extract_verdict $'findings\n**VERDICT: PASS.**' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: period inside bold"; exit 1; }
+  [ "$(_extract_verdict $'findings\n****VERDICT: PASS****' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: four-char decoration"; exit 1; }
+  # The accepted grammar is NARROW: ornament plus AT MOST ONE terminal mark.
+  # Unlimited punctuation is not ornament, it is non-contractual output, and it
+  # must not authorise a merge.
+  [ "$(_extract_verdict $'findings\nVERDICT: PASS!!!' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: multi-punctuation must not authorise"; exit 1; }
+  [ "$(_extract_verdict $'findings\nVERDICT: PASS...' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: ellipsis must not authorise"; exit 1; }
+  [ "$(_extract_verdict $'findings\n****' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: decoration-only line"; exit 1; }
+  [ "$(_extract_verdict $'findings\nNOT A VERDICT: PASS' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: prefixed line must not match"; exit 1; }
   # ...but decoration must not smuggle a verdict past a trailing restatement.
   [ "$(_extract_verdict $'VERDICT: PASS\n**but I would have said VERDICT: FAIL**' 2>/dev/null)" = "" ] \
     || { echo "FAIL _extract_verdict: decorated restatement must still fail closed"; exit 1; }
