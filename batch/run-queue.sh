@@ -149,11 +149,58 @@ _marker_bodies_since() {
         | .body' 2>/dev/null
 }
 
-# _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty).
-# The cross-review contract puts the verdict on the final line, so the LAST
-# match is authoritative even if the reviewer echoed the token earlier in prose.
+# _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty = NO USABLE VERDICT).
+#
+# #65: this used to take the LAST MATCHING TOKEN anywhere in the prose, so a
+# closing remark like "had the microphone not been stopped I would have returned
+# VERDICT: FAIL" silently flipped the recorded outcome -- and this single string
+# decides whether a PR auto-merges.
+#
+# The fix anchors on the CONTRACT the reviewer is given: the verdict is the FINAL
+# LINE. So parse only the last non-empty line and require it to be exactly a
+# verdict. That is strictly better than counting tokens (the first attempt here):
+# a reviewer quoting "VERDICT: FAIL" while explaining its findings is no longer
+# punished with a malformed review, while a trailing restatement still fails
+# closed because the last line is then not a bare verdict.
+#
+# Anything else yields empty, which every caller already treats as "no verdict"
+# and escalates. Fail closed, like the rest of this file.
 _extract_verdict() {
-  printf '%s\n' "$1" | grep -oE 'VERDICT: (PASS|FAIL)' | tail -n1 | sed 's/^VERDICT: //'
+  local last
+  last=$(printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -n1)
+  # Normalise the decoration real agents emit around a final line. Byte-exact
+  # matching escalates on `**VERDICT: PASS**`, which is benign output rather than
+  # a malformed review -- but the grammar accepted here must stay NARROW, because
+  # this string authorises an automatic merge.
+  #
+  # Accepted: balanced markdown/code ornament in any order, plus AT MOST ONE
+  # terminal period or exclamation. Rejected (fails closed): `VERDICT: PASS!!!`
+  # and `VERDICT: PASS...`, which are not ornament but non-contractual output.
+  #
+  # Stripping is order-INDEPENDENT and bounded. A first attempt stripped all
+  # decoration then punctuation, which made `` `VERDICT: FAIL`. `` fail while
+  # `` `VERDICT: FAIL.` `` passed -- the trailing tick was never reconsidered.
+  # The loop removes one character per side per pass instead, so interleaving
+  # does not matter, and the bound stops a line of pure decoration ever
+  # normalising into a verdict.
+  local _punct=0 _i=0 _before
+  while [ "$_i" -lt 8 ]; do
+    _before="$last"
+    last="${last#"${last%%[![:space:]]*}"}"
+    last="${last%"${last##*[![:space:]]}"}"
+    case "$last" in [*\`_]*) last="${last#?}" ;; esac
+    case "$last" in
+      *[*\`_]) last="${last%?}" ;;
+      *[.!])    [ "$_punct" -eq 0 ] && { last="${last%?}"; _punct=1; } ;;
+    esac
+    [ "$last" = "$_before" ] && break
+    _i=$((_i + 1))
+  done
+  case "$last" in
+    "VERDICT: PASS") printf 'PASS' ;;
+    "VERDICT: FAIL") printf 'FAIL' ;;
+    *) [ -n "$last" ] && echo "[batch] WARN: review's final line is not a bare verdict -> treating as no verdict" >&2 ;;
+  esac
 }
 
 # _normalize_ci <newline-separated gh check buckets> -> green|red|pending
@@ -1171,7 +1218,9 @@ _recovery_review_prompt() {
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
 First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr FETCH_HEAD; cd /tmp/review-$pr.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
-Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so trust the PR's green CI for those.
+Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
+A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
+If the change acquires a resource that must be released -- a capture device, stream, handle, lock or subscription -- verify its FAILURE paths are tested, not just the happy path; a missing release-on-error test is a blocking finding. (muesli #666 left a microphone recording when a capture start failed.) Keep that scope narrow: do not treat every state change as in scope.
 Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL'. Put findings BEFORE the verdict so the verdict is the last line even if output is long.
 EOF
 }
@@ -2484,10 +2533,68 @@ self_test() {
   printf '%s' "$row3" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="skipped" and d["pr"] is None and d["wall_seconds"]==0 and d["bound"]=="n/a" and d["implementer"] is None, d; print("json_row skipped OK (implementer omitted -> null)")'
   # --- Layer-2 recovery: pure decision helpers -------------------------------
   RECOVERY_REVIEWER=codex   # make the asserts deterministic regardless of env
-  [ "$(_extract_verdict $'note\nVERDICT: FAIL\nmore prose\nVERDICT: PASS')" = "PASS" ] \
-    || { echo "FAIL _extract_verdict: last match should win"; exit 1; }
-  [ "$(_extract_verdict 'no verdict token here')" = "" ] \
+  # #65: the old contract was "last matching token anywhere wins", and this test
+  # asserted it -- so a closing restatement silently flipped an auto-merge. Now
+  # anchored on the contract the reviewer is actually given: the verdict is the
+  # FINAL LINE, and must be exactly that.
+  [ "$(_extract_verdict $'findings here\nVERDICT: PASS' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: single PASS"; exit 1; }
+  [ "$(_extract_verdict $'findings here\nVERDICT: FAIL' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: single FAIL"; exit 1; }
+  # Trailing whitespace/blank lines after the verdict are normal agent output.
+  [ "$(_extract_verdict $'findings\nVERDICT: PASS   \n\n' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: trailing blank lines"; exit 1; }
+  # Decoration real agents emit must NOT escalate (kimi, on its own suggestion:
+  # byte-exact anchoring is brittle against markdown).
+  [ "$(_extract_verdict $'findings\n**VERDICT: PASS**' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: markdown-bold verdict"; exit 1; }
+  [ "$(_extract_verdict $'findings\nVERDICT: FAIL.' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: trailing full stop"; exit 1; }
+  [ "$(_extract_verdict $'findings\n`VERDICT: PASS`' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: code-ticked verdict"; exit 1; }
+  # Decoration and punctuation COMBINED, in both orders. The first cut stripped
+  # all decoration then punctuation, so `\`VERDICT: FAIL\`.` failed while
+  # `\`VERDICT: FAIL.\`` passed -- no test combined them, so it went unnoticed.
+  [ "$(_extract_verdict $'findings\n`VERDICT: FAIL`.' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: tick-then-period"; exit 1; }
+  [ "$(_extract_verdict $'findings\n`VERDICT: FAIL.`' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: period-inside-ticks"; exit 1; }
+  [ "$(_extract_verdict $'findings\n**VERDICT: PASS.**' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: period inside bold"; exit 1; }
+  [ "$(_extract_verdict $'findings\n****VERDICT: PASS****' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: four-char decoration"; exit 1; }
+  # The accepted grammar is NARROW: ornament plus AT MOST ONE terminal mark.
+  # Unlimited punctuation is not ornament, it is non-contractual output, and it
+  # must not authorise a merge.
+  [ "$(_extract_verdict $'findings\nVERDICT: PASS!!!' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: multi-punctuation must not authorise"; exit 1; }
+  [ "$(_extract_verdict $'findings\nVERDICT: PASS...' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: ellipsis must not authorise"; exit 1; }
+  [ "$(_extract_verdict $'findings\n****' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: decoration-only line"; exit 1; }
+  [ "$(_extract_verdict $'findings\nNOT A VERDICT: PASS' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: prefixed line must not match"; exit 1; }
+  # ...but decoration must not smuggle a verdict past a trailing restatement.
+  [ "$(_extract_verdict $'VERDICT: PASS\n**but I would have said VERDICT: FAIL**' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: decorated restatement must still fail closed"; exit 1; }
+  # A restatement AFTER the verdict must fail closed -- the exact flip that
+  # motivated this change.
+  [ "$(_extract_verdict $'VERDICT: PASS\nbut had X failed I would have said VERDICT: FAIL' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: trailing restatement must yield no verdict"; exit 1; }
+  # Quoting the token WHILE explaining findings is legitimate and must not be
+  # punished, so long as the final line is the real verdict.
+  [ "$(_extract_verdict $'I considered VERDICT: FAIL here but the guard holds\nVERDICT: PASS' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: mid-findings mention must not block a valid final verdict"; exit 1; }
+  [ "$(_extract_verdict 'no verdict token here' 2>/dev/null)" = "" ] \
     || { echo "FAIL _extract_verdict: empty when absent"; exit 1; }
+  [ "$(_extract_verdict '' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: empty input"; exit 1; }
+  # Empty input must be SILENT; a non-verdict final line should warn.
+  [ -z "$(_extract_verdict '' 2>&1 >/dev/null)" ] \
+    || { echo "FAIL _extract_verdict: empty input must not warn"; exit 1; }
+  [ -n "$(_extract_verdict $'VERDICT: PASS\ntrailing prose' 2>&1 >/dev/null)" ] \
+    || { echo "FAIL _extract_verdict: non-verdict final line must warn"; exit 1; }
+  echo "_extract_verdict OK (#65 last-line anchored, fails closed)"
   [ "$(_normalize_ci $'pass\npass')"    = "green"   ] || { echo "FAIL _normalize_ci green"; exit 1; }
   [ "$(_normalize_ci $'pass\nfail')"    = "red"     ] || { echo "FAIL _normalize_ci red"; exit 1; }
   [ "$(_normalize_ci $'pass\npending')" = "pending" ] || { echo "FAIL _normalize_ci pending"; exit 1; }
