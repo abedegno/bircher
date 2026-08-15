@@ -149,11 +149,27 @@ _marker_bodies_since() {
         | .body' 2>/dev/null
 }
 
-# _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty).
-# The cross-review contract puts the verdict on the final line, so the LAST
-# match is authoritative even if the reviewer echoed the token earlier in prose.
+# _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty = NO USABLE VERDICT).
+#
+# #65: this used to take the LAST match, on the reasoning that the contract puts
+# the verdict on the final line so a token echoed earlier should not win. That
+# holds only while the reviewer never mentions the token AFTER its real verdict.
+# A closing remark like "had the microphone not been stopped I would have
+# returned VERDICT: FAIL" silently flips the recorded outcome -- and this single
+# string decides whether a PR auto-merges.
+#
+# So: EXACTLY ONE token is a verdict. Two or more is a MALFORMED review, not
+# last-wins; zero is malformed. Both yield empty, which every caller already
+# treats as "no verdict" and escalates. Fail closed, like the rest of this file.
 _extract_verdict() {
-  printf '%s\n' "$1" | grep -oE 'VERDICT: (PASS|FAIL)' | tail -n1 | sed 's/^VERDICT: //'
+  local hits n
+  hits=$(printf '%s\n' "$1" | grep -oE 'VERDICT: (PASS|FAIL)')
+  n=$(printf '%s' "$hits" | grep -c . 2>/dev/null || echo 0)
+  case "$n" in
+    1) printf '%s' "${hits#VERDICT: }" ;;
+    0) : ;;
+    *) echo "[batch] WARN: review emitted $n verdict tokens -> MALFORMED (not last-wins); treating as no verdict" >&2 ;;
+  esac
 }
 
 # _normalize_ci <newline-separated gh check buckets> -> green|red|pending
@@ -1171,7 +1187,9 @@ _recovery_review_prompt() {
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
 First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr FETCH_HEAD; cd /tmp/review-$pr.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
-Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so trust the PR's green CI for those.
+Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
+A green check is a CLAIM, not evidence: for any gate you could not run yourself, confirm from the run log that the step actually EXECUTED and reported results, and NAME in your findings every gate you delegated rather than ran. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
+If the change acquires a resource, mutates externally-visible state, or touches a privacy-sensitive path, verify the FAILURE paths are tested -- not just the happy path. A missing error-path test is a blocking finding. (muesli #666 left a microphone recording when a capture start failed; every test covered the success path.)
 Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL'. Put findings BEFORE the verdict so the verdict is the last line even if output is long.
 EOF
 }
@@ -2484,10 +2502,23 @@ self_test() {
   printf '%s' "$row3" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outcome"]=="skipped" and d["pr"] is None and d["wall_seconds"]==0 and d["bound"]=="n/a" and d["implementer"] is None, d; print("json_row skipped OK (implementer omitted -> null)")'
   # --- Layer-2 recovery: pure decision helpers -------------------------------
   RECOVERY_REVIEWER=codex   # make the asserts deterministic regardless of env
-  [ "$(_extract_verdict $'note\nVERDICT: FAIL\nmore prose\nVERDICT: PASS')" = "PASS" ] \
-    || { echo "FAIL _extract_verdict: last match should win"; exit 1; }
-  [ "$(_extract_verdict 'no verdict token here')" = "" ] \
+  # #65: the old contract was "last match wins", and this test asserted it. That
+  # made a closing remark restating the token silently flip an auto-merge
+  # decision. Exactly one token is now a verdict; anything else is malformed and
+  # fails closed to "no verdict", which callers already escalate.
+  [ "$(_extract_verdict $'findings here\nVERDICT: PASS' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: single PASS"; exit 1; }
+  [ "$(_extract_verdict $'findings here\nVERDICT: FAIL' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: single FAIL"; exit 1; }
+  [ "$(_extract_verdict $'note\nVERDICT: FAIL\nmore prose\nVERDICT: PASS' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: two tokens must be MALFORMED, not last-wins"; exit 1; }
+  [ "$(_extract_verdict $'VERDICT: PASS\nbut had X failed I would have said VERDICT: FAIL' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: trailing restatement must be MALFORMED"; exit 1; }
+  [ "$(_extract_verdict 'no verdict token here' 2>/dev/null)" = "" ] \
     || { echo "FAIL _extract_verdict: empty when absent"; exit 1; }
+  [ "$(_extract_verdict '' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: empty input"; exit 1; }
+  echo "_extract_verdict OK (#65 exactly-one-token, fails closed)"
   [ "$(_normalize_ci $'pass\npass')"    = "green"   ] || { echo "FAIL _normalize_ci green"; exit 1; }
   [ "$(_normalize_ci $'pass\nfail')"    = "red"     ] || { echo "FAIL _normalize_ci red"; exit 1; }
   [ "$(_normalize_ci $'pass\npending')" = "pending" ] || { echo "FAIL _normalize_ci pending"; exit 1; }

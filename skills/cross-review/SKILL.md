@@ -39,8 +39,13 @@ anyone needs to read through.
    `export PATH=/root/bin:$PATH &&` in the same shell call, since the reviewer's
    shell may not persist env between calls (`export PATH=/root/bin:$PATH && go
 build ./...`, `... && go vet ./...`, client `... && npm run typecheck` / `...
-&& npx vitest run <touched>`, plugin `... && pytest`; DB-backed `go test`
-   needs a DB the runner lacks, so trust the PR's green CI for those) —
+&& npx vitest run <touched>`, plugin `... && pytest`) —
+   for any gate it CANNOT run itself (DB-backed `go test` needs a DB the runner
+   lacks), it must NOT simply accept a green check: it must confirm from the run
+   log that the step actually EXECUTED and reported results, and must name in its
+   findings every gate it delegated rather than ran. A green check is a claim,
+   not evidence — muesli #705 shipped a CI gate that reported success while tests
+   failed, and passed review because the reviewer was told to trust it —
    and NEVER edit/commit/open a PR (read-only). Pass the PR number + the
    acceptance contract. Example:
    `sys_session_send(agent="claude_code"|"codex", title="review-<task_slug>",
