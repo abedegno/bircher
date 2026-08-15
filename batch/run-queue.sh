@@ -2115,14 +2115,14 @@ ${prompt}"
         echo "[batch] $item: session $conv_id died (state=$_ss) -> stop waiting" >&2
         break
       fi
-      # #61: a run of failed lookups means we are flying blind. It is TEMPTING to
-      # break out early and recover -- the first cut of this fix did exactly that
-      # -- but codex review showed it introduces a race: the same unreachable
+      # #61: a run of failed lookups means we are flying blind. Breaking out early
+      # to recover (the first cut of this fix) is worse: the same unreachable
       # server that caused the unknowns also makes `_stop_session` fail, so death
-      # can never be CONFIRMED, and ground-truth recovery would then run
-      # concurrently with a coordinator that is still working the PR. Waiting to
-      # the cap is slower but cannot corrupt anything, so keep the old control
-      # flow and make the blindness LOUD instead. Visibility was the real defect.
+      # is never CONFIRMED and recovery races a coordinator that may still be
+      # working the PR. So keep the old control flow -- but note that waiting to
+      # the cap only NARROWS that window, it does not close it (an earlier
+      # comment here claimed it "cannot corrupt anything", which was wrong).
+      # The teardown below closes it, by refusing to recover while blind.
       if [ "${_ss%%|*}" = unknown ]; then
         _unknown_polls=$((_unknown_polls + 1))
         if [ "$_unknown_polls" = "${BIRCHER_UNKNOWN_POLL_LIMIT:-5}" ]; then
@@ -2137,6 +2137,7 @@ ${prompt}"
   # ALIVE (cap reached, not a death), cancel it via the API so it actually
   # stops -- killing the local client alone does NOT stop the server-side
   # session, and a live coordinator would otherwise race the recovery review.
+  local _blind=0
   if [ -z "$marker" ] && [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
     local _ss; _ss=$(_session_state "$conv_id")
     if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = alive ]; then
@@ -2148,6 +2149,17 @@ ${prompt}"
         _ss=$(_session_state "$conv_id")
         [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = died ] && break
       done
+      # #61: if the state is STILL unknown, the stop was never confirmed and the
+      # coordinator may be alive and working. Ground-truth recovery reads AND
+      # WRITES the PR, so running it here can race a live session. Refuse, and
+      # escalate to a human instead -- an escalation costs attention, a race
+      # costs a corrupted PR. `alive` with a real status (running/idle) is a
+      # different case: we reached the server, it answered, the stop was
+      # delivered, and the existing behaviour is unchanged.
+      if [ "${_ss%%|*}" = unknown ]; then
+        _blind=1
+        echo "[batch] WARN $item: session $conv_id state still UNKNOWN after cancel -- cannot confirm it stopped; SKIPPING ground-truth recovery to avoid racing a live coordinator" >&2
+      fi
     fi
   fi
   # Teardown: the session is server-side (no local client to kill). If it is
@@ -2208,12 +2220,19 @@ EOF
     # marker. Recover from ground truth -- the implementer's
     # PR usually exists and is CI-green; complete or truthfully label the item
     # here instead of recording a bare timeout that re-balloons the item.
-    echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
-    local rec
-    rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-    IFS='|' read -r outcome review note <<EOF
+    if [ "${_blind:-0}" = 1 ]; then
+      # Blind at teardown (see above): do not touch the PR.
+      outcome="escalated"; review="na"
+      note="server unreachable at cap; could not confirm the session stopped, so ground-truth recovery was skipped to avoid racing a live coordinator - needs a human"
+      echo "[batch] $item: blind at teardown -> escalating without recovery" >&2
+    else
+      echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
+      local rec
+      rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
+      IFS='|' read -r outcome review note <<EOF
 $rec
 EOF
+    fi
     ci_first="false"; rounds="0"
   fi
 
