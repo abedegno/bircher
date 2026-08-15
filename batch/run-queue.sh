@@ -2216,10 +2216,15 @@ $marker
 EOF
     : "${outcome:=timeout}" "${ci_first:=false}"
   else
-    # No marker: the session died or was cancelled at the cap without posting a
-    # marker. Recover from ground truth -- the implementer's
-    # PR usually exists and is CI-green; complete or truthfully label the item
-    # here instead of recording a bare timeout that re-balloons the item.
+    # No marker. Two cases, and they must not be conflated:
+    #
+    #   - the session is known to have ended (died, or a cancel we CONFIRMED):
+    #     recover from ground truth -- the implementer's PR usually exists and is
+    #     CI-green, so complete or truthfully label the item here rather than
+    #     recording a bare timeout that re-balloons it;
+    #   - we are BLIND (`_blind`): the cancel was never confirmed because the
+    #     server was unreachable, so the coordinator may still be running.
+    #     Recovery reads and WRITES the PR, so it must not run here.
     if [ "${_blind:-0}" = 1 ]; then
       # Blind at teardown (see above): do not touch the PR.
       outcome="escalated"; review="na"
