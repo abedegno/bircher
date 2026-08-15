@@ -168,6 +168,15 @@ _marker_bodies_since() {
 _extract_verdict() {
   local last
   last=$(printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -n1)
+  # Normalise the decoration real agents emit around a final line -- markdown
+  # emphasis, code ticks, a trailing full stop. Without this the anchor is
+  # byte-exact and escalates on `**VERDICT: PASS**`, which is benign output, not
+  # a malformed review. Normalisation only strips ornament: it can never turn a
+  # FAIL into a PASS, so fail-closed is preserved.
+  last=$(printf '%s' "$last" \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+          -e 's/^[*`_]\{1,3\}//'  -e 's/[*`_]\{1,3\}$//' \
+          -e 's/[.![:space:]]*$//')
   case "$last" in
     "VERDICT: PASS") printf 'PASS' ;;
     "VERDICT: FAIL") printf 'FAIL' ;;
@@ -2516,6 +2525,17 @@ self_test() {
   # Trailing whitespace/blank lines after the verdict are normal agent output.
   [ "$(_extract_verdict $'findings\nVERDICT: PASS   \n\n' 2>/dev/null)" = "PASS" ] \
     || { echo "FAIL _extract_verdict: trailing blank lines"; exit 1; }
+  # Decoration real agents emit must NOT escalate (kimi, on its own suggestion:
+  # byte-exact anchoring is brittle against markdown).
+  [ "$(_extract_verdict $'findings\n**VERDICT: PASS**' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: markdown-bold verdict"; exit 1; }
+  [ "$(_extract_verdict $'findings\nVERDICT: FAIL.' 2>/dev/null)" = "FAIL" ] \
+    || { echo "FAIL _extract_verdict: trailing full stop"; exit 1; }
+  [ "$(_extract_verdict $'findings\n`VERDICT: PASS`' 2>/dev/null)" = "PASS" ] \
+    || { echo "FAIL _extract_verdict: code-ticked verdict"; exit 1; }
+  # ...but decoration must not smuggle a verdict past a trailing restatement.
+  [ "$(_extract_verdict $'VERDICT: PASS\n**but I would have said VERDICT: FAIL**' 2>/dev/null)" = "" ] \
+    || { echo "FAIL _extract_verdict: decorated restatement must still fail closed"; exit 1; }
   # A restatement AFTER the verdict must fail closed -- the exact flip that
   # motivated this change.
   [ "$(_extract_verdict $'VERDICT: PASS\nbut had X failed I would have said VERDICT: FAIL' 2>/dev/null)" = "" ] \
