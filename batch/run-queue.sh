@@ -376,6 +376,31 @@ EOF
   _poll_ci "$pr" "${BIRCHER_CI_RERUN_WAIT:-900}"
 }
 
+# _send_retry_decision <fails_so_far> <max> -> retry|give-up   (PURE, self-tested)
+# Bounds the rc-5 prompt-delivery retry. Split out because the rc-5 path lives in
+# run_item, which has no test harness -- but the BUDGET is the part that can loop
+# forever, so it should not be the untested part. A non-numeric or absent max
+# falls back to 2 rather than to "unbounded": the failure this bounds is an
+# infinite session-creating loop.
+_send_retry_decision() {
+  local fails="${1:-0}" max="${2:-2}"
+  case "$max"   in ''|*[!0-9]*) max=2 ;; esac
+  case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+  # Digits-only is NOT enough. A value too large for the shell's integer test
+  # makes `[ ... -ge ... ]` ERROR rather than answer, and an erroring test is
+  # false -- so the guard fell through to `retry` and the budget became
+  # unbounded again, which is the precise failure it exists to prevent
+  # (codex review; reproduced on bash 3.2 with a 30-digit value). Treat an
+  # absurd magnitude as misconfiguration rather than as a very large budget.
+  [ "${#max}"   -gt 4 ] && max=2
+  [ "${#fails}" -gt 4 ] && fails=9999
+  [ "$max" -lt 1 ] && max=1
+  # Fail CLOSED: give up unless we can positively establish there is budget
+  # left. Any comparison that cannot be evaluated must bound, never unbound.
+  [ "$fails" -lt "$max" ] 2>/dev/null || { echo give-up; return; }
+  echo retry
+}
+
 # _is_limit_message <text> -> yes|no. Matches the provider usage-limit
 # signature a coordinator emits as its FIRST message when the window is
 # exhausted (run #11: "You've hit your session limit / resets 6pm ...").
@@ -491,6 +516,9 @@ _codex_usage() {
 }
 
 # _session_died <status> <err_code> -> "died" | "alive"
+# `unknown` (from a failed lookup) maps to alive DELIBERATELY: one failed poll
+# must never trigger recovery against a session that may still be running. A
+# RUN of them is a different question, handled by the poll loop (#61).
 # The server session is DEAD (recovery may run) only when it has a non-empty
 # last_task_error_code OR a terminal-dead status. It is ALIVE for running AND
 # idle: a coordinator ends its turn and goes idle between turns while a
@@ -506,45 +534,77 @@ _session_died() {
   esac
 }
 
-# _session_state <conv_id> -> "<status>|<err_code>" ("|" on any failure).
+# _session_state <conv_id> -> "<status>|<err_code>"; "unknown|" on any failure.
+#
+# #61: this used to return "|" on failure, which _session_died read as `alive`.
+# A transient 404/5xx/timeout was therefore indistinguishable from a healthy
+# coordinator, so a DEAD one could be waited on to the full cap -- and, worse,
+# a sustained lookup failure against a LIVE coordinator kept bircher blind while
+# it ran. `unknown` keeps the same conservative single-poll behaviour (never
+# recover against a session we cannot confirm dead) while letting the caller
+# SEE the difference and act on a run of them.
 # Reads the server session so run_item can detect death (vs the ambiguous
 # local client process). $SERVER is the omnigent server (e.g. http://omnigent:8000).
 _session_state() {
   local conv_id="$1" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf '|'; return; }
+  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf 'unknown|'; return; }
   printf '%s' "$json" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
 except Exception:
-    print("|"); sys.exit(0)
+    print("unknown|"); sys.exit(0)
 print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.last_task_error_code") or ""))
-' 2>/dev/null || printf '|'
+' 2>/dev/null || printf 'unknown|'
 }
 
 # _last_assistant_text <conv_id> [n] -> concatenated text of the newest n (default
-# 3) assistant messages in the conversation, one blob on stdout ("" on any error).
+# 3) assistant messages, one blob on stdout. rc 0 = we got an answer (possibly
+# empty); rc 1 = the LOOKUP FAILED and the empty output means nothing.
 # Used by the within-item fast limit check (B-2): a young session whose first
 # assistant turn is a provider "hit your limit" message means the implementer
 # vendor's window is exhausted -- fail fast and re-gate rather than idle the cap.
-# (omnigent/server/API.md: GET /v1/conversations/{id}/items.)
+#
+# #60: this called GET /v1/conversations/{id}/items, which omnigent v0.9.0
+# REMOVED. The 404 was swallowed by `curl -sf ... || return 0`, so the check
+# silently answered "no limit message" for a whole release and every exhausted
+# window idled the full ITEM_TIMEOUT instead of re-gating in seconds. The
+# replacement is GET /v1/sessions/{id}/items, same order/limit shape.
+#
+# The rc split exists because that is what made the regression invisible: an
+# empty string meant BOTH "no assistant text yet" and "we could not ask".
 _last_assistant_text() {
   local conv_id="$1" n="${2:-3}" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/conversations/$conv_id/items?order=desc&limit=20" 2>/dev/null) || return 0
-  printf '%s' "$json" | python3 -c '
+  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id/items?order=desc&limit=20" 2>/dev/null) || {
+    echo "[batch] WARN: session-items lookup failed for $conv_id (limit check cannot run this poll)" >&2
+    return 1
+  }
+  local out
+  # A 200 carrying malformed or unexpectedly-shaped JSON is ALSO a failed lookup.
+  # The first cut of this fix only handled curl rc, leaving `sys.exit(0)` and
+  # `|| true` to reproduce the very ambiguity it removed (codex review).
+  out=$(printf '%s' "$json" | python3 -c '
 import json,sys
 n=int(sys.argv[1])
-try: data=json.load(sys.stdin).get("data") or []
-except Exception: sys.exit(0)
+try:
+    data=json.load(sys.stdin).get("data")
+except Exception:
+    sys.exit(1)
+if data is None or not isinstance(data, list):
+    sys.exit(1)
 out=[]
 for it in data:
-    if it.get("role")!="assistant": continue
+    if not isinstance(it, dict) or it.get("role")!="assistant": continue
     for c in (it.get("content") or []):
-        t=c.get("text")
+        t=c.get("text") if isinstance(c, dict) else None
         if t: out.append(t)
     if len(out)>=n: break
 print("\n".join(out))
-' "$n" 2>/dev/null || true
+' "$n" 2>/dev/null) || {
+    echo "[batch] WARN: session-items response for $conv_id was unparseable (limit check cannot run this poll)" >&2
+    return 1
+  }
+  printf '%s' "$out"
 }
 
 # --- REST launch helpers (omnigent server API; see omnigent/server/API.md) ----
@@ -1950,9 +2010,29 @@ ${prompt}"
     bound_outcome="failed"
     echo "[batch] !!!! BINDING MISMATCH for $item: session host_id='${sess_host:-<empty>}' != local='$host_id'" >&2
   fi
-  _send_prompt "$conv_id" "$prompt" || echo "[batch] WARN $item: send_prompt failed" >&2
+  # #61: a failed delivery used to warn and carry on. The session exists but has
+  # NO prompt, so the coordinator idles, ground-truth recovery finds nothing, and
+  # the queue file is moved to processed at the end -- consuming an item that was
+  # never worked. Stop the session and leave the queue file QUEUED instead.
+  #
+  # NOTE the budget is per RUN, not persistent: a permanently undeliverable item
+  # keeps its queue file and gets a fresh budget next run. That is deliberate --
+  # losing the item is worse -- but it means a genuinely dead endpoint churns
+  # session create/stop once per run until someone looks. No dead-letter state
+  # exists yet (codex review).
+  if ! _send_prompt "$conv_id" "$prompt"; then
+    # rc 5, NOT rc 3. rc 3 means "usage limit -> re-gate and retry", and its
+    # caller loops on it unboundedly (the quota budget only bounds consecutive
+    # PREFLIGHT failures, and is re-declared each iteration). A deterministic
+    # delivery failure -- server down, bad payload -- would therefore spin
+    # forever creating sessions (codex review). rc 5 carries its own small,
+    # bounded retry budget in the caller.
+    echo "[batch] $item: send_prompt FAILED -> stopping session; item stays queued (rc 5)" >&2
+    _stop_session "$conv_id"
+    return 5
+  fi
 
-  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0
+  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0 _unknown_polls=0
   while [ "$elapsed" -lt "$ITEM_TIMEOUT" ]; do
     sleep "$POLL"; elapsed=$(( $(date +%s) - start )); polls=$((polls + 1))
     # B-2 within-item fast limit check: only in the early window (first 2 polls).
@@ -2035,12 +2115,29 @@ ${prompt}"
         echo "[batch] $item: session $conv_id died (state=$_ss) -> stop waiting" >&2
         break
       fi
+      # #61: a run of failed lookups means we are flying blind. Breaking out early
+      # to recover (the first cut of this fix) is worse: the same unreachable
+      # server that caused the unknowns also makes `_stop_session` fail, so death
+      # is never CONFIRMED and recovery races a coordinator that may still be
+      # working the PR. So keep the old control flow -- but note that waiting to
+      # the cap only NARROWS that window, it does not close it (an earlier
+      # comment here claimed it "cannot corrupt anything", which was wrong).
+      # The teardown below closes it, by refusing to recover while blind.
+      if [ "${_ss%%|*}" = unknown ]; then
+        _unknown_polls=$((_unknown_polls + 1))
+        if [ "$_unknown_polls" = "${BIRCHER_UNKNOWN_POLL_LIMIT:-5}" ]; then
+          echo "[batch] WARN $item: session state UNKNOWN for $_unknown_polls consecutive polls (server unreachable?) -- still waiting to the cap; death cannot be confirmed so recovery must not start early" >&2
+        fi
+      else
+        _unknown_polls=0
+      fi
     fi
   done
   # If we exited the loop without a marker/noop and the server session is still
   # ALIVE (cap reached, not a death), cancel it via the API so it actually
   # stops -- killing the local client alone does NOT stop the server-side
   # session, and a live coordinator would otherwise race the recovery review.
+  local _blind=0
   if [ -z "$marker" ] && [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
     local _ss; _ss=$(_session_state "$conv_id")
     if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = alive ]; then
@@ -2052,6 +2149,17 @@ ${prompt}"
         _ss=$(_session_state "$conv_id")
         [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = died ] && break
       done
+      # #61: if the state is STILL unknown, the stop was never confirmed and the
+      # coordinator may be alive and working. Ground-truth recovery reads AND
+      # WRITES the PR, so running it here can race a live session. Refuse, and
+      # escalate to a human instead -- an escalation costs attention, a race
+      # costs a corrupted PR. `alive` with a real status (running/idle) is a
+      # different case: we reached the server, it answered, the stop was
+      # delivered, and the existing behaviour is unchanged.
+      if [ "${_ss%%|*}" = unknown ]; then
+        _blind=1
+        echo "[batch] WARN $item: session $conv_id state still UNKNOWN after cancel -- cannot confirm it stopped; SKIPPING ground-truth recovery to avoid racing a live coordinator" >&2
+      fi
     fi
   fi
   # Teardown: the session is server-side (no local client to kill). If it is
@@ -2108,16 +2216,28 @@ $marker
 EOF
     : "${outcome:=timeout}" "${ci_first:=false}"
   else
-    # No marker: the session died or was cancelled at the cap without posting a
-    # marker. Recover from ground truth -- the implementer's
-    # PR usually exists and is CI-green; complete or truthfully label the item
-    # here instead of recording a bare timeout that re-balloons the item.
-    echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
-    local rec
-    rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-    IFS='|' read -r outcome review note <<EOF
+    # No marker. Two cases, and they must not be conflated:
+    #
+    #   - the session is known to have ended (died, or a cancel we CONFIRMED):
+    #     recover from ground truth -- the implementer's PR usually exists and is
+    #     CI-green, so complete or truthfully label the item here rather than
+    #     recording a bare timeout that re-balloons it;
+    #   - we are BLIND (`_blind`): the cancel was never confirmed because the
+    #     server was unreachable, so the coordinator may still be running.
+    #     Recovery reads and WRITES the PR, so it must not run here.
+    if [ "${_blind:-0}" = 1 ]; then
+      # Blind at teardown (see above): do not touch the PR.
+      outcome="escalated"; review="na"
+      note="server unreachable at cap; could not confirm the session stopped, so ground-truth recovery was skipped to avoid racing a live coordinator - needs a human"
+      echo "[batch] $item: blind at teardown -> escalating without recovery" >&2
+    else
+      echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
+      local rec
+      rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
+      IFS='|' read -r outcome review note <<EOF
 $rec
 EOF
+    fi
     ci_first="false"; rounds="0"
   fi
 
@@ -2697,6 +2817,10 @@ SH
   [ "$(_session_died error '')"     = "died"  ] || { echo "FAIL _session_died error";    exit 1; }
   [ "$(_session_died cancelled '')" = "died"  ] || { echo "FAIL _session_died cancelled";exit 1; }
   [ "$(_session_died idle 'ReadError')" = "died" ] || { echo "FAIL _session_died errcode"; exit 1; }
+  # #61: a failed lookup ("unknown") must still read as alive for a SINGLE poll --
+  # never recover against a session we cannot confirm dead. The run-of-unknowns
+  # escape hatch lives in the poll loop, not here.
+  [ "$(_session_died unknown '')"   = "alive" ] || { echo "FAIL _session_died unknown"; exit 1; }
   echo "_session_died OK"
   # --- RC2: _session_state parse, via fake curl -------
   local ssdir; ssdir=$(mktemp -d)
@@ -2711,8 +2835,96 @@ SH
   [ "$ss" = "running|" ] || { echo "FAIL _session_state running: '$ss'"; exit 1; }
   ss=$(PATH="$ssdir:$PATH" SERVER=http://x FAKE_STATUS=failed FAKE_ERR=ReadError _session_state conv_t)
   [ "$ss" = "failed|ReadError" ] || { echo "FAIL _session_state failed: '$ss'"; exit 1; }
+  # #61: a FAILED lookup must be distinguishable from a healthy session. Before
+  # this it returned "|", which _session_died read as alive -- indistinguishable
+  # from a real answer, which is why the v0.9.0 endpoint removal went unnoticed.
+  cat >"$ssdir/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22          # curl -f on an HTTP error
+SH
+  chmod +x "$ssdir/curl"
+  ss=$(PATH="$ssdir:$PATH" SERVER=http://x _session_state conv_t)
+  [ "$ss" = "unknown|" ] || { echo "FAIL _session_state http-error: expected 'unknown|', got '$ss'"; exit 1; }
+  cat >"$ssdir/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'not json at all'
+SH
+  chmod +x "$ssdir/curl"
+  ss=$(PATH="$ssdir:$PATH" SERVER=http://x _session_state conv_t)
+  [ "$ss" = "unknown|" ] || { echo "FAIL _session_state malformed: expected 'unknown|', got '$ss'"; exit 1; }
   rm -rf "$ssdir"
-  echo "session helpers OK"
+  echo "session helpers OK (incl. #61 unknown-vs-alive)"
+  # --- #60: _last_assistant_text hits the v0.9.0 endpoint and reports failure --
+  local ldir; ldir=$(mktemp -d)
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$URL_LOG"
+printf '{"data":[{"role":"assistant","content":[{"text":"You have hit your usage limit"}]}]}'
+SH
+  chmod +x "$ldir/curl"
+  local ltxt
+  ltxt=$(PATH="$ldir:$PATH" SERVER=http://x URL_LOG="$ldir/urls" _last_assistant_text conv_t 3)
+  grep -q '/v1/sessions/conv_t/items' "$ldir/urls" \
+    || { echo "FAIL _last_assistant_text: wrong endpoint"; cat "$ldir/urls"; rm -rf "$ldir"; exit 1; }
+  grep -q '/v1/conversations/' "$ldir/urls" \
+    && { echo "FAIL _last_assistant_text: still calling the REMOVED conversations endpoint"; rm -rf "$ldir"; exit 1; }
+  [ "$(_is_limit_message "$ltxt")" = yes ] \
+    || { echo "FAIL _last_assistant_text: limit message not detected: '$ltxt'"; rm -rf "$ldir"; exit 1; }
+  # A failed lookup must be rc 1, NOT rc 0 with empty output (the #60 defect).
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+exit 22
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: failed lookup returned rc 0 (indistinguishable from 'no text')"; rm -rf "$ldir"; exit 1
+  fi
+  # A 200 carrying junk is ALSO a failed lookup -- the first cut of this fix only
+  # handled curl rc, so a malformed body still returned rc 0 + empty (codex review).
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'this is not json'
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: malformed 200 body returned rc 0"; rm -rf "$ldir"; exit 1
+  fi
+  # ...as is a 200 whose shape is not what the parser expects.
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"items":[{"role":"assistant"}]}'
+SH
+  chmod +x "$ldir/curl"
+  if PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1; then
+    echo "FAIL _last_assistant_text: unexpected schema (no .data) returned rc 0"; rm -rf "$ldir"; exit 1
+  fi
+  # But a well-formed response with NO assistant text is a legitimate empty: rc 0.
+  cat >"$ldir/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"data":[{"role":"user","content":[{"text":"hello"}]}]}'
+SH
+  chmod +x "$ldir/curl"
+  PATH="$ldir:$PATH" SERVER=http://x _last_assistant_text conv_t 3 >/dev/null 2>&1 \
+    || { echo "FAIL _last_assistant_text: legitimate empty must be rc 0, not a failure"; rm -rf "$ldir"; exit 1; }
+  rm -rf "$ldir"
+  echo "_last_assistant_text OK (#60 endpoint + loud failure)"
+  # --- #61b: the rc-5 delivery-retry budget must actually bound -------------
+  [ "$(_send_retry_decision 0 2)" = retry   ] || { echo "FAIL send-retry 0/2";  exit 1; }
+  [ "$(_send_retry_decision 1 2)" = retry   ] || { echo "FAIL send-retry 1/2";  exit 1; }
+  [ "$(_send_retry_decision 2 2)" = give-up ] || { echo "FAIL send-retry 2/2";  exit 1; }
+  [ "$(_send_retry_decision 9 2)" = give-up ] || { echo "FAIL send-retry 9/2";  exit 1; }
+  # Garbage or absent config must NOT mean unbounded -- that is the loop this
+  # exists to prevent.
+  [ "$(_send_retry_decision 2 '')"    = give-up ] || { echo "FAIL send-retry empty max";  exit 1; }
+  [ "$(_send_retry_decision 2 abc)"   = give-up ] || { echo "FAIL send-retry junk max";   exit 1; }
+  [ "$(_send_retry_decision 1 0)"     = give-up ] || { echo "FAIL send-retry zero max";   exit 1; }
+  # All-digit but too large for the shell's integer test: the comparison ERRORS,
+  # and an erroring test used to fall through to "retry" = unbounded.
+  [ "$(_send_retry_decision 5 999999999999999999999999999999)" = give-up ] \
+    || { echo "FAIL send-retry oversized max (unbounded retry)"; exit 1; }
+  [ "$(_send_retry_decision 99999999999999999999 2)" = give-up ] \
+    || { echo "FAIL send-retry oversized fails"; exit 1; }
+  echo "_send_retry_decision OK (#61b bounded)"
   # --- REST launch helpers, via fake curl on PATH -----------------------------
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/curl" <<'SH'
@@ -3599,6 +3811,9 @@ __HELP__
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"; : > "$DEFERRED_READY_FILE"
   for f in "${items[@]}"; do
     local halt=0
+    # Bounded across the whole retry loop for THIS item, unlike qwait below,
+    # which is re-declared per iteration and so cannot bound anything.
+    local send_fails=0 send_max="${BIRCHER_SEND_RETRIES:-2}"
     while :; do
       # B-2 quota gate: start-of-run preflight cannot protect a long run
       # (run #11). Probe BOTH providers before each launch (the probes also
@@ -3638,6 +3853,13 @@ __HELP__
       case $? in
         2) halt=1; break ;;
         3) echo "[batch] usage limit hit at item start; re-gating and retrying $f" >&2; continue ;;
+        5) send_fails=$((send_fails + 1))
+           if [ "$(_send_retry_decision "$send_fails" "$send_max")" = give-up ]; then
+             echo "[batch] $f: prompt delivery failed $send_fails times -> giving up on this item; it stays QUEUED for the next run" >&2
+             break
+           fi
+           echo "[batch] $f: prompt delivery failed ($send_fails/$send_max) -> retrying" >&2
+           sleep 30; continue ;;
         *) break ;;
       esac
     done
