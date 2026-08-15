@@ -45,7 +45,10 @@ build ./...`, `... && go vet ./...`, client `... && npm run typecheck` / `...
    log that the step actually EXECUTED and reported results, and must name in its
    findings every gate it delegated rather than ran. A green check is a claim,
    not evidence — muesli #705 shipped a CI gate that reported success while tests
-   failed, and passed review because the reviewer was told to trust it. It must
+   failed, and passed review because the reviewer was told to trust it. (Verified
+   2026-08-15 that this is actionable: the reviewer session has `gh` at
+   /root/bin/gh, authenticated, and can run both `gh pr checks` and
+   `gh run view --log`.) It must
    also check FAILURE-path tests for changes that acquire a releasable resource
    (muesli #666 left a microphone recording when a capture start failed). Keep
    that scope narrow: broadening it to "any state change" would make almost every
