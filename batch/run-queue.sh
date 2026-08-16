@@ -393,10 +393,30 @@ _commit_ci_lines() {
   runs=$(gh api "repos/$REPO/commits/$sha/check-runs" \
     -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null) || return 1
   statuses=$(gh api "repos/$REPO/commits/$sha/status" \
-    -q '[.statuses[]] | group_by(.context) | map(max_by(.updated_at))[]
-        | "\(.context)|" + (if .state == "pending" then "in_progress|"
-                             else "completed|" + (if .state == "success" then "success" else "failure" end)
-                             end)' 2>/dev/null) || return 1
+    -q '[.statuses[]] | to_entries | map(.value + {_i: .key})
+        | group_by(.context)
+        | map(sort_by([.updated_at, (0 - ._i)]) | last)[]
+        | if (.context | test("[|\n]")) then "__MALFORMED_CONTEXT__"
+          else "\(.context)|" + (if .state == "pending" then "in_progress|"
+                                 else "completed|" + (if .state == "success" then "success" else "failure" end)
+                                 end)
+          end' 2>/dev/null) || return 1
+  # A name carrying the field delimiter cannot be represented in this protocol.
+  # Emitting it anyway corrupts the record: `a|b` pending becomes `a|b|in_progress|`,
+  # _keep_blocking_checks reads the name as `a`, the required match fails, it falls
+  # back, and _checkrun_state sees `b|in_progress|` -- which it does not recognise as
+  # pending, so a required PENDING status reads GREEN. Refuse instead.
+  case "$statuses" in *__MALFORMED_CONTEXT__*)
+    echo "[batch] WARN: a required context name contains a delimiter; cannot classify CI safely for $sha" >&2
+    return 1 ;;
+  esac
+  case "$runs" in *"|"*"|"*"|"*)
+    # Same hazard on the check-run side: a name containing `|` yields >3 fields.
+    if printf '%s\n' "$runs" | awk -F'|' 'NF>3 {exit 1}'; then :; else
+      echo "[batch] WARN: a check-run name contains a delimiter; cannot classify CI safely for $sha" >&2
+      return 1
+    fi ;;
+  esac
   printf '%s\n%s\n' "$runs" "$statuses" | grep -v '^$' || true
 }
 
@@ -1767,6 +1787,10 @@ _rerun_main_ci() {
       || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
   fi
   sleep 20
+  # Once, not per poll: inside the loop's command substitution the cache in
+  # _required_contexts dies with the subshell, so it re-requested branch
+  # protection every 30s -- the exact hazard the comment on _poll_ci warns about.
+  local _rr_req; _rr_req=$(_required_contexts)
   while [ "$w" -lt "$MAIN_CI_TIMEOUT" ]; do
     # #67: same helper AND same required set as the watcher. This used to poll
     # unnamed check-runs with no _keep_blocking_checks, so a non-required failure
@@ -1774,7 +1798,7 @@ _rerun_main_ci() {
     # that filtering exists to prevent. Selecting a workflow to re-run and
     # deciding whether main is green are separate concerns.
     lines=$(_commit_ci_lines "$sha") || lines=""
-    lines=$(_keep_blocking_checks "$lines" "$(_required_contexts)")
+    lines=$(_keep_blocking_checks "$lines" "$_rr_req")
     st=$(_checkrun_state "$lines")
     [ "$st" != pending ] && { echo "$st"; return; }
     sleep 30; w=$((w + 30))
@@ -3216,11 +3240,20 @@ SH
   cat >"$cdir/gh" <<'SH'
 #!/usr/bin/env bash
 # args: api <path> -q <filter>
+# NB: propagate jq's exit status. An earlier version ended with a blanket
+# `exit 0`, which swallowed a jq failure -- so the shim could not express the
+# malformed-response case the real `gh api` produces, and the test for it could
+# never have failed. Defaults are assigned plainly rather than inside a
+# ${VAR:-...} expansion, whose escaping produced invalid JSON.
 filter=""; nx=0
 for a in "$@"; do [ "$nx" = 1 ] && { filter="$a"; nx=0; }; [ "$a" = "-q" ] && nx=1; done
+runs_json="${FAKE_RUNS_JSON-}";     [ -n "$runs_json" ]     || runs_json='{"check_runs":[]}'
+status_json="${FAKE_STATUS_JSON-}"; [ -n "$status_json" ]   || status_json='{"statuses":[]}'
 case "$*" in
-  *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1; printf '%s' "${FAKE_RUNS_JSON:-{\"check_runs\":[]\}}" | jq -r "$filter" ;;
-  *"/status"*)     [ "${FAKE_STATUS_RC:-0}" = 0 ] || exit 1; printf '%s' "${FAKE_STATUS_JSON:-{\"statuses\":[]\}}" | jq -r "$filter" ;;
+  *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1
+                   printf '%s' "$runs_json"   | jq -r "$filter"; exit $? ;;
+  *"/status"*)     [ "${FAKE_STATUS_RC:-0}" = 0 ] || exit 1
+                   printf '%s' "$status_json" | jq -r "$filter"; exit $? ;;
 esac
 exit 0
 SH
@@ -3259,6 +3292,24 @@ SH
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' _cl)" \
     = "server|completed|success" ] \
     || { echo "FAIL _commit_ci_lines: zero statuses must be normal, not an error"; rm -rf "$cdir"; exit 1; }
+  # EQUAL timestamps: GitHub returns newest-first, and max_by picks the LAST equal
+  # maximum -- so `[failure, success]` at the same second selected the stale
+  # success and read GREEN. Tie-break is now by input order.
+  [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"ext-ci","state":"failure","updated_at":"2026-01-01T00:00:00Z"},{"context":"ext-ci","state":"success","updated_at":"2026-01-01T00:00:00Z"}]}' _cl)" \
+    = "ext-ci|completed|failure" ] \
+    || { echo "FAIL _commit_ci_lines: equal timestamps must take the FIRST (newest) entry"; rm -rf "$cdir"; exit 1; }
+  # A context carrying the field delimiter cannot be represented; emitting it
+  # anyway turned a required PENDING status into GREEN. Must fail closed.
+  FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: a pipe in a context name must fail closed"; rm -rf "$cdir"; exit 1; }
+  FAKE_STATUS_JSON='{"statuses":[{"context":"a\nb","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: a newline in a context name must fail closed"; rm -rf "$cdir"; exit 1; }
+  # An absent .statuses key is a malformed response, not "no statuses".
+  FAKE_STATUS_JSON='{}' _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: absent .statuses must fail closed"; rm -rf "$cdir"; exit 1; }
+  # A state GitHub may add later must not read as success.
+  [ "$(FAKE_STATUS_JSON="$(_st_json some_new_state)" _cl)" = "ext-ci|completed|failure" ] \
+    || { echo "FAIL _commit_ci_lines: an unknown state must not read as success"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
   # --- B-2v2/B-3v2: limit-message matcher + usage-aware vendor pick -----------
