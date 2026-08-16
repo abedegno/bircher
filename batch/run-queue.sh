@@ -1226,10 +1226,20 @@ EOF
 # read whole files, run gates each with an inline PATH export, end with an
 # exact VERDICT line (findings above it).
 _recovery_review_prompt() {
-  local pr="$1"
+  local pr="$1" sha="${2:-}"
+  # #66: the worktree is created at the EXACT captured commit, not at FETCH_HEAD.
+  # `pull/N/head` is a MOVING ref: a push between capture and the reviewer's fetch
+  # would have it read one commit while the merge pinned another, and a later
+  # force-push back to the captured sha would then merge code the reviewer never
+  # read. Checking out the sha removes the ambiguity mechanically rather than by
+  # asking the reviewer to verify it. If the sha is no longer reachable from the
+  # ref, the checkout fails and so does the review -- which is the correct
+  # outcome, not a regression.
+  local _co="FETCH_HEAD"; [ -n "$sha" ] && _co="$sha"
   cat <<EOF
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr FETCH_HEAD; cd /tmp/review-$pr.
+First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr $_co; cd /tmp/review-$pr.
+You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
@@ -3678,6 +3688,28 @@ SH
       && { echo "FAIL recover_pr_cmd: stamped cross-review with an unusable head ('$_bad')"; rm -rf "$prdir"; exit 1; }
   done
   echo "recover_pr_cmd unusable-head refused OK (#66)"
+  # #66: the prompt must pin the checkout to the CAPTURED sha. The first cut
+  # passed the sha in and the function ignored it, still fetching the moving
+  # `pull/N/head` -- so the reviewer could read a different commit than the one
+  # the merge pinned. Assert the sha reaches the prompt text.
+  local _pp
+  _pp=$(REPO=demo/demo _recovery_review_prompt 9 a502a88e20f959c908d00871ee7f25572512dd6d)
+  case "$_pp" in
+    *"worktree add --detach /tmp/review-9 a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: checkout not pinned to the captured sha"; exit 1 ;;
+  esac
+  case "$_pp" in
+    *"reviewing EXACTLY commit a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: prompt does not name the reviewed commit"; exit 1 ;;
+  esac
+  # With no sha it must still work (pre-#66 behaviour), rather than emitting an
+  # empty checkout target.
+  _pp=$(REPO=demo/demo _recovery_review_prompt 9)
+  case "$_pp" in
+    *"worktree add --detach /tmp/review-9 FETCH_HEAD"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: no-sha fallback broken"; exit 1 ;;
+  esac
+  echo "_recovery_review_prompt pins the reviewed commit OK (#66)"
   # BEHIND PR: update-branch FIRST, then review + merge
   : > "$prdir/log"; : > "$prdir/store"
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
