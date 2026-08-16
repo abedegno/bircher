@@ -926,6 +926,16 @@ merge_ready_pr() {
   local item="$1" pr="$2" expected_sha="${3:-}"
   MERGE_NOTE=""
   MERGE_RETRY_ELIGIBLE=0
+  # #66: an automatic merge MUST be pinned. This used to treat an absent sha as
+  # authorisation for an unpinned merge, so every caller had to remember a subtle
+  # precondition -- and _merge_gate's comments record that exact mistake already
+  # happening once. Refuse instead. A caller that legitimately needs an unpinned
+  # merge should not be reaching for this function.
+  if [ -z "$expected_sha" ]; then
+    MERGE_NOTE="merge refused: no reviewed head to pin to"
+    echo "[batch:merge] $item: refusing to merge PR #$pr UNPINNED (no reviewed head) -> left for the human" >&2
+    return 0
+  fi
   # Wait out GitHub's mergeability recompute, then merge. A transient gh failure
   # yields an EMPTY $m (not UNKNOWN); treat empty like UNKNOWN so a hiccup keeps
   # polling and, if it persists, is flagged retry-eligible for the sweep instead
@@ -959,11 +969,7 @@ merge_ready_pr() {
   # review, so a race can never land unreviewed code.
   local merged=0 mt=0
   while [ "$mt" -lt 30 ]; do
-    if [ -n "$expected_sha" ]; then
-      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
-    else
-      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch >/dev/null 2>&1 && { merged=1; break; }
-    fi
+    gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
     [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
     mt=$((mt + 5))
   done
@@ -1193,14 +1199,21 @@ recover_pr_cmd() {
   fi
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
-  local rec r_outcome r_review r_note
+  local rec r_outcome r_review r_note r_sha
   rec=$(recover_from_ground_truth "$item" "$code" "$pr")
-  IFS='|' read -r r_outcome r_review r_note <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha <<EOF
 $rec
 EOF
-  echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note" >&2
+  echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
   if [ "$r_outcome" = "ready" ]; then
-    merge_ready_pr "$item" "$pr"; local mrc=$?
+    # #66: this was the one production caller that merged UNPINNED. A recovery
+    # PASS with no captured head cannot be merged automatically -- the same
+    # fail-closed rule the marker path already applies.
+    if [ -z "$r_sha" ]; then
+      echo "[batch:recover-pr] $code: ready but no reviewed head captured -> NOT merging; left for a human" >&2
+      return 0
+    fi
+    merge_ready_pr "$item" "$pr" "$r_sha"; local mrc=$?
     echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}" >&2
     return $mrc
   fi
@@ -1213,10 +1226,20 @@ EOF
 # read whole files, run gates each with an inline PATH export, end with an
 # exact VERDICT line (findings above it).
 _recovery_review_prompt() {
-  local pr="$1"
+  local pr="$1" sha="${2:-}"
+  # #66: the worktree is created at the EXACT captured commit, not at FETCH_HEAD.
+  # `pull/N/head` is a MOVING ref: a push between capture and the reviewer's fetch
+  # would have it read one commit while the merge pinned another, and a later
+  # force-push back to the captured sha would then merge code the reviewer never
+  # read. Checking out the sha removes the ambiguity mechanically rather than by
+  # asking the reviewer to verify it. If the sha is no longer reachable from the
+  # ref, the checkout fails and so does the review -- which is the correct
+  # outcome, not a regression.
+  local _co="FETCH_HEAD"; [ -n "$sha" ] && _co="$sha"
   cat <<EOF
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr FETCH_HEAD; cd /tmp/review-$pr.
+First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr $_co; cd /tmp/review-$pr.
+You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
@@ -1266,7 +1289,7 @@ _reconcile_item_pr() {
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
 recover_from_ground_truth() {
   local item="$1" code="$2" pr="$3" issue="${4:-}"
-  local ci="na" verdict="" reviewer_out=""
+  local ci="na" verdict="" reviewer_out="" reviewed_sha=""
   # A tracked PR that was CLOSED without merging can never satisfy this item --
   # drop it and let the discovery below find the real one. See _pr_is_abandoned
   # for the i506 scratch-PR case this exists for.
@@ -1354,9 +1377,25 @@ recover_from_ground_truth() {
       ci=$(_rerun_and_wait_ci "$pr")
     done
     if [ "$ci" = green ]; then
-      echo "[batch:recover] $item: PR #$pr CI green, no marker -> $RECOVERY_REVIEWER recovery review" >&2
+      # #66: capture the commit the reviewer is about to read OURSELVES, before
+      # dispatching. The normal path gets this from the reviewer's marker `head=`
+      # (#24); recovery had no equivalent, so an out-of-band PASS could bless a
+      # PR with no same-head guarantee at all.
+      #
+      # Deliberately NOT asked of the reviewer: that would make a merge-critical
+      # value another model-reported field (#67). And deliberately NOT read from
+      # `headRefOid` AFTER the review -- the normal path's comments explain why
+      # that blesses a concurrent push. Observed at dispatch time, from the ref
+      # we hand the reviewer, is the only version that is evidence.
+      reviewed_sha=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.sha' 2>/dev/null)
+      case "$reviewed_sha" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+        *) echo "[batch:recover] $item: could not capture a full 40-hex head for PR #$pr (got '${reviewed_sha:-<empty>}') -> cannot pin a recovery merge" >&2
+           reviewed_sha="" ;;
+      esac
+      echo "[batch:recover] $item: PR #$pr CI green, no marker -> $RECOVERY_REVIEWER recovery review at ${reviewed_sha:0:7}" >&2
       local prompt rlog
-      prompt=$(_recovery_review_prompt "$pr")
+      prompt=$(_recovery_review_prompt "$pr" "$reviewed_sha")
       rlog="/tmp/recover-$item.log"
       ( cd "$BUNDLE_DIR" && omnigent run "agents/$RECOVERY_REVIEWER" \
           --server "$SERVER" -p "$prompt" ) >"$rlog" 2>&1 || true
@@ -1365,6 +1404,10 @@ recover_from_ground_truth() {
     fi
   fi
 
+  # #66: the reviewed SHA is EVIDENCE attached to the result, not an input to
+  # classification -- classify_recovery stays the pure ground-truth-to-outcome
+  # mapping it documents and self-tests. It rides in the marker (`head=`) and in
+  # this function's 4th return field instead.
   local tuple r_outcome r_review r_ci r_note
   tuple=$(classify_recovery "$pr" "$ci" "$verdict")
   IFS='|' read -r r_outcome r_review r_ci r_note <<EOF
@@ -1374,7 +1417,11 @@ EOF
   # Post a self-describing marker to the PR (reviewer findings above it, if any).
   if [ -n "$pr" ]; then
     local marker_line body
-    marker_line="bircher-status: outcome=$r_outcome ci=$r_ci ci_first=false review=$r_review rounds=0 note=\"$r_note\""
+    # head= only on a ready/PASS outcome: it is the merge-authorising evidence,
+    # and a failed or escalated recovery must never carry one.
+    local _head_field=""
+    [ "$r_outcome" = "ready" ] && [ -n "$reviewed_sha" ] && _head_field=" head=$reviewed_sha"
+    marker_line="bircher-status: outcome=$r_outcome ci=$r_ci ci_first=false review=$r_review rounds=0${_head_field} note=\"$r_note\""
     if [ -n "$reviewer_out" ]; then
       body="Recovery cross-vendor review (coordinator session ended before posting a marker):
 
@@ -1390,7 +1437,13 @@ $marker_line"
       || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
   fi
 
-  echo "$r_outcome|$r_review|$r_note"
+  # 4th field (#66): the orchestrator-captured reviewed SHA, empty unless this is
+  # a ready outcome with a validated 40-hex head. Callers MUST pin the merge and
+  # the cross-review status to it; an empty value means "cannot pin", which now
+  # means "cannot auto-merge".
+  local _sha_out=""
+  [ "$r_outcome" = "ready" ] && _sha_out="$reviewed_sha"
+  echo "$r_outcome|$r_review|$r_note|$_sha_out"
 }
 
 # _is_blank <text> -> rc 0 if text is empty or whitespace-only.
@@ -1728,26 +1781,29 @@ _pr_is_abandoned() {
 #
 # The cap stays (scorecard rows are one JSONL line each; unbounded notes bloat the
 # file) but is generous, and a truncated note now says so and points at the source.
-# _merge_gate <had_marker:0|1> <marker_head> -> "pin|<sha>" | "unpinned" | "skip"
+# _merge_gate <had_marker:0|1> <marker_head> -> "pin|<sha>" | "skip"
 #
 # Decides how (or whether) an outcome=ready item may be merged in-run. Pure, so the
-# three cases can be asserted directly — they are easy to conflate and the failure
-# mode of conflating them is silent.
+# cases can be asserted directly — they are easy to conflate and the failure mode of
+# conflating them is silent.
 #
-#   marker + head=   -> pin      : merge atomically against the reviewed commit.
-#   marker, no head= -> skip     : the reviewer did not say what it reviewed, so the
-#                                  commit is unverifiable. Leave the PR for a human.
-#   no marker        -> unpinned : the ground-truth recovery path. It has no marker
-#                                  BY DEFINITION and never carried a reviewed sha, so
-#                                  failing closed here would break every recovery
-#                                  (including --recover-pr) rather than close a race.
+#   head present -> pin  : merge atomically against the reviewed commit.
+#   no head      -> skip : the commit that was reviewed is unverifiable. Leave the
+#                          PR for a human.
 #
 # The `skip` case is the point of issue #24. It previously passed an empty sha to
 # merge_ready_pr, which silently took its UNPINNED branch and merged anyway while the
 # log claimed the PR had been left for a human.
+#
+# #66 REMOVED a third case. `no marker -> unpinned` existed because the ground-truth
+# recovery path has no marker by definition and "never carried a reviewed sha", so
+# failing closed would have broken every recovery. That premise no longer holds:
+# recovery now captures the head itself at dispatch time and returns it, so a missing
+# head means the same thing on every path — we cannot say what was reviewed — and gets
+# the same answer. `had_marker` is retained in the signature for its callers but no
+# longer changes the decision.
 _merge_gate() {
-  local had_marker="$1" head="${2:-}"
-  if [ "$had_marker" != "1" ]; then printf 'unpinned'; return 0; fi
+  local head="${2:-}"
   if [ -n "$head" ]; then printf 'pin|%s' "$head"; return 0; fi
   printf 'skip'
 }
@@ -2283,7 +2339,7 @@ EOF
       echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
       local rec
       rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-      IFS='|' read -r outcome review note <<EOF
+      IFS='|' read -r outcome review note marker_head <<EOF
 $rec
 EOF
     fi
@@ -2302,17 +2358,18 @@ EOF
     # it feeds. Only the reviewer knows which commit it actually read.
     #
     # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
-    # sha to merge_ready_pr does NOT fail closed — it takes the unpinned branch and
-    # merges anyway — so the skip has to happen HERE, before the call.
+    # sha to merge_ready_pr used to NOT fail closed — it took an unpinned branch and
+    # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
+    # also refuses an empty sha, so this is now belt and braces rather than the only
+    # guard.
     local _had_marker=0; [ -n "$marker" ] && _had_marker=1
     local _gate; _gate=$(_merge_gate "$_had_marker" "${marker_head:-}")
     local reviewed_sha=""
     case "$_gate" in
       pin\|*)   reviewed_sha="${_gate#pin|}" ;;
-      unpinned) : ;;   # recovery path: no marker, no reviewed sha, as before
-      skip)
-        echo "[batch] $item: marker carries no head= -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
-        MERGE_NOTE="merge skipped: marker carried no head= (reviewed commit unverifiable)"
+        skip)
+        echo "[batch] $item: no reviewed head available -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
+        MERGE_NOTE="merge skipped: no reviewed head (reviewed commit unverifiable)"
         note="${note:+$note; }$MERGE_NOTE"
         merge_rc=0
         ;;
@@ -2389,20 +2446,26 @@ self_test() {
     | jq -r "$(_branch_code_filter i23) | .[].headRefName" 2>/dev/null)
   [ "$bfout" = "i23-bar" ] || { echo "FAIL branch filter: prefix collision, got '$bfout'"; exit 1; }
   echo "_branch_code_filter OK (#22)"
-  # --- #24 follow-up: the three merge gates must stay distinct ----------------
+  # --- #24 + #66: the merge gate must fail closed without a reviewed head -------
   # Regression guard. An earlier cut passed an empty sha to merge_ready_pr believing
   # that failed closed; merge_ready_pr's else-branch merged UNPINNED while the log
-  # said the PR was left for a human. The skip must be decided before the call.
+  # said the PR was left for a human. The skip is decided before the call, and since
+  # #66 the callee refuses an empty sha too.
   [ "$(_merge_gate 1 a502a88e20f959c908d00871ee7f25572512dd6d)" = "pin|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
-    || { echo "FAIL merge_gate: marker+head must pin"; exit 1; }
+    || { echo "FAIL merge_gate: head must pin"; exit 1; }
   [ "$(_merge_gate 1 '')" = "skip" ] \
-    || { echo "FAIL merge_gate: marker WITHOUT head must skip, never merge unpinned"; exit 1; }
-  [ "$(_merge_gate 0 '')" = "unpinned" ] \
-    || { echo "FAIL merge_gate: no marker (recovery) must still merge unpinned"; exit 1; }
-  # A head arriving with no marker is not a thing; recovery still wins, so that a
-  # stray value can never turn a recovery into a pinned merge against an unreviewed sha.
-  [ "$(_merge_gate 0 deadbeefdeadbeef)" = "unpinned" ] \
-    || { echo "FAIL merge_gate: no-marker must ignore a stray head"; exit 1; }
+    || { echo "FAIL merge_gate: no head must skip, never merge unpinned"; exit 1; }
+  # #66 removed the `unpinned` outcome. It existed because ground-truth recovery had
+  # no marker and "never carried a reviewed sha" -- recovery now captures the head
+  # itself, so a missing head means the same thing on every path and gets the same
+  # answer. A recovery WITH a head pins; without one it skips.
+  [ "$(_merge_gate 0 '')" = "skip" ] \
+    || { echo "FAIL merge_gate: recovery without a head must skip, not merge unpinned"; exit 1; }
+  [ "$(_merge_gate 0 a502a88e20f959c908d00871ee7f25572512dd6d)" = "pin|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+    || { echo "FAIL merge_gate: recovery WITH a head must pin"; exit 1; }
+  case "$(_merge_gate 0 '')$(_merge_gate 1 '')" in
+    *unpinned*) echo "FAIL merge_gate: the unpinned outcome must no longer exist"; exit 1 ;;
+  esac
   echo "_merge_gate OK (#24 fail-closed)"
   # --- non-CI check-runs must not turn main red -------------------------------
   # Regression guard for 2026-08-07 (i520): merging .github/dependabot.yml added 28
@@ -2759,6 +2822,12 @@ self_test() {
 # fake gh: `pr checks ... --json bucket` -> two passing checks;
 #          `pr comment ... --body X` -> write X to $GH_COMMENT_OUT
 sub="$2"
+# #66: recovery captures the reviewed head itself via `gh api repos/../pulls/N`.
+# FAKE_HEAD_SHA drives it so the tests can exercise present / absent / malformed.
+if [ "$1" = "api" ]; then
+  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}"; exit 0 ;; esac
+  exit 0
+fi
 if [ "$sub" = "checks" ]; then printf 'pass\npass\n'; exit 0; fi
 if [ "$sub" = "comment" ]; then
   while [ "$#" -gt 0 ]; do
@@ -2782,8 +2851,12 @@ SH
   rec_out=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
             GH_COMMENT_OUT="$shimdir/comment.txt" RECOVERY_REVIEWER=codex \
             recover_from_ground_truth demo demo 7)
-  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
+  # #66: 4th field is the orchestrator-captured reviewed head, so the recovery
+  # merge can be pinned exactly as the marker path is.
+  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
     || { echo "FAIL recover happy-path tuple: '$rec_out'"; exit 1; }
+  grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
+    || { echo "FAIL recover: marker must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
   grep -q '^bircher-status: outcome=ready ci=green ' "$shimdir/comment.txt" \
     || { echo "FAIL recover: marker not posted to PR"; exit 1; }
   grep -q 'VERDICT: PASS' "$shimdir/comment.txt" \
@@ -2791,7 +2864,7 @@ SH
   local rec_nopr
   rec_nopr=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
              recover_from_ground_truth demo demo "")
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)" ] \
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)|" ] \
     || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "recover_from_ground_truth OK"
@@ -2800,6 +2873,11 @@ SH
   cat >"$ddir/gh" <<'SH'
 #!/usr/bin/env bash
 # fake gh: an open PR #300 for the item; CI green; record the marker comment.
+# #66: also answer the reviewed-head lookup so a ready recovery can be pinned.
+if [ "$1" = "api" ]; then
+  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}" ;; esac
+  exit 0
+fi
 case "$2" in
   list)    printf '%s\n' '300' ;;
   checks)  printf 'pass\npass\n' ;;
@@ -2816,7 +2894,7 @@ SH
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex recover_from_ground_truth i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
+  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -2848,6 +2926,11 @@ SH
   # a body that mentions #307 but does NOT close it must NOT match (search returns it; regex rejects)
   cat >"$idir/gh" <<'SH'
 #!/usr/bin/env bash
+# #66: answer the reviewed-head lookup so a ready recovery can be pinned.
+if [ "$1" = "api" ]; then
+  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}" ;; esac
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   printf '%s ' "$@" | grep -q -- '--search' && { printf '[{"number":999,"body":"see also #307 for context"}]\n'; exit 0; }
 fi
@@ -2859,6 +2942,11 @@ SH
   # end-to-end: recover with a wrong code (no branch match) but the issue param adopts #305
   cat >"$idir/gh" <<'SH'
 #!/usr/bin/env bash
+# #66: answer the reviewed-head lookup so a ready recovery can be pinned.
+if [ "$1" = "api" ]; then
+  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}" ;; esac
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   printf '%s ' "$@" | grep -q -- '--search' && { printf '[{"number":305,"body":"Impl. Closes #307 done"}]\n'; exit 0; }
   exit 0
@@ -2871,7 +2959,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex recover_from_ground_truth iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
+  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
@@ -3193,15 +3281,15 @@ exit 0
 SH
   chmod +x "$mdir/gh"
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
-  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
     || { echo "FAIL merge_ready_pr deferred path"; exit 1; }
   # #10 cross-review status: a ready item posts bircher/cross-review=success before merging
   local slog="$mdir/status.log"; : >"$slog"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" FAKE_STATUS_STORE="$mdir/s3" merge_ready_pr demo 7 >/dev/null 2>&1 )
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_GH_LOG="$slog" FAKE_STATUS_STORE="$mdir/s3" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
   grep -q 'repos/demo/demo/statuses/headsha' "$slog" \
     && grep -q 'state=success' "$slog" \
     && grep -q 'context=bircher/cross-review' "$slog" \
@@ -3230,7 +3318,7 @@ SH
   chmod +x "$sdir/gh"; : > "$sdir/pmlog"
   # (a) protected repo: merge BLOCKED while status unconfirmed -> merge ATTEMPTED, deferred, retry-eligible
   ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 PMLOG="$sdir/pmlog" \
-      merge_ready_pr demo 7 >/dev/null 2>&1
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?
     [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
     || { echo "FAIL merge_ready_pr: status-unconfirmed+blocked not deferred/eligible"; rm -rf "$sdir"; exit 1; }
@@ -3238,7 +3326,7 @@ SH
   # (b) unprotected repo: merge SUCCEEDS while status unconfirmed -> merged (best-effort)
   : > "$sdir/pmlog"
   ( PATH="$sdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=0 PMLOG="$sdir/pmlog" \
-      merge_ready_pr demo 7 >/dev/null 2>&1
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?
     [ $rc -eq 0 ] && case "$MERGE_NOTE" in ""|merged*) true;; *) false;; esac ) \
     || { echo "FAIL merge_ready_pr: status-unconfirmed best-effort merge did not succeed"; rm -rf "$sdir"; exit 1; }
@@ -3256,7 +3344,7 @@ fi
 exit 0
 SH
   chmod +x "$edir/gh"
-  ( PATH="$edir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 merge_ready_pr demo 7 >/dev/null 2>&1
+  ( PATH="$edir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?
     [ $rc -eq 0 ] && [ "${MERGE_RETRY_ELIGIBLE:-x}" = 1 ] && case "$MERGE_NOTE" in "merge deferred: mergeable="*) true;; *) false;; esac ) \
     || { echo "FAIL merge_ready_pr: empty mergeable not retry-eligible"; rm -rf "$edir"; exit 1; }
@@ -3290,6 +3378,26 @@ SH
     || { echo "FAIL merge_ready_pr: stale pinned head not refused"; rm -rf "$mhdir"; exit 1; }
   [ ! -s "$mhdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite stale pinned head"; cat "$mhdir/pmlog"; rm -rf "$mhdir"; exit 1; }
   rm -rf "$mhdir"; echo "merge_ready_pr pinned-head-mismatch OK (atomic refuse)"
+  # #66: an automatic merge with NO reviewed head must be refused outright. This
+  # used to take an unpinned branch and merge anyway, so every caller had to
+  # remember the precondition; --recover-pr was the one that did not.
+  local updir; updir=$(mktemp -d)
+  cat >"$updir/gh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$UNPIN_LOG"
+[ "$2" = "view" ] && { echo MERGEABLE; exit 0; }
+exit 0
+SH
+  chmod +x "$updir/gh"
+  ( PATH="$updir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 UNPIN_LOG="$updir/log" \
+      merge_ready_pr demo 7 >/dev/null 2>&1
+    case "$MERGE_NOTE" in *"no reviewed head"*) : ;; *) exit 1 ;; esac ) \
+    || { echo "FAIL merge_ready_pr: empty sha must be refused with an explanatory note"; rm -rf "$updir"; exit 1; }
+  grep -q "pr merge" "$updir/log" 2>/dev/null \
+    && { echo "FAIL merge_ready_pr: attempted a merge with no reviewed head"; cat "$updir/log"; rm -rf "$updir"; exit 1; }
+  grep -q "statuses/" "$updir/log" 2>/dev/null \
+    && { echo "FAIL merge_ready_pr: posted cross-review status with no reviewed head"; cat "$updir/log"; rm -rf "$updir"; exit 1; }
+  rm -rf "$updir"; echo "merge_ready_pr unpinned-refused OK (#66)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
   local rdir; rdir=$(mktemp -d)
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
@@ -3543,6 +3651,8 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ]   && { echo "merge $3" >> "${PR_LOG:-/dev/null}"; exit 0; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q 'update-branch' && { echo "update-branch" >> "${PR_LOG:-/dev/null}"; exit 0; }
+  # #66: recovery captures the reviewed head itself before dispatching the review.
+  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}"; exit 0 ;; esac
   if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; fi
   printf '%s\n' "$@" | grep -q '/status' && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
@@ -3563,6 +3673,43 @@ SH
   grep -q 'context=bircher/cross-review' "$prdir/log" || { echo "FAIL recover_pr_cmd: cross-review status not posted"; rm -rf "$prdir"; exit 1; }
   grep -qx 'merge 9' "$prdir/log" || { echo "FAIL recover_pr_cmd: PR not merged"; rm -rf "$prdir"; exit 1; }
   grep -q 'update-branch' "$prdir/log" && { echo "FAIL recover_pr_cmd: update-branch run for an up-to-date PR"; rm -rf "$prdir"; exit 1; }
+  # #66: a recovery whose head cannot be captured as a full 40-hex sha must NOT
+  # merge -- this was the one production path that merged unpinned. Abbreviated
+  # and malformed values fail closed too, so the looser 7-40 hex marker contract
+  # is not inherited by accident.
+  for _bad in "" "a502a88" "not-a-sha" "a502a88e20f959c908d00871ee7f25572512dd6dEXTRA"; do
+    : > "$prdir/log"; : > "$prdir/store"
+    ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x BIRCHER_STATUS_BACKOFF=0 \
+        MAIN_CI_TIMEOUT=31 PR_LOG="$prdir/log" STORE="$prdir/store" FAKE_MSS=CLEAN \
+        FAKE_HEAD_SHA="$_bad" recover_pr_cmd rdemo 9 codex >/dev/null 2>&1 )
+    grep -q 'merge 9' "$prdir/log" \
+      && { echo "FAIL recover_pr_cmd: merged with an unusable head ('$_bad')"; cat "$prdir/log"; rm -rf "$prdir"; exit 1; }
+    grep -q 'context=bircher/cross-review' "$prdir/log" \
+      && { echo "FAIL recover_pr_cmd: stamped cross-review with an unusable head ('$_bad')"; rm -rf "$prdir"; exit 1; }
+  done
+  echo "recover_pr_cmd unusable-head refused OK (#66)"
+  # #66: the prompt must pin the checkout to the CAPTURED sha. The first cut
+  # passed the sha in and the function ignored it, still fetching the moving
+  # `pull/N/head` -- so the reviewer could read a different commit than the one
+  # the merge pinned. Assert the sha reaches the prompt text.
+  local _pp
+  _pp=$(REPO=demo/demo _recovery_review_prompt 9 a502a88e20f959c908d00871ee7f25572512dd6d)
+  case "$_pp" in
+    *"worktree add --detach /tmp/review-9 a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: checkout not pinned to the captured sha"; exit 1 ;;
+  esac
+  case "$_pp" in
+    *"reviewing EXACTLY commit a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: prompt does not name the reviewed commit"; exit 1 ;;
+  esac
+  # With no sha it must still work (pre-#66 behaviour), rather than emitting an
+  # empty checkout target.
+  _pp=$(REPO=demo/demo _recovery_review_prompt 9)
+  case "$_pp" in
+    *"worktree add --detach /tmp/review-9 FETCH_HEAD"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: no-sha fallback broken"; exit 1 ;;
+  esac
+  echo "_recovery_review_prompt pins the reviewed commit OK (#66)"
   # BEHIND PR: update-branch FIRST, then review + merge
   : > "$prdir/log"; : > "$prdir/store"
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
