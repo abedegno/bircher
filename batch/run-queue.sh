@@ -326,7 +326,7 @@ _classify_ci_failure() {
 _reopen_reverted_issues() {
 	local pr="$1" nums n rc
 	[ -n "$pr" ] || return 0
-	nums=$(gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
+	nums=$(_net_run "$BIRCHER_NET_TIMEOUT" gh pr view "$pr" --repo "$REPO" --json closingIssuesReferences \
 		-q '.closingIssuesReferences[]?.number' 2>/dev/null); rc=$?
 	if [ "$rc" -ne 0 ]; then
 		echo "[batch:merge] WARN revert: could NOT look up the issues PR #$pr closed (gh rc=$rc) - any are still marked fixed; check by hand" >&2
@@ -338,7 +338,7 @@ _reopen_reverted_issues() {
 	fi
 	while IFS= read -r n; do
 		[ -n "$n" ] || continue
-		if gh issue reopen "$n" --repo "$REPO" \
+		if _net_run "$BIRCHER_NET_TIMEOUT" gh issue reopen "$n" --repo "$REPO" \
 			--comment "Reopening: the fix for this was merged in #$pr and then automatically reverted because main CI went red. The defect is live again." >/dev/null 2>&1; then
 			echo "[batch:merge] revert: reopened issue #$n (its fix was reverted)" >&2
 		else
@@ -456,7 +456,6 @@ _arm_ci_deadline() {
     span=7200
   }
   MAIN_CI_DEADLINE_AT=$((now + span))
-  export MAIN_CI_DEADLINE_AT
 }
 
 # _past_ci_deadline -> rc 0 once the shared main-CI wall clock has run out.
@@ -475,6 +474,28 @@ _past_ci_deadline() {
   [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || return 1
   [ "$(date +%s)" -ge "$MAIN_CI_DEADLINE_AT" ]
 }
+
+# _net_run <seconds> <cmd...> -> run a NETWORK command under a fixed wall-clock cap.
+#
+# #62: distinct from `_ci_gh` on purpose. `_ci_gh` shrinks its cap to whatever is left
+# of the main-CI deadline, which is right for polling -- once the deadline passes there
+# is no point continuing to poll. It is exactly WRONG for the confirmed-red recovery
+# path, which runs AFTER that deadline has typically expired and must still be able to
+# fetch, revert and push. Capping recovery at the CI remainder would give it one second
+# and guarantee it failed.
+#
+# `git fetch`, `git worktree add` against a remote-tracking ref, and `git push` all
+# perform network and credential operations. An earlier revision justified leaving them
+# unbounded as "not network-facing", which was simply false: a hang there means the
+# revert never completes, the function never returns 2, and the queue never reaches its
+# halt handling -- main stays red with no operator-facing final state recorded.
+_net_run() {
+  local cap="$1"; shift
+  case "$cap" in ''|*[!0-9]*) cap=300 ;; esac
+  cap=$((10#$cap)); [ "$cap" -ge 5 ] 2>/dev/null || cap=300
+  if command -v timeout >/dev/null 2>&1; then timeout "$cap" "$@"; else "$@"; fi
+}
+BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-300}"
 
 # _ci_call_cap -> seconds any single main-CI `gh` call may take: the smaller of
 # BIRCHER_CI_CALL_TIMEOUT (120s) and whatever is left on the shared deadline.
@@ -1279,8 +1300,15 @@ merge_ready_pr() {
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
     return 0
   fi
-  # #62: arm the absolute deadline BEFORE the first post-merge GitHub lookup, not
-  # after. Armed later, a hang in either the merge-sha lookup or the branch-protection
+  # #62: LOCAL, not global. `_arm_ci_deadline` assigns to this name; declaring it local
+  # here means bash's dynamic scoping still shows it to every helper called from this
+  # function -- including `_rerun_main_ci` inside a command substitution -- while it
+  # vanishes on EVERY return path with no cleanup to forget. Exported and un-cleared, an
+  # expired deadline from one item shrank the next item's `_required_contexts` lookup to
+  # a one-second cap, which failed, made the required set unknown, and let
+  # `_keep_blocking_checks` fall back to every check.
+  local MAIN_CI_DEADLINE_AT=""
+  # Arm BEFORE the first post-merge GitHub lookup, not after. Armed later, a hang in either the merge-sha lookup or the branch-protection
   # fetch below would run unbounded and the deadline would never even be set -- the
   # watch would not start, so nothing downstream could time it out.
   _arm_ci_deadline
@@ -1324,14 +1352,15 @@ merge_ready_pr() {
         return 2
       fi
       local rw="/tmp/revert-$pr" pc rargs reverted=0
-      if ( cd "$WORKDIR" && git fetch origin -q \
-            && git worktree add --detach "$rw" origin/main -q ); then
+      if ( cd "$WORKDIR" && _net_run "$BIRCHER_NET_TIMEOUT" git fetch origin -q \
+            && _net_run "$BIRCHER_NET_TIMEOUT" git worktree add --detach "$rw" origin/main -q ); then
         # parents = (fields in `rev-list --parents` line) - 1; a merge commit needs -m 1.
         pc=$(git -C "$rw" rev-list --parents -n1 "$sha" 2>/dev/null | wc -w | tr -d ' ')
         pc=$(( pc > 0 ? pc - 1 : 1 ))
         rargs=$(_revert_git_args "$sha" "$pc")
         # shellcheck disable=SC2086
-        if [ -n "$rargs" ] && ( cd "$rw" && git revert $rargs && git push origin HEAD:main -q ); then
+        if [ -n "$rargs" ] && ( cd "$rw" && git revert $rargs \
+              && _net_run "$BIRCHER_NET_TIMEOUT" git push origin HEAD:main -q ); then
           echo "[batch:merge] $item: revert pushed to main (parents=$pc)" >&2; reverted=1
         else
           echo "[batch:merge] WARN $item: automatic revert FAILED (sha=$sha parents=$pc) - main is red; fix by hand" >&2
@@ -4646,8 +4675,60 @@ SH
     || { echo "FAIL #62: _arm_ci_deadline must precede the merge-sha lookup (arm=$_arm_ln view=$_view_ln)"; rm -rf "$_tdir"; exit 1; }
   printf '%s\n' "$_body" | grep -q 'sha=$(_ci_gh pr view' \
     || { echo "FAIL #62: the merge-sha lookup must be bounded"; rm -rf "$_tdir"; exit 1; }
+  # NO LEAK ACROSS ITEMS. The deadline used to be an exported global that nothing
+  # cleared, so an EXPIRED one from a previous merge shrank the next item's
+  # `_required_contexts` lookup to a one-second cap -- which failed, made the required
+  # set unknown, and let `_keep_blocking_checks` fall back to every check. It is now a
+  # local in merge_ready_pr, which bash's dynamic scoping still shows to every helper
+  # called from there (including inside a command substitution) while it vanishes on
+  # every return path with no cleanup to forget.
+  printf '%s\n' "$_body" | grep -q 'local MAIN_CI_DEADLINE_AT' \
+    || { echo "FAIL #62: MAIN_CI_DEADLINE_AT must be LOCAL to merge_ready_pr, or it leaks into the next item"; rm -rf "$_tdir"; exit 1; }
+  declare -f _arm_ci_deadline | grep -q 'export MAIN_CI_DEADLINE_AT' \
+    && { echo "FAIL #62: _arm_ci_deadline must not EXPORT the deadline (that is the leak)"; rm -rf "$_tdir"; exit 1; }
+  # Prove the scoping actually works both ways: visible to a helper called through a
+  # command substitution, and gone once the arming frame returns.
+  _scope_probe() { local MAIN_CI_DEADLINE_AT=""; _arm_ci_deadline 2>/dev/null; echo "$( _ci_call_cap )"; }
+  _inner_cap=$(_scope_probe)
+  { [ -n "$_inner_cap" ] && [ "$_inner_cap" -ge 5 ]; } 2>/dev/null \
+    || { echo "FAIL #62: the armed deadline must reach helpers called via \$( ) (got '$_inner_cap')"; rm -rf "$_tdir"; exit 1; }
+  [ -z "${MAIN_CI_DEADLINE_AT:-}" ] \
+    || { echo "FAIL #62: the deadline survived the frame that armed it -> it will shorten the next item"; rm -rf "$_tdir"; exit 1; }
+  unset -f _scope_probe
+  # RECOVERY IS BOUNDED SEPARATELY. It runs after the CI deadline has typically expired
+  # and must still fetch, revert and push -- capping it at the CI remainder would give
+  # it one second and guarantee failure. `git fetch`, `git worktree add` against a
+  # remote-tracking ref and `git push` are all network operations; calling them "not
+  # network-facing" was simply wrong.
+  printf '%s\n' "$_body" | grep -q '_net_run "$BIRCHER_NET_TIMEOUT" git fetch origin' \
+    || { echo "FAIL #62: the recovery git fetch must be bounded"; rm -rf "$_tdir"; exit 1; }
+  printf '%s\n' "$_body" | grep -q '_net_run "$BIRCHER_NET_TIMEOUT" git push origin' \
+    || { echo "FAIL #62: the recovery git push must be bounded"; rm -rf "$_tdir"; exit 1; }
+  # EVERY gh invocation in there, not just one: an assertion that merely finds
+  # `_net_run` somewhere passes while a second call sits unbounded next to it.
+  # `grep -v 'echo '` because `declare -f` re-emits diagnostic strings on their own
+  # lines, and one of them contains the literal "gh rc=$rc" -- a message about gh, not
+  # a call to it. Matching that was a false positive that failed the whole suite.
+  _unbounded=$(declare -f _reopen_reverted_issues | grep -E '(^|[^_[:alnum:]])gh ' \
+                 | grep -v '_net_run' | grep -v 'echo ' || true)
+  [ -z "${_unbounded//[[:space:]]/}" ] \
+    || { echo "FAIL #62: unbounded gh call in _reopen_reverted_issues: $_unbounded"; rm -rf "$_tdir"; exit 1; }
+  # _net_run's cap is INDEPENDENT of the CI deadline: an expired one must not shrink it.
+  : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 9999 )) \
+    _net_run "$BIRCHER_NET_TIMEOUT" gh x >/dev/null 2>&1 )
+  [ "$(cat "$_tdir/caps")" = "$BIRCHER_NET_TIMEOUT" ] \
+    || { echo "FAIL #62: _net_run must ignore an expired CI deadline (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
+  for _bad in "" "abc" "0" "0000060"; do
+    : > "$_tdir/caps"
+    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" _net_run "$_bad" gh x >/dev/null 2>&1 )
+    _cap=$(cat "$_tdir/caps")
+    { [ -n "$_cap" ] && [ "$_cap" -ge 5 ]; } 2>/dev/null \
+      || { echo "FAIL #62: _net_run cap '$_bad' must fall back to a sane value (got '$_cap')"; rm -rf "$_tdir"; exit 1; }
+    case "$_cap" in 0?*) echo "FAIL #62: _net_run cap '$_cap' is not canonical decimal"; rm -rf "$_tdir"; exit 1 ;; esac
+  done
   rm -rf "$_tdir"
-  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln
+  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
