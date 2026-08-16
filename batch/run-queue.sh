@@ -238,15 +238,43 @@ classify_recovery() {
 }
 
 # _checkrun_state <lines of "status|conclusion"> -> green|red|pending
-# Classifies GitHub check-runs on a commit (gh api .../check-runs). RED on any
-# failing conclusion; PENDING while anything is queued/in_progress or when no
-# check-runs have registered yet (empty input - never treat silence as green);
-# otherwise GREEN (success/neutral/skipped).
+# Classifies GitHub check-runs on a commit (gh api .../check-runs). PENDING when no
+# check-runs have registered yet (empty input - never treat silence as green).
+#
+# GREEN IS AN ALLOWLIST, and deliberately so. This was two denylists -- red for a
+# list of failing conclusions, pending for `queued|in_progress`, and GREEN for
+# everything else -- so every value on neither list read as a pass. GitHub's own
+# OpenAPI description gives the check-run `status` enum as
+#   queued, in_progress, completed, waiting, requested, pending
+# and the last three were all landing on the green default. `waiting` and `requested`
+# are what a deployment-gated or Actions-requested check run reports, so a required
+# check sitting behind an approval gate read as though it had passed. A bare
+# `completed|` with no conclusion read green too.
+#
+# So: green requires POSITIVE evidence of a pass -- completed, with one of the three
+# conclusions GitHub defines as non-failing. Anything not yet completed is pending,
+# including status values GitHub has not invented yet. Anything completed without a
+# passing conclusion is red, likewise including future values: a spurious red costs a
+# revert, which this pipeline can undo (_reopen_reverted_issues), while a spurious
+# green ships broken code, which is the entire subject of #67.
 _checkrun_state() {
-  local lines="$1"
+  local lines="$1" line st cc saw_pending=0
   [ -z "${lines//[[:space:]]/}" ] && { echo pending; return; }
-  if printf '%s\n' "$lines" | grep -qE '\|(failure|cancelled|timed_out|action_required|stale)$'; then echo red; return; fi
-  if printf '%s\n' "$lines" | grep -qE '^(queued|in_progress)\|'; then echo pending; return; fi
+  while IFS= read -r line; do
+    [ -n "${line//[[:space:]]/}" ] || continue
+    st="${line%%|*}"; cc="${line#*|}"
+    case "$st" in
+      completed)
+        case "$cc" in
+          success|neutral|skipped) ;;   # the only non-failing conclusions GitHub defines
+          *) echo red; return ;;        # failure/cancelled/timed_out/action_required/
+        esac ;;                         # stale/"" and anything added later
+      *) saw_pending=1 ;;               # queued/in_progress/waiting/requested/pending/...
+    esac
+  done <<EOF
+$lines
+EOF
+  [ "$saw_pending" = 1 ] && { echo pending; return; }
   echo green
 }
 
@@ -436,6 +464,18 @@ _commit_ci_lines() {
   }
   sts_json=$(_ci_fetch_records "repos/$REPO/commits/$sha/status" statuses) || {
     echo "[batch] WARN: unusable status response for $sha -> failing closed" >&2
+    return 1
+  }
+  # Validate the fields deduplication SORTS ON, before it sorts on them. The shape
+  # guard only established that `.statuses` is an array; a record with a missing,
+  # null or non-string `updated_at` would still be ordered -- by jq's cross-type
+  # ordering, where null sorts below every string -- so a stale success could beat a
+  # current failure and the function would return rc 0 having chosen wrongly.
+  # `updated_at` is always present on a real status (verified against a live PR head).
+  printf '%s' "$sts_json" | jq -e '
+      all(.[]; (.context|type) == "string" and (.state|type) == "string"
+               and (.updated_at|type) == "string")' >/dev/null 2>&1 || {
+    echo "[batch] WARN: a commit status on $sha lacks a usable context/state/updated_at -> failing closed" >&2
     return 1
   }
   recs=$(jq -c -n --argjson runs "$runs_json" --argjson sts "$sts_json" '
@@ -3309,7 +3349,29 @@ SH
   [ "$(_checkrun_state '')" = "pending" ]                                      || { echo "FAIL _checkrun_state empty"; exit 1; }
   [ "$(_checkrun_state 'completed|action_required')" = "red" ]                 || { echo "FAIL _checkrun_state action_required"; exit 1; }
   [ "$(_checkrun_state $'completed|skipped\ncompleted|neutral')" = "green" ]   || { echo "FAIL _checkrun_state skipped/neutral"; exit 1; }
-  echo "_checkrun_state OK"
+  # GREEN IS AN ALLOWLIST. These are the values that used to fall through two
+  # denylists onto the green default. `waiting`, `requested` and `pending` are all in
+  # GitHub's documented check-run `status` enum -- `waiting`/`requested` are exactly
+  # what a check run behind a deployment approval gate reports -- so a required check
+  # that had not started read as though it had passed.
+  for _st in 'waiting|' 'requested|' 'pending|' 'queued|' 'in_progress|' 'some_future_status|'; do
+    [ "$(_checkrun_state "$_st")" = "pending" ] \
+      || { echo "FAIL _checkrun_state: '$_st' must be pending, not green"; exit 1; }
+    [ "$(_checkrun_state "$(printf 'completed|success\n%s' "$_st")")" = "pending" ] \
+      || { echo "FAIL _checkrun_state: '$_st' must hold the whole set pending"; exit 1; }
+  done
+  # A completed run with no conclusion, or one GitHub adds later, is not evidence of
+  # a pass. Red rather than pending: a spurious revert is recoverable, a false green
+  # ships broken code.
+  for _cc in 'completed|' 'completed|startup_failure' 'completed|stale' 'completed|some_future_conclusion'; do
+    [ "$(_checkrun_state "$_cc")" = "red" ] \
+      || { echo "FAIL _checkrun_state: '$_cc' must be red, not green"; exit 1; }
+  done
+  # Red still outranks pending when both are present.
+  [ "$(_checkrun_state $'in_progress|\ncompleted|failure')" = "red" ] \
+    || { echo "FAIL _checkrun_state: red must outrank pending"; exit 1; }
+  unset _st _cc
+  echo "_checkrun_state OK (green is an allowlist)"
   # --- #67: commit statuses must reach the CI verdict ------------------------
   # A required context can be a commit STATUS, not a check-run. The post-merge
   # watcher read only /check-runs, so such a context was invisible to it.
@@ -3488,6 +3550,17 @@ SH
                '[{"check_runs":[{"name":"server","status":null,"conclusion":"success"}]}]'; do
     FAKE_RUNS_BODY="$_body" _cl >/dev/null 2>&1 \
       && { echo "FAIL _commit_ci_lines: non-string record field must fail closed ($_body)"; rm -rf "$cdir"; exit 1; }
+  done
+  # Deduplication SORTS on `updated_at`, so that field must be validated before it is
+  # sorted on: jq orders null below every string, so a stale success with a null
+  # timestamp could beat a current failure and still return rc 0.
+  for _body in '[{"statuses":[{"context":"ext-ci","state":"success"}]}]' \
+               '[{"statuses":[{"context":"ext-ci","state":"success","updated_at":null}]}]' \
+               '[{"statuses":[{"context":"ext-ci","state":"success","updated_at":123}]}]' \
+               '[{"statuses":[{"context":null,"state":"success","updated_at":"2026-01-01T00:00:00Z"}]}]' \
+               '[{"statuses":[{"context":"ext-ci","state":null,"updated_at":"2026-01-01T00:00:00Z"}]}]'; do
+    FAKE_STATUS_BODY="$_body" _cl >/dev/null 2>&1 \
+      && { echo "FAIL _commit_ci_lines: unsortable/malformed status record must fail closed ($_body)"; rm -rf "$cdir"; exit 1; }
   done
   # A NEWLINE in a name breaks both the line protocol and the line-oriented required
   # match, so it cannot even be established whether the check is required -> always
