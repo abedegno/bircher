@@ -430,7 +430,12 @@ _arm_ci_deadline() {
   now=$(date +%s 2>/dev/null)
   case "$now" in
     ''|*[!0-9]*)
-      unset MAIN_CI_DEADLINE_AT
+      # ASSIGN empty, never `unset`. `unset` on a dynamically scoped local HIDES that
+      # local and re-exposes an outer variable of the same name -- so a stale expired
+      # deadline left in the environment would spring back into view here, give every
+      # subsequent call a one-second cap, and halt a successfully merged PR as
+      # unresolved. Assignment leaves this frame's binding in place and empty.
+      MAIN_CI_DEADLINE_AT=""
       echo "[batch] WARN: cannot read the clock -> main-CI absolute deadline NOT armed (the per-loop budgets still bound every wait)" >&2
       return 1 ;;
   esac
@@ -493,7 +498,11 @@ _net_run() {
   local cap="$1"; shift
   case "$cap" in ''|*[!0-9]*) cap=300 ;; esac
   cap=$((10#$cap)); [ "$cap" -ge 5 ] 2>/dev/null || cap=300
-  if command -v timeout >/dev/null 2>&1; then timeout "$cap" "$@"; else "$@"; fi
+  # -k: plain `timeout` sends only SIGTERM and then KEEPS WAITING if the child ignores
+  # it, so it is not a bound at all against exactly the hung transport this exists to
+  # stop. A `git push` stuck in credential negotiation that does not die on TERM would
+  # leave recovery blocked forever and main red.
+  if command -v timeout >/dev/null 2>&1; then timeout -k 10 "$cap" "$@"; else "$@"; fi
 }
 BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-300}"
 
@@ -529,7 +538,7 @@ _ci_call_cap() {
 _ci_gh() {
   local cap; cap=$(_ci_call_cap)
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$cap" gh "$@"
+    timeout -k 10 "$cap" gh "$@"   # -k: see _net_run -- TERM alone is not a bound
   else
     gh "$@"
   fi
@@ -4615,30 +4624,40 @@ SH
   # runnable on stock macOS, where coreutils' timeout is absent. The runner is Linux
   # and always takes the bounded path.
   local _tdir; _tdir=$(mktemp -d)
-  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "$TO_LOG"\nshift\nexec "$@"\n' > "$_tdir/timeout"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'printf "%s\n" "$*" >> "$TO_ARGS"' \
+    'if [ "$1" = "-k" ]; then shift 2; fi' \
+    'printf "%s\n" "$1" >> "$TO_LOG"' \
+    'shift' \
+    'exec "$@"' > "$_tdir/timeout"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$_tdir/gh"
-  chmod +x "$_tdir/timeout" "$_tdir/gh"; : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
+  chmod +x "$_tdir/timeout" "$_tdir/gh"; : > "$_tdir/caps"; : > "$_tdir/args"
+  : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" TO_ARGS="$_tdir/args" MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
+  # A TERM-only timeout is not a bound: a child that ignores SIGTERM leaves `timeout`
+  # waiting forever, which is exactly the hung transport this wraps against.
+  grep -q -- '-k' "$_tdir/args" \
+    || { echo "FAIL #62: _ci_gh must pass -k (TERM alone does not bound a child that ignores it)"; rm -rf "$_tdir"; exit 1; }
   [ "$(cat "$_tdir/caps")" = 120 ] \
     || { echo "FAIL #62: an unarmed deadline must cap a gh call at the 120s default (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
   # With less than the default left on the deadline, the REMAINDER is the cap -- a
   # single call must never be allowed to outlive the bound it is supposed to respect.
-  : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 30 )) _ci_gh api x >/dev/null 2>&1 )
+  : > "$_tdir/caps"; : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 30 )) _ci_gh api x >/dev/null 2>&1 )
   _cap=$(cat "$_tdir/caps")
   { [ "$_cap" -ge 25 ] && [ "$_cap" -le 30 ]; } \
     || { echo "FAIL #62: the cap must shrink to the deadline remainder (got '$_cap', expected ~30)"; rm -rf "$_tdir"; exit 1; }
   # Already past the deadline: still a positive cap, never 0 or negative, which
   # `timeout` would read as "no limit at all".
-  : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 500 )) _ci_gh api x >/dev/null 2>&1 )
+  : > "$_tdir/caps"; : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 500 )) _ci_gh api x >/dev/null 2>&1 )
   [ "$(cat "$_tdir/caps")" -ge 1 ] \
     || { echo "FAIL #62: a passed deadline must still yield a POSITIVE cap, not 0 (which timeout reads as unlimited)"; rm -rf "$_tdir"; exit 1; }
   # An unusable BIRCHER_CI_CALL_TIMEOUT must fall back, not disable the cap. Leading
   # zeros here are the same octal trap as the deadline span.
   for _bad in "" "abc" "0" "3" "0000060"; do
-    : > "$_tdir/caps"
-    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" BIRCHER_CI_CALL_TIMEOUT="$_bad" \
+    : > "$_tdir/caps"; : > "$_tdir/args"
+    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" BIRCHER_CI_CALL_TIMEOUT="$_bad" \
       MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
     _cap=$(cat "$_tdir/caps")
     { [ -n "$_cap" ] && [ "$_cap" -ge 5 ]; } 2>/dev/null \
@@ -4649,16 +4668,16 @@ SH
     case "$_cap" in 0?*) echo "FAIL #62: cap '$_cap' from '$_bad' is not canonical decimal"; rm -rf "$_tdir"; exit 1 ;; esac
   done
   # ...and a leading-zero cap must mean its DECIMAL value.
-  : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" BIRCHER_CI_CALL_TIMEOUT=0000060 \
+  : > "$_tdir/caps"; : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" BIRCHER_CI_CALL_TIMEOUT=0000060 \
     MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
   [ "$(cat "$_tdir/caps")" = 60 ] \
     || { echo "FAIL #62: BIRCHER_CI_CALL_TIMEOUT=0000060 must yield a cap of 60 (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
   # The branch-protection lookup is easy to overlook because it is not "CI" -- but it
   # runs inside the post-merge watch, so a hang there outlives the absolute deadline
   # exactly as a hung check-runs fetch would.
-  : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" REPO=demo/demo \
+  : > "$_tdir/caps"; : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" REPO=demo/demo \
     _REQUIRED_CONTEXTS_LOADED= _REQUIRED_CONTEXTS_CACHE= MAIN_CI_DEADLINE_AT= \
     _required_contexts >/dev/null 2>&1 )
   [ -s "$_tdir/caps" ] \
@@ -4694,6 +4713,19 @@ SH
     || { echo "FAIL #62: the armed deadline must reach helpers called via \$( ) (got '$_inner_cap')"; rm -rf "$_tdir"; exit 1; }
   [ -z "${MAIN_CI_DEADLINE_AT:-}" ] \
     || { echo "FAIL #62: the deadline survived the frame that armed it -> it will shorten the next item"; rm -rf "$_tdir"; exit 1; }
+  # DEAD CLOCK WITH A STALE OUTER VALUE. `unset` on a dynamically scoped local HIDES
+  # it and re-exposes an outer variable of the same name -- so an expired deadline left
+  # in the environment would spring back, cap every later call at one second, and halt
+  # a successfully merged PR as unresolved. The scope test above starts with no outer
+  # value and so cannot see this; this one deliberately plants one.
+  _dead_probe() { local MAIN_CI_DEADLINE_AT=""; _arm_ci_deadline 2>/dev/null; printf '%s' "${MAIN_CI_DEADLINE_AT:-UNARMED}"; }
+  local _ddir2; _ddir2=$(mktemp -d)
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$_ddir2/date"; chmod +x "$_ddir2/date"
+  _res=$( MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 9999 )); export MAIN_CI_DEADLINE_AT
+          PATH="$_ddir2:$PATH" _dead_probe )
+  [ "$_res" = UNARMED ] \
+    || { echo "FAIL #62: a dead clock re-exposed a stale outer deadline ('$_res') instead of leaving this merge unarmed"; rm -rf "$_ddir2"; exit 1; }
+  rm -rf "$_ddir2"; unset -f _dead_probe
   unset -f _scope_probe
   # RECOVERY IS BOUNDED SEPARATELY. It runs after the CI deadline has typically expired
   # and must still fetch, revert and push -- capping it at the CI remainder would give
@@ -4714,21 +4746,23 @@ SH
   [ -z "${_unbounded//[[:space:]]/}" ] \
     || { echo "FAIL #62: unbounded gh call in _reopen_reverted_issues: $_unbounded"; rm -rf "$_tdir"; exit 1; }
   # _net_run's cap is INDEPENDENT of the CI deadline: an expired one must not shrink it.
-  : > "$_tdir/caps"
-  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 9999 )) \
+  : > "$_tdir/caps"; : > "$_tdir/args"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 9999 )) \
     _net_run "$BIRCHER_NET_TIMEOUT" gh x >/dev/null 2>&1 )
   [ "$(cat "$_tdir/caps")" = "$BIRCHER_NET_TIMEOUT" ] \
     || { echo "FAIL #62: _net_run must ignore an expired CI deadline (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
+  grep -q -- '-k' "$_tdir/args" \
+    || { echo "FAIL #62: _net_run must pass -k -- a git push that ignores SIGTERM would block recovery forever"; rm -rf "$_tdir"; exit 1; }
   for _bad in "" "abc" "0" "0000060"; do
-    : > "$_tdir/caps"
-    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" _net_run "$_bad" gh x >/dev/null 2>&1 )
+    : > "$_tdir/caps"; : > "$_tdir/args"
+    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" TO_ARGS="$_tdir/args" _net_run "$_bad" gh x >/dev/null 2>&1 )
     _cap=$(cat "$_tdir/caps")
     { [ -n "$_cap" ] && [ "$_cap" -ge 5 ]; } 2>/dev/null \
       || { echo "FAIL #62: _net_run cap '$_bad' must fall back to a sane value (got '$_cap')"; rm -rf "$_tdir"; exit 1; }
     case "$_cap" in 0?*) echo "FAIL #62: _net_run cap '$_cap' is not canonical decimal"; rm -rf "$_tdir"; exit 1 ;; esac
   done
   rm -rf "$_tdir"
-  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded
+  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded _res _ddir2
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
