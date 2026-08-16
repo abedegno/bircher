@@ -411,24 +411,61 @@ EOF
   _classify_ci_failure "$total"
 }
 
-# _past_ci_deadline -> rc 0 once the shared main-CI wall clock has run out.
+# _arm_ci_deadline -> sets MAIN_CI_DEADLINE_AT to an absolute epoch instant.
 #
 # #62: the initial watch and each re-run poll have their own budgets, and each lives in
 # its own function with its own elapsed counter -- so three re-runs multiplied a 900s
 # budget into a ~71-minute worst case, and raising it for a slow first watch would have
-# made that ~4 hours. This is the one bound they all share. `merge_ready_pr` arms it as
-# an absolute epoch instant at the start of the watch; unarmed, it never fires, so any
-# caller that has not armed it keeps exactly its own budget.
+# made that ~4 hours. An absolute instant is the only thing all three loops can agree
+# on. Exported, because _rerun_main_ci runs inside a command substitution.
 #
-# An unusable value reads as "not past" rather than erroring: the per-loop budgets still
-# bound every caller, so failing open here cannot run forever, whereas failing closed on
-# a garbled value would abandon a healthy watch. (bash's `[ x -ge y ]` ERRORS rather
-# than returning false on an oversized operand -- learned the hard way in #61b -- so the
-# digits check has to come first, not be left to the comparison.)
+# Every input is validated before the arithmetic. An oversized override would otherwise
+# overflow to a NEGATIVE epoch, which `_past_ci_deadline` then rejects for its minus
+# sign -- silently disabling the very bound the operator was trying to set. And an
+# unreadable clock would arm the deadline near epoch 0, expiring instantly and halting a
+# healthy merge before its watch began. Both are configuration-reachable, since the span
+# is a documented environment override.
+_arm_ci_deadline() {
+  local now span="${MAIN_CI_ABSOLUTE_DEADLINE:-}"
+  now=$(date +%s 2>/dev/null)
+  case "$now" in
+    ''|*[!0-9]*)
+      unset MAIN_CI_DEADLINE_AT
+      echo "[batch] WARN: cannot read the clock -> main-CI absolute deadline NOT armed (the per-loop budgets still bound every wait)" >&2
+      return 1 ;;
+  esac
+  # Magnitude clamp BEFORE the arithmetic, not after: a digits-only value can still be
+  # too large to add without wrapping, and bash wraps to a POSITIVE 19-digit number
+  # rather than erroring, so the overflow looks like a valid far-future instant. Same
+  # lesson as #61b's retry bound.
+  #
+  # ONE validation, not two. An earlier cut also had a `case ... *[!0-9]*` digit check
+  # in front of this; the length-and-minimum test below already rejects everything it
+  # rejected (bash's comparison error is non-zero, and `2>/dev/null` keeps it quiet), so
+  # no test could tell whether the digit check was there. A guard nothing can falsify is
+  # not defence in depth, it is decoration.
+  { [ "${#span}" -le 7 ] && [ "$span" -ge 60 ]; } 2>/dev/null || {
+    echo "[batch] WARN: unusable BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE '${MAIN_CI_ABSOLUTE_DEADLINE}' -> using 7200s" >&2
+    span=7200
+  }
+  MAIN_CI_DEADLINE_AT=$((now + span))
+  export MAIN_CI_DEADLINE_AT
+}
+
+# _past_ci_deadline -> rc 0 once the shared main-CI wall clock has run out.
+#
+# Unarmed, it never fires, so any caller that has not armed it keeps exactly its own
+# budget. An unusable value reads as "not past" rather than erroring: the per-loop
+# budgets still bound every caller, so failing open here cannot run forever, whereas
+# failing closed on a garbled value would abandon a healthy watch. (bash's
+# `[ x -ge y ]` ERRORS rather than returning false on an oversized operand -- #61b -- so
+# the digits check has to come first and be silent, not be left to the comparison. A
+# test that only asserts "nonzero" cannot tell the guard from the error.)
 _past_ci_deadline() {
   case "${MAIN_CI_DEADLINE_AT:-}" in
     ''|*[!0-9]*) return 1 ;;
   esac
+  [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || return 1
   [ "$(date +%s)" -ge "$MAIN_CI_DEADLINE_AT" ]
 }
 
@@ -1205,11 +1242,9 @@ merge_ready_pr() {
   local waited=0 state=pending lines mreq
   mreq=$(_required_contexts)   # once, not on every 30s poll
   # #62: arm the absolute deadline HERE, at the start of the watch, so the initial
-  # watch and every subsequent re-run share one bound. Exported because
-  # _rerun_main_ci runs inside a command substitution and would otherwise start its
-  # own count -- the two budgets multiplying is the failure this bound exists to stop.
-  MAIN_CI_DEADLINE_AT=$(( $(date +%s) + MAIN_CI_ABSOLUTE_DEADLINE ))
-  export MAIN_CI_DEADLINE_AT
+  # watch and every subsequent re-run share one bound. Re-armed per merge, deliberately:
+  # it bounds how long ONE merge's verdict may take, not the whole wave.
+  _arm_ci_deadline
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
     sleep 30; waited=$((waited + 30))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
@@ -1865,11 +1900,21 @@ _drop_non_ci_checkruns() {
 #
 # Worst case with the defaults: 3 x (MAIN_CI_TIMEOUT 900s + 20s startup) + 2 x 300s
 # = 56 minutes, plus the initial watch. That initial watch is now
-# MAIN_CI_SETTLE_TIMEOUT (3600s, #62) rather than 900s, so the arithmetic ceiling
-# would be ~116 minutes -- but MAIN_CI_ABSOLUTE_DEADLINE (7200s) bounds the whole
-# sequence, and `_past_ci_deadline` is checked in this loop and in both poll loops.
-# That deadline, not the sum of the budgets, is the ceiling on how long a genuinely
-# broken main stays unreverted; keep it in mind before raising anything here.
+# MAIN_CI_SETTLE_TIMEOUT (3600s, #62) rather than 900s, so the sum of the budgets is
+# ~116 minutes; MAIN_CI_ABSOLUTE_DEADLINE (7200s = 120m) bounds the sequence, and
+# `_past_ci_deadline` is checked in this loop, before each re-run dispatch, before the
+# partial-green confirmation, and in both poll loops.
+#
+# Be precise about what that bound is worth: it is checked BETWEEN operations, never
+# inside one. A `gh` call that hangs rather than failing is not interrupted, so the
+# deadline bounds how much WORK is started, not how long the process can block. Giving
+# it teeth against a hung subprocess needs a per-call timeout, which `timeout(1)` does
+# not portably provide (absent on macOS by default). Treat 7200s as the ceiling on
+# scheduled work, not a hard kill.
+#
+# The practical figure that matters: a genuinely broken main can now stay unreverted for
+# up to ~120 minutes rather than ~71. That is the price of tolerating the 2867s CI run
+# that halted a healthy wave; keep it in mind before raising anything here.
 _rerun_main_ci_until_green() {
 	local sha="$1" budget="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
 	local st=unknown mode
@@ -1896,6 +1941,12 @@ _rerun_main_ci_until_green() {
 			# No budget check needed: the last affordable re-run is always full, so a
 			# green from a PARTIAL run always has at least one re-run left to confirm it.
 			echo "[batch:merge] main CI green on a partial re-run -> confirming with a full re-run" >&2
+			# This dispatch does NOT pass back through the loop guard above, so it needs
+			# its own check or it can start a fresh full re-run after the deadline.
+			if _past_ci_deadline; then
+				echo "[batch:merge] confirming full re-run skipped: the ${MAIN_CI_ABSOLUTE_DEADLINE}s absolute deadline passed -> partial green is not evidence" >&2
+				st=unknown; break
+			fi
 			st=$(_rerun_main_ci "$sha" full); budget=$((budget - 1))
 			if [ "$st" = green ]; then
 				echo "[batch:merge] full re-run confirmed GREEN -> the red was transient" >&2
@@ -1958,6 +2009,13 @@ _revert_git_args() {
 # distinguish a flaky red/hung main from a genuine one before reverting/halting.
 _rerun_main_ci() {
   local sha="$1" full="${2:-}" rid w=0 lines st
+  # #62: check BEFORE dispatching. This function costs a `gh run list`, a `gh run
+  # rerun` and a 20s startup sleep before it reaches its poll loop, so a check only at
+  # the loop would let all of that run past an expired deadline.
+  if _past_ci_deadline; then
+    echo "[batch:merge] re-run not dispatched: the ${MAIN_CI_ABSOLUTE_DEADLINE}s absolute deadline passed" >&2
+    echo unknown; return
+  fi
   rid=$(gh run list --repo "$REPO" --branch main --limit 10 --json databaseId,headSha \
         -q ".[] | select(.headSha==\"$sha\") | .databaseId" 2>/dev/null | head -1)
   # `unknown`, NOT red: no verdict was obtained. Reporting red here would let a
@@ -2990,6 +3048,12 @@ self_test() {
   # mutated there dies with the subshell and every call would replay the first
   # answer (which is how the first version of this test fooled itself).
   local _sq="${TMPDIR:-/tmp}/bircher-st-seq-$$"
+  # SAVE the real function before shadowing it. `unset -f` below used to delete the
+  # script's own definition, not just this stub, so every test after this point ran
+  # against a _rerun_main_ci that did not exist -- calls returned empty and any
+  # assertion on them was vacuous. Nothing noticed because nothing called it again
+  # until #62 added a test that did.
+  local _real_rerun; _real_rerun=$(declare -f _rerun_main_ci)
   _rerun_main_ci() {
     local first rest
     first=$(head -1 "$_sq"); rest=$(tail -n +2 "$_sq")
@@ -3048,7 +3112,11 @@ self_test() {
   [ "$(_rerun_main_ci_until_green deadbeef notanumber 0 2>/dev/null)" = green ] \
     || { echo "FAIL #52: a non-numeric budget must fall back to a sane default"; exit 1; }
 
-  rm -f "$_sq" "$_sq.n" "$_sq.modes"; unset -f _rerun_main_ci _seq _ncalls
+  rm -f "$_sq" "$_sq.n" "$_sq.modes"; unset -f _seq _ncalls
+  # RESTORE, do not unset: see the note where _real_rerun is captured.
+  unset -f _rerun_main_ci; eval "$_real_rerun"
+  declare -F _rerun_main_ci >/dev/null \
+    || { echo "FAIL: the real _rerun_main_ci was not restored after stubbing"; exit 1; }
   echo "_rerun_main_ci_until_green OK (#52)"
 
   local _std="${TMPDIR:-/tmp}/bircher-st-pr-$$"; mkdir -p "$_std"; NOOP_DIR="$_std"
@@ -4354,14 +4422,96 @@ SH
     || { echo "FAIL #62: a passed deadline MUST fire"; exit 1; }
   # An unusable value reads as "not past": the per-loop budgets still bound every
   # caller, so failing open cannot run forever, while failing closed on a garbled
-  # value would abandon a healthy watch. bash ERRORS rather than returning false on an
-  # oversized `-ge` operand (#61b), so the digits check must come before the compare --
-  # these two cases are the ones that regressed last time.
-  for _bad in "" "abc" "12a" "99999999999999999999999999" "-5" " 123"; do
-    ( MAIN_CI_DEADLINE_AT="$_bad"; _past_ci_deadline ) \
-      && { echo "FAIL #62: unusable deadline '$_bad' must read as NOT past"; exit 1; }
+  # value would abandon a healthy watch.
+  #
+  # ASSERT ON STDERR TOO. bash ERRORS rather than returning false on an oversized
+  # `-ge` operand (#61b), and an error is also non-zero -- so an rc-only assertion
+  # passes whether the guard rejected the value deliberately or bash blew up on it.
+  # That is the same unfalsifiable-assertion trap as the #67 test shims: the earlier
+  # version of this loop was caught by its `-5` case alone and would have missed the
+  # guard's removal entirely for every other value.
+  for _bad in "" "abc" "12a" "99999999999999999999999999" "-5" " 123" "1e9"; do
+    _err=$( { MAIN_CI_DEADLINE_AT="$_bad"; _past_ci_deadline; } 2>&1 ); _rc=$?
+    [ "$_rc" -ne 0 ] \
+      || { echo "FAIL #62: unusable deadline '$_bad' must read as NOT past"; exit 1; }
+    [ -z "$_err" ] \
+      || { echo "FAIL #62: '$_bad' was REJECTED BY BASH, not by the guard: $_err"; exit 1; }
   done
-  unset _bad
+  # An all-digit but absurd value is the one that proves the magnitude clamp rather
+  # than the digits check: it passes `*[!0-9]*` and only the length test stops it.
+  _err=$( { MAIN_CI_DEADLINE_AT=99999999999999999999; _past_ci_deadline; } 2>&1 ); _rc=$?
+  { [ "$_rc" -ne 0 ] && [ -z "$_err" ]; } \
+    || { echo "FAIL #62: an oversized ALL-DIGIT deadline must be clamped, not compared (rc=$_rc err=$_err)"; exit 1; }
+  # Arming validates its inputs. The assertion has to bound the armed value from ABOVE
+  # as well as below: bash's overflow on `now + 99999999999999999999` wraps to a
+  # POSITIVE 19-digit number, so "later than now" is satisfied while the deadline sits
+  # ~246 billion years out and `_past_ci_deadline`'s length clamp then rejects it as
+  # unusable -- silently disabling the bound the operator was trying to set. An
+  # assertion that only checked `> now` passed straight through that.
+  _sane_arm() { # <label>; asserts the armed instant is in (now, now + max span]
+    local now armed; now=$(date +%s)
+    armed="${MAIN_CI_DEADLINE_AT:-}"
+    case "$armed" in ''|*[!0-9]*) echo "FAIL #62: $1 left the deadline unusable ('$armed')"; exit 1 ;; esac
+    [ "${#armed}" -le 12 ] \
+      || { echo "FAIL #62: $1 armed an out-of-range deadline ($armed) -- _past_ci_deadline would reject it and fail OPEN"; exit 1; }
+    [ "$armed" -gt "$now" ] \
+      || { echo "FAIL #62: $1 armed a deadline in the past ($armed <= $now)"; exit 1; }
+    [ "$armed" -le "$((now + 9999999))" ] \
+      || { echo "FAIL #62: $1 armed a deadline beyond the maximum span ($armed)"; exit 1; }
+    # Also bound from BELOW by the minimum span: a 1-second deadline would expire
+    # before the first poll and halt healthy merges, so an absurdly small override
+    # must fall back rather than be honoured.
+    [ "$armed" -ge "$((now + 60))" ] \
+      || { echo "FAIL #62: $1 armed a deadline under the minimum span ($armed vs $now)"; exit 1; }
+  }
+  ( MAIN_CI_ABSOLUTE_DEADLINE=99999999999999999999 _arm_ci_deadline 2>/dev/null
+    _sane_arm "an oversized span" )                        || exit 1
+  ( MAIN_CI_ABSOLUTE_DEADLINE=abc _arm_ci_deadline 2>/dev/null
+    _sane_arm "a non-numeric span" )                       || exit 1
+  ( MAIN_CI_ABSOLUTE_DEADLINE=1 _arm_ci_deadline 2>/dev/null
+    _sane_arm "an absurdly small span" )                   || exit 1
+  # An 8-digit span (~3.2 years) is the case that isolates the LENGTH clamp: it is
+  # small enough that `-ge 60` succeeds normally, so only the length test rejects it.
+  # The 20-digit case above is caught either way, because bash ERRORS on an oversized
+  # `-ge` operand -- but zsh truncates and compares instead (#61b), so a clamp that
+  # only works by relying on that error is not a clamp.
+  ( MAIN_CI_ABSOLUTE_DEADLINE=99999999 _arm_ci_deadline 2>/dev/null
+    _sane_arm "an 8-digit span" )                          || exit 1
+  ( MAIN_CI_ABSOLUTE_DEADLINE=7200 _arm_ci_deadline 2>/dev/null
+    _sane_arm "the default span"
+    _past_ci_deadline ) \
+    && { echo "FAIL #62: a freshly armed deadline must not already be past"; exit 1; }
+  # A DEAD CLOCK must leave the deadline unarmed, never arm it near epoch 0 -- which
+  # would expire instantly and halt a healthy merge before its watch began.
+  local _ddir; _ddir=$(mktemp -d)
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$_ddir/date"; chmod +x "$_ddir/date"
+  ( PATH="$_ddir:$PATH" MAIN_CI_DEADLINE_AT=  _arm_ci_deadline 2>/dev/null
+    [ -z "${MAIN_CI_DEADLINE_AT:-}" ] ) \
+    || { echo "FAIL #62: a dead clock must leave the deadline UNARMED, not armed near epoch 0"; rm -rf "$_ddir"; exit 1; }
+  rm -rf "$_ddir"; unset -f _sane_arm
+  # An EXPIRED deadline must stop _rerun_main_ci BEFORE it dispatches. That path costs
+  # a `gh run list`, a `gh run rerun` and a 20s startup sleep before it reaches its own
+  # poll loop, so a check only at the loop would let all of it run past the deadline.
+  # Asserting on the gh log, not just the return value: `unknown` is also what a failed
+  # lookup returns, so a rc-only assertion could not tell the guard from a broken shim.
+  local _rdir; _rdir=$(mktemp -d)
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$GH_CALLS"\nexit 1\n' > "$_rdir/gh"
+  chmod +x "$_rdir/gh"; : > "$_rdir/calls"
+  _rr=$( PATH="$_rdir:$PATH" REPO=demo/demo GH_CALLS="$_rdir/calls" \
+         MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 1 )) _rerun_main_ci deadsha 2>/dev/null )
+  [ "$_rr" = unknown ] \
+    || { echo "FAIL #62: a re-run past the deadline must report unknown (got '$_rr')"; rm -rf "$_rdir"; exit 1; }
+  [ ! -s "$_rdir/calls" ] \
+    || { echo "FAIL #62: a re-run past the deadline DISPATCHED anyway: $(cat "$_rdir/calls")"; rm -rf "$_rdir"; exit 1; }
+  # ...and with the deadline in the future it must still reach gh, or the assertion
+  # above would pass for a function that never does anything.
+  : > "$_rdir/calls"
+  ( PATH="$_rdir:$PATH" REPO=demo/demo GH_CALLS="$_rdir/calls" \
+    MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 600 )) _rerun_main_ci livesha >/dev/null 2>&1 )
+  [ -s "$_rdir/calls" ] \
+    || { echo "FAIL #62: with time remaining, the re-run must still reach gh"; rm -rf "$_rdir"; exit 1; }
+  rm -rf "$_rdir"
+  unset _bad _err _rc _ddir _rdir _rr
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
