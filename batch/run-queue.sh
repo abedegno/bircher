@@ -2219,7 +2219,8 @@ _rerun_main_ci() {
     lines=$(_keep_blocking_checks "$lines" "$_rr_req")
     st=$(_checkrun_state "$lines")
     [ "$st" != pending ] && { echo "$st"; return; }
-    sleep "$MAIN_CI_POLL_INTERVAL"; w=$((w + MAIN_CI_POLL_INTERVAL))
+    _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
+    sleep "$_iv"; w=$((w + _iv))
   done
   echo pending
 }
@@ -3257,6 +3258,22 @@ SH
           export PATH _GH_NO_RUN _GH_RERUN_RC; _rerun_main_ci deadbeef 2>/dev/null )
   [ "$_out" = unknown ] \
     || { echo "FAIL #52: a failed rerun dispatch must be unknown, not '$_out'"; exit 1; }
+  # #62: the RE-RUN poll loop must validate the interval too. It is a SECOND loop, and
+  # consolidating the validation missed it precisely because the hostile-value
+  # integration test drives the initial watch to green and never enters this one. With
+  # an unvalidated `abc`, `sleep` fails every iteration while the arithmetic resolves
+  # the unset name to 0, so `w` never advances and the loop polls to the deadline.
+  # Here the run EXISTS and stays pending, so the loop is actually entered.
+  local _t0 _t1
+  _t0=$(date +%s)
+  _out=$( PATH="$_g52:$PATH"; REPO=demo/demo MAIN_CI_TIMEOUT=3 MAIN_CI_POLL_INTERVAL=abc
+          export PATH; _rerun_main_ci deadbeef 2>/dev/null )
+  _t1=$(date +%s)
+  [ "$_out" = pending ] \
+    || { echo "FAIL #62: the re-run poll must exhaust its budget and report pending, got '$_out'"; exit 1; }
+  [ "$(( _t1 - _t0 ))" -le 120 ] \
+    || { echo "FAIL #62: a non-numeric MAIN_CI_POLL_INTERVAL stalled the re-run loop ($(( _t1 - _t0 ))s)"; exit 1; }
+  unset _t0 _t1
   rm -rf "$_g52"; unset _g52
 
   # --- #52: retries prove transience causally; no verdict must never revert -----
