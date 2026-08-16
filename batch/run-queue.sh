@@ -64,6 +64,10 @@ MAIN_CI_TIMEOUT="${BIRCHER_MAIN_CI_TIMEOUT:-900}"                  # each RE-RUN
 # per-loop elapsed counter: each loop lives in its own function and would otherwise
 # restart its own count, which is how the two budgets multiplied in the first place.
 MAIN_CI_ABSOLUTE_DEADLINE="${BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE:-7200}"
+# How often the CI poll loops look. Injectable so the self-test does not pay 30s per
+# watched merge: splitting the budgets left MAIN_CI_TIMEOUT controlling only the RERUN
+# loop, so a test setting it low no longer bounds the initial watch at all.
+MAIN_CI_POLL_INTERVAL="${BIRCHER_MAIN_CI_POLL_INTERVAL:-30}"
 # B-3 vendor allocation: which vendor implements each item.
 #   auto (default) = usage-aware selection that balances the two subscriptions'
 #   WEEKLY windows (pick the lower used_percent) and rides out 5h-window
@@ -739,7 +743,7 @@ _poll_ci() {
         buckets=$(_keep_blocking_checks "$buckets" "$req")
     ci=$(_normalize_ci "$buckets")
     [ "$ci" != pending ] && { echo "$ci"; return; }
-    sleep 30; w=$((w + 30))
+    sleep "$MAIN_CI_POLL_INTERVAL"; w=$((w + MAIN_CI_POLL_INTERVAL))
   done
   echo pending
 }
@@ -1347,8 +1351,22 @@ merge_ready_pr() {
   # fetch below would run unbounded and the deadline would never even be set -- the
   # watch would not start, so nothing downstream could time it out.
   _arm_ci_deadline
-  local sha sha_rc
-  sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null); sha_rc=$?
+  # RETRY before concluding the oid is absent. GitHub's PR representation is eventually
+  # consistent -- this file already waits out the mergeability recompute above for the
+  # same reason -- so a single empty answer immediately after a merge is not evidence of
+  # persistent absence, and halting on first sight would strand healthy merges. A
+  # transport FAILURE is different and breaks out at once. Bounded by both a try count
+  # and the absolute deadline.
+  local sha sha_rc _sha_try=0
+  while :; do
+    sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null); sha_rc=$?
+    { [ "$sha_rc" -ne 0 ] || [ -n "$sha" ]; } && break
+    [ "$_sha_try" -ge "${BIRCHER_MERGE_SHA_TRIES:-5}" ] && break
+    _past_ci_deadline && break
+    _sha_try=$((_sha_try + 1))
+    echo "[batch:merge] $item: no merge sha for PR #$pr yet (try $_sha_try) -> retrying" >&2
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 3
+  done
   # A FAILED lookup is not "no merge sha". The PR is already merged at this point, so an
   # unwatched main is the one outcome that must never be reported as success -- and
   # returning 0 here does exactly that, letting the queue move on while a merge that may
@@ -1377,7 +1395,7 @@ merge_ready_pr() {
   local waited=0 state=pending lines mreq
   mreq=$(_required_contexts)   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
-    sleep 30; waited=$((waited + 30))
+    sleep "$MAIN_CI_POLL_INTERVAL"; waited=$((waited + MAIN_CI_POLL_INTERVAL))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
     # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
     # as pending, so a failed lookup keeps polling rather than reading green.
@@ -2179,7 +2197,7 @@ _rerun_main_ci() {
     lines=$(_keep_blocking_checks "$lines" "$_rr_req")
     st=$(_checkrun_state "$lines")
     [ "$st" != pending ] && { echo "$st"; return; }
-    sleep 30; w=$((w + 30))
+    sleep "$MAIN_CI_POLL_INTERVAL"; w=$((w + MAIN_CI_POLL_INTERVAL))
   done
   echo pending
 }
@@ -2858,6 +2876,14 @@ self_test() {
     PATH="$_ST_TO_DIR:$PATH"; export PATH
     echo "[self-test] no timeout(1) on this box -> using a passthrough shim (the runner has GNU coreutils)" >&2
   fi
+  # Capture the SHIPPED defaults before overriding them for speed -- the #62 assertions
+  # below check the defaults, not whatever the suite is running with.
+  _DEF_SETTLE="$MAIN_CI_SETTLE_TIMEOUT"; _DEF_RERUN="$MAIN_CI_TIMEOUT"; _DEF_ABS="$MAIN_CI_ABSOLUTE_DEADLINE"
+  # Splitting the budgets (#62) left MAIN_CI_TIMEOUT bounding only the RERUN loop, so the
+  # per-test `MAIN_CI_TIMEOUT=31` no longer bounds the initial watch -- every watched
+  # merge silently started costing a 30s poll, and an unparseable green would have cost
+  # an hour. Bound the settle loop and shrink the interval for the whole suite.
+  MAIN_CI_SETTLE_TIMEOUT=5; MAIN_CI_POLL_INTERVAL=1
   local m
   # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
   # caller fails closed on that rather than merging an unverified commit.
@@ -4006,6 +4032,13 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     # FAKE_NO_SHA models GitHub answering the lookup SUCCESSFULLY with no oid --
     # distinct from the transport failing, and the case that used to return rc 0.
     [ "${FAKE_NO_SHA:-0}" = 1 ] && { echo ""; exit 0; }
+    # FAKE_SHA_EMPTY_TIMES models EVENTUAL CONSISTENCY: empty for the first N calls,
+    # then the real oid. Counted in a FILE because each call is a separate process.
+    if [ -n "${FAKE_SHA_EMPTY_TIMES:-}" ] && [ -n "${FAKE_SHA_COUNT_FILE:-}" ]; then
+      _n=$(cat "$FAKE_SHA_COUNT_FILE" 2>/dev/null || echo 0); _n=$((_n + 1))
+      echo "$_n" > "$FAKE_SHA_COUNT_FILE"
+      [ "$_n" -le "$FAKE_SHA_EMPTY_TIMES" ] && { echo ""; exit 0; }
+    fi
     echo "deadbeefsha"
   else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
   exit 0
@@ -4036,6 +4069,19 @@ SH
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
+  # ELAPSED-TIME GUARD. The happy path now ENTERS the main-CI watch (the shims used to
+  # return an empty merge sha to skip it, which is the unsafe shortcut #62 removed), so
+  # this asserts the watch is actually bounded by MAIN_CI_POLL_INTERVAL and exits on the
+  # first green observation. Without it, hardcoding the interval back to 30s is a silent
+  # 3-minute regression that no correctness assertion can see -- verified: that mutation
+  # left the suite green and only the clock changed.
+  _t0=$(date +%s)
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s7" \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  _t1=$(date +%s)
+  [ "$(( _t1 - _t0 ))" -le 15 ] \
+    || { echo "FAIL #62: the main-CI watch took $(( _t1 - _t0 ))s -- MAIN_CI_POLL_INTERVAL is not being honoured"; exit 1; }
+  unset _t0 _t1
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
   # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
@@ -4057,6 +4103,18 @@ SH
     rc=$?
     [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
     || { echo "FAIL #62: an EMPTY merge sha (rc 0) must halt too, not report the merge successful"; exit 1; }
+  # ...but NOT on first sight. GitHub's PR representation is eventually consistent, so a
+  # transient empty oid must be retried, not treated as persistent absence -- halting
+  # immediately would strand healthy merges. Two empties then the real oid must proceed.
+  : > "$mdir/shacount"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s6" \
+    BIRCHER_STATUS_BACKOFF=0 FAKE_SHA_EMPTY_TIMES=2 FAKE_SHA_COUNT_FILE="$mdir/shacount" \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] && ! printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
+    || { echo "FAIL #62: a transient empty merge sha must be RETRIED, not halted on first sight"; exit 1; }
+  [ "$(cat "$mdir/shacount" 2>/dev/null)" -ge 3 ] \
+    || { echo "FAIL #62: the retry never happened (lookup called $(cat "$mdir/shacount" 2>/dev/null) times, expected >=3)"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
@@ -4610,12 +4668,16 @@ SH
   # so the watch timed out `pending`, the re-run gave no verdict, and the wave halted
   # with main healthy. The settle budget now covers that; the absolute deadline stops
   # the settle budget and three re-run budgets from multiplying into hours.
-  [ "$MAIN_CI_SETTLE_TIMEOUT" -gt 2867 ] \
-    || { echo "FAIL #62: the settle budget must cover the observed 2867s main-CI run"; exit 1; }
-  [ "$MAIN_CI_TIMEOUT" = 900 ] \
+  [ "$_DEF_SETTLE" -gt 2867 ] \
+    || { echo "FAIL #62: the settle budget must cover the observed 2867s main-CI run (default=$_DEF_SETTLE)"; exit 1; }
+  [ "$_DEF_RERUN" = 900 ] \
     || { echo "FAIL #62: the RE-RUN budget must stay 900s (raising it multiplies by the re-run count)"; exit 1; }
-  [ "$MAIN_CI_ABSOLUTE_DEADLINE" -ge "$MAIN_CI_SETTLE_TIMEOUT" ] \
+  [ "$_DEF_ABS" -ge "$_DEF_SETTLE" ] \
     || { echo "FAIL #62: the absolute deadline must not be shorter than the settle budget"; exit 1; }
+  # The initial watch must NOT be bounded by the re-run budget -- that conflation is what
+  # made a per-test MAIN_CI_TIMEOUT silently stop bounding it.
+  [ "$_DEF_SETTLE" != "$_DEF_RERUN" ] \
+    || { echo "FAIL #62: the settle and re-run budgets must be distinct"; exit 1; }
   ( unset MAIN_CI_DEADLINE_AT; _past_ci_deadline ) \
     && { echo "FAIL #62: an UNARMED deadline must never fire"; exit 1; }
   ( MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 300 )); _past_ci_deadline ) \
