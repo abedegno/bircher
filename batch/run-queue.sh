@@ -389,14 +389,14 @@ EOF
 # rc 1 on either fetch failing: a failed status lookup must never read as "no
 # statuses" alongside green check-runs, which would be a false green.
 _commit_ci_lines() {
-  local sha="$1" runs statuses
+  local sha="$1" required="${2:-}" runs statuses bad
   runs=$(gh api "repos/$REPO/commits/$sha/check-runs" \
     -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null) || return 1
   statuses=$(gh api "repos/$REPO/commits/$sha/status" \
     -q '[.statuses[]] | to_entries | map(.value + {_i: .key})
         | group_by(.context)
         | map(sort_by([.updated_at, (0 - ._i)]) | last)[]
-        | if (.context | test("[|\n]")) then "__MALFORMED_CONTEXT__"
+        | if (.context | test("[|\n]")) then "__MALFORMED_CONTEXT__\t" + .context
           else "\(.context)|" + (if .state == "pending" then "in_progress|"
                                  else "completed|" + (if .state == "success" then "success" else "failure" end)
                                  end)
@@ -405,18 +405,31 @@ _commit_ci_lines() {
   # Emitting it anyway corrupts the record: `a|b` pending becomes `a|b|in_progress|`,
   # _keep_blocking_checks reads the name as `a`, the required match fails, it falls
   # back, and _checkrun_state sees `b|in_progress|` -- which it does not recognise as
-  # pending, so a required PENDING status reads GREEN. Refuse instead.
-  case "$statuses" in *__MALFORMED_CONTEXT__*)
-    echo "[batch] WARN: a required context name contains a delimiter; cannot classify CI safely for $sha" >&2
-    return 1 ;;
-  esac
-  case "$runs" in *"|"*"|"*"|"*)
-    # Same hazard on the check-run side: a name containing `|` yields >3 fields.
-    if printf '%s\n' "$runs" | awk -F'|' 'NF>3 {exit 1}'; then :; else
-      echo "[batch] WARN: a check-run name contains a delimiter; cannot classify CI safely for $sha" >&2
-      return 1
-    fi ;;
-  esac
+  # pending, so a required PENDING status reads GREEN.
+  #
+  # But refuse only when such a context is REQUIRED. A non-required one is filtered
+  # out downstream regardless, so halting every verdict over it would turn a cosmetic
+  # naming choice in someone else's repo into an outage. Required and unrepresentable
+  # is genuinely "cannot classify"; anything else is dropped with a warning.
+  bad=$(printf '%s\n' "$statuses" | sed -n 's/^__MALFORMED_CONTEXT__\t//p')
+  statuses=$(printf '%s\n' "$statuses" | grep -v '^__MALFORMED_CONTEXT__' || true)
+  if [ -n "$bad" ]; then
+    while IFS= read -r _b; do
+      [ -n "$_b" ] || continue
+      if [ -n "$required" ] && printf '%s\n' "$required" | grep -Fxq "$_b"; then
+        echo "[batch] WARN: REQUIRED context '$_b' contains a delimiter and cannot be classified -> failing closed for $sha" >&2
+        return 1
+      fi
+      echo "[batch] WARN: dropping non-required context '$_b' (contains a delimiter)" >&2
+    done <<EOF
+$bad
+EOF
+  fi
+  # Same hazard on the check-run side: a name containing `|` yields >3 fields.
+  if ! printf '%s\n' "$runs" | awk -F'|' 'NF>3 {exit 1}'; then
+    echo "[batch] WARN: a check-run name contains a delimiter; cannot classify CI safely for $sha" >&2
+    return 1
+  fi
   printf '%s\n%s\n' "$runs" "$statuses" | grep -v '^$' || true
 }
 
@@ -1052,7 +1065,7 @@ merge_ready_pr() {
     # #67: check-runs AND commit statuses -- a required status was invisible here.
     # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
     # as pending, so a failed lookup keeps polling rather than reading green.
-    lines=$(_commit_ci_lines "$sha") || lines=""
+    lines=$(_commit_ci_lines "$sha" "$mreq") || lines=""
     lines=$(_keep_blocking_checks "$lines" "$mreq")
     state=$(_checkrun_state "$lines")
     [ "$state" != "pending" ] && break
@@ -1797,7 +1810,7 @@ _rerun_main_ci() {
     # could contradict the watch that triggered it -- and re-create the #43 stall
     # that filtering exists to prevent. Selecting a workflow to re-run and
     # deciding whether main is green are separate concerns.
-    lines=$(_commit_ci_lines "$sha") || lines=""
+    lines=$(_commit_ci_lines "$sha" "$_rr_req") || lines=""
     lines=$(_keep_blocking_checks "$lines" "$_rr_req")
     st=$(_checkrun_state "$lines")
     [ "$st" != pending ] && { echo "$st"; return; }
@@ -3300,10 +3313,18 @@ SH
     || { echo "FAIL _commit_ci_lines: equal timestamps must take the FIRST (newest) entry"; rm -rf "$cdir"; exit 1; }
   # A context carrying the field delimiter cannot be represented; emitting it
   # anyway turned a required PENDING status into GREEN. Must fail closed.
-  FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' _cl >/dev/null 2>&1 \
-    && { echo "FAIL _commit_ci_lines: a pipe in a context name must fail closed"; rm -rf "$cdir"; exit 1; }
-  FAKE_STATUS_JSON='{"statuses":[{"context":"a\nb","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' _cl >/dev/null 2>&1 \
-    && { echo "FAIL _commit_ci_lines: a newline in a context name must fail closed"; rm -rf "$cdir"; exit 1; }
+  # A REQUIRED unrepresentable context is "cannot classify" -> fail closed.
+  FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' \
+    PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'a|b' >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: a REQUIRED pipe-bearing context must fail closed"; rm -rf "$cdir"; exit 1; }
+  # A NON-required one is dropped, not fatal -- halting every verdict over a
+  # cosmetic name in someone else's repo would be an outage, and it would be
+  # filtered downstream anyway.
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+       FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' \
+       PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
+    = "server|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing context must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   # An absent .statuses key is a malformed response, not "no statuses".
   FAKE_STATUS_JSON='{}' _cl >/dev/null 2>&1 \
     && { echo "FAIL _commit_ci_lines: absent .statuses must fail closed"; rm -rf "$cdir"; exit 1; }
