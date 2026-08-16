@@ -1279,17 +1279,18 @@ merge_ready_pr() {
     echo "[batch:merge] $item: merge of PR #$pr FAILED -> left open for the human" >&2
     return 0
   fi
+  # #62: arm the absolute deadline BEFORE the first post-merge GitHub lookup, not
+  # after. Armed later, a hang in either the merge-sha lookup or the branch-protection
+  # fetch below would run unbounded and the deadline would never even be set -- the
+  # watch would not start, so nothing downstream could time it out.
+  _arm_ci_deadline
   local sha
-  sha=$(gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null)
+  sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null)
   echo "[batch:merge] $item: PR #$pr MERGED (${sha:-sha unknown}); watching main CI" >&2
   [ -z "$sha" ] && { MERGE_NOTE="merged; main-CI watch skipped (no merge sha)"; return 0; }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
   local waited=0 state=pending lines mreq
   mreq=$(_required_contexts)   # once, not on every 30s poll
-  # #62: arm the absolute deadline HERE, at the start of the watch, so the initial
-  # watch and every subsequent re-run share one bound. Re-armed per merge, deliberately:
-  # it bounds how long ONE merge's verdict may take, not the whole wave.
-  _arm_ci_deadline
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
     sleep 30; waited=$((waited + 30))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
@@ -1843,7 +1844,11 @@ _REQUIRED_CONTEXTS_LOADED=""
 _required_contexts() {
   if [ -z "$_REQUIRED_CONTEXTS_LOADED" ]; then
     _REQUIRED_CONTEXTS_LOADED=1
-    _REQUIRED_CONTEXTS_CACHE=$(gh api \
+    # #62: bounded like every other CI lookup. This one is easy to overlook because it
+    # is not "CI" -- but it runs inside the post-merge watch, and a hang here outlives
+    # the absolute deadline just as surely as a hung check-runs fetch would. With the
+    # deadline unarmed (the PR path) the cap is simply the 120s default.
+    _REQUIRED_CONTEXTS_CACHE=$(_ci_gh api \
       "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
       --jq '.required_status_checks.contexts[]?' 2>/dev/null) || _REQUIRED_CONTEXTS_CACHE=""
   fi
@@ -4620,8 +4625,29 @@ SH
     MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
   [ "$(cat "$_tdir/caps")" = 60 ] \
     || { echo "FAIL #62: BIRCHER_CI_CALL_TIMEOUT=0000060 must yield a cap of 60 (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
+  # The branch-protection lookup is easy to overlook because it is not "CI" -- but it
+  # runs inside the post-merge watch, so a hang there outlives the absolute deadline
+  # exactly as a hung check-runs fetch would.
+  : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" REPO=demo/demo \
+    _REQUIRED_CONTEXTS_LOADED= _REQUIRED_CONTEXTS_CACHE= MAIN_CI_DEADLINE_AT= \
+    _required_contexts >/dev/null 2>&1 )
+  [ -s "$_tdir/caps" ] \
+    || { echo "FAIL #62: _required_contexts must go through the bounded wrapper"; rm -rf "$_tdir"; exit 1; }
+  # ORDER MATTERS, and it is not observable from behaviour alone: the deadline has to be
+  # armed BEFORE the first post-merge GitHub lookup. Armed after, a hang in the
+  # merge-sha or branch-protection call would run unbounded AND leave the deadline
+  # unset, so nothing downstream could ever time it out. Asserted structurally because
+  # the alternative is driving a full merge with a blocking shim.
+  _body=$(declare -f merge_ready_pr)
+  _arm_ln=$(printf '%s\n' "$_body" | grep -n '_arm_ci_deadline' | head -1 | cut -d: -f1)
+  _view_ln=$(printf '%s\n' "$_body" | grep -n 'pr view .*mergeCommit' | head -1 | cut -d: -f1)
+  { [ -n "$_arm_ln" ] && [ -n "$_view_ln" ] && [ "$_arm_ln" -lt "$_view_ln" ]; } \
+    || { echo "FAIL #62: _arm_ci_deadline must precede the merge-sha lookup (arm=$_arm_ln view=$_view_ln)"; rm -rf "$_tdir"; exit 1; }
+  printf '%s\n' "$_body" | grep -q 'sha=$(_ci_gh pr view' \
+    || { echo "FAIL #62: the merge-sha lookup must be bounded"; rm -rf "$_tdir"; exit 1; }
   rm -rf "$_tdir"
-  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n
+  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
