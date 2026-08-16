@@ -1361,11 +1361,18 @@ merge_ready_pr() {
     return 2
   fi
   echo "[batch:merge] $item: PR #$pr MERGED (${sha:-sha unknown}); watching main CI" >&2
-  # PRE-EXISTING, and left alone deliberately: an EMPTY sha with rc 0 still returns 0.
-  # It carries the same operational risk (main unwatched), but changing it is a
-  # behaviour change beyond the finding that prompted this, and GitHub returning no
-  # merge commit for a just-merged PR is a different failure from a lookup that broke.
-  [ -z "$sha" ] && { MERGE_NOTE="merged; main-CI watch skipped (no merge sha)"; return 0; }
+  # An EMPTY sha with rc 0 halts too. I argued for leaving this at rc 0 on the grounds
+  # that GitHub returning no merge commit is a DIFFERENT failure from a lookup that
+  # broke; review refuted it, correctly. The safety invariant is about the OUTCOME, not
+  # the cause: after a confirmed merge, not having the identifier needed to watch main
+  # is unresolved post-merge state either way. Returning 0 told the caller the merge
+  # succeeded, `run_item` propagated it, the loop launched the next item, and the sweep
+  # recorded `0:merged` -- stacking further merges onto a main nobody had checked.
+  [ -z "$sha" ] && {
+    echo "[batch:merge] !!!! $item: no merge sha for PR #$pr -> main is UNWATCHED -> HALTING !!!!" >&2
+    MERGE_NOTE="merged; no merge sha - main is UNWATCHED, check by hand"
+    return 2
+  }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
   local waited=0 state=pending lines mreq
   mreq=$(_required_contexts)   # once, not on every 30s poll
@@ -3995,7 +4002,11 @@ SH
 # fake gh for merge_ready_pr: $FAKE_MERGEABLE controls mergeability; FAKE_GH_LOG records status posts.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   if printf '%s\n' "$@" | grep -q 'headRefOid'; then echo "headsha1234567"
-  elif printf '%s\n' "$@" | grep -q 'mergeCommit'; then echo "deadbeefsha"
+  elif printf '%s\n' "$@" | grep -q 'mergeCommit'; then
+    # FAKE_NO_SHA models GitHub answering the lookup SUCCESSFULLY with no oid --
+    # distinct from the transport failing, and the case that used to return rc 0.
+    [ "${FAKE_NO_SHA:-0}" = 1 ] && { echo ""; exit 0; }
+    echo "deadbeefsha"
   else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
   exit 0
 fi
@@ -4036,6 +4047,16 @@ SH
     rc=$?
     [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
     || { echo "FAIL #62: a refused merge-sha lookup must halt (rc 2) with an UNWATCHED note, not skip the watch"; exit 1; }
+  # ...and the SUCCESSFUL-but-empty answer halts identically. I argued these were
+  # different failures and should differ; review refuted it. The invariant is about the
+  # outcome -- after a confirmed merge, no identifier means main goes unwatched -- not
+  # about which layer failed to supply it. Returning 0 here had `run_item` propagate
+  # success and the sweep record `0:merged`, stacking merges onto an unchecked main.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s5" \
+    FAKE_NO_SHA=1 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
+    || { echo "FAIL #62: an EMPTY merge sha (rc 0) must halt too, not report the merge successful"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
@@ -4057,7 +4078,9 @@ SH
 # cross-review status NEVER verifies (read-back empty); `pr merge` exits $FAKE_MERGE_RC.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo "headsha1234567"; exit 0; }
-  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  # A real sha: an empty one now HALTS (rc 2, main unwatched). These tests set
+  # MAIN_CI_TIMEOUT low, so entering the watch costs a second or two.
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo "mergesha7654321"; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}"; }
@@ -4112,7 +4135,9 @@ SH
 # current head is headsha1234567; a --match-head-commit != that -> merge refused.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo headsha1234567; exit 0; }
-  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  # A real sha: an empty one now HALTS (rc 2, main unwatched). These tests set
+  # MAIN_CI_TIMEOUT low, so entering the watch costs a second or two.
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo "mergesha7654321"; exit 0; }
   echo MERGEABLE; exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
@@ -4187,7 +4212,9 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     { [ -n "$MERGEDDIR" ] && [ -f "$MERGEDDIR/$p" ]; } && { echo MERGED; exit 0; }
     cat "$STATEDIR/$p" 2>/dev/null || echo OPEN; exit 0
   fi
-  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo ""; exit 0; }
+  # A real sha: an empty one now HALTS (rc 2, main unwatched). These tests set
+  # MAIN_CI_TIMEOUT low, so entering the watch costs a second or two.
+  printf '%s\n' "$@" | grep -q 'mergeCommit' && { echo "mergesha7654321"; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
@@ -4404,7 +4431,10 @@ J
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { echo "${FAKE_MSS:-CLEAN}"; exit 0; }
   printf '%s\n' "$@" | grep -q 'headRefOid'       && { echo "headsha1234567"; exit 0; }
-  printf '%s\n' "$@" | grep -q 'mergeCommit'      && { echo ""; exit 0; }  # empty sha -> merge_ready_pr skips the slow main-CI watch (covered by the merge_ready_pr test)
+  # A real sha: an empty one now HALTS (rc 2, main unwatched), so this shim would fail
+  # the recovery test for the wrong reason. The watch it enters is bounded by
+  # MAIN_CI_TIMEOUT, which these tests set to a couple of seconds.
+  printf '%s\n' "$@" | grep -q 'mergeCommit'      && { echo "mergesha7654321"; exit 0; }
   echo "${FAKE_MERGEABLE:-MERGEABLE}"; exit 0
 fi
 [ "$1" = "pr" ] && [ "$2" = "checks" ]  && { printf 'pass\npass\n'; exit 0; }
