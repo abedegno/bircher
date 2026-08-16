@@ -359,6 +359,47 @@ EOF
   _classify_ci_failure "$total"
 }
 
+# _commit_ci_lines <sha> -> "name|status|conclusion" for BOTH check-runs and
+# commit STATUSES on a commit; rc 1 if either lookup fails.
+#
+# #67: the post-merge watcher and the rerun poll read only /check-runs, so a
+# REQUIRED context that happens to be a commit status was invisible to them --
+# `_required_contexts` lists it (GitHub's `contexts` covers both kinds), so
+# `_keep_blocking_checks` kept looking for a name that could never appear. The PR
+# path never had this gap because `gh pr checks` returns both.
+#
+# Statuses are normalised into check-run shape. The mapping that matters:
+#   success -> completed|success
+#   failure -> completed|failure
+#   error   -> completed|failure   <-- NOT passed through: _checkrun_state matches
+#                                      only check-run conclusions, so a bare
+#                                      `error` would read as GREEN. GitHub counts
+#                                      error and failure alike as a failed status.
+#   pending -> in_progress|
+#
+# Uses `.statuses[]` rather than the combined `.state`: the combined verdict is
+# `pending` whenever a required context has not reported, which on a merge commit
+# is the normal case (verified: muesli merge commits carry 0 statuses, combined
+# `pending`, while PR heads carry review-gate + bircher/cross-review).
+#
+# Deduped newest-first per context. The API appears to return one entry per
+# context, but that is not documented as guaranteed and a stale duplicate could
+# flip a verdict, so it is not assumed.
+#
+# rc 1 on either fetch failing: a failed status lookup must never read as "no
+# statuses" alongside green check-runs, which would be a false green.
+_commit_ci_lines() {
+  local sha="$1" runs statuses
+  runs=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+    -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null) || return 1
+  statuses=$(gh api "repos/$REPO/commits/$sha/status" \
+    -q '[.statuses[]] | group_by(.context) | map(max_by(.updated_at))[]
+        | "\(.context)|" + (if .state == "pending" then "in_progress|"
+                             else "completed|" + (if .state == "success" then "success" else "failure" end)
+                             end)' 2>/dev/null) || return 1
+  printf '%s\n%s\n' "$runs" "$statuses" | grep -v '^$' || true
+}
+
 # _poll_ci <pr> <timeout_s> -> green|red|pending
 # Poll `gh pr checks` until CI settles (not pending) or the timeout elapses.
 _poll_ci() {
@@ -988,8 +1029,10 @@ merge_ready_pr() {
   mreq=$(_required_contexts)   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_TIMEOUT" ]; do
     sleep 30; waited=$((waited + 30))
-    lines=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-      -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null)
+    # #67: check-runs AND commit statuses -- a required status was invisible here.
+    # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
+    # as pending, so a failed lookup keeps polling rather than reading green.
+    lines=$(_commit_ci_lines "$sha") || lines=""
     lines=$(_keep_blocking_checks "$lines" "$mreq")
     state=$(_checkrun_state "$lines")
     [ "$state" != "pending" ] && break
@@ -1725,8 +1768,13 @@ _rerun_main_ci() {
   fi
   sleep 20
   while [ "$w" -lt "$MAIN_CI_TIMEOUT" ]; do
-    lines=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-      -q '.check_runs[] | "\(.status)|\(.conclusion // "")"' 2>/dev/null)
+    # #67: same helper AND same required set as the watcher. This used to poll
+    # unnamed check-runs with no _keep_blocking_checks, so a non-required failure
+    # could contradict the watch that triggered it -- and re-create the #43 stall
+    # that filtering exists to prevent. Selecting a workflow to re-run and
+    # deciding whether main is green are separate concerns.
+    lines=$(_commit_ci_lines "$sha") || lines=""
+    lines=$(_keep_blocking_checks "$lines" "$(_required_contexts)")
     st=$(_checkrun_state "$lines")
     [ "$st" != pending ] && { echo "$st"; return; }
     sleep 30; w=$((w + 30))
@@ -3156,6 +3204,63 @@ SH
   [ "$(_checkrun_state 'completed|action_required')" = "red" ]                 || { echo "FAIL _checkrun_state action_required"; exit 1; }
   [ "$(_checkrun_state $'completed|skipped\ncompleted|neutral')" = "green" ]   || { echo "FAIL _checkrun_state skipped/neutral"; exit 1; }
   echo "_checkrun_state OK"
+  # --- #67: commit statuses must reach the CI verdict ------------------------
+  # A required context can be a commit STATUS, not a check-run. The post-merge
+  # watcher read only /check-runs, so such a context was invisible to it.
+  #
+  # The fake gh runs the REAL jq filter against fixture JSON, so these exercise
+  # the actual normalisation. A first cut had the shim return pre-normalised
+  # lines, which meant the `error -> failure` mapping was never executed and two
+  # assertions were accidentally identical.
+  local cdir; cdir=$(mktemp -d)
+  cat >"$cdir/gh" <<'SH'
+#!/usr/bin/env bash
+# args: api <path> -q <filter>
+filter=""; nx=0
+for a in "$@"; do [ "$nx" = 1 ] && { filter="$a"; nx=0; }; [ "$a" = "-q" ] && nx=1; done
+case "$*" in
+  *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1; printf '%s' "${FAKE_RUNS_JSON:-{\"check_runs\":[]\}}" | jq -r "$filter" ;;
+  *"/status"*)     [ "${FAKE_STATUS_RC:-0}" = 0 ] || exit 1; printf '%s' "${FAKE_STATUS_JSON:-{\"statuses\":[]\}}" | jq -r "$filter" ;;
+esac
+exit 0
+SH
+  chmod +x "$cdir/gh"
+  _st_json() { printf '{"statuses":[{"context":"ext-ci","state":"%s","updated_at":"2026-01-01T00:00:00Z"}]}' "$1"; }
+  _cl() { PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123; }
+  # Each status state maps to the right check-run shape -- via the real jq.
+  [ "$(FAKE_STATUS_JSON="$(_st_json success)" _cl)" = "ext-ci|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: success mapping"; rm -rf "$cdir"; exit 1; }
+  [ "$(FAKE_STATUS_JSON="$(_st_json failure)" _cl)" = "ext-ci|completed|failure" ] \
+    || { echo "FAIL _commit_ci_lines: failure mapping"; rm -rf "$cdir"; exit 1; }
+  # THE TRAP: `error` passed through as a conclusion would read GREEN, because
+  # _checkrun_state matches only check-run failure conclusions.
+  [ "$(FAKE_STATUS_JSON="$(_st_json error)" _cl)" = "ext-ci|completed|failure" ] \
+    || { echo "FAIL _commit_ci_lines: status 'error' must map to failure, not pass through"; rm -rf "$cdir"; exit 1; }
+  [ "$(_checkrun_state "$(FAKE_STATUS_JSON="$(_st_json error)" _cl | sed 's/^[^|]*|//')")" = red ] \
+    || { echo "FAIL _commit_ci_lines: status 'error' must make the verdict red"; rm -rf "$cdir"; exit 1; }
+  [ "$(FAKE_STATUS_JSON="$(_st_json pending)" _cl)" = "ext-ci|in_progress|" ] \
+    || { echo "FAIL _commit_ci_lines: pending mapping"; rm -rf "$cdir"; exit 1; }
+  # Newest-per-context only: a stale duplicate must not flip the verdict.
+  [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"ext-ci","state":"failure","updated_at":"2026-01-01T00:00:00Z"},{"context":"ext-ci","state":"success","updated_at":"2026-01-02T00:00:00Z"}]}' _cl)" \
+    = "ext-ci|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: must take the NEWEST status per context"; rm -rf "$cdir"; exit 1; }
+  # Statuses merge with check-runs.
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+       FAKE_STATUS_JSON="$(_st_json success)" _cl | sort | tr '\n' ' ')" \
+    = "ext-ci|completed|success server|completed|success " ] \
+    || { echo "FAIL _commit_ci_lines: statuses not merged with check-runs"; rm -rf "$cdir"; exit 1; }
+  # FAIL CLOSED: either fetch failing must not yield a partial (false-green) list.
+  FAKE_STATUS_RC=1 _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: status fetch failure must be rc 1, not a green subset"; rm -rf "$cdir"; exit 1; }
+  FAKE_RUNS_RC=1 _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: check-run fetch failure must be rc 1"; rm -rf "$cdir"; exit 1; }
+  # Zero statuses is NORMAL -- merge commits legitimately carry none (verified
+  # against muesli: merge commits have 0, PR heads carry review-gate).
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' _cl)" \
+    = "server|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: zero statuses must be normal, not an error"; rm -rf "$cdir"; exit 1; }
+  rm -rf "$cdir"; unset -f _cl _st_json
+  echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
   # --- B-2v2/B-3v2: limit-message matcher + usage-aware vendor pick -----------
   [ "$(_is_limit_message "You've hit your session limit - resets 6pm")" = "yes" ] || { echo "FAIL limitmsg session"; exit 1; }
   [ "$(_is_limit_message "weekly limit exceeded... hit your weekly limit")" = "yes" ] || { echo "FAIL limitmsg weekly"; exit 1; }
