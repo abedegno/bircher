@@ -494,6 +494,28 @@ _past_ci_deadline() {
 # unbounded as "not network-facing", which was simply false: a hang there means the
 # revert never completes, the function never returns 2, and the queue never reaches its
 # halt handling -- main stays red with no operator-facing final state recorded.
+# _timeout_bin -> the path to a GNU-compatible timeout(1), or rc 1 if there is none.
+#
+# #62: both wrappers used to fall through to running the command UNBOUNDED when
+# `timeout` was missing -- which silently discarded the entire guarantee this issue
+# exists to provide, on exactly the machines least likely to notice. Now they refuse.
+#
+# Refusing is the conservative outcome on both paths that use it: `_ci_gh`'s callers
+# already treat a non-zero return as a failed lookup (keep polling -> deadline -> halt),
+# and `_net_run`'s recovery callers already treat it as "revert setup FAILED - main is
+# red; fix by hand". Neither silently proceeds.
+#
+# `gtimeout` is checked too: that is the name GNU coreutils installs on macOS, so a
+# developer box with coreutils is fully supported rather than falling into the refusal.
+_timeout_bin() {
+  if [ -z "${_TIMEOUT_BIN_LOADED:-}" ]; then
+    _TIMEOUT_BIN_LOADED=1
+    _TIMEOUT_BIN_CACHE=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || printf '')
+  fi
+  [ -n "$_TIMEOUT_BIN_CACHE" ] || return 1
+  printf '%s' "$_TIMEOUT_BIN_CACHE"
+}
+
 _net_run() {
   local cap="$1"; shift
   case "$cap" in ''|*[!0-9]*) cap=300 ;; esac
@@ -502,7 +524,11 @@ _net_run() {
   # it, so it is not a bound at all against exactly the hung transport this exists to
   # stop. A `git push` stuck in credential negotiation that does not die on TERM would
   # leave recovery blocked forever and main red.
-  if command -v timeout >/dev/null 2>&1; then timeout -k 10 "$cap" "$@"; else "$@"; fi
+  local tb; tb=$(_timeout_bin) || {
+    echo "[batch] WARN: no usable timeout(1) -> refusing to run '$1' UNBOUNDED" >&2
+    return 1
+  }
+  "$tb" -k "${BIRCHER_KILL_GRACE:-10}" "$cap" "$@"
 }
 BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-300}"
 
@@ -537,11 +563,11 @@ _ci_call_cap() {
 # coreutils' timeout is absent; the runner is Linux and always takes the bounded path.
 _ci_gh() {
   local cap; cap=$(_ci_call_cap)
-  if command -v timeout >/dev/null 2>&1; then
-    timeout -k 10 "$cap" gh "$@"   # -k: see _net_run -- TERM alone is not a bound
-  else
-    gh "$@"
-  fi
+  local tb; tb=$(_timeout_bin) || {
+    echo "[batch] WARN: no usable timeout(1) -> refusing to run 'gh $1' UNBOUNDED" >&2
+    return 1
+  }
+  "$tb" -k "${BIRCHER_KILL_GRACE:-10}" "$cap" gh "$@"   # -k: see _net_run
 }
 
 # _ci_fetch_records <api-path> <list-field> -> every record in <list-field>, across
@@ -2795,6 +2821,21 @@ EOF
 }
 
 self_test() {
+  # #62: the wrappers now REFUSE to run a network command when no timeout(1) exists,
+  # which is right in production and would otherwise make this whole suite unrunnable on
+  # a box without GNU coreutils (stock macOS). Give it a passthrough so every existing
+  # test still exercises the wrapper rather than skipping it. Blocks that assert on the
+  # wrapper's ARGUMENTS prepend their own recording shim, which wins over this one.
+  if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+    _ST_TO_DIR=$(mktemp -d)
+    printf '%s\n' '#!/usr/bin/env bash' \
+      'if [ "$1" = "-k" ]; then shift 2; fi' \
+      'shift' \
+      'exec "$@"' > "$_ST_TO_DIR/timeout"
+    chmod +x "$_ST_TO_DIR/timeout"
+    PATH="$_ST_TO_DIR:$PATH"; export PATH
+    echo "[self-test] no timeout(1) on this box -> using a passthrough shim (the runner has GNU coreutils)" >&2
+  fi
   local m
   # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
   # caller fails closed on that rather than merging an unverified commit.
@@ -4778,6 +4819,58 @@ SH
       || { echo "FAIL #62: _net_run cap '$_bad' must fall back to a sane value (got '$_cap')"; rm -rf "$_tdir"; exit 1; }
     case "$_cap" in 0?*) echo "FAIL #62: _net_run cap '$_cap' is not canonical decimal"; rm -rf "$_tdir"; exit 1 ;; esac
   done
+  # NO timeout(1) -> REFUSE, never run unbounded. Falling through was the whole
+  # guarantee silently discarded on exactly the machines least likely to notice.
+  #
+  # Resolution and execution are tested SEPARATELY on purpose. `_timeout_bin` uses only
+  # the `command -v` builtin, so it can be probed with a PATH containing nothing else;
+  # the wrappers need a real PATH to exec through, so their refusal is driven by forcing
+  # the cache instead. An earlier cut conflated the two and stripped PATH so hard that
+  # `#!/usr/bin/env bash` could not find bash.
+  local _edir; _edir=$(mktemp -d); : > "$_edir/ran"
+  printf '#!/usr/bin/env bash\necho ran >> "$RAN_LOG"\nexit 0\n' > "$_edir/gh"; chmod +x "$_edir/gh"
+  [ -z "$( PATH="$_edir"; _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= _timeout_bin )" ] \
+    || { echo "FAIL #62: _timeout_bin must find nothing when neither timeout nor gtimeout exists"; rm -rf "$_edir"; exit 1; }
+  ( PATH="$_edir"; _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= _timeout_bin >/dev/null ) \
+    && { echo "FAIL #62: _timeout_bin must return non-zero when there is no timeout(1)"; rm -rf "$_edir"; exit 1; }
+  # gtimeout is GNU coreutils' name on macOS: a dev box with coreutils must resolve,
+  # not be refused.
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$_edir/gtimeout"; chmod +x "$_edir/gtimeout"
+  [ "$( PATH="$_edir"; _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= _timeout_bin )" = "$_edir/gtimeout" ] \
+    || { echo "FAIL #62: _timeout_bin must accept gtimeout (GNU coreutils on macOS)"; rm -rf "$_edir"; exit 1; }
+  # The wrappers refuse, and do NOT execute, when resolution comes back empty.
+  ( RAN_LOG="$_edir/ran"; export RAN_LOG
+    _TIMEOUT_BIN_LOADED=1 _TIMEOUT_BIN_CACHE= _ci_gh api x >/dev/null 2>&1 ) \
+    && { echo "FAIL #62: _ci_gh must FAIL when no timeout(1) exists, not run unbounded"; rm -rf "$_edir"; exit 1; }
+  ( RAN_LOG="$_edir/ran"; export RAN_LOG
+    _TIMEOUT_BIN_LOADED=1 _TIMEOUT_BIN_CACHE= _net_run 60 "$_edir/gh" >/dev/null 2>&1 ) \
+    && { echo "FAIL #62: _net_run must FAIL when no timeout(1) exists, not run unbounded"; rm -rf "$_edir"; exit 1; }
+  [ ! -s "$_edir/ran" ] \
+    || { echo "FAIL #62: a wrapper RAN the command with no timeout(1) available"; rm -rf "$_edir"; exit 1; }
+  rm -rf "$_edir"
+  # BEHAVIOURAL:  # BEHAVIOURAL: a child that IGNORES SIGTERM must still be killed, within cap+grace.
+  # This is the one thing the argument-recording shims cannot prove, and it needs a
+  # REAL timeout -- so it runs only where one exists (always, on the Linux runner).
+  # Gate on a REAL implementation, not merely on `command -v timeout` succeeding: the
+  # suite installs a passthrough shim under that name when the box has none, and the
+  # passthrough by definition does not kill anything. (It ran for the child's full 60s
+  # and failed this assertion, which is the test proving it is behavioural rather than
+  # decorative.) `_ST_TO_DIR` is set only when the passthrough was needed.
+  if [ -z "${_ST_TO_DIR:-}" ]; then
+    local _kdir; _kdir=$(mktemp -d)
+    printf '#!/usr/bin/env bash\ntrap "" TERM\nsleep 60\n' > "$_kdir/stubborn"; chmod +x "$_kdir/stubborn"
+    local _t0 _t1 _el
+    _t0=$(date +%s)
+    ( _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= BIRCHER_KILL_GRACE=1 \
+      _net_run 5 "$_kdir/stubborn" >/dev/null 2>&1 )
+    _t1=$(date +%s); _el=$(( _t1 - _t0 ))
+    [ "$_el" -le 20 ] \
+      || { echo "FAIL #62: a TERM-ignoring child was not force-killed (took ${_el}s, cap 5 + grace 1)"; rm -rf "$_kdir"; exit 1; }
+    rm -rf "$_kdir"; unset _t0 _t1 _el _kdir
+  else
+    echo "[self-test] SKIP: no real timeout(1) -> kill-escalation not exercised here (it is on the runner)" >&2
+  fi
+  unset _edir
   rm -rf "$_tdir"
   unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded _res _ddir2
   echo "_past_ci_deadline OK (#62 shared wall clock)"
