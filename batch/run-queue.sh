@@ -392,27 +392,32 @@ _commit_ci_lines() {
   local sha="$1" required="${2:-}" runs statuses bad
   runs=$(gh api "repos/$REPO/commits/$sha/check-runs" \
     -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null) || return 1
-  statuses=$(gh api "repos/$REPO/commits/$sha/status" \
-    -q '[.statuses[]] | to_entries | map(.value + {_i: .key})
-        | group_by(.context)
-        | map(sort_by([.updated_at, (0 - ._i)]) | last)[]
-        | if (.context | test("[|\n]")) then "__MALFORMED_CONTEXT__\t" + .context
-          else "\(.context)|" + (if .state == "pending" then "in_progress|"
-                                 else "completed|" + (if .state == "success" then "success" else "failure" end)
-                                 end)
-          end' 2>/dev/null) || return 1
-  # A name carrying the field delimiter cannot be represented in this protocol.
-  # Emitting it anyway corrupts the record: `a|b` pending becomes `a|b|in_progress|`,
-  # _keep_blocking_checks reads the name as `a`, the required match fails, it falls
-  # back, and _checkrun_state sees `b|in_progress|` -- which it does not recognise as
-  # pending, so a required PENDING status reads GREEN.
+  # Fetch once, then extract valid records and unrepresentable names SEPARATELY.
+  # An earlier cut multiplexed both into one stream with a `__MALFORMED_CONTEXT__`
+  # sentinel; a legitimate context merely BEGINNING with that string was then
+  # deleted by the cleanup while not being recognised as malformed, so a required
+  # FAILING status silently vanished and the verdict read green. Control records
+  # and data records must not share an unescaped namespace.
+  local raw dedup bad
+  raw=$(gh api "repos/$REPO/commits/$sha/status" 2>/dev/null) || return 1
+  dedup='[.statuses[]] | to_entries | map(.value + {_i: .key})
+         | group_by(.context) | map(sort_by([.updated_at, (0 - ._i)]) | last)[]'
+  statuses=$(printf '%s' "$raw" | jq -r "$dedup"'
+        | select(.context | test("[|\n]") | not)
+        | "\(.context)|" + (if .state == "pending" then "in_progress|"
+                            else "completed|" + (if .state == "success" then "success" else "failure" end)
+                            end)' 2>/dev/null) || return 1
+  bad=$(printf '%s' "$raw" | jq -r "$dedup"'
+        | select(.context | test("[|\n]")) | .context' 2>/dev/null) || return 1
+  # A name carrying a field delimiter cannot be represented in this protocol:
+  # `a|b` pending would become `a|b|in_progress|`, _keep_blocking_checks would read
+  # the name as `a`, the required match would fail, it would fall back, and
+  # _checkrun_state would see `b|in_progress|` -- unrecognised, so a required
+  # PENDING status would read GREEN.
   #
-  # But refuse only when such a context is REQUIRED. A non-required one is filtered
-  # out downstream regardless, so halting every verdict over it would turn a cosmetic
-  # naming choice in someone else's repo into an outage. Required and unrepresentable
-  # is genuinely "cannot classify"; anything else is dropped with a warning.
-  bad=$(printf '%s\n' "$statuses" | sed -n 's/^__MALFORMED_CONTEXT__\t//p')
-  statuses=$(printf '%s\n' "$statuses" | grep -v '^__MALFORMED_CONTEXT__' || true)
+  # Refuse only when such a context is REQUIRED. A non-required one is filtered
+  # downstream anyway, so halting every verdict over it would turn a cosmetic
+  # naming choice in someone else's repo into an outage.
   if [ -n "$bad" ]; then
     while IFS= read -r _b; do
       [ -n "$_b" ] || continue
@@ -3266,6 +3271,8 @@ case "$*" in
   *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1
                    printf '%s' "$runs_json"   | jq -r "$filter"; exit $? ;;
   *"/status"*)     [ "${FAKE_STATUS_RC:-0}" = 0 ] || exit 1
+                   # No -q: the caller wants raw JSON (it applies jq itself).
+                   if [ -z "$filter" ]; then printf '%s' "$status_json"; exit 0; fi
                    printf '%s' "$status_json" | jq -r "$filter"; exit $? ;;
 esac
 exit 0
@@ -3331,6 +3338,15 @@ SH
   # A state GitHub may add later must not read as success.
   [ "$(FAKE_STATUS_JSON="$(_st_json some_new_state)" _cl)" = "ext-ci|completed|failure" ] \
     || { echo "FAIL _commit_ci_lines: an unknown state must not read as success"; rm -rf "$cdir"; exit 1; }
+  # The exact false-green the sentinel design allowed: a REAL context whose name
+  # merely begins with the old sentinel string was deleted by the cleanup while
+  # not being recognised as malformed, so a required FAILING status vanished and
+  # the verdict read green. Control records no longer share a namespace with data.
+  [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl)" \
+    = "__MALFORMED_CONTEXT__prod|completed|failure" ] \
+    || { echo "FAIL _commit_ci_lines: a context named like the old sentinel must survive as a normal record"; rm -rf "$cdir"; exit 1; }
+  [ "$(_checkrun_state "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl | sed 's/^[^|]*|//')")" = red ] \
+    || { echo "FAIL _commit_ci_lines: sentinel-named failing context must still read red"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
   # --- B-2v2/B-3v2: limit-message matcher + usage-aware vendor pick -----------
@@ -3405,7 +3421,7 @@ if [ "$1" = "api" ]; then
     [ "$n" -ge "${LAND_AT:-1}" ] && printf 'success\n' >> "$STORE"
     exit 0
   fi
-  if printf '%s\n' "$@" | grep -q '/status'; then cat "$STORE" 2>/dev/null; exit 0; fi
+  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; fi
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3447,7 +3463,7 @@ if [ "$1" = "api" ]; then
     printf 'success\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
     exit 0
   fi
-  if printf '%s\n' "$@" | grep -q '/status'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
   # Demo repo has no branch protection -> empty required set, so _keep_blocking_checks
   # falls back to ignore-list-only. Without this the catch-all below hands back
   # "completed|success" as though it were a required-contexts list.
@@ -3487,7 +3503,7 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}"; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/statuses/' && exit 0   # POST "ok" but never persists
-  printf '%s\n' "$@" | grep -q '/status'    && exit 0   # read-back empty -> _post fails
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; exit 0; }   # read-back empty -> _post fails
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3543,7 +3559,7 @@ if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
 fi
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/status'    && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3636,7 +3652,7 @@ if [ "$1" = "api" ]; then
   tref=$(printf '%s' "$*" | sed -n 's#.*/git/trees/\([A-Za-z0-9._-]*\).*#\1#p')
   if [ -n "$tref" ]; then cat "$TREEDIR/$tref" 2>/dev/null || exit 1; exit 0; fi
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/status'    && { cat "$STORE" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3831,7 +3847,7 @@ if [ "$1" = "api" ]; then
   # #66: recovery captures the reviewed head itself before dispatching the review.
   case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}"; exit 0 ;; esac
   if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; fi
-  printf '%s\n' "$@" | grep -q '/status' && { cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status' && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
