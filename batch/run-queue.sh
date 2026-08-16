@@ -453,17 +453,14 @@ _arm_ci_deadline() {
   # catch it. An earlier revision dropped this check as unfalsifiable -- true at the
   # time, and false the moment `10#` below arrived and made it load-bearing. Removing it
   # killed the entire self-test mid-run, silently.
-  case "$span" in ''|*[!0-9]*) span=7200 ;; esac
+  span=$(_clamp_int "$span" 7200 60 9999999)
   # FORCE BASE 10. `$((now + 0000060))` reads the operand as OCTAL: 0000060 arms 48
   # seconds, not 60, so a leading-zero override lands under the very minimum this
   # validation exists to enforce; 00007200 arms 3712s. `[ x -ge y ]` compares decimal,
   # so the range check below cannot see any of it -- the two disagree about what the
   # string means.
-  span=$((10#$span))
-  { [ "${#span}" -le 7 ] && [ "$span" -ge 60 ]; } 2>/dev/null || {
-    echo "[batch] WARN: unusable BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE '${MAIN_CI_ABSOLUTE_DEADLINE}' -> using 7200s" >&2
-    span=7200
-  }
+  [ "$span" = "${MAIN_CI_ABSOLUTE_DEADLINE:-}" ] \
+    || echo "[batch] WARN: unusable BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE '${MAIN_CI_ABSOLUTE_DEADLINE}' -> using ${span}s" >&2
   MAIN_CI_DEADLINE_AT=$((now + span))
 }
 
@@ -498,6 +495,29 @@ _past_ci_deadline() {
 # unbounded as "not network-facing", which was simply false: a hang there means the
 # revert never completes, the function never returns 2, and the queue never reaches its
 # halt handling -- main stays red with no operator-facing final state recorded.
+# _clamp_int <value> <default> <min> <max> -> a usable decimal integer.
+#
+# #62: this is the THIRD numeric knob on this branch, and review found the same defect
+# in each of the first two before this existed -- so it is now written once. Every
+# element matters and each corresponds to a real finding:
+#   * digits first, because `$((10#abc))` is a FATAL arithmetic error that aborts the
+#     shell rather than returning non-zero;
+#   * a length cap before the arithmetic, because bash WRAPS an oversized operand to a
+#     positive value instead of erroring, so overflow looks like a valid large number;
+#   * base 10 forced, because `$(( ))` reads a leading zero as OCTAL while `[ -ge ]`
+#     reads it as decimal, and the two then disagree about what the string meant;
+#   * range checked, because a syntactically fine value can still be operationally
+#     absurd -- a 1-second deadline or a 0-second poll interval.
+# Anything failing any of those falls back to the default rather than being honoured.
+_clamp_int() {
+  local v="$1" def="$2" lo="$3" hi="$4"
+  case "$v" in ''|*[!0-9]*) printf '%s' "$def"; return ;; esac
+  [ "${#v}" -le 9 ] || { printf '%s' "$def"; return; }
+  v=$((10#$v))
+  { [ "$v" -ge "$lo" ] && [ "$v" -le "$hi" ]; } || { printf '%s' "$def"; return; }
+  printf '%s' "$v"
+}
+
 # _timeout_bin -> the path to a GNU-compatible timeout(1), or rc 1 if there is none.
 #
 # #62: both wrappers used to fall through to running the command UNBOUNDED when
@@ -540,8 +560,7 @@ BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-300}"
 # BIRCHER_CI_CALL_TIMEOUT (120s) and whatever is left on the shared deadline.
 _ci_call_cap() {
   local cap="${BIRCHER_CI_CALL_TIMEOUT:-120}" now rem
-  case "$cap" in ''|*[!0-9]*) cap=120 ;; esac
-  cap=$((10#$cap)); [ "$cap" -ge 5 ] 2>/dev/null || cap=120
+  cap=$(_clamp_int "$cap" 120 5 3600)
   case "${MAIN_CI_DEADLINE_AT:-}" in ''|*[!0-9]*) printf '%s' "$cap"; return ;; esac
   [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || { printf '%s' "$cap"; return ; }
   now=$(date +%s 2>/dev/null)
@@ -743,7 +762,8 @@ _poll_ci() {
         buckets=$(_keep_blocking_checks "$buckets" "$req")
     ci=$(_normalize_ci "$buckets")
     [ "$ci" != pending ] && { echo "$ci"; return; }
-    sleep "$MAIN_CI_POLL_INTERVAL"; w=$((w + MAIN_CI_POLL_INTERVAL))
+    _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
+    sleep "$_iv"; w=$((w + _iv))
   done
   echo pending
 }
@@ -1357,11 +1377,12 @@ merge_ready_pr() {
   # persistent absence, and halting on first sight would strand healthy merges. A
   # transport FAILURE is different and breaks out at once. Bounded by both a try count
   # and the absolute deadline.
-  local sha sha_rc _sha_try=0
+  local sha sha_rc _sha_try=0 _sha_max
+  _sha_max=$(_clamp_int "${BIRCHER_MERGE_SHA_TRIES:-5}" 5 1 20)
   while :; do
     sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null); sha_rc=$?
     { [ "$sha_rc" -ne 0 ] || [ -n "$sha" ]; } && break
-    [ "$_sha_try" -ge "${BIRCHER_MERGE_SHA_TRIES:-5}" ] && break
+    [ "$_sha_try" -ge "$_sha_max" ] && break
     _past_ci_deadline && break
     _sha_try=$((_sha_try + 1))
     echo "[batch:merge] $item: no merge sha for PR #$pr yet (try $_sha_try) -> retrying" >&2
@@ -1392,10 +1413,11 @@ merge_ready_pr() {
     return 2
   }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
-  local waited=0 state=pending lines mreq
+  local waited=0 state=pending lines mreq _iv
   mreq=$(_required_contexts)   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
-    sleep "$MAIN_CI_POLL_INTERVAL"; waited=$((waited + MAIN_CI_POLL_INTERVAL))
+    _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
+    sleep "$_iv"; waited=$((waited + _iv))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
     # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
     # as pending, so a failed lookup keeps polling rather than reading green.
@@ -2162,7 +2184,7 @@ _revert_git_args() {
 # run for the merge commit ONCE, then re-polls the commit's check-runs. Used to
 # distinguish a flaky red/hung main from a genuine one before reverting/halting.
 _rerun_main_ci() {
-  local sha="$1" full="${2:-}" rid w=0 lines st
+  local sha="$1" full="${2:-}" rid w=0 lines st _iv
   # #62: check BEFORE dispatching. This function costs a `gh run list`, a `gh run
   # rerun` and a 20s startup sleep before it reaches its poll loop, so a check only at
   # the loop would let all of that run past an expired deadline.
@@ -4115,6 +4137,30 @@ SH
     || { echo "FAIL #62: a transient empty merge sha must be RETRIED, not halted on first sight"; exit 1; }
   [ "$(cat "$mdir/shacount" 2>/dev/null)" -ge 3 ] \
     || { echo "FAIL #62: the retry never happened (lookup called $(cat "$mdir/shacount" 2>/dev/null) times, expected >=3)"; exit 1; }
+  # HOSTILE CONFIG AT THE CALL SITES. A non-numeric retry count makes `[ n -ge abc ]`
+  # ERROR -- which is non-zero, so the break never fires and the loop runs to the
+  # absolute deadline hammering GitHub. Validated, it clamps to 5 and halts promptly.
+  : > "$mdir/shacount2"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s8" \
+    BIRCHER_STATUS_BACKOFF=0 BIRCHER_MERGE_SHA_TRIES=abc FAKE_NO_SHA=1 \
+    FAKE_SHA_COUNT_FILE="$mdir/shacount2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -eq 2 ] ) \
+    || { echo "FAIL #62: a non-numeric BIRCHER_MERGE_SHA_TRIES must clamp and halt, not loop to the deadline"; exit 1; }
+  # A hostile POLL INTERVAL must not break the watch: unvalidated, `sleep abc` fails and
+  # `waited + abc` is an arithmetic error, so the loop never advances and spins to the
+  # settle budget. Validated, it falls back to the PRODUCTION default -- which is 30s,
+  # so this case legitimately costs one real poll. The assertion is that the watch
+  # terminates correctly, not that it is fast; an earlier version bounded it at 15s and
+  # failed on the correct behaviour.
+  _t0=$(date +%s)
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s9" \
+    MAIN_CI_POLL_INTERVAL=abc merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -eq 0 ] ) \
+    || { echo "FAIL #62: a non-numeric MAIN_CI_POLL_INTERVAL broke the watch loop"; exit 1; }
+  _t1=$(date +%s)
+  [ "$(( _t1 - _t0 ))" -le 60 ] \
+    || { echo "FAIL #62: a non-numeric MAIN_CI_POLL_INTERVAL did not fall back cleanly ($(( _t1 - _t0 ))s)"; exit 1; }
+  unset _t0 _t1
   # deferred path: CONFLICTING -> rc 0 with a deferral note
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
@@ -4991,6 +5037,41 @@ SH
   unset _edir
   rm -rf "$_tdir"
   unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded _res _ddir2
+  # _clamp_int is the single validated path for every numeric knob on this branch --
+  # the same defect was found independently in the first two before it existed.
+  [ "$(_clamp_int 42 7 1 100)"     = 42 ]   || { echo "FAIL clamp: a valid value must pass through"; exit 1; }
+  [ "$(_clamp_int abc 7 1 100)"    = 7 ]    || { echo "FAIL clamp: non-digits must fall back"; exit 1; }
+  [ "$(_clamp_int '' 7 1 100)"     = 7 ]    || { echo "FAIL clamp: empty must fall back"; exit 1; }
+  [ "$(_clamp_int ' 4' 7 1 100)"   = 7 ]    || { echo "FAIL clamp: whitespace must fall back"; exit 1; }
+  [ "$(_clamp_int -5 7 1 100)"     = 7 ]    || { echo "FAIL clamp: negative must fall back"; exit 1; }
+  [ "$(_clamp_int 0 7 1 100)"      = 7 ]    || { echo "FAIL clamp: below min must fall back"; exit 1; }
+  [ "$(_clamp_int 101 7 1 100)"    = 7 ]    || { echo "FAIL clamp: above max must fall back"; exit 1; }
+  # OCTAL: 0000060 is 48 to $(( )) and 60 to [ -ge ]. Must come out as decimal 60.
+  [ "$(_clamp_int 0000060 7 1 100)" = 60 ]  || { echo "FAIL clamp: leading zeros must read as DECIMAL"; exit 1; }
+  # OVERFLOW: bash WRAPS rather than erroring, so an oversized value looks valid. The
+  # length cap is not redundant with the range check, and this is the value that proves
+  # it: 18446744073709551666 is 2^64 + 50, so `$((10#...))` yields exactly 50 -- inside
+  # [1,100], accepted by the range check, and a completely fabricated number. A merely
+  # "very large" test value wraps to something out of range and is caught either way,
+  # which is why the first version of this assertion could not tell the guards apart.
+  [ "$(_clamp_int 18446744073709551666 7 1 100)" = 7 ] \
+    || { echo "FAIL clamp: an oversized value that WRAPS INTO RANGE must fall back, not be honoured"; exit 1; }
+  [ "$(_clamp_int 99999999999999999999 7 1 100)" = 7 ] || { echo "FAIL clamp: oversized must fall back"; exit 1; }
+  # FATAL-ABORT guard: $((10#abc)) kills the shell, so the digit check must precede it.
+  # An rc-only assertion cannot tell the guard from the abort -- require clean stderr.
+  _cerr=$( _clamp_int abc 7 1 100 2>&1 >/dev/null )
+  [ -z "$_cerr" ] || { echo "FAIL clamp: rejected by BASH, not by the guard: $_cerr"; exit 1; }
+  unset _cerr
+  # A hostile poll interval must not defeat the loops: 0 would spin without advancing
+  # the counter, and a huge one would sleep past the absolute deadline.
+  [ "$(_clamp_int 0 30 1 300)"     = 30 ]   || { echo "FAIL #62: a 0 poll interval must fall back (it would hot-loop)"; exit 1; }
+  [ "$(_clamp_int 86400 30 1 300)" = 30 ]   || { echo "FAIL #62: a huge poll interval must fall back (it would sleep past the deadline)"; exit 1; }
+  [ "$(_clamp_int abc 5 1 20)"     = 5 ]    || { echo "FAIL #62: a non-numeric retry count must fall back, not disable the bound"; exit 1; }
+  [ "$(_clamp_int 100000 5 1 20)"  = 5 ]    || { echo "FAIL #62: an oversized retry count must clamp"; exit 1; }
+  # ...and the CALL SITES must actually use it. Unit-testing the helper proves nothing
+  # about whether the loops route through it -- both mutations that stripped the call
+  # sites left every assertion above green.
+  echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
