@@ -39,7 +39,31 @@ RECOVERY_REVIEWER="${BIRCHER_RECOVERY_REVIEWER:-codex}"
 # lost to serial admin-nav conflicts) disappears. Opt out with =0.
 INRUN_MERGE="${BIRCHER_INRUN_MERGE:-1}"
 # How long to watch MAIN's CI on each merge commit before halting conservatively.
-MAIN_CI_TIMEOUT="${BIRCHER_MAIN_CI_TIMEOUT:-900}"
+#
+# #62: this used to be ONE constant for both the initial watch and every re-run poll,
+# at 900s. That is below what main CI actually takes here: muesli's merge commit
+# a80a55b2 (PR #696) ran CI for 2867s, because the same merge spawned 18 Dependabot
+# update jobs and starved the queue. The watcher timed out mid-run with the state still
+# `pending`, the re-run produced no verdict, and `_main_ci_verdict pending unknown`
+# halted the wave with main perfectly healthy. Every other main commit in that window
+# took 265-374s, so a flat 900s looks generous right up until it isn't.
+#
+# #62 was filed against a different cause -- "a path-filtered change registers no CI" --
+# which the evidence does not support: that commit carries 43 check-runs with all six
+# main-applicable required contexts green. The halt was the timeout, not a missing
+# classification.
+#
+# Split rather than raised, because these two budgets are consumed differently:
+# _rerun_main_ci_until_green spends MAIN_CI_TIMEOUT up to three times, so raising the
+# shared constant to cover a slow first watch would have turned a documented ~71-minute
+# worst case into ~4 hours, leaving a genuinely red main unreverted for that long.
+MAIN_CI_SETTLE_TIMEOUT="${BIRCHER_MAIN_CI_SETTLE_TIMEOUT:-3600}"   # the INITIAL watch
+MAIN_CI_TIMEOUT="${BIRCHER_MAIN_CI_TIMEOUT:-900}"                  # each RE-RUN poll
+# One wall-clock bound over the whole watch-plus-re-runs sequence, so no combination of
+# the two budgets above can exceed it. Stored as an absolute epoch instant rather than a
+# per-loop elapsed counter: each loop lives in its own function and would otherwise
+# restart its own count, which is how the two budgets multiplied in the first place.
+MAIN_CI_ABSOLUTE_DEADLINE="${BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE:-7200}"
 # B-3 vendor allocation: which vendor implements each item.
 #   auto (default) = usage-aware selection that balances the two subscriptions'
 #   WEEKLY windows (pick the lower used_percent) and rides out 5h-window
@@ -385,6 +409,27 @@ _ci_failure_kind() {
 $ids
 EOF
   _classify_ci_failure "$total"
+}
+
+# _past_ci_deadline -> rc 0 once the shared main-CI wall clock has run out.
+#
+# #62: the initial watch and each re-run poll have their own budgets, and each lives in
+# its own function with its own elapsed counter -- so three re-runs multiplied a 900s
+# budget into a ~71-minute worst case, and raising it for a slow first watch would have
+# made that ~4 hours. This is the one bound they all share. `merge_ready_pr` arms it as
+# an absolute epoch instant at the start of the watch; unarmed, it never fires, so any
+# caller that has not armed it keeps exactly its own budget.
+#
+# An unusable value reads as "not past" rather than erroring: the per-loop budgets still
+# bound every caller, so failing open here cannot run forever, whereas failing closed on
+# a garbled value would abandon a healthy watch. (bash's `[ x -ge y ]` ERRORS rather
+# than returning false on an oversized operand -- learned the hard way in #61b -- so the
+# digits check has to come first, not be left to the comparison.)
+_past_ci_deadline() {
+  case "${MAIN_CI_DEADLINE_AT:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$(date +%s)" -ge "$MAIN_CI_DEADLINE_AT" ]
 }
 
 # _ci_fetch_records <api-path> <list-field> -> every record in <list-field>, across
@@ -1159,7 +1204,13 @@ merge_ready_pr() {
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
   local waited=0 state=pending lines mreq
   mreq=$(_required_contexts)   # once, not on every 30s poll
-  while [ "$waited" -lt "$MAIN_CI_TIMEOUT" ]; do
+  # #62: arm the absolute deadline HERE, at the start of the watch, so the initial
+  # watch and every subsequent re-run share one bound. Exported because
+  # _rerun_main_ci runs inside a command substitution and would otherwise start its
+  # own count -- the two budgets multiplying is the failure this bound exists to stop.
+  MAIN_CI_DEADLINE_AT=$(( $(date +%s) + MAIN_CI_ABSOLUTE_DEADLINE ))
+  export MAIN_CI_DEADLINE_AT
+  while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
     sleep 30; waited=$((waited + 30))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
     # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
@@ -1813,9 +1864,12 @@ _drop_non_ci_checkruns() {
 # nothing left to confirm it reports `unknown` (no verdict -> halt, never revert).
 #
 # Worst case with the defaults: 3 x (MAIN_CI_TIMEOUT 900s + 20s startup) + 2 x 300s
-# = 56 minutes, ~71 including the initial post-merge watch. That is the ceiling on
-# how long a genuinely broken main stays unreverted; keep it in mind before raising
-# the budget.
+# = 56 minutes, plus the initial watch. That initial watch is now
+# MAIN_CI_SETTLE_TIMEOUT (3600s, #62) rather than 900s, so the arithmetic ceiling
+# would be ~116 minutes -- but MAIN_CI_ABSOLUTE_DEADLINE (7200s) bounds the whole
+# sequence, and `_past_ci_deadline` is checked in this loop and in both poll loops.
+# That deadline, not the sum of the budgets, is the ceiling on how long a genuinely
+# broken main stays unreverted; keep it in mind before raising anything here.
 _rerun_main_ci_until_green() {
 	local sha="$1" budget="${2:-${BIRCHER_MAIN_CI_RERUNS:-3}}" delay="${3:-${BIRCHER_MAIN_CI_RERUN_DELAY:-300}}"
 	local st=unknown mode
@@ -1823,6 +1877,14 @@ _rerun_main_ci_until_green() {
 	case "$budget" in ''|*[!0-9]*) budget=3 ;; esac
 	[ "$budget" -ge 1 ] 2>/dev/null || budget=1
 	while [ "$budget" -gt 0 ]; do
+		# #62: the shared wall clock outranks the re-run budget. Checked at the TOP so an
+		# in-flight poll always finishes -- cutting one mid-flight would discard a verdict
+		# we have already paid for, and the point of the bound is to stop the budgets
+		# multiplying, not to shave seconds.
+		if _past_ci_deadline; then
+			echo "[batch:merge] main CI re-runs abandoned: the ${MAIN_CI_ABSOLUTE_DEADLINE}s absolute deadline passed" >&2
+			break
+		fi
 		# The last re-run we can afford must be full, so a green can be accepted.
 		mode=""; [ "$budget" -eq 1 ] && mode=full
 		st=$(_rerun_main_ci "$sha" "$mode"); budget=$((budget - 1))
@@ -1913,7 +1975,7 @@ _rerun_main_ci() {
   # _required_contexts dies with the subshell, so it re-requested branch
   # protection every 30s -- the exact hazard the comment on _poll_ci warns about.
   local _rr_req; _rr_req=$(_required_contexts)
-  while [ "$w" -lt "$MAIN_CI_TIMEOUT" ]; do
+  while [ "$w" -lt "$MAIN_CI_TIMEOUT" ] && ! _past_ci_deadline; do
     # #67: same helper AND same required set as the watcher. This used to poll
     # unnamed check-runs with no _keep_blocking_checks, so a non-required failure
     # could contradict the watch that triggered it -- and re-create the #43 stall
@@ -4273,6 +4335,34 @@ SH
   [ "$(_main_ci_verdict pending red)"  = halt ]        || { echo "FAIL verdict pending,red"; exit 1; }
   [ "$(_main_ci_verdict pending pending)" = halt ]     || { echo "FAIL verdict pending,pending"; exit 1; }
   echo "_main_ci_verdict OK"
+  # --- #62: the shared main-CI wall clock --------------------------------------
+  # The bug this bounds: muesli's a80a55b2 ran CI for 2867s against a 900s watcher,
+  # so the watch timed out `pending`, the re-run gave no verdict, and the wave halted
+  # with main healthy. The settle budget now covers that; the absolute deadline stops
+  # the settle budget and three re-run budgets from multiplying into hours.
+  [ "$MAIN_CI_SETTLE_TIMEOUT" -gt 2867 ] \
+    || { echo "FAIL #62: the settle budget must cover the observed 2867s main-CI run"; exit 1; }
+  [ "$MAIN_CI_TIMEOUT" = 900 ] \
+    || { echo "FAIL #62: the RE-RUN budget must stay 900s (raising it multiplies by the re-run count)"; exit 1; }
+  [ "$MAIN_CI_ABSOLUTE_DEADLINE" -ge "$MAIN_CI_SETTLE_TIMEOUT" ] \
+    || { echo "FAIL #62: the absolute deadline must not be shorter than the settle budget"; exit 1; }
+  ( unset MAIN_CI_DEADLINE_AT; _past_ci_deadline ) \
+    && { echo "FAIL #62: an UNARMED deadline must never fire"; exit 1; }
+  ( MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 300 )); _past_ci_deadline ) \
+    && { echo "FAIL #62: a future deadline must not fire"; exit 1; }
+  ( MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 1 )); _past_ci_deadline ) \
+    || { echo "FAIL #62: a passed deadline MUST fire"; exit 1; }
+  # An unusable value reads as "not past": the per-loop budgets still bound every
+  # caller, so failing open cannot run forever, while failing closed on a garbled
+  # value would abandon a healthy watch. bash ERRORS rather than returning false on an
+  # oversized `-ge` operand (#61b), so the digits check must come before the compare --
+  # these two cases are the ones that regressed last time.
+  for _bad in "" "abc" "12a" "99999999999999999999999999" "-5" " 123"; do
+    ( MAIN_CI_DEADLINE_AT="$_bad"; _past_ci_deadline ) \
+      && { echo "FAIL #62: unusable deadline '$_bad' must read as NOT past"; exit 1; }
+  done
+  unset _bad
+  echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
   [ "$(_revert_git_args abc123 1)" = "--no-edit abc123" ] || { echo "FAIL revert single-parent"; exit 1; }
