@@ -3367,9 +3367,30 @@ SH
     [ "$(_checkrun_state "$_cc")" = "red" ] \
       || { echo "FAIL _checkrun_state: '$_cc' must be red, not green"; exit 1; }
   done
-  # Red still outranks pending when both are present.
+  # Red still outranks pending when both are present, in EITHER order -- red
+  # short-circuits on the first red line while pending is only decided after the
+  # whole set, so ordering must not change the verdict.
   [ "$(_checkrun_state $'in_progress|\ncompleted|failure')" = "red" ] \
     || { echo "FAIL _checkrun_state: red must outrank pending"; exit 1; }
+  [ "$(_checkrun_state $'completed|failure\nin_progress|')" = "red" ] \
+    || { echo "FAIL _checkrun_state: red must outrank pending in either order"; exit 1; }
+  # Malformed lines must never read green. A one-field line has no conclusion to
+  # match; extra fields, trailing whitespace and a stray CR all make the conclusion
+  # unrecognised. Each of these reached this function as green before the allowlist.
+  [ "$(_checkrun_state 'completed')" = "red" ]              || { echo "FAIL _checkrun_state: one-field line"; exit 1; }
+  [ "$(_checkrun_state 'completed|success|extra')" = "red" ] || { echo "FAIL _checkrun_state: three-field line"; exit 1; }
+  [ "$(_checkrun_state 'completed|success ')" = "red" ]      || { echo "FAIL _checkrun_state: trailing whitespace"; exit 1; }
+  [ "$(_checkrun_state "$(printf 'completed|success\r')")" = "red" ] || { echo "FAIL _checkrun_state: trailing CR"; exit 1; }
+  [ "$(_checkrun_state ' completed|success')" = "pending" ]  || { echo "FAIL _checkrun_state: leading whitespace"; exit 1; }
+  [ "$(_checkrun_state '   ')" = "pending" ]                 || { echo "FAIL _checkrun_state: whitespace-only"; exit 1; }
+  # The final line must be read whether or not the input ends in a newline -- the
+  # here-doc supplies the terminator, but that is worth pinning.
+  [ "$(_checkrun_state 'completed|failure')" = "red" ] \
+    || { echo "FAIL _checkrun_state: unterminated single line dropped"; exit 1; }
+  [ "$(_checkrun_state $'completed|success\ncompleted|failure')" = "red" ] \
+    || { echo "FAIL _checkrun_state: unterminated final line dropped"; exit 1; }
+  [ "$(_checkrun_state $'completed|success\n')" = "green" ] \
+    || { echo "FAIL _checkrun_state: a trailing newline must not read as a record"; exit 1; }
   unset _st _cc
   echo "_checkrun_state OK (green is an allowlist)"
   # --- #67: commit statuses must reach the CI verdict ------------------------
