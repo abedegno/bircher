@@ -359,8 +359,44 @@ EOF
   _classify_ci_failure "$total"
 }
 
-# _commit_ci_lines <sha> -> "name|status|conclusion" for BOTH check-runs and
-# commit STATUSES on a commit; rc 1 if either lookup fails.
+# _ci_fetch_records <api-path> <list-field> -> every record in <list-field>, across
+# ALL pages, as one compact JSON array on stdout. rc 1 unless the WHOLE response is
+# well-formed: on any doubt it fails closed rather than emitting a partial set.
+#
+# This replaced `gh api <path> -q '<filter>'`, which had two ways to hand back an
+# incomplete record set with rc 0:
+#
+#   PAGINATION. GitHub returns 30 records per page and `gh api` fetches only the
+#   first without --paginate. muesli's own main commit already carries 28 check-runs
+#   (measured 2026-08-16), so one more Dependabot batch puts a required failure on
+#   page 2 where nothing will ever see it.
+#
+#   EMPTY BODY. `gh api` can exit 0 having written nothing, and jq exits 0 with no
+#   output on zero inputs. The empty result then reads as "no records": the required
+#   set matches nothing, _keep_blocking_checks falls back to every check, and
+#   _checkrun_state calls it green. Silence must never be green. (`{}`, `null` and
+#   error objects like {"message":"Not Found"} did already fail closed under -q,
+#   because `.field[]` errors on null and `gh api -q` propagates jq's status - both
+#   verified. The empty body was the one that got through.)
+#
+# --slurp makes gh emit ONE JSON array of page objects, so the entire response can be
+# shape-checked before anything is read out of it. The outer `jq -s` additionally
+# asserts that exactly one document arrived: plain `jq -e` reports only the status of
+# the LAST of several concatenated documents, so a degraded first page followed by a
+# well-formed one would otherwise pass.
+_ci_fetch_records() {
+  local path="$1" field="$2" raw
+  raw=$(gh api --paginate --slurp "$path" 2>/dev/null) || return 1
+  printf '%s' "$raw" | jq -e -s --arg f "$field" '
+      length == 1
+      and (.[0] | type == "array" and length > 0
+           and all(.[]; type == "object" and (.[$f] | type == "array")))' >/dev/null 2>&1 || return 1
+  printf '%s' "$raw" | jq -c -s --arg f "$field" '[ .[0][] | .[$f][] ]' 2>/dev/null || return 1
+}
+
+# _commit_ci_lines <sha> [required] -> "name|status|conclusion" for BOTH check-runs
+# and commit STATUSES on a commit; rc 1 if either lookup is anything less than a
+# complete, well-formed response.
 #
 # #67: the post-merge watcher and the rerun poll read only /check-runs, so a
 # REQUIRED context that happens to be a commit status was invisible to them --
@@ -386,66 +422,74 @@ EOF
 # context, but that is not documented as guaranteed and a stale duplicate could
 # flip a verdict, so it is not assumed.
 #
-# rc 1 on either fetch failing: a failed status lookup must never read as "no
-# statuses" alongside green check-runs, which would be a false green.
+# STRUCTURE. Both kinds are normalised into ONE materialised record array, and every
+# step downstream reads that array. This is deliberate: four separate false-greens in
+# this function were all variants of two streams disagreeing about the same record --
+# a stale duplicate winning dedup, control data sharing a namespace with record data,
+# an unvalidated body reading as "none", and one half being validated while the other
+# was not. With a single validated array there is no second stream to disagree with.
 _commit_ci_lines() {
-  local sha="$1" required="${2:-}" runs statuses bad
-  runs=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-    -q '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "")"' 2>/dev/null) || return 1
-  # Fetch once, then extract valid records and unrepresentable names SEPARATELY.
-  # An earlier cut multiplexed both into one stream with a `__MALFORMED_CONTEXT__`
-  # sentinel; a legitimate context merely BEGINNING with that string was then
-  # deleted by the cleanup while not being recognised as malformed, so a required
-  # FAILING status silently vanished and the verdict read green. Control records
-  # and data records must not share an unescaped namespace.
-  local raw dedup bad
-  raw=$(gh api "repos/$REPO/commits/$sha/status" 2>/dev/null) || return 1
-  # Validate the payload SHAPE before extracting. `gh api` can return rc 0 with an
-  # empty body, and jq exits 0 with no output on zero inputs -- so an empty or
-  # degraded response would silently become "no statuses", and a required
-  # status-backed context would then match nothing, fall back to all checks, and
-  # read GREEN. Rejects: empty body, `null`, a non-object, a missing `.statuses`,
-  # and an error object such as {"message":"Not Found"} that is valid JSON.
-  printf '%s' "$raw" | jq -e 'type == "object" and (.statuses | type == "array")' >/dev/null 2>&1 || {
-    echo "[batch] WARN: unusable status payload for $sha -> failing closed" >&2
+  local sha="$1" required="${2:-}" runs_json sts_json recs bad_pipe nl_count _b
+  runs_json=$(_ci_fetch_records "repos/$REPO/commits/$sha/check-runs" check_runs) || {
+    echo "[batch] WARN: unusable check-runs response for $sha -> failing closed" >&2
     return 1
   }
-  dedup='[.statuses[]] | to_entries | map(.value + {_i: .key})
-         | group_by(.context) | map(sort_by([.updated_at, (0 - ._i)]) | last)[]'
-  statuses=$(printf '%s' "$raw" | jq -r "$dedup"'
-        | select(.context | test("[|\n]") | not)
-        | "\(.context)|" + (if .state == "pending" then "in_progress|"
-                            else "completed|" + (if .state == "success" then "success" else "failure" end)
-                            end)' 2>/dev/null) || return 1
-  bad=$(printf '%s' "$raw" | jq -r "$dedup"'
-        | select(.context | test("[|\n]")) | .context' 2>/dev/null) || return 1
-  # A name carrying a field delimiter cannot be represented in this protocol:
+  sts_json=$(_ci_fetch_records "repos/$REPO/commits/$sha/status" statuses) || {
+    echo "[batch] WARN: unusable status response for $sha -> failing closed" >&2
+    return 1
+  }
+  recs=$(jq -c -n --argjson runs "$runs_json" --argjson sts "$sts_json" '
+      [ $runs[] | {name, status, conclusion: (.conclusion // "")} ]
+    + [ $sts | to_entries | map(.value + {_i: .key})
+        | group_by(.context) | map(sort_by([.updated_at, (0 - ._i)]) | last)[]
+        | {name: .context,
+           status: (if .state == "pending" then "in_progress" else "completed" end),
+           conclusion: (if .state == "pending" then ""
+                        elif .state == "success" then "success"
+                        else "failure" end)} ]' 2>/dev/null) || return 1
+  # A record whose name or status is not a string would emit `null|...` and classify
+  # as an unrecognised - therefore green - line. Never guess at a malformed record.
+  printf '%s' "$recs" | jq -e '
+      all(.[]; (.name|type) == "string" and (.status|type) == "string"
+               and (.conclusion|type) == "string")' >/dev/null 2>&1 || {
+    echo "[batch] WARN: a CI record on $sha has a non-string name/status -> failing closed" >&2
+    return 1
+  }
+  # A newline in a name breaks the line protocol AND the line-oriented `grep -Fxq`
+  # used to test membership of the required set -- so it cannot even be established
+  # whether such a check is required. Always fail closed.
+  nl_count=$(printf '%s' "$recs" | jq -r '[.[] | select(.name | test("\n"))] | length') || return 1
+  if [ "${nl_count:-0}" != 0 ]; then
+    echo "[batch] WARN: a CI check name on $sha contains a newline and cannot be matched -> failing closed" >&2
+    return 1
+  fi
+  # A name carrying the field delimiter cannot be represented in this protocol:
   # `a|b` pending would become `a|b|in_progress|`, _keep_blocking_checks would read
   # the name as `a`, the required match would fail, it would fall back, and
   # _checkrun_state would see `b|in_progress|` -- unrecognised, so a required
-  # PENDING status would read GREEN.
+  # PENDING check would read GREEN.
   #
-  # Refuse only when such a context is REQUIRED. A non-required one is filtered
+  # Refuse only when such a check is REQUIRED. A non-required one is filtered
   # downstream anyway, so halting every verdict over it would turn a cosmetic
-  # naming choice in someone else's repo into an outage.
-  if [ -n "$bad" ]; then
+  # naming choice in someone else's repo into an outage. This applies to check-runs
+  # and statuses alike; an earlier cut refused unconditionally on the check-run side
+  # and conditionally on the status side, for no reason other than how it grew.
+  bad_pipe=$(printf '%s' "$recs" | jq -r '.[] | select(.name | test("[|]")) | .name') || return 1
+  if [ -n "$bad_pipe" ]; then
     while IFS= read -r _b; do
       [ -n "$_b" ] || continue
       if [ -n "$required" ] && printf '%s\n' "$required" | grep -Fxq "$_b"; then
-        echo "[batch] WARN: REQUIRED context '$_b' contains a delimiter and cannot be classified -> failing closed for $sha" >&2
+        echo "[batch] WARN: REQUIRED check '$_b' contains a delimiter and cannot be classified -> failing closed for $sha" >&2
         return 1
       fi
-      echo "[batch] WARN: dropping non-required context '$_b' (contains a delimiter)" >&2
+      echo "[batch] WARN: dropping non-required check '$_b' (contains a delimiter)" >&2
     done <<EOF
-$bad
+$bad_pipe
 EOF
   fi
-  # Same hazard on the check-run side: a name containing `|` yields >3 fields.
-  if ! printf '%s\n' "$runs" | awk -F'|' 'NF>3 {exit 1}'; then
-    echo "[batch] WARN: a check-run name contains a delimiter; cannot classify CI safely for $sha" >&2
-    return 1
-  fi
-  printf '%s\n%s\n' "$runs" "$statuses" | grep -v '^$' || true
+  printf '%s' "$recs" | jq -r '
+      .[] | select(.name | test("[|]") | not)
+          | "\(.name)|\(.status)|\(.conclusion)"' 2>/dev/null
 }
 
 # _poll_ci <pr> <timeout_s> -> green|red|pending
@@ -1671,6 +1715,16 @@ _keep_blocking_checks() {
   # (contexts that never run on this event, a renamed job), not a genuine "no checks".
   # Returning empty there reads as "CI has not registered yet" -> pending forever, or
   # worse, hides a red. Fall back to ignore-list-only, which errs toward red.
+  #
+  # REJECTED (2026-08-16, raised by review): "require EVERY required context to be
+  # present, else pending". That is right for a PR head and wrong here. Required
+  # contexts are a branch-protection property of the PR, and the post-merge watcher
+  # reads a MERGE COMMIT, where most of them legitimately never report -- muesli's
+  # merge commits carry 0 statuses and a combined `pending`, and `review-gate` /
+  # `bircher/cross-review` only ever appear on PR heads. Demanding completeness there
+  # would make every post-merge watch poll to timeout, i.e. halt the pipeline. The
+  # completeness this function CANNOT provide is instead enforced upstream, by
+  # _commit_ci_lines failing closed on any response that is not whole.
   if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
     printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
     return
@@ -3267,26 +3321,52 @@ SH
   local cdir; cdir=$(mktemp -d)
   cat >"$cdir/gh" <<'SH'
 #!/usr/bin/env bash
-# args: api <path> -q <filter>
-# NB: propagate jq's exit status. An earlier version ended with a blanket
-# `exit 0`, which swallowed a jq failure -- so the shim could not express the
-# malformed-response case the real `gh api` produces, and the test for it could
-# never have failed. Defaults are assigned plainly rather than inside a
-# ${VAR:-...} expansion, whose escaping produced invalid JSON.
-filter=""; nx=0
-for a in "$@"; do [ "$nx" = 1 ] && { filter="$a"; nx=0; }; [ "$a" = "-q" ] && nx=1; done
-runs_json="${FAKE_RUNS_JSON-}";     [ -n "$runs_json" ]     || runs_json='{"check_runs":[]}'
-status_json="${FAKE_STATUS_JSON-}"; [ -n "$status_json" ]   || status_json='{"statuses":[]}'
-# FAKE_STATUS_BODY lets a test emit a DEGRADED body (empty, null, an error object)
-# that the ${VAR:-default} fallback above would otherwise replace.
-[ -n "${FAKE_STATUS_BODY+set}" ] && status_json="$FAKE_STATUS_BODY"
+# args: api [--paginate --slurp] <path> [-q <filter>]
+#
+# Three fixture shapes per endpoint, deliberately distinct:
+#   FAKE_*_JSON   one page object; wrapped in [...] when --slurp is present, because
+#                 that is what real `gh api --slurp` emits.
+#   FAKE_*_PAGES  a complete page ARRAY -- served in full ONLY when --paginate is
+#                 present, and truncated to page 1 otherwise, because that is what
+#                 real `gh api` does. Without that the pagination test would pass
+#                 even with --paginate deleted, i.e. assert nothing.
+#   FAKE_*_BODY   emitted VERBATIM, so a test can express a degraded response that
+#                 the wrapping would otherwise repair. Without a BODY var on the
+#                 check-runs side, its empty-body false-green was inexpressible,
+#                 which is exactly why it survived three reviews.
+#
+# jq's exit status is propagated: an earlier version ended with a blanket `exit 0`,
+# which swallowed it, so the malformed-response tests could never have failed.
+# Defaults are assigned plainly rather than inside a ${VAR:-...} expansion, whose
+# escaping produced invalid JSON.
+filter=""; nx=0; slurp=0; paginate=0
+for a in "$@"; do
+  [ "$nx" = 1 ] && { filter="$a"; nx=0; }
+  [ "$a" = "-q" ] && nx=1
+  [ "$a" = "--slurp" ] && slurp=1
+  [ "$a" = "--paginate" ] && paginate=1
+done
+_pages() { # <pages-array> -> all of it with --paginate, else just page 1
+  if [ "$paginate" = 1 ]; then printf '%s' "$1"; else printf '%s' "$1" | jq -c '[.[0]]'; fi
+}
+runs_json="${FAKE_RUNS_JSON-}";     [ -n "$runs_json" ]   || runs_json='{"check_runs":[]}'
+status_json="${FAKE_STATUS_JSON-}"; [ -n "$status_json" ] || status_json='{"statuses":[]}'
+if   [ -n "${FAKE_RUNS_BODY+set}" ];  then runs_out="$FAKE_RUNS_BODY"
+elif [ -n "${FAKE_RUNS_PAGES-}" ];    then runs_out="$(_pages "$FAKE_RUNS_PAGES")"
+elif [ "$slurp" = 1 ];                then runs_out="[$runs_json]"
+else                                       runs_out="$runs_json"; fi
+if   [ -n "${FAKE_STATUS_BODY+set}" ]; then status_out="$FAKE_STATUS_BODY"
+elif [ -n "${FAKE_STATUS_PAGES-}" ];   then status_out="$(_pages "$FAKE_STATUS_PAGES")"
+elif [ "$slurp" = 1 ];                 then status_out="[$status_json]"
+else                                        status_out="$status_json"; fi
 case "$*" in
   *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1
-                   printf '%s' "$runs_json"   | jq -r "$filter"; exit $? ;;
+                   if [ -z "$filter" ]; then printf '%s' "$runs_out"; exit 0; fi
+                   printf '%s' "$runs_out"   | jq -r "$filter"; exit $? ;;
   *"/status"*)     [ "${FAKE_STATUS_RC:-0}" = 0 ] || exit 1
                    # No -q: the caller wants raw JSON (it applies jq itself).
-                   if [ -z "$filter" ]; then printf '%s' "$status_json"; exit 0; fi
-                   printf '%s' "$status_json" | jq -r "$filter"; exit $? ;;
+                   if [ -z "$filter" ]; then printf '%s' "$status_out"; exit 0; fi
+                   printf '%s' "$status_out" | jq -r "$filter"; exit $? ;;
 esac
 exit 0
 SH
@@ -3360,19 +3440,71 @@ SH
     || { echo "FAIL _commit_ci_lines: a context named like the old sentinel must survive as a normal record"; rm -rf "$cdir"; exit 1; }
   [ "$(_checkrun_state "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl | sed 's/^[^|]*|//')")" = red ] \
     || { echo "FAIL _commit_ci_lines: sentinel-named failing context must still read red"; rm -rf "$cdir"; exit 1; }
-  # A DEGRADED status response must fail closed, not read as "no statuses".
-  # `gh api` can return rc 0 with an empty body, and jq exits 0 with no output on
-  # zero inputs -- so without a shape check a required status-backed context would
-  # match nothing, fall back to all checks, and read GREEN.
-  for _body in "" "null" "{}" '{"statuses":null}' '{"message":"Not Found"}'; do
+  # A DEGRADED response must fail closed, not read as "no records". `gh api` can
+  # return rc 0 with an empty body, and jq exits 0 with no output on zero inputs --
+  # so without a shape check a required context would match nothing, fall back to
+  # all checks, and read GREEN. The list also covers responses that are valid JSON
+  # but not the page ARRAY --slurp promises, and TWO CONCATENATED documents, which
+  # a bare `jq -e` accepts because it reports only the last one's status.
+  for _body in "" "null" "{}" '[]' '{"statuses":[]}' '[{"statuses":null}]' \
+               '[{"message":"Not Found"}]' '[{"statuses":[]}][{"statuses":[]}]' \
+               '[{"message":"x"}][{"statuses":[]}]'; do
     FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
       FAKE_STATUS_BODY="$_body" _cl >/dev/null 2>&1 \
       && { echo "FAIL _commit_ci_lines: degraded status body '${_body:-<empty>}' must fail closed"; rm -rf "$cdir"; exit 1; }
   done
-  # ...but a well-formed EMPTY list is legitimate (merge commits have none).
+  # THE FOURTH FALSE-GREEN: the check-runs half was a bare `gh api -q` with no shape
+  # check while the status half was validated, so an empty check-runs body dropped
+  # every check-run and a lone green status carried the verdict. The test shim could
+  # not even express it (no BODY var on that side), which is how it survived three
+  # adversarial passes. Both halves now go through _ci_fetch_records.
+  for _body in "" "null" "{}" '[]' '{"check_runs":[]}' '[{"check_runs":null}]' \
+               '[{"message":"Not Found"}]' '[{"check_runs":[]}][{"check_runs":[]}]'; do
+    FAKE_RUNS_BODY="$_body" FAKE_STATUS_JSON="$(_st_json success)" _cl >/dev/null 2>&1 \
+      && { echo "FAIL _commit_ci_lines: degraded check-runs body '${_body:-<empty>}' must fail closed"; rm -rf "$cdir"; exit 1; }
+  done
+  # ...but a well-formed EMPTY list on either side is legitimate: merge commits carry
+  # no statuses, and a commit with no CI at all carries no check-runs (-> pending).
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
-       FAKE_STATUS_BODY='{"statuses":[]}' _cl)" = "server|completed|success" ] \
+       FAKE_STATUS_BODY='[{"statuses":[]}]' _cl)" = "server|completed|success" ] \
     || { echo "FAIL _commit_ci_lines: an empty statuses ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
+  [ "$(FAKE_RUNS_BODY='[{"check_runs":[]}]' FAKE_STATUS_JSON="$(_st_json success)" _cl)" \
+    = "ext-ci|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: an empty check_runs ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
+  # PAGINATION. GitHub serves 30 records per page; muesli's main commit already
+  # carries 28 check-runs. Without --paginate a required FAILURE on page 2 is simply
+  # not fetched, page 1 is all green, and the verdict reads green.
+  [ "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
+       _cl | sort | tr '\n' ' ')" = "p1|completed|success p2|completed|failure " ] \
+    || { echo "FAIL _commit_ci_lines: records beyond page 1 must be fetched"; rm -rf "$cdir"; exit 1; }
+  [ "$(_checkrun_state "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
+       _cl | sed 's/^[^|]*|//')")" = red ] \
+    || { echo "FAIL _commit_ci_lines: a page-2 failure must make the verdict red"; rm -rf "$cdir"; exit 1; }
+  # A record with a non-string name/status would emit `null|...`, which classifies as
+  # an unrecognised -- therefore GREEN -- line. Never guess at a malformed record.
+  for _body in '[{"check_runs":[{"status":"completed","conclusion":"success"}]}]' \
+               '[{"check_runs":[{"name":null,"status":"completed","conclusion":"success"}]}]' \
+               '[{"check_runs":[{"name":{"x":1},"status":"completed","conclusion":"success"}]}]' \
+               '[{"check_runs":[{"name":"server","status":null,"conclusion":"success"}]}]'; do
+    FAKE_RUNS_BODY="$_body" _cl >/dev/null 2>&1 \
+      && { echo "FAIL _commit_ci_lines: non-string record field must fail closed ($_body)"; rm -rf "$cdir"; exit 1; }
+  done
+  # A NEWLINE in a name breaks both the line protocol and the line-oriented required
+  # match, so it cannot even be established whether the check is required -> always
+  # fail closed, required set or not.
+  FAKE_STATUS_JSON='{"statuses":[{"context":"a\nb","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' \
+    _cl >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: a newline-bearing name must fail closed"; rm -rf "$cdir"; exit 1; }
+  # The delimiter rule now applies to CHECK-RUNS on the same required/non-required
+  # terms as statuses; it used to refuse unconditionally on that side, which would
+  # halt every wave over one awkwardly-named job in a repo bircher does not control.
+  FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null}]}' \
+    PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'a|b' >/dev/null 2>&1 \
+    && { echo "FAIL _commit_ci_lines: a REQUIRED pipe-bearing check-run must fail closed"; rm -rf "$cdir"; exit 1; }
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null},{"name":"server","status":"completed","conclusion":"success"}]}' \
+       PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
+    = "server|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing check-run must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
   # --- B-2v2/B-3v2: limit-message matcher + usage-aware vendor pick -----------
@@ -3447,7 +3579,10 @@ if [ "$1" = "api" ]; then
     [ "$n" -ge "${LAND_AT:-1}" ] && printf 'success\n' >> "$STORE"
     exit 0
   fi
-  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; fi
+  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; fi
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3489,11 +3624,14 @@ if [ "$1" = "api" ]; then
     printf 'success\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
     exit 0
   fi
-  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
   # Demo repo has no branch protection -> empty required set, so _keep_blocking_checks
   # falls back to ignore-list-only. Without this the catch-all below hands back
   # "completed|success" as though it were a required-contexts list.
   if printf '%s\n' "$@" | grep -q '/protection'; then exit 0; fi
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3529,7 +3667,10 @@ fi
 [ "$1" = "pr" ] && [ "$2" = "merge" ] && { echo "merge $3" >> "${PMLOG:-/dev/null}"; exit "${FAKE_MERGE_RC:-0}"; }
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/statuses/' && exit 0   # POST "ok" but never persists
-  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; exit 0; }   # read-back empty -> _post fails
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; exit 0; }   # read-back empty -> _post fails
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3585,7 +3726,10 @@ if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
 fi
 if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3678,7 +3822,10 @@ if [ "$1" = "api" ]; then
   tref=$(printf '%s' "$*" | sed -n 's#.*/git/trees/\([A-Za-z0-9._-]*\).*#\1#p')
   if [ -n "$tref" ]; then cat "$TREEDIR/$tref" 2>/dev/null || exit 1; exit 0; fi
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
-  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; }
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -3873,7 +4020,10 @@ if [ "$1" = "api" ]; then
   # #66: recovery captures the reviewed head itself before dispatching the review.
   case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}"; exit 0 ;; esac
   if printf '%s\n' "$@" | grep -q '/statuses/'; then echo "status $*" >> "${PR_LOG:-/dev/null}"; printf 'success\n' >> "${STORE:-/dev/null}"; exit 0; fi
-  printf '%s\n' "$@" | grep -q '/status' && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '{"statuses":[]}'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  printf '%s\n' "$@" | grep -q '/status' && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
+  # catch-all's bare "name|status|conclusion" lines will not do here.
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
