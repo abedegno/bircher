@@ -1347,9 +1347,24 @@ merge_ready_pr() {
   # fetch below would run unbounded and the deadline would never even be set -- the
   # watch would not start, so nothing downstream could time it out.
   _arm_ci_deadline
-  local sha
-  sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null)
+  local sha sha_rc
+  sha=$(_ci_gh pr view "$pr" --repo "$REPO" --json mergeCommit -q '.mergeCommit.oid' 2>/dev/null); sha_rc=$?
+  # A FAILED lookup is not "no merge sha". The PR is already merged at this point, so an
+  # unwatched main is the one outcome that must never be reported as success -- and
+  # returning 0 here does exactly that, letting the queue move on while a merge that may
+  # have broken main goes unexamined. The refusal path added for a missing timeout(1)
+  # reaches this line, which is how it was found: `_ci_gh` returning 1 fell straight into
+  # the empty-sha branch below and skipped the watch.
+  if [ "$sha_rc" -ne 0 ]; then
+    echo "[batch:merge] !!!! $item: merge-sha lookup FAILED after merging PR #$pr -> main is UNWATCHED -> HALTING !!!!" >&2
+    MERGE_NOTE="merged; merge-sha lookup FAILED - main is UNWATCHED, check by hand"
+    return 2
+  fi
   echo "[batch:merge] $item: PR #$pr MERGED (${sha:-sha unknown}); watching main CI" >&2
+  # PRE-EXISTING, and left alone deliberately: an EMPTY sha with rc 0 still returns 0.
+  # It carries the same operational risk (main unwatched), but changing it is a
+  # behaviour change beyond the finding that prompted this, and GitHub returning no
+  # merge commit for a just-merged PR is a different failure from a lookup that broke.
   [ -z "$sha" ] && { MERGE_NOTE="merged; main-CI watch skipped (no merge sha)"; return 0; }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
   local waited=0 state=pending lines mreq
@@ -4010,6 +4025,17 @@ SH
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
+  # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
+  # the watch and report success. The PR is already merged by this point, so reporting
+  # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
+  # read as success. Before the fix, `_ci_gh`'s rc 1 fell into the empty-sha branch and
+  # returned 0.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s4" \
+    _TIMEOUT_BIN_LOADED=1 _TIMEOUT_BIN_CACHE= \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
+    || { echo "FAIL #62: a refused merge-sha lookup must halt (rc 2) with an UNWATCHED note, not skip the watch"; exit 1; }
   # deferred path: CONFLICTING -> rc 0 with a deferral note
   ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_MERGEABLE=CONFLICTING FAKE_STATUS_STORE="$mdir/s2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: mergeable=CONFLICTING" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" != 1 ] ) \
