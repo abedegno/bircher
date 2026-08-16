@@ -439,11 +439,18 @@ _arm_ci_deadline() {
   # rather than erroring, so the overflow looks like a valid far-future instant. Same
   # lesson as #61b's retry bound.
   #
-  # ONE validation, not two. An earlier cut also had a `case ... *[!0-9]*` digit check
-  # in front of this; the length-and-minimum test below already rejects everything it
-  # rejected (bash's comparison error is non-zero, and `2>/dev/null` keeps it quiet), so
-  # no test could tell whether the digit check was there. A guard nothing can falsify is
-  # not defence in depth, it is decoration.
+  # Digits FIRST, and not optional: `$((10#abc))` is a FATAL arithmetic error that
+  # aborts the shell outright rather than returning non-zero, so no `||` downstream can
+  # catch it. An earlier revision dropped this check as unfalsifiable -- true at the
+  # time, and false the moment `10#` below arrived and made it load-bearing. Removing it
+  # killed the entire self-test mid-run, silently.
+  case "$span" in ''|*[!0-9]*) span=7200 ;; esac
+  # FORCE BASE 10. `$((now + 0000060))` reads the operand as OCTAL: 0000060 arms 48
+  # seconds, not 60, so a leading-zero override lands under the very minimum this
+  # validation exists to enforce; 00007200 arms 3712s. `[ x -ge y ]` compares decimal,
+  # so the range check below cannot see any of it -- the two disagree about what the
+  # string means.
+  span=$((10#$span))
   { [ "${#span}" -le 7 ] && [ "$span" -ge 60 ]; } 2>/dev/null || {
     echo "[batch] WARN: unusable BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE '${MAIN_CI_ABSOLUTE_DEADLINE}' -> using 7200s" >&2
     span=7200
@@ -467,6 +474,44 @@ _past_ci_deadline() {
   esac
   [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || return 1
   [ "$(date +%s)" -ge "$MAIN_CI_DEADLINE_AT" ]
+}
+
+# _ci_call_cap -> seconds any single main-CI `gh` call may take: the smaller of
+# BIRCHER_CI_CALL_TIMEOUT (120s) and whatever is left on the shared deadline.
+_ci_call_cap() {
+  local cap="${BIRCHER_CI_CALL_TIMEOUT:-120}" now rem
+  case "$cap" in ''|*[!0-9]*) cap=120 ;; esac
+  cap=$((10#$cap)); [ "$cap" -ge 5 ] 2>/dev/null || cap=120
+  case "${MAIN_CI_DEADLINE_AT:-}" in ''|*[!0-9]*) printf '%s' "$cap"; return ;; esac
+  [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || { printf '%s' "$cap"; return ; }
+  now=$(date +%s 2>/dev/null)
+  case "$now" in ''|*[!0-9]*) printf '%s' "$cap"; return ;; esac
+  rem=$(( MAIN_CI_DEADLINE_AT - now ))
+  [ "$rem" -lt 1 ] && rem=1
+  [ "$rem" -lt "$cap" ] && cap="$rem"
+  printf '%s' "$cap"
+}
+
+# _ci_gh <args...> -> `gh`, bounded by a wall clock.
+#
+# #62: the absolute deadline is checked BETWEEN operations, so it could not bound one.
+# A `gh` call that HANGS rather than failing was never interrupted: the initial watch or
+# a re-run poll would block indefinitely, `_main_ci_verdict` would never be reached, and
+# a genuinely broken main would stay unreverted with no halt. An earlier revision waved
+# this away as unportable, which was wrong -- this script already depends on `timeout`
+# unguarded for preflight and dispatch (:2256, :2265, :2303).
+#
+# A timed-out call exits non-zero, which every caller here already treats as a failed
+# lookup -> keep polling -> eventually the deadline. Failing closed, on the existing
+# path. The `command -v` fallback keeps the self-test runnable on stock macOS, where
+# coreutils' timeout is absent; the runner is Linux and always takes the bounded path.
+_ci_gh() {
+  local cap; cap=$(_ci_call_cap)
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$cap" gh "$@"
+  else
+    gh "$@"
+  fi
 }
 
 # _ci_fetch_records <api-path> <list-field> -> every record in <list-field>, across
@@ -496,7 +541,7 @@ _past_ci_deadline() {
 # well-formed one would otherwise pass.
 _ci_fetch_records() {
   local path="$1" field="$2" raw
-  raw=$(gh api --paginate --slurp "$path" 2>/dev/null) || return 1
+  raw=$(_ci_gh api --paginate --slurp "$path" 2>/dev/null) || return 1
   printf '%s' "$raw" | jq -e -s --arg f "$field" '
       length == 1
       and (.[0] | type == "array" and length > 0
@@ -2016,17 +2061,17 @@ _rerun_main_ci() {
     echo "[batch:merge] re-run not dispatched: the ${MAIN_CI_ABSOLUTE_DEADLINE}s absolute deadline passed" >&2
     echo unknown; return
   fi
-  rid=$(gh run list --repo "$REPO" --branch main --limit 10 --json databaseId,headSha \
+  rid=$(_ci_gh run list --repo "$REPO" --branch main --limit 10 --json databaseId,headSha \
         -q ".[] | select(.headSha==\"$sha\") | .databaseId" 2>/dev/null | head -1)
   # `unknown`, NOT red: no verdict was obtained. Reporting red here would let a
   # rate limit or "this workflow is already running" masquerade as confirmed
   # regression evidence and revert a good commit (2026-08-12 hit both).
   [ -n "$rid" ] || { echo unknown; return; }
   if [ "$full" = full ]; then
-    gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
+    _ci_gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
   else
-    gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
-      || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
+    _ci_gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
+      || _ci_gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1 || { echo unknown; return; }
   fi
   sleep 20
   # Once, not per poll: inside the loop's command substitution the cache in
@@ -4467,7 +4512,8 @@ SH
   ( MAIN_CI_ABSOLUTE_DEADLINE=99999999999999999999 _arm_ci_deadline 2>/dev/null
     _sane_arm "an oversized span" )                        || exit 1
   ( MAIN_CI_ABSOLUTE_DEADLINE=abc _arm_ci_deadline 2>/dev/null
-    _sane_arm "a non-numeric span" )                       || exit 1
+    _sane_arm "a non-numeric span" ) \
+    || { echo "FAIL #62: a non-numeric span must fall back, not abort (\$((10#abc)) is FATAL, not a non-zero return)"; exit 1; }
   ( MAIN_CI_ABSOLUTE_DEADLINE=1 _arm_ci_deadline 2>/dev/null
     _sane_arm "an absurdly small span" )                   || exit 1
   # An 8-digit span (~3.2 years) is the case that isolates the LENGTH clamp: it is
@@ -4477,6 +4523,20 @@ SH
   # only works by relying on that error is not a clamp.
   ( MAIN_CI_ABSOLUTE_DEADLINE=99999999 _arm_ci_deadline 2>/dev/null
     _sane_arm "an 8-digit span" )                          || exit 1
+  # LEADING ZEROS ARE OCTAL to `$(( ))` but decimal to `[ -ge ]`, so the two disagreed
+  # about what the string meant: 0000060 armed 48s (under the very minimum the check
+  # exists to enforce), 00007200 armed 3712s, and 0000080 was an arithmetic ERROR that
+  # left the deadline unusable. All three verified against the shipped code first.
+  ( MAIN_CI_ABSOLUTE_DEADLINE=0000060  _arm_ci_deadline 2>/dev/null
+    _sane_arm "a leading-zero minimum" )                   || exit 1
+  ( MAIN_CI_ABSOLUTE_DEADLINE=0000080  _arm_ci_deadline 2>/dev/null
+    _sane_arm "a leading-zero 8" )                         || exit 1
+  # In range is not enough -- it must mean what it says in DECIMAL. 00007200 is 7200
+  # seconds, not 3712, and _sane_arm's window is wide enough to accept both.
+  ( MAIN_CI_ABSOLUTE_DEADLINE=00007200 _arm_ci_deadline 2>/dev/null
+    _sane_arm "a leading-zero default"
+    _n=$(date +%s); [ "$(( MAIN_CI_DEADLINE_AT - _n ))" -ge 7000 ] ) \
+    || { echo "FAIL #62: a leading-zero span must be read as DECIMAL (00007200 = 7200s, not 3712)"; exit 1; }
   ( MAIN_CI_ABSOLUTE_DEADLINE=7200 _arm_ci_deadline 2>/dev/null
     _sane_arm "the default span"
     _past_ci_deadline ) \
@@ -4511,7 +4571,57 @@ SH
   [ -s "$_rdir/calls" ] \
     || { echo "FAIL #62: with time remaining, the re-run must still reach gh"; rm -rf "$_rdir"; exit 1; }
   rm -rf "$_rdir"
-  unset _bad _err _rc _ddir _rdir _rr
+  # --- #62: main-CI gh calls are bounded by a wall clock ------------------------
+  # A `gh` call that HANGS rather than failing was never interrupted, so the initial
+  # watch or a re-run poll could block indefinitely and a broken main would stay
+  # unreverted with no halt ever reached.
+  #
+  # Tested through a FAKE `timeout` that records its arguments, rather than by sleeping
+  # under the real one: that makes the wiring assertion exact and keeps the suite
+  # runnable on stock macOS, where coreutils' timeout is absent. The runner is Linux
+  # and always takes the bounded path.
+  local _tdir; _tdir=$(mktemp -d)
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "$TO_LOG"\nshift\nexec "$@"\n' > "$_tdir/timeout"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$_tdir/gh"
+  chmod +x "$_tdir/timeout" "$_tdir/gh"; : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
+  [ "$(cat "$_tdir/caps")" = 120 ] \
+    || { echo "FAIL #62: an unarmed deadline must cap a gh call at the 120s default (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
+  # With less than the default left on the deadline, the REMAINDER is the cap -- a
+  # single call must never be allowed to outlive the bound it is supposed to respect.
+  : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) + 30 )) _ci_gh api x >/dev/null 2>&1 )
+  _cap=$(cat "$_tdir/caps")
+  { [ "$_cap" -ge 25 ] && [ "$_cap" -le 30 ]; } \
+    || { echo "FAIL #62: the cap must shrink to the deadline remainder (got '$_cap', expected ~30)"; rm -rf "$_tdir"; exit 1; }
+  # Already past the deadline: still a positive cap, never 0 or negative, which
+  # `timeout` would read as "no limit at all".
+  : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" MAIN_CI_DEADLINE_AT=$(( $(date +%s) - 500 )) _ci_gh api x >/dev/null 2>&1 )
+  [ "$(cat "$_tdir/caps")" -ge 1 ] \
+    || { echo "FAIL #62: a passed deadline must still yield a POSITIVE cap, not 0 (which timeout reads as unlimited)"; rm -rf "$_tdir"; exit 1; }
+  # An unusable BIRCHER_CI_CALL_TIMEOUT must fall back, not disable the cap. Leading
+  # zeros here are the same octal trap as the deadline span.
+  for _bad in "" "abc" "0" "3" "0000060"; do
+    : > "$_tdir/caps"
+    ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" BIRCHER_CI_CALL_TIMEOUT="$_bad" \
+      MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
+    _cap=$(cat "$_tdir/caps")
+    { [ -n "$_cap" ] && [ "$_cap" -ge 5 ]; } 2>/dev/null \
+      || { echo "FAIL #62: unusable BIRCHER_CI_CALL_TIMEOUT '$_bad' must fall back to a sane cap (got '$_cap')"; rm -rf "$_tdir"; exit 1; }
+    # CANONICAL, not merely in range: the cap is handed to `timeout` verbatim, so
+    # "0000060" must have become "60". Asserting only ">= 5" cannot see the difference
+    # and left the base-10 forcing unfalsifiable.
+    case "$_cap" in 0?*) echo "FAIL #62: cap '$_cap' from '$_bad' is not canonical decimal"; rm -rf "$_tdir"; exit 1 ;; esac
+  done
+  # ...and a leading-zero cap must mean its DECIMAL value.
+  : > "$_tdir/caps"
+  ( PATH="$_tdir:$PATH" TO_LOG="$_tdir/caps" BIRCHER_CI_CALL_TIMEOUT=0000060 \
+    MAIN_CI_DEADLINE_AT= _ci_gh api x >/dev/null 2>&1 )
+  [ "$(cat "$_tdir/caps")" = 60 ] \
+    || { echo "FAIL #62: BIRCHER_CI_CALL_TIMEOUT=0000060 must yield a cap of 60 (got '$(cat "$_tdir/caps")')"; rm -rf "$_tdir"; exit 1; }
+  rm -rf "$_tdir"
+  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
   [ "$(_revert_git_args '' 1)" = "" ]                     || { echo "FAIL revert empty-sha (must be blank -> no bare git revert)"; exit 1; }
