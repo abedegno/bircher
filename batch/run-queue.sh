@@ -3073,30 +3073,40 @@ self_test() {
   # closed nothing", so a revert could leave a live defect marked fixed while the
   # log said all was well. 2026-08-12: that also silently unblocked a dependent
   # issue whose fix alone would have shipped a broken app.
-  gh() {
-    case "$*" in
-      *"--json closingIssuesReferences"*)
-        [ "${_GH_LOOKUP_FAILS:-0}" = 1 ] && return 4
-        printf '%s\n' ${_GH_ISSUES:-} ;;
-      *"issue reopen"*) [ "${_GH_REOPEN_FAILS:-0}" = 1 ] && return 5; return 0 ;;
-      *) return 0 ;;
-    esac
-  }
+  # A PATH SHIM, not a shell function. #62 routed these calls through `_net_run`, which
+  # uses `timeout` -- and `timeout` execs a BINARY, so it cannot see a shell function.
+  # On macOS `timeout` is absent and the wrapper falls through, so a function shim kept
+  # passing locally while the same test failed on the Linux runner, where the real `gh`
+  # was invoked instead of the stub. Modelling production (gh IS a binary) makes the
+  # test exercise the wrapper rather than bypass it.
+  local _g50; _g50=$(mktemp -d)
+  cat >"$_g50/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"--json closingIssuesReferences"*)
+    [ "${_GH_LOOKUP_FAILS:-0}" = 1 ] && exit 4
+    printf '%s\n' ${_GH_ISSUES:-} ;;
+  *"issue reopen"*) [ "${_GH_REOPEN_FAILS:-0}" = 1 ] && exit 5; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$_g50/gh"
   local _out
-  _GH_ISSUES="41 42" _out=$(_reopen_reverted_issues 99 2>&1)
+  export _GH_ISSUES _GH_LOOKUP_FAILS _GH_REOPEN_FAILS
+  _GH_ISSUES="41 42" _out=$(PATH="$_g50:$PATH" _reopen_reverted_issues 99 2>&1)
   printf '%s' "$_out" | grep -q "reopened issue #41" \
     || { echo "FAIL #50: did not reopen the first closed issue"; exit 1; }
   printf '%s' "$_out" | grep -q "reopened issue #42" \
     || { echo "FAIL #50: did not reopen the second closed issue"; exit 1; }
 
-  _GH_ISSUES="" _out=$(_reopen_reverted_issues 99 2>&1)
+  _GH_ISSUES="" _out=$(PATH="$_g50:$PATH" _reopen_reverted_issues 99 2>&1)
   printf '%s' "$_out" | grep -q "closed no issues" \
     || { echo "FAIL #50: a PR that closed nothing should say so"; exit 1; }
   printf '%s' "$_out" | grep -qi "WARN" \
     && { echo "FAIL #50: closing nothing is not a warning"; exit 1; }
 
   # The distinction that matters: a lookup FAILURE must not read as "nothing to do".
-  _GH_LOOKUP_FAILS=1 _out=$(_reopen_reverted_issues 99 2>&1)
+  _GH_LOOKUP_FAILS=1 _out=$(PATH="$_g50:$PATH" _reopen_reverted_issues 99 2>&1)
   printf '%s' "$_out" | grep -qi "WARN.*could NOT look up" \
     || { echo "FAIL #50: a failed lookup must warn, not report silence"; exit 1; }
   printf '%s' "$_out" | grep -q "closed no issues" \
@@ -3104,32 +3114,39 @@ self_test() {
 
   # NB: these are assignments, not command prefixes, so they persist between
   # cases -- reset the previous one explicitly or it leaks into this test.
-  _GH_LOOKUP_FAILS=0 _GH_ISSUES="41" _GH_REOPEN_FAILS=1 _out=$(_reopen_reverted_issues 99 2>&1)
+  _GH_LOOKUP_FAILS=0 _GH_ISSUES="41" _GH_REOPEN_FAILS=1 _out=$(PATH="$_g50:$PATH" _reopen_reverted_issues 99 2>&1)
   printf '%s' "$_out" | grep -qi "WARN.*could NOT reopen issue #41" \
     || { echo "FAIL #50: a failed reopen must warn"; exit 1; }
-  unset -f gh
-  unset _GH_ISSUES _GH_LOOKUP_FAILS _GH_REOPEN_FAILS
+  rm -rf "$_g50"
+  unset _GH_ISSUES _GH_LOOKUP_FAILS _GH_REOPEN_FAILS _g50
   echo "_reopen_reverted_issues OK (#50)"
 
   # _rerun_main_ci itself must report `unknown`, not `red`, when it never obtained a
   # verdict -- the stub above replaces the whole function, so this exercises its own
   # dispatch path. `red` here is what let a rate limit read as regression evidence.
-  gh() {
-    case "$*" in
-      *"run list"*)  [ "${_GH_NO_RUN:-0}" = 1 ] && return 0; echo 12345 ;;
-      *"run rerun"*) return "${_GH_RERUN_RC:-0}" ;;
-      *) return 0 ;;
-    esac
-  }
+  # PATH shim, not a shell function -- see the note in the #50 block: `_ci_gh` wraps
+  # these in `timeout`, which execs a binary and cannot see a function.
+  local _g52; _g52=$(mktemp -d)
+  cat >"$_g52/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"run list"*)  [ "${_GH_NO_RUN:-0}" = 1 ] && exit 0; echo 12345 ;;
+  *"run rerun"*) exit "${_GH_RERUN_RC:-0}" ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$_g52/gh"
   # Run in subshells with REPO/MAIN_CI_TIMEOUT scoped in: the function reads both,
   # and the suite does not set them globally.
-  _out=$( REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=1; _rerun_main_ci deadbeef 2>/dev/null )
+  _out=$( PATH="$_g52:$PATH"; REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=1
+          export PATH _GH_NO_RUN; _rerun_main_ci deadbeef 2>/dev/null )
   [ "$_out" = unknown ] \
     || { echo "FAIL #52: no run found must be unknown, not '$_out'"; exit 1; }
-  _out=$( REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=0 _GH_RERUN_RC=1; _rerun_main_ci deadbeef 2>/dev/null )
+  _out=$( PATH="$_g52:$PATH"; REPO=demo/demo MAIN_CI_TIMEOUT=1 _GH_NO_RUN=0 _GH_RERUN_RC=1
+          export PATH _GH_NO_RUN _GH_RERUN_RC; _rerun_main_ci deadbeef 2>/dev/null )
   [ "$_out" = unknown ] \
     || { echo "FAIL #52: a failed rerun dispatch must be unknown, not '$_out'"; exit 1; }
-  unset -f gh
+  rm -rf "$_g52"; unset _g52
 
   # --- #52: retries prove transience causally; no verdict must never revert -----
   # State lives in a FILE: the helper calls the stub inside $( ), so a variable
