@@ -400,6 +400,16 @@ _commit_ci_lines() {
   # and data records must not share an unescaped namespace.
   local raw dedup bad
   raw=$(gh api "repos/$REPO/commits/$sha/status" 2>/dev/null) || return 1
+  # Validate the payload SHAPE before extracting. `gh api` can return rc 0 with an
+  # empty body, and jq exits 0 with no output on zero inputs -- so an empty or
+  # degraded response would silently become "no statuses", and a required
+  # status-backed context would then match nothing, fall back to all checks, and
+  # read GREEN. Rejects: empty body, `null`, a non-object, a missing `.statuses`,
+  # and an error object such as {"message":"Not Found"} that is valid JSON.
+  printf '%s' "$raw" | jq -e 'type == "object" and (.statuses | type == "array")' >/dev/null 2>&1 || {
+    echo "[batch] WARN: unusable status payload for $sha -> failing closed" >&2
+    return 1
+  }
   dedup='[.statuses[]] | to_entries | map(.value + {_i: .key})
          | group_by(.context) | map(sort_by([.updated_at, (0 - ._i)]) | last)[]'
   statuses=$(printf '%s' "$raw" | jq -r "$dedup"'
@@ -3267,6 +3277,9 @@ filter=""; nx=0
 for a in "$@"; do [ "$nx" = 1 ] && { filter="$a"; nx=0; }; [ "$a" = "-q" ] && nx=1; done
 runs_json="${FAKE_RUNS_JSON-}";     [ -n "$runs_json" ]     || runs_json='{"check_runs":[]}'
 status_json="${FAKE_STATUS_JSON-}"; [ -n "$status_json" ]   || status_json='{"statuses":[]}'
+# FAKE_STATUS_BODY lets a test emit a DEGRADED body (empty, null, an error object)
+# that the ${VAR:-default} fallback above would otherwise replace.
+[ -n "${FAKE_STATUS_BODY+set}" ] && status_json="$FAKE_STATUS_BODY"
 case "$*" in
   *"/check-runs"*) [ "${FAKE_RUNS_RC:-0}" = 0 ] || exit 1
                    printf '%s' "$runs_json"   | jq -r "$filter"; exit $? ;;
@@ -3347,6 +3360,19 @@ SH
     || { echo "FAIL _commit_ci_lines: a context named like the old sentinel must survive as a normal record"; rm -rf "$cdir"; exit 1; }
   [ "$(_checkrun_state "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl | sed 's/^[^|]*|//')")" = red ] \
     || { echo "FAIL _commit_ci_lines: sentinel-named failing context must still read red"; rm -rf "$cdir"; exit 1; }
+  # A DEGRADED status response must fail closed, not read as "no statuses".
+  # `gh api` can return rc 0 with an empty body, and jq exits 0 with no output on
+  # zero inputs -- so without a shape check a required status-backed context would
+  # match nothing, fall back to all checks, and read GREEN.
+  for _body in "" "null" "{}" '{"statuses":null}' '{"message":"Not Found"}'; do
+    FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+      FAKE_STATUS_BODY="$_body" _cl >/dev/null 2>&1 \
+      && { echo "FAIL _commit_ci_lines: degraded status body '${_body:-<empty>}' must fail closed"; rm -rf "$cdir"; exit 1; }
+  done
+  # ...but a well-formed EMPTY list is legitimate (merge commits have none).
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+       FAKE_STATUS_BODY='{"statuses":[]}' _cl)" = "server|completed|success" ] \
+    || { echo "FAIL _commit_ci_lines: an empty statuses ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
   # --- B-2v2/B-3v2: limit-message matcher + usage-aware vendor pick -----------
