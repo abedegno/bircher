@@ -1606,7 +1606,11 @@ merge_ready_pr() {
     # A failed protection lookup is recoverable: retry it EVERY poll (the 30s interval
     # already rate-limits it to the same cadence as the CI fetch beside it) until it
     # answers, so a transient outage does not cost the whole phase.
-    if [ "$MAIN_SNAP_STATE" = unknown ]; then
+    # Gated on the list being SET. The snapshot only matters for the completeness gate,
+    # and `mreq` was fetched once per phase before this change -- so retrying it on an
+    # opted-OUT repo would add an API call per poll during a protection outage, which is
+    # a behaviour change on repos whose whole guarantee is that nothing changed.
+    if [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] && [ "$MAIN_SNAP_STATE" = unknown ]; then
       _snap=$(_required_contexts_snapshot)
       MAIN_SNAP_STATE=${_snap%%$'\n'*}
       MAIN_SNAP_NAMES=${_snap#*$'\n'}; [ "$MAIN_SNAP_STATE" = known ] || MAIN_SNAP_NAMES=""
@@ -2540,7 +2544,7 @@ _rerun_main_ci() {
     # could contradict the watch that triggered it -- and re-create the #43 stall
     # that filtering exists to prevent. Selecting a workflow to re-run and
     # deciding whether main is green are separate concerns.
-    if [ "$_rr_state" = unknown ]; then
+    if [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] && [ "$_rr_state" = unknown ]; then
       _rr_snap=$(_required_contexts_snapshot)
       _rr_state=${_rr_snap%%$'\n'*}
       _rr_names=${_rr_snap#*$'\n'}; [ "$_rr_state" = known ] || _rr_names=""
@@ -5946,6 +5950,34 @@ plugins (python) gate|in_progress|'
   [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nDependabot')" _expected_set known "$(printf 'a\nDependabot')" | tr -d '\n')" = a ] \
     || { echo "FAIL #70: an ignore-listed context must be subtracted from the expected set"; exit 1; }
   unset _ec_lines
+  # OPT-OUT MUST COST NOTHING. With the list unset, an unreadable protection endpoint
+  # must not add a lookup per poll: `mreq` was fetched once per phase before #70, and a
+  # repo whose entire guarantee is "nothing changed" should not start paying for a
+  # feature it has not enabled. Counted, because the alternative is asserting it in prose.
+  local _pd; _pd=$(mktemp -d); : > "$_pd/prot"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *"/protection"*) echo x >> "$PROT_LOG"; echo "HTTP 500 broke" >&2; exit 1 ;; esac' \
+    'case "$*" in *mergeable*) echo MERGEABLE; exit 0 ;; *"/check-runs"*) printf "%s" "[{\"check_runs\":[{\"name\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]}]"; exit 0 ;; esac' \
+    'case "$*" in *mergeCommit*) echo mergesha7654321; exit 0 ;; *headRefOid*) echo headsha1234567; exit 0 ;; esac' \
+    'case "$*" in *"/status"*) printf "%s" "[{\"statuses\":[]}]"; exit 0 ;; esac' \
+    'exit 0' > "$_pd/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_pd/timeout"
+  chmod +x "$_pd/gh" "$_pd/timeout"
+  ( PATH="$_pd:$PATH"; export PATH; PROT_LOG="$_pd/prot"; export PROT_LOG
+    REPO=demo/demo MAIN_CI_SETTLE_TIMEOUT=4 MAIN_CI_POLL_INTERVAL=1 BIRCHER_MAIN_CI_RERUN=0 \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  _pn=$(wc -l < "$_pd/prot" | tr -d ' ')
+  [ "$_pn" -le 1 ] \
+    || { echo "FAIL #70: with the list UNSET, a failing protection lookup was retried $_pn times (expected 1 per phase)"; rm -rf "$_pd"; exit 1; }
+  # ...and with the list SET it MUST retry, or a transient outage costs the whole phase.
+  : > "$_pd/prot"
+  ( PATH="$_pd:$PATH"; export PATH; PROT_LOG="$_pd/prot"; export PROT_LOG
+    REPO=demo/demo MAIN_CI_SETTLE_TIMEOUT=4 MAIN_CI_POLL_INTERVAL=1 BIRCHER_MAIN_CI_RERUN=0 \
+      BIRCHER_MAIN_EXPECTED_CONTEXTS='server (go)' \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ "$(wc -l < "$_pd/prot" | tr -d ' ')" -ge 2 ] \
+    || { echo "FAIL #70: with the list SET, an unreadable protection endpoint must be retried each poll"; rm -rf "$_pd"; exit 1; }
+  rm -rf "$_pd"; unset _pd _pn
   echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
