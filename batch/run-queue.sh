@@ -2208,9 +2208,19 @@ _REQUIRED_CONTEXTS_LOADED=""
 # `known` cannot be mistaken for the state -- the distinction #67's __MALFORMED_CONTEXT__
 # failure was actually about.
 #
+# BOTH representations. GitHub's `status-check-policy` carries `contexts` (names) AND
+# `checks` (`{context, app_id}`, which pins a check to a producing app). Reading only
+# `contexts` would drop any check configured through the app-bound form: the operator's
+# declared context would then fail the intersection, be silently removed from the
+# expected set, and #70's gate would not apply to it at all -- the exact defect this
+# issue exists to close, reintroduced one layer down. Unioned and deduplicated, so the
+# two agree when GitHub keeps them in sync and nothing is lost when it does not.
+#
 # 404 is an ANSWER, not a failure: an unprotected branch returns it, and treating that as
 # `unknown` would hold every merge on a repo that simply has no branch protection. Any
-# other error is `unknown`.
+# other error is `unknown`. NOTE a token lacking permission to READ protection also gets
+# 404, not 403 -- observed directly. That lands in `empty`, which for #70 fails SAFE: the
+# declared list is then used unintersected, so the completeness gate still applies.
 _required_contexts_snapshot() {
   # ONE call. A first cut ran gh twice -- once for stderr, once for stdout -- which both
   # doubles the cost and lets the two observations disagree. stderr goes to a temp file
@@ -2219,7 +2229,7 @@ _required_contexts_snapshot() {
   local out err rc tmp
   tmp=$(mktemp 2>/dev/null) || { printf 'unknown\n'; return; }
   out=$(_ci_gh api "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
-        --jq '.required_status_checks.contexts[]?' 2>"$tmp"); rc=$?
+        --jq '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique[]' 2>"$tmp"); rc=$?
   err=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
   if [ "$rc" -ne 0 ]; then
     if _contains "$err" 'Branch not protected' || _contains "$err" 'HTTP 404'; then
@@ -2295,7 +2305,7 @@ _required_contexts() {
     # deadline unarmed (the PR path) the cap is simply the 120s default.
     _REQUIRED_CONTEXTS_CACHE=$(_ci_gh api \
       "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
-      --jq '.required_status_checks.contexts[]?' 2>/dev/null) || _REQUIRED_CONTEXTS_CACHE=""
+      --jq '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique[]' 2>/dev/null) || _REQUIRED_CONTEXTS_CACHE=""
   fi
   printf '%s' "$_REQUIRED_CONTEXTS_CACHE"
 }
@@ -5978,6 +5988,39 @@ plugins (python) gate|in_progress|'
   [ "$(wc -l < "$_pd/prot" | tr -d ' ')" -ge 2 ] \
     || { echo "FAIL #70: with the list SET, an unreadable protection endpoint must be retried each poll"; rm -rf "$_pd"; exit 1; }
   rm -rf "$_pd"; unset _pd _pn
+  # APP-BOUND REQUIRED CHECKS. GitHub's status-check-policy carries `contexts` (names)
+  # AND `checks` ({context, app_id}). Reading only `contexts` drops any check configured
+  # through the app-bound form: the operator's declared context then fails the
+  # intersection, is silently removed from the expected set, and #70's gate does not
+  # apply to it -- this issue's own defect, reintroduced one layer down. The fixture puts
+  # the delayed context ONLY in `checks`.
+  local _ad; _ad=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in' \
+    '  *"/protection"*)' \
+    '    # Honour the caller'"'"'s --jq, as real `gh api` does. A first version applied' \
+    '    # the union expression INSIDE the shim, so it returned both contexts whatever' \
+    '    # the production code asked for -- and the mutation reverting the union to' \
+    '    # .contexts-only was scored as caught while never being exercised.' \
+    '    JQ=""; nx=0; for a in "$@"; do [ "$nx" = 1 ] && { JQ="$a"; nx=0; }; [ "$a" = "--jq" ] && nx=1; done' \
+    '    printf "%s" "$PROT_JSON" | jq -r "${JQ:-.}"; exit 0 ;;' \
+    '  *mergeable*) echo MERGEABLE; exit 0 ;;' \
+    '  *mergeCommit*) echo mergesha7654321; exit 0 ;;' \
+    '  *headRefOid*) echo headsha1234567; exit 0 ;;' \
+    '  *"/status"*) printf "%s" "[{\"statuses\":[]}]"; exit 0 ;;' \
+    '  *"/check-runs"*) printf "%s" "[{\"check_runs\":[{\"name\":\"unit\",\"status\":\"completed\",\"conclusion\":\"success\"}]}]"; exit 0 ;;' \
+    'esac' 'exit 0' > "$_ad/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_ad/timeout"
+  chmod +x "$_ad/gh" "$_ad/timeout"
+  ( PATH="$_ad:$PATH"; export PATH
+    PROT_JSON='{"required_status_checks":{"contexts":["unit"],"checks":[{"context":"unit"},{"context":"e2e"}]}}'
+    export PROT_JSON
+    REPO=demo/demo MAIN_CI_SETTLE_TIMEOUT=3 MAIN_CI_POLL_INTERVAL=1 BIRCHER_MAIN_CI_RERUN=0 \
+      BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'unit\ne2e')" \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #70: an app-bound required check (present only in .checks) was dropped, so the gate did not apply"; rm -rf "$_ad"; exit 1; }
+  rm -rf "$_ad"; unset _ad
   echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
