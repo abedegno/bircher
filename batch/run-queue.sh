@@ -5617,6 +5617,20 @@ SH
   [ "$_kg" = 2 ] \
     || { echo "FAIL #71: both timeout wrappers must clamp the kill grace (found $_kg)"; exit 1; }
   unset _kg
+  # LEADING ZEROS END TO END. `_clamp_int` canonicalises (it reassigns v=$((10#$v))
+  # before printing), so `$(( now + span ))` inside _arm_deadline cannot re-read the
+  # value as octal -- the #62 defect cannot come back through the generalised helper.
+  # Review flagged this as a regression; it was not, but the class is real enough that
+  # the invariant is now pinned rather than argued.
+  for _lz in 00007200 0000600 0000060; do
+    _c=$(_clamp_int "$_lz" 600 60 9999999)
+    case "$_c" in 0?*) echo "FAIL #71: _clamp_int returned non-canonical '$_c' for '$_lz'"; exit 1 ;; esac
+    _armed=""; _arm_deadline _armed "$_c"
+    _span=$(( _armed - $(date +%s) ))
+    [ "$_span" -ge $(( _c - 2 )) ] && [ "$_span" -le $(( _c + 2 )) ] \
+      || { echo "FAIL #71: BUDGET='$_lz' armed ${_span}s, expected ~${_c}s (octal re-interpretation?)"; exit 1; }
+  done
+  unset _lz _c _armed _span
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
