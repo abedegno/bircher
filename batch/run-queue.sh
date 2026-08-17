@@ -2907,6 +2907,25 @@ self_test() {
   # merge silently started costing a 30s poll, and an unparseable green would have cost
   # an hour. Bound the settle loop and shrink the interval for the whole suite.
   MAIN_CI_SETTLE_TIMEOUT=5; MAIN_CI_POLL_INTERVAL=1
+  # CALL-SITE STRUCTURE FIRST. These are instant, and they must run before any test that
+  # could hang: stripping the merge-sha clamp makes a later behavioural test hot-loop
+  # for two hours, so placed after it these assertions would never be reached.
+  # STRUCTURAL, because the behavioural version of this one cannot fail fast. Strip the
+  # clamp from the merge-sha retry and `[ n -ge abc ]` errors every iteration, so the
+  # break never fires and the loop hot-polls the API until the 7200s deadline: the test
+  # "catches" it by hanging for two hours. A hang is not a regression test -- it is slow,
+  # it says nothing about what broke, and it burns API quota to say it. This fails in
+  # milliseconds and names the call site.
+  _cs=$(declare -f merge_ready_pr)
+  printf '%s\n' "$_cs" | grep -q '_sha_max=\$(_clamp_int' \
+    || { echo "FAIL #62: the merge-sha retry count must go through _clamp_int (a raw value hot-loops to the deadline)"; exit 1; }
+  for _fn in merge_ready_pr _rerun_main_ci _poll_ci; do
+    _cs=$(declare -f "$_fn")
+    printf '%s\n' "$_cs" | grep -q 'MAIN_CI_POLL_INTERVAL' || continue
+    printf '%s\n' "$_cs" | grep 'MAIN_CI_POLL_INTERVAL' | grep -qv '_clamp_int' \
+      && { echo "FAIL #62: $_fn uses MAIN_CI_POLL_INTERVAL without _clamp_int"; exit 1; }
+  done
+  unset _cs _fn
   local m
   # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
   # caller fails closed on that rather than merging an unverified commit.
@@ -4154,15 +4173,12 @@ SH
     || { echo "FAIL #62: a transient empty merge sha must be RETRIED, not halted on first sight"; exit 1; }
   [ "$(cat "$mdir/shacount" 2>/dev/null)" -ge 3 ] \
     || { echo "FAIL #62: the retry never happened (lookup called $(cat "$mdir/shacount" 2>/dev/null) times, expected >=3)"; exit 1; }
-  # HOSTILE CONFIG AT THE CALL SITES. A non-numeric retry count makes `[ n -ge abc ]`
-  # ERROR -- which is non-zero, so the break never fires and the loop runs to the
-  # absolute deadline hammering GitHub. Validated, it clamps to 5 and halts promptly.
-  : > "$mdir/shacount2"
-  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s8" \
-    BIRCHER_STATUS_BACKOFF=0 BIRCHER_MERGE_SHA_TRIES=abc FAKE_NO_SHA=1 \
-    FAKE_SHA_COUNT_FILE="$mdir/shacount2" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
-    [ "$?" -eq 2 ] ) \
-    || { echo "FAIL #62: a non-numeric BIRCHER_MERGE_SHA_TRIES must clamp and halt, not loop to the deadline"; exit 1; }
+  # A non-numeric retry count is covered STRUCTURALLY, not behaviourally -- see the
+  # assertion in the _clamp_int block. Driven behaviourally it cannot fail fast:
+  # `[ n -ge abc ]` errors every iteration so the break never fires, and the test
+  # "catches" the regression by hot-polling the API for two hours. Bounding the count
+  # is the property worth asserting, and the structural check asserts it in
+  # milliseconds. What IS driven behaviourally here is the retry itself, above.
   # A hostile POLL INTERVAL must not break the watch: unvalidated, `sleep abc` fails and
   # `waited + abc` is an arithmetic error, so the loop never advances and spins to the
   # settle budget. Validated, it falls back to the PRODUCTION default -- which is 30s,
@@ -5085,9 +5101,8 @@ SH
   [ "$(_clamp_int 86400 30 1 300)" = 30 ]   || { echo "FAIL #62: a huge poll interval must fall back (it would sleep past the deadline)"; exit 1; }
   [ "$(_clamp_int abc 5 1 20)"     = 5 ]    || { echo "FAIL #62: a non-numeric retry count must fall back, not disable the bound"; exit 1; }
   [ "$(_clamp_int 100000 5 1 20)"  = 5 ]    || { echo "FAIL #62: an oversized retry count must clamp"; exit 1; }
-  # ...and the CALL SITES must actually use it. Unit-testing the helper proves nothing
-  # about whether the loops route through it -- both mutations that stripped the call
-  # sites left every assertion above green.
+  # (The call sites are asserted structurally at the top of the suite -- unit-testing
+  # the helper proves nothing about whether the loops route through it.)
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
