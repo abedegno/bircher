@@ -5363,13 +5363,12 @@ SH
   _mb=$(declare -f merge_ready_pr)
   [ "$(printf '%s\n' "$_mb" | grep -c '_deadline_passed "\$PREMERGE_DEADLINE_AT"')" -ge 5 ] \
     || { echo "FAIL #71: merge_ready_pr's pre-merge loops must all consult the phase deadline"; exit 1; }
-  # COUNTING checks is not the property. Two defects survived a count-based assertion:
-  # a bare `sleep 5` immediately after a check crosses the deadline it just tested, and
-  # the reconciliation probe ran with no check at all. Assert the shapes instead.
-  printf '%s\n' "$_mb" | grep -E '^[[:space:]]*(\[|.*\|\|)[[:space:]]*sleep [0-9]' \
-    && { echo "FAIL #71: merge_ready_pr has an UNCAPPED sleep -- it will cross the deadline it just checked"; exit 1; }
-  printf '%s\n' "$_mb" | grep -B2 '_pr_merge_state' | grep -q '_deadline_passed' \
-    || { echo "FAIL #71: the reconciliation probe must check the deadline before its network call"; exit 1; }
+  # NOTE: the count above is a cheap smoke check, NOT the property. Two real defects
+  # once satisfied it -- a bare `sleep 5` immediately after a check, and an unguarded
+  # reconciliation probe -- and a shape-matching replacement was no better: it only
+  # recognised the spellings I happened to write, and would have missed
+  # `delay=5; sleep "$delay"` or `command sleep 5`. The property is enforced
+  # BEHAVIOURALLY below instead.
   printf '%s\n' "$_mb" | grep -q '_arm_deadline PREMERGE_DEADLINE_AT' \
     || { echo "FAIL #71: the pre-merge deadline must be armed"; exit 1; }
   # Armed BEFORE the first network call, or the phase it bounds has already started.
@@ -5444,6 +5443,80 @@ SH
   [ "$(( _t1 - _t0 ))" -le 6 ] \
     || { echo "FAIL #71: the status backoff overran the phase deadline ($(( _t1 - _t0 ))s for a 3s budget)"; rm -rf "$_sd3"; exit 1; }
   rm -rf "$_sd3"; unset _sd3 _t0 _t1
+  # ONCE THE PHASE DEADLINE IS SPENT, merge_ready_pr must neither sleep nor call out.
+  # Behavioural, and spelling-independent: a shimmed clock jumps forward after arming,
+  # and `sleep` and `gh` are instrumented, so ANY wait or call after expiry is caught
+  # however it is written. This replaces a grep for `sleep <digit>`, which only ever
+  # tested the spellings I had used.
+  local _bd; _bd=$(mktemp -d); : > "$_bd/sleeps"; : > "$_bd/ghcalls"; : > "$_bd/n"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'n=$(cat "$DATE_N" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$DATE_N"' \
+    'r=$(/bin/date +%s)' \
+    'if [ "$n" -le 1 ]; then echo "$r"; else echo "$((r + ${DATE_OFFSET:-99999}))"; fi' \
+    > "$_bd/date"
+  printf '#!/usr/bin/env bash\necho "$*" >> "$SLEEP_LOG"\nexit 0\n' > "$_bd/sleep"
+  # The shim must drive the flow THROUGH the mergeability poll and into the merge retry
+  # loop, or that loop's sleep is never exercised -- which is exactly why the first
+  # version of this test scored a real uncapped sleep there as caught when it was not.
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$GH_CALLS"' \
+    'case "$*" in' \
+    '  *mergeable*)          echo "${FAKE_MERGEABLE_OUT:-MERGEABLE}"; exit 0 ;;' \
+    '  *state,headRefOid*)   echo "OPEN|headsha1234567"; exit 0 ;;' \
+    'esac' \
+    'exit 1' > "$_bd/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_bd/timeout"
+  chmod +x "$_bd/date" "$_bd/sleep" "$_bd/gh" "$_bd/timeout"
+  ( PATH="$_bd:$PATH"; export PATH
+    DATE_N="$_bd/n"; DATE_OFFSET=99999; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
+    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS
+    REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ ! -s "$_bd/sleeps" ] \
+    || { echo "FAIL #71: merge_ready_pr slept $(wc -l < "$_bd/sleeps") time(s) after the phase deadline expired"; rm -rf "$_bd"; exit 1; }
+  # THE DURATION, not just the timing. The instrumented sleep returns instantly, so a
+  # fake clock alone cannot show an overrun -- an uncapped `sleep 5` issued with 2s left
+  # looks identical to a capped one. Asserting the ARGUMENT catches it however it is
+  # spelled: `sleep 5`, `_d=5; sleep "$_d"`, `command sleep "$((5))"` all log 5.
+  # DATE_OFFSET=598 against a 600s budget leaves ~2s remaining for the whole run.
+  : > "$_bd/sleeps"; : > "$_bd/n3"
+  ( PATH="$_bd:$PATH"; export PATH
+    DATE_N="$_bd/n3"; DATE_OFFSET=598; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
+    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS
+    REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  _check_sleeps() { # <log> <label>
+    local _slp
+    while IFS= read -r _slp; do
+      [ -n "$_slp" ] || continue
+      case "$_slp" in ''|*[!0-9]*) echo "FAIL #71: non-numeric sleep argument '$_slp' ($2)"; rm -rf "$_bd"; exit 1 ;; esac
+      [ "$_slp" -le 2 ] \
+        || { echo "FAIL #71: $2 slept ${_slp}s with only ~2s of phase budget left -- not capped to the remainder"; rm -rf "$_bd"; exit 1; }
+    done < "$1"
+  }
+  _check_sleeps "$_bd/sleeps" "the merge retry loop"
+  # ...and again with mergeability never resolving, which is the ONLY way to reach the
+  # mergeability poll's own sleep. One shim cannot exercise both loops: answering
+  # MERGEABLE skips that poll entirely, and not answering it never reaches the merge.
+  : > "$_bd/sleeps"; : > "$_bd/n4"
+  ( PATH="$_bd:$PATH"; export PATH
+    DATE_N="$_bd/n4"; DATE_OFFSET=598; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
+    FAKE_MERGEABLE_OUT=UNKNOWN
+    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS FAKE_MERGEABLE_OUT
+    REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  _check_sleeps "$_bd/sleeps" "the mergeability poll"
+  unset -f _check_sleeps
+  # ...and the control: with the clock running normally it MUST do work, or the
+  # assertion above would hold for a function that does nothing at all.
+  : > "$_bd/ghcalls"
+  ( PATH="$_bd:$PATH"; export PATH
+    DATE_N="$_bd/n2"; DATE_OFFSET=0; SLEEP_LOG="$_bd/sleeps2"; GH_CALLS="$_bd/ghcalls"
+    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS
+    REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ -s "$_bd/ghcalls" ] \
+    || { echo "FAIL #71: with budget remaining, merge_ready_pr must still call gh"; rm -rf "$_bd"; exit 1; }
+  rm -rf "$_bd"; unset _bd
   rm -rf "$_sd"; unset _sd
   # The kill grace is added to EVERY capped call, so an unvalidated one weakens the
   # whole bound. The honest statement is "deadline plus at most one clamped grace".
