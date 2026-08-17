@@ -1424,7 +1424,9 @@ merge_ready_pr() {
         gh pr view "$pr" --repo "$REPO" --json mergeable -q '.mergeable' 2>/dev/null)
     { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && {
       _deadline_passed "$PREMERGE_DEADLINE_AT" && break
-      [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5; t=$((t + 5)); }
+      # Capped: checking the deadline and THEN sleeping a fixed 5s crosses it by four
+      # when one second remains. The check does not bound the sleep that follows it.
+      [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep "$(_cap_to 5 "$PREMERGE_DEADLINE_AT")"; t=$((t + 5)); }
   done
   if [ "$m" != "MERGEABLE" ]; then
     MERGE_NOTE="merge deferred: mergeable=${m:-unknown}"
@@ -1456,6 +1458,10 @@ merge_ready_pr() {
     # #71: a failed ATTEMPT is not a failed MERGE. The request can complete server-side
     # before the client dies, so ask GitHub before concluding -- otherwise a merged PR
     # is recorded as deferred and its merge commit is never watched.
+    # #71: the reconciliation probe is itself a network call. Reached with the budget
+    # already spent by the merge attempt, `_cap_to` floors it to 1s and it can still
+    # burn another kill grace -- so the phase overran by two graces, not one.
+    _deadline_passed "$PREMERGE_DEADLINE_AT" && break
     case "$(_pr_merge_state "$pr" "$expected_sha")" in
       merged)
         echo "[batch:merge] $item: PR #$pr was already MERGED server-side (the client call failed) -> continuing" >&2
@@ -1470,7 +1476,7 @@ merge_ready_pr() {
         merged=1; break ;;
     esac
     _deadline_passed "$PREMERGE_DEADLINE_AT" && break
-    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep "$(_cap_to 5 "$PREMERGE_DEADLINE_AT")"
     mt=$((mt + 5))
   done
   if [ "$merged" != 1 ]; then
@@ -1506,7 +1512,11 @@ merge_ready_pr() {
     _past_ci_deadline && break
     _sha_try=$((_sha_try + 1))
     echo "[batch:merge] $item: no merge sha for PR #$pr yet (try $_sha_try) -> retrying" >&2
-    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 3
+    # Capped against the CI deadline for the same reason as the pre-merge sleeps: a
+    # fixed sleep after a deadline check crosses the deadline it just tested. The
+    # overshoot here is small against a 7200s budget, but the rule is uniform so the
+    # assertion can be "no bare numeric sleep" rather than a list of exceptions.
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep "$(_cap_to 3 "${MAIN_CI_DEADLINE_AT:-}")"
   done
   # A FAILED lookup is not "no merge sha". The PR is already merged at this point, so an
   # unwatched main is the one outcome that must never be reported as success -- and
@@ -5351,8 +5361,15 @@ SH
   # disabled the sleep counter wins instantly, and with it enabled the test would race
   # the clock and flake.
   _mb=$(declare -f merge_ready_pr)
-  [ "$(printf '%s\n' "$_mb" | grep -c '_deadline_passed "\$PREMERGE_DEADLINE_AT"')" -ge 4 ] \
+  [ "$(printf '%s\n' "$_mb" | grep -c '_deadline_passed "\$PREMERGE_DEADLINE_AT"')" -ge 5 ] \
     || { echo "FAIL #71: merge_ready_pr's pre-merge loops must all consult the phase deadline"; exit 1; }
+  # COUNTING checks is not the property. Two defects survived a count-based assertion:
+  # a bare `sleep 5` immediately after a check crosses the deadline it just tested, and
+  # the reconciliation probe ran with no check at all. Assert the shapes instead.
+  printf '%s\n' "$_mb" | grep -E '^[[:space:]]*(\[|.*\|\|)[[:space:]]*sleep [0-9]' \
+    && { echo "FAIL #71: merge_ready_pr has an UNCAPPED sleep -- it will cross the deadline it just checked"; exit 1; }
+  printf '%s\n' "$_mb" | grep -B2 '_pr_merge_state' | grep -q '_deadline_passed' \
+    || { echo "FAIL #71: the reconciliation probe must check the deadline before its network call"; exit 1; }
   printf '%s\n' "$_mb" | grep -q '_arm_deadline PREMERGE_DEADLINE_AT' \
     || { echo "FAIL #71: the pre-merge deadline must be armed"; exit 1; }
   # Armed BEFORE the first network call, or the phase it bounds has already started.
