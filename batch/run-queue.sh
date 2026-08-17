@@ -5153,7 +5153,7 @@ SH
   # merge-sha or branch-protection call would run unbounded AND leave the deadline
   # unset, so nothing downstream could ever time it out. Asserted structurally because
   # the alternative is driving a full merge with a blocking shim.
-  _body=$(declare -f merge_ready_pr)
+  _body=$(declare -f merge_ready_pr); _body_rc=$?
   _arm_ln=$(printf '%s\n' "$_body" | grep -n '_arm_ci_deadline' | head -1 | cut -d: -f1)
   _view_ln=$(printf '%s\n' "$_body" | grep -n 'pr view .*mergeCommit' | head -1 | cut -d: -f1)
   { [ -n "$_arm_ln" ] && [ -n "$_view_ln" ] && [ "$_arm_ln" -lt "$_view_ln" ]; } \
@@ -5167,8 +5167,15 @@ SH
   # local in merge_ready_pr, which bash's dynamic scoping still shows to every helper
   # called from there (including inside a command substitution) while it vanishes on
   # every return path with no cleanup to forget.
+  # Diagnostics on failure: this assertion failed ONCE on the Linux runner and then
+  # passed four consecutive runs, with the source and `declare -f` rendering verified
+  # identical on both platforms. Unexplained, so a recurrence must say what it actually
+  # saw rather than only that it did not match.
   printf '%s\n' "$_body" | grep -q 'local MAIN_CI_DEADLINE_AT' \
-    || { echo "FAIL #62: MAIN_CI_DEADLINE_AT must be LOCAL to merge_ready_pr, or it leaks into the next item"; rm -rf "$_tdir"; exit 1; }
+    || { echo "FAIL #62: MAIN_CI_DEADLINE_AT must be LOCAL to merge_ready_pr, or it leaks into the next item"
+         echo "  diag: _body is ${#_body} chars; declare -f rc was ${_body_rc:-?}; bash ${BASH_VERSION}"
+         printf '  diag: first 3 lines of _body: %s\n' "$(printf '%s\n' "$_body" | head -3 | tr '\n' '~')"
+         rm -rf "$_tdir"; exit 1; }
   declare -f _arm_ci_deadline | grep -q 'export MAIN_CI_DEADLINE_AT' \
     && { echo "FAIL #62: _arm_ci_deadline must not EXPORT the deadline (that is the leak)"; rm -rf "$_tdir"; exit 1; }
   # Prove the scoping actually works both ways: visible to a helper called through a
@@ -5280,7 +5287,7 @@ SH
   fi
   unset _edir
   rm -rf "$_tdir"
-  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _arm_ln _view_ln _inner_cap _unbounded _res _ddir2
+  unset _bad _err _rc _ddir _rdir _rr _tdir _cap _n _body _body_rc _arm_ln _view_ln _inner_cap _unbounded _res _ddir2
   # _clamp_int is the single validated path for every numeric knob on this branch --
   # the same defect was found independently in the first two before it existed.
   [ "$(_clamp_int 42 7 1 100)"     = 42 ]   || { echo "FAIL clamp: a valid value must pass through"; exit 1; }
