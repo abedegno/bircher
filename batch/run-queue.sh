@@ -238,9 +238,30 @@ _extract_verdict() {
 # No checks at all (empty) -> pending: CI has not registered yet, do not review.
 _normalize_ci() {
   local buckets="$1"
-  [ -z "${buckets//[[:space:]]/}" ] && { echo pending; return; }
-  if printf '%s\n' "$buckets" | grep -qE '^(fail|cancel)$'; then echo red; return; fi
-  if printf '%s\n' "$buckets" | grep -qE '^pending$'; then echo pending; return; fi
+  # `case`, not `${buckets//[[:space:]]/}`: that global substitution walks and rebuilds
+  # the whole string and is pathologically slow on a large one -- a 140KB input took
+  # minutes, which is how it was found. A single pattern match answers the same question
+  # ("is there any non-whitespace character?") in one pass. Buckets are normally tiny, so
+  # this never bit in production, but the SIGPIPE fixture below has to be big.
+  case "$buckets" in *[![:space:]]*) : ;; *) echo pending; return ;; esac
+  # PIPE-FREE, and this one is not cosmetic. Under `set -o pipefail`, `grep -q` exits
+  # the instant it matches and the producing `printf` takes SIGPIPE; the pipeline then
+  # reports FAILURE despite the match. On this function that inverts a merge-safety
+  # verdict: a bucket list beginning with `fail` matches, grep exits, printf dies at 141,
+  # the `if` is skipped -- and so is the pending check, for the same reason -- and red CI
+  # is reported GREEN. Whether it fires depends on buffer size and scheduling, so it
+  # would present as a rare, unreproducible bad merge.
+  local line red=0 pend=0
+  while IFS= read -r line; do
+    case "$line" in
+      fail|cancel) red=1 ;;
+      pending)     pend=1 ;;
+    esac
+  done <<EOF
+$buckets
+EOF
+  [ "$red" = 1 ]  && { echo red; return; }
+  [ "$pend" = 1 ] && { echo pending; return; }
   echo green
 }
 
@@ -874,7 +895,8 @@ _send_retry_decision() {
 # signature a coordinator emits as its FIRST message when the window is
 # exhausted (run #11: "You've hit your session limit / resets 6pm ...").
 _is_limit_message() {
-  printf '%s' "$1" | grep -qiE "hit your (session|usage|weekly) limit|usage limit (reached|hit)" \
+  # grep -c reads to EOF, so the producer cannot be SIGPIPEd mid-write (see _contains).
+  [ "$(printf '%s' "$1" | grep -ciE "hit your (session|usage|weekly) limit|usage limit (reached|hit)")" != 0 ] \
     && echo yes || echo no
 }
 
@@ -1119,7 +1141,10 @@ _upload_bundle() {
   # means no status was appended (e.g. a stubbed curl), so fall through to the
   # body unchanged rather than eating the first line of the response.
   code=$(printf '%s' "$resp" | tail -n1)
-  if printf '%s' "$code" | grep -qE '^[0-9]{3}$'; then
+  # Pure parameter expansion rather than `printf | grep -q`: the pipeline form is
+  # SIGPIPE-flaky under pipefail (see _contains), and "exactly three digits" needs no
+  # subprocess at all.
+  if [ "${#code}" = 3 ] && [ -z "${code//[0-9]/}" ]; then
     resp=$(printf '%s' "$resp" | sed '$d')
     case "$code" in
       200|201) : ;;
@@ -1248,10 +1273,13 @@ _post_cross_review_status() {
     # confirmation, so the caller merges best-effort and branch protection decides --
     # which is the existing conservative path, not a new one.
     _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
-    if _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+    # grep -c (not -q) so the producer is never SIGPIPEd mid-write, and the COUNT is
+    # compared rather than the pipeline's exit status -- the failure mode that can turn
+    # a landed status into an unconfirmed one, and red CI into green in _normalize_ci.
+    if [ "$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
          gh api "repos/$REPO/commits/$sha/status" \
          -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
-         | grep -qx 'success'; then
+         | grep -cx 'success')" != 0 ]; then
       echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
       return 0
     fi
@@ -2843,7 +2871,7 @@ ${prompt}"
       # Only markers posted by THIS run count (issue #47). A stale marker from an
       # earlier run must not short-circuit the session now in flight.
       local body; body=$(_marker_bodies_since "$pr" "$start")
-      if printf '%s' "$body" | grep -q 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
+      if _contains "$body" 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
       if [ "$polls" = 1 ] \
          && gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null \
             | grep -q 'bircher-status:'; then
@@ -2956,7 +2984,7 @@ ${prompt}"
     # earlier run is not this run's verdict, and adopting it here would record a
     # stale outcome as if the session had produced it.
     local _fb; _fb=$(_marker_bodies_since "$pr" "$start")
-    printf '%s' "$_fb" | grep -q 'bircher-status:' && marker=$(parse_marker "$_fb")
+    _contains "$_fb" 'bircher-status:' && marker=$(parse_marker "$_fb")
   fi
 
   local outcome ci_first review rounds note
@@ -3361,6 +3389,27 @@ self_test() {
   [ "$(_normalize_ci $'pass\nfail')"    = "red"     ] || { echo "FAIL _normalize_ci red"; exit 1; }
   [ "$(_normalize_ci $'pass\npending')" = "pending" ] || { echo "FAIL _normalize_ci pending"; exit 1; }
   [ "$(_normalize_ci '')"               = "pending" ] || { echo "FAIL _normalize_ci empty->pending"; exit 1; }
+  # SIGPIPE REGRESSION. This was `printf | grep -qE '^(fail|cancel)$'` under
+  # `set -o pipefail`. grep exits the instant it matches, so if the producing printf
+  # still has output buffered it takes SIGPIPE and the pipeline reports FAILURE despite
+  # the match -- and the pending check dies the same way. Red CI was then reported
+  # GREEN, on the merge-safety path.
+  #
+  # The input must EXCEED THE PIPE BUFFER (64KB on Linux) for the producer to still be
+  # writing when grep exits; a few thousand short lines fit entirely inside it and never
+  # reproduce the fault. Hence ~140KB of padding, built with awk because bash string
+  # concatenation in a loop is quadratic and made this test the slowest thing in the
+  # suite before I noticed.
+  _pad=$(awk 'BEGIN{for(i=0;i<3000;i++) printf "pass-%039d\n", i}')
+  [ "${#_pad}" -gt 65536 ] \
+    || { echo "FAIL _normalize_ci: the SIGPIPE fixture (${#_pad} bytes) is under the pipe buffer and proves nothing"; exit 1; }
+  [ "$(_normalize_ci "$(printf 'fail\n%s' "$_pad")")" = "red" ] \
+    || { echo "FAIL _normalize_ci: a large list starting with 'fail' must be RED, not green (SIGPIPE regression)"; exit 1; }
+  [ "$(_normalize_ci "$(printf 'pending\n%s' "$_pad")")" = "pending" ] \
+    || { echo "FAIL _normalize_ci: a large list starting with 'pending' must be PENDING, not green"; exit 1; }
+  [ "$(_normalize_ci "$(printf 'pending\nfail\n%s' "$_pad")")" = "red" ] \
+    || { echo "FAIL _normalize_ci: red must outrank pending in a large list"; exit 1; }
+  unset _pad
   [ "$(_classify_ci_failure 0)" = infra ]   || { echo "FAIL _classify_ci_failure 0->infra"; exit 1; }
   [ "$(_classify_ci_failure 3)" = genuine ] || { echo "FAIL _classify_ci_failure 3->genuine"; exit 1; }
   [ "$(_classify_ci_failure '')" = infra ]  || { echo "FAIL _classify_ci_failure empty->infra"; exit 1; }
