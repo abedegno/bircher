@@ -2232,9 +2232,17 @@ _required_contexts_snapshot() {
         --jq '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique[]' 2>"$tmp"); rc=$?
   err=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
   if [ "$rc" -ne 0 ]; then
-    if _contains "$err" 'Branch not protected' || _contains "$err" 'HTTP 404'; then
+    # ONLY the message GitHub returns for a genuinely unprotected branch counts as an
+    # authoritative empty set. A blanket "HTTP 404" was too permissive: a token that
+    # cannot READ protection also gets 404 (observed directly), and classifying that as
+    # `empty` would use the declared list UNINTERSECTED -- letting a stale, misspelled or
+    # PR-only entry gate on a context branch protection never required, and turning a
+    # permission regression into a multi-hour halt after a healthy merge. Indistinguishable
+    # 404s are `unknown`, which holds pending and says why.
+    if _contains "$err" 'Branch not protected'; then
       printf 'empty\n'
     else
+      _contains "$err" '404' && echo "[batch] WARN: branch protection returned 404 but not 'Branch not protected' -> treating as UNREADABLE, not unprotected (token permissions?)" >&2
       printf 'unknown\n'
     fi
     return
@@ -6020,6 +6028,47 @@ plugins (python) gate|in_progress|'
       merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     [ "$?" -ne 0 ] ) \
     || { echo "FAIL #70: an app-bound required check (present only in .checks) was dropped, so the gate did not apply"; rm -rf "$_ad"; exit 1; }
+  # A PERMISSION 404 is not evidence that the branch is unprotected. Both return 404;
+  # only the message distinguishes them. Misread, a stale or PR-only entry in the
+  # declared list would gate on a context protection never required -- a permission
+  # regression becoming a multi-hour halt after a perfectly healthy merge.
+  local _p4; _p4=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *"/protection"*) echo "$PROT_ERR" >&2; exit 1 ;; esac' 'exit 0' > "$_p4/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_p4/timeout"
+  chmod +x "$_p4/gh" "$_p4/timeout"
+  [ "$( PATH="$_p4:$PATH" PROT_ERR='gh: Branch not protected (HTTP 404)' REPO=demo/demo \
+        _required_contexts_snapshot )" = empty ] \
+    || { echo "FAIL #70: 'Branch not protected' must classify as an authoritative EMPTY set"; rm -rf "$_p4"; exit 1; }
+  [ "$( PATH="$_p4:$PATH" PROT_ERR='gh: Not Found (HTTP 404)' REPO=demo/demo \
+        _required_contexts_snapshot 2>/dev/null )" = unknown ] \
+    || { echo "FAIL #70: a permission 404 must be UNREADABLE, not 'unprotected' -- it would use the declared list unintersected"; rm -rf "$_p4"; exit 1; }
+  [ "$( PATH="$_p4:$PATH" PROT_ERR='gh: Bad gateway (HTTP 502)' REPO=demo/demo \
+        _required_contexts_snapshot 2>/dev/null )" = unknown ] \
+    || { echo "FAIL #70: a non-404 error must be unknown"; rm -rf "$_p4"; exit 1; }
+  # The SECOND union call site. `_required_contexts` feeds the PR path (poll, sibling
+  # reconciliation, recovery) and got the same fix -- but nothing exercised it, so
+  # reverting only that line to `.contexts` was test-invisible even though the commit
+  # deliberately changed it. Driven through a jq-honouring fixture, as real gh api behaves.
+  local _rc2; _rc2=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *"/protection"*)' \
+    '  JQ=""; nx=0; for a in "$@"; do [ "$nx" = 1 ] && { JQ="$a"; nx=0; }; [ "$a" = "--jq" ] && nx=1; done' \
+    '  printf "%s" "$PROT_JSON" | jq -r "${JQ:-.}"; exit 0 ;; esac' 'exit 0' > "$_rc2/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_rc2/timeout"
+  chmod +x "$_rc2/gh" "$_rc2/timeout"
+  _rcout=$( PATH="$_rc2:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":["unit"],"checks":[{"context":"unit"},{"context":"e2e"}]}}' \
+    _REQUIRED_CONTEXTS_LOADED= _REQUIRED_CONTEXTS_CACHE= _required_contexts )
+  _contains "$_rcout" 'e2e' \
+    || { echo "FAIL #70: _required_contexts dropped an app-bound required check (got '$_rcout')"; rm -rf "$_rc2"; exit 1; }
+  _contains "$_rcout" 'unit' \
+    || { echo "FAIL #70: _required_contexts dropped a legacy context (got '$_rcout')"; rm -rf "$_rc2"; exit 1; }
+  # Deduplicated: `unit` appears in BOTH representations and must be listed once.
+  [ "$(printf '%s\n' "$_rcout" | grep -c '^unit$')" = 1 ] \
+    || { echo "FAIL #70: a context in both .contexts and .checks must be deduplicated"; rm -rf "$_rc2"; exit 1; }
+  rm -rf "$_rc2"; unset _rc2 _rcout
+  rm -rf "$_p4"; unset _p4
   rm -rf "$_ad"; unset _ad
   echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
