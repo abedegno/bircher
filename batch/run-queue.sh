@@ -429,39 +429,64 @@ EOF
 # unreadable clock would arm the deadline near epoch 0, expiring instantly and halting a
 # healthy merge before its watch began. Both are configuration-reachable, since the span
 # is a documented environment override.
-_arm_ci_deadline() {
-  local now span="${MAIN_CI_ABSOLUTE_DEADLINE:-}"
+_arm_deadline() {
+  local __var="$1" span="$2" now
   now=$(date +%s 2>/dev/null)
   case "$now" in
     ''|*[!0-9]*)
-      # ASSIGN empty, never `unset`. `unset` on a dynamically scoped local HIDES that
-      # local and re-exposes an outer variable of the same name -- so a stale expired
-      # deadline left in the environment would spring back into view here, give every
-      # subsequent call a one-second cap, and halt a successfully merged PR as
-      # unresolved. Assignment leaves this frame's binding in place and empty.
-      MAIN_CI_DEADLINE_AT=""
-      echo "[batch] WARN: cannot read the clock -> main-CI absolute deadline NOT armed (the per-loop budgets still bound every wait)" >&2
+      # ASSIGN empty, never `unset`: unset on a dynamically scoped local HIDES it and
+      # re-exposes an outer variable of the same name, so a stale expired deadline in
+      # the environment would spring back and cap every later call at one second (#62).
+      printf -v "$__var" '%s' ''
+      echo "[batch] WARN: cannot read the clock -> $__var NOT armed (the per-loop budgets still bound every wait)" >&2
       return 1 ;;
   esac
-  # Magnitude clamp BEFORE the arithmetic, not after: a digits-only value can still be
-  # too large to add without wrapping, and bash wraps to a POSITIVE 19-digit number
-  # rather than erroring, so the overflow looks like a valid far-future instant. Same
-  # lesson as #61b's retry bound.
-  #
-  # Digits FIRST, and not optional: `$((10#abc))` is a FATAL arithmetic error that
-  # aborts the shell outright rather than returning non-zero, so no `||` downstream can
-  # catch it. An earlier revision dropped this check as unfalsifiable -- true at the
-  # time, and false the moment `10#` below arrived and made it load-bearing. Removing it
-  # killed the entire self-test mid-run, silently.
-  span=$(_clamp_int "$span" 7200 60 9999999)
-  # FORCE BASE 10. `$((now + 0000060))` reads the operand as OCTAL: 0000060 arms 48
-  # seconds, not 60, so a leading-zero override lands under the very minimum this
-  # validation exists to enforce; 00007200 arms 3712s. `[ x -ge y ]` compares decimal,
-  # so the range check below cannot see any of it -- the two disagree about what the
-  # string means.
+  printf -v "$__var" '%s' "$(( now + span ))"
+}
+
+_arm_ci_deadline() {
+  local span
+  span=$(_clamp_int "${MAIN_CI_ABSOLUTE_DEADLINE:-}" 7200 60 9999999)
   [ "$span" = "${MAIN_CI_ABSOLUTE_DEADLINE:-}" ] \
     || echo "[batch] WARN: unusable BIRCHER_MAIN_CI_ABSOLUTE_DEADLINE '${MAIN_CI_ABSOLUTE_DEADLINE}' -> using ${span}s" >&2
-  MAIN_CI_DEADLINE_AT=$((now + span))
+  _arm_deadline MAIN_CI_DEADLINE_AT "$span"
+}
+
+# _deadline_passed <epoch> -> rc 0 once that instant has passed.
+#
+# #71: generalised from _past_ci_deadline so the pre-merge phase can have its own wall
+# clock without a third copy of this arithmetic -- the numeric-validation lesson from
+# #62, where the same defect was found independently in three hand-rolled copies.
+#
+# An unusable value reads as "not past" rather than erroring: per-loop budgets still
+# bound every caller, so failing open here cannot run forever, whereas failing closed on
+# a garbled value would abandon healthy work. The digits check must come first and be
+# SILENT: bash's `[ x -ge y ]` ERRORS rather than returning false on an oversized operand
+# (#61b), and a test asserting only "non-zero" cannot tell the guard from the error.
+_deadline_passed() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 12 ] || return 1
+  [ "$(date +%s)" -ge "$1" ]
+}
+
+# _cap_to <default> <epoch> -> seconds a single call may take: min(default, remaining).
+#
+# #71: floored at 1, never 0 -- `timeout 0` means NO LIMIT, so a zero cap would silently
+# remove the bound at exactly the moment the budget ran out. Unarmed or unusable epoch
+# -> the default, so a caller with no deadline still gets a per-call ceiling.
+_cap_to() {
+  local def="$1" at="${2:-}" now rem
+  def=$(_clamp_int "$def" 120 1 3600)
+  case "$at" in ''|*[!0-9]*) printf '%s' "$def"; return ;; esac
+  [ "${#at}" -le 12 ] || { printf '%s' "$def"; return; }
+  now=$(date +%s 2>/dev/null)
+  case "$now" in ''|*[!0-9]*) printf '%s' "$def"; return ;; esac
+  rem=$(( at - now ))
+  [ "$rem" -lt 1 ] && rem=1
+  [ "$rem" -lt "$def" ] && def="$rem"
+  printf '%s' "$def"
 }
 
 # _past_ci_deadline -> rc 0 once the shared main-CI wall clock has run out.
@@ -473,13 +498,7 @@ _arm_ci_deadline() {
 # `[ x -ge y ]` ERRORS rather than returning false on an oversized operand -- #61b -- so
 # the digits check has to come first and be silent, not be left to the comparison. A
 # test that only asserts "nonzero" cannot tell the guard from the error.)
-_past_ci_deadline() {
-  case "${MAIN_CI_DEADLINE_AT:-}" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || return 1
-  [ "$(date +%s)" -ge "$MAIN_CI_DEADLINE_AT" ]
-}
+_past_ci_deadline() { _deadline_passed "${MAIN_CI_DEADLINE_AT:-}"; }
 
 # _net_run <seconds> <cmd...> -> run a NETWORK command under a fixed wall-clock cap.
 #
@@ -542,8 +561,11 @@ _timeout_bin() {
 
 _net_run() {
   local cap="$1"; shift
-  case "$cap" in ''|*[!0-9]*) cap=300 ;; esac
-  cap=$((10#$cap)); [ "$cap" -ge 5 ] 2>/dev/null || cap=300
+  # #71: floor of 1, not 5. A COMPUTED remainder of 1-4 seconds is a correct answer,
+  # and the old clamp replaced it with the 300s default -- so a call could run five
+  # minutes past the very deadline the remainder was protecting. Operator-configured
+  # defaults are validated separately, at load, where a 1-second value IS an error.
+  cap=$(_clamp_int "$cap" 300 1 3600)
   # -k: plain `timeout` sends only SIGTERM and then KEEPS WAITING if the child ignores
   # it, so it is not a bound at all against exactly the hung transport this exists to
   # stop. A `git push` stuck in credential negotiation that does not die on TERM would
@@ -554,21 +576,26 @@ _net_run() {
   }
   "$tb" -k "${BIRCHER_KILL_GRACE:-10}" "$cap" "$@"
 }
-BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-300}"
+# Validated once, here, rather than at each use: these are OPERATOR-configured, so a
+# 1-second value is a mistake and must fall back -- unlike a computed deadline remainder,
+# where 1 second is meaningful. Conflating the two is what let a small remainder expand
+# into a 300s call (#71).
+BIRCHER_NET_TIMEOUT=$(_clamp_int "${BIRCHER_NET_TIMEOUT:-300}" 300 30 3600)
+# #71: the pre-merge phase gets ONE wall clock covering the mergeability poll, the
+# cross-review status post+verify, and the merge/reconciliation retries. Separate
+# budgets per phase would reintroduce exactly the multiplication #62 removed.
+BIRCHER_PREMERGE_BUDGET=$(_clamp_int "${BIRCHER_PREMERGE_BUDGET:-600}" 600 60 7200)
+BIRCHER_PREMERGE_TIMEOUT=$(_clamp_int "${BIRCHER_PREMERGE_TIMEOUT:-60}" 60 10 3600)
 
 # _ci_call_cap -> seconds any single main-CI `gh` call may take: the smaller of
 # BIRCHER_CI_CALL_TIMEOUT (120s) and whatever is left on the shared deadline.
+# The CONFIGURED ceiling is clamped here, at the point of use, with a floor of 5 -- an
+# operator setting 3 has made a mistake. `_cap_to`'s own floor of 1 is a different thing
+# entirely: it exists so a COMPUTED remainder of 1-4s passes through intact, which is
+# what a per-call clamp of 5 used to destroy by expanding it back to the default (#71).
+# Clamping at use rather than at load also survives a runtime override.
 _ci_call_cap() {
-  local cap="${BIRCHER_CI_CALL_TIMEOUT:-120}" now rem
-  cap=$(_clamp_int "$cap" 120 5 3600)
-  case "${MAIN_CI_DEADLINE_AT:-}" in ''|*[!0-9]*) printf '%s' "$cap"; return ;; esac
-  [ "${#MAIN_CI_DEADLINE_AT}" -le 12 ] || { printf '%s' "$cap"; return ; }
-  now=$(date +%s 2>/dev/null)
-  case "$now" in ''|*[!0-9]*) printf '%s' "$cap"; return ;; esac
-  rem=$(( MAIN_CI_DEADLINE_AT - now ))
-  [ "$rem" -lt 1 ] && rem=1
-  [ "$rem" -lt "$cap" ] && cap="$rem"
-  printf '%s' "$cap"
+  _cap_to "$(_clamp_int "${BIRCHER_CI_CALL_TIMEOUT:-120}" 120 5 3600)" "${MAIN_CI_DEADLINE_AT:-}"
 }
 
 # _ci_gh <args...> -> `gh`, bounded by a wall clock.
@@ -1140,6 +1167,41 @@ _prune_session() {
 # human merged it. Contract: rc 0 = status confirmed present on the head sha;
 # rc 1 = gave up after retries (caller escalates + records for the end-of-run sweep,
 # not a silent defer).
+# _pr_merge_state <pr> <expected_sha> -> merged | merged-unpinned | open | unknown
+#
+# #71: `gh pr merge` can COMPLETE SERVER-SIDE and then have its client die -- a timeout,
+# a dropped response. Treating that as "merge failed" left a PR that IS merged with no
+# main-CI watch and the item recorded as deferred: the same false-success class #62
+# closed two of. So a failed attempt asks GitHub what actually happened before
+# concluding anything.
+#
+# Evidence is `state == MERGED` plus a non-null headRefOid, deliberately NOT
+# `mergeCommit.oid`: that field is eventually consistent and is exactly what forced a
+# retry loop into #62's merge-sha lookup. Requiring it here would reintroduce the trap
+# one function earlier.
+#
+# `merged-unpinned` -- MERGED, but not at the head we reviewed -- is its own answer
+# rather than an error, because the code IS on main and must still be watched. What it
+# must never do is report success; that is the caller's job.
+_pr_merge_state() {
+  local pr="$1" expected="${2:-}" out st head
+  out=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+        gh pr view "$pr" --repo "$REPO" --json state,headRefOid \
+        -q '"\(.state)|\(.headRefOid)"' 2>/dev/null) || { echo unknown; return; }
+  st="${out%%|*}"; head="${out#*|}"
+  case "$st" in
+    MERGED) ;;
+    OPEN)   echo open; return ;;
+    *)      echo unknown; return ;;
+  esac
+  case "$head" in ''|null) echo unknown; return ;; esac
+  if [ -n "$expected" ] && [ "$head" != "$expected" ]; then
+    echo merged-unpinned
+  else
+    echo merged
+  fi
+}
+
 _post_cross_review_status() {
   local item="$1" pr="$2" sha="${3:-}" attempt err
   # Head sha: the caller may PIN it (the sweep pins the reviewed head so the status
@@ -1147,7 +1209,8 @@ _post_cross_review_status() {
   # few retries (gh pr view can transiently fail too).
   if [ -z "$sha" ]; then
     for attempt in 1 2 3; do
-      sha=$(gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
+      sha=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+            gh pr view "$pr" --repo "$REPO" --json headRefOid -q '.headRefOid' 2>/dev/null)
       [ -n "$sha" ] && break
       [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
     done
@@ -1157,16 +1220,22 @@ _post_cross_review_status() {
   # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
   # non-transient cause is diagnosable next time.
   for attempt in 1 2 3 4 5; do
-    err=$(gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+    err=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+            gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
             -f context=bircher/cross-review \
             -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
-    if gh api "repos/$REPO/commits/$sha/status" \
+    if _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+         gh api "repos/$REPO/commits/$sha/status" \
          -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
          | grep -qx 'success'; then
       echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
       return 0
     fi
     echo "[batch:merge] WARN $item: cross-review status not confirmed on ${sha:0:7} (attempt $attempt/5)${err:+: $err}" >&2
+    # #71: the phase deadline outranks the attempt counter, and a fixed backoff sleep
+    # must not overrun it either -- five attempts x (POST + verify) could otherwise
+    # spend ten minutes inside a "60-second" per-call cap.
+    _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
     [ "$attempt" -lt 5 ] && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * attempt * 2)); }
   done
   echo "[batch:merge] ERROR $item: could NOT post bircher/cross-review on PR #$pr after 5 attempts -> ESCALATE (ready, needs human merge)" >&2
@@ -1306,6 +1375,19 @@ merge_ready_pr() {
   local item="$1" pr="$2" expected_sha="${3:-}"
   MERGE_NOTE=""
   MERGE_RETRY_ELIGIBLE=0
+  # #71: evidence that what LANDED was not what was reviewed. Two variables, not one:
+  # MERGE_NOTE is reassigned by every post-merge outcome (sha lookup failure, revert
+  # success, revert failure, unresolved CI), so a note set at detection would be lost on
+  # exactly the paths that matter most -- an unreviewed merge followed by a red main.
+  # This one is written ONCE, at detection, and read by the callers that report.
+  MERGE_UNREVIEWED=0
+  MERGE_UNREVIEWED_NOTE=""
+  # ONE wall clock for the whole pre-merge phase, armed before the first network call.
+  # Per-call caps do not bound a LOOP: five status attempts x (POST + verify) at 60s
+  # each is ten minutes inside a "60-second" ceiling. Local, so it cannot leak into the
+  # next item the way the CI deadline did (#62).
+  local PREMERGE_DEADLINE_AT=""
+  _arm_deadline PREMERGE_DEADLINE_AT "$BIRCHER_PREMERGE_BUDGET"
   # #66: an automatic merge MUST be pinned. This used to treat an absent sha as
   # authorisation for an unpinned merge, so every caller had to remember a subtle
   # precondition -- and _merge_gate's comments record that exact mistake already
@@ -1321,9 +1403,13 @@ merge_ready_pr() {
   # polling and, if it persists, is flagged retry-eligible for the sweep instead
   # of stranding a ready PR.
   local m=UNKNOWN t=0
-  while { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && [ "$t" -lt 60 ]; do
-    m=$(gh pr view "$pr" --repo "$REPO" --json mergeable -q '.mergeable' 2>/dev/null)
-    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5; t=$((t + 5)); }
+  while { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && [ "$t" -lt 60 ] \
+        && ! _deadline_passed "$PREMERGE_DEADLINE_AT"; do
+    m=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
+        gh pr view "$pr" --repo "$REPO" --json mergeable -q '.mergeable' 2>/dev/null)
+    { [ "$m" = "UNKNOWN" ] || [ -z "$m" ]; } && {
+      _deadline_passed "$PREMERGE_DEADLINE_AT" && break
+      [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5; t=$((t + 5)); }
   done
   if [ "$m" != "MERGEABLE" ]; then
     MERGE_NOTE="merge deferred: mergeable=${m:-unknown}"
@@ -1348,8 +1434,27 @@ merge_ready_pr() {
   # it: --match-head-commit makes gh refuse the merge if a push moved the head after
   # review, so a race can never land unreviewed code.
   local merged=0 mt=0
-  while [ "$mt" -lt 30 ]; do
-    gh pr merge "$pr" --repo "$REPO" --squash --delete-branch --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
+  while [ "$mt" -lt 30 ] && ! _deadline_passed "$PREMERGE_DEADLINE_AT"; do
+    _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
+      gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
+      --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
+    # #71: a failed ATTEMPT is not a failed MERGE. The request can complete server-side
+    # before the client dies, so ask GitHub before concluding -- otherwise a merged PR
+    # is recorded as deferred and its merge commit is never watched.
+    case "$(_pr_merge_state "$pr" "$expected_sha")" in
+      merged)
+        echo "[batch:merge] $item: PR #$pr was already MERGED server-side (the client call failed) -> continuing" >&2
+        merged=1; break ;;
+      merged-unpinned)
+        # MERGED, but not at the head we reviewed. The code is on main so it must still
+        # be watched -- but it can never be reported as a success. Flag and evidence are
+        # set HERE, at detection, because every later exit path reassigns MERGE_NOTE.
+        MERGE_UNREVIEWED=1
+        MERGE_UNREVIEWED_NOTE="merged head was NOT the reviewed head ${expected_sha:0:7} -- review did not cover what landed"
+        echo "[batch:merge] !!!! $item: PR #$pr merged at a head bircher never reviewed (expected ${expected_sha:0:7}) !!!!" >&2
+        merged=1; break ;;
+    esac
+    _deadline_passed "$PREMERGE_DEADLINE_AT" && break
     [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep 5
     mt=$((mt + 5))
   done
@@ -1437,6 +1542,14 @@ merge_ready_pr() {
   fi
   case "$decision" in
     continue)
+      # #71: green proves the build is healthy, not that review covered what landed.
+      # Every other arm already returns 2; this is the only one that could have reported
+      # an unreviewed merge as a success.
+      if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
+        echo "[batch:merge] !!!! $item: main CI green on $sha, but $MERGE_UNREVIEWED_NOTE -> HALTING !!!!" >&2
+        MERGE_NOTE="merged then HALTED: $MERGE_UNREVIEWED_NOTE"
+        return 2
+      fi
       echo "[batch:merge] $item: main CI green on $sha" >&2
       return 0 ;;
     revert-halt)
@@ -1589,7 +1702,13 @@ reconcile_deferred_ready() {
         # STOP the sweep: do NOT merge further PRs onto a possibly-red main -- the
         # same halt safety the main item loop honors on an rc-2 merge.
         echo "[batch:sweep] !!!! $item: PR #$pr sweep merge triggered a main-CI HALT (rc=2; $MERGE_NOTE) -> stopping sweep !!!!" >&2
-        json_row "$item" "$pr" ready false sweep 0 0 "sweep merge halted the run (rc=2): ${MERGE_NOTE:-unknown}" ok >> "$SCORECARD"
+        # #71: an unreviewed merge is not a `ready` row. The sweep does not close issues
+        # on this path, but the scorecard is what a human reads afterwards.
+        if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
+          json_row "$item" "$pr" escalated false sweep 0 0 "sweep merge halted (rc=2): ${MERGE_NOTE:-unknown}; $MERGE_UNREVIEWED_NOTE" ok >> "$SCORECARD"
+        else
+          json_row "$item" "$pr" ready false sweep 0 0 "sweep merge halted the run (rc=2): ${MERGE_NOTE:-unknown}" ok >> "$SCORECARD"
+        fi
         break ;;
       *)
         echo "[batch:sweep] $item: PR #$pr STILL not merged (rc=$mrc; $MERGE_NOTE) -> escalate for human" >&2
@@ -1647,7 +1766,7 @@ EOF
       return 0
     fi
     merge_ready_pr "$item" "$pr" "$r_sha"; local mrc=$?
-    echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}" >&2
+    echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}${MERGE_UNREVIEWED_NOTE:+ UNREVIEWED=\"$MERGE_UNREVIEWED_NOTE\"}" >&2
     return $mrc
   fi
   echo "[batch:recover-pr] $code: NOT ready (outcome=$r_outcome) -> PR left open with marker for human" >&2
@@ -2868,6 +2987,16 @@ EOF
     if [ "$_gate" != "skip" ]; then
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
       [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
+      # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
+      # scorecard row is written from $outcome -- captured from the item's MARKER, not
+      # from merge_rc -- and _ensure_issue_closed fires on outcome=ready. Left alone, an
+      # unreviewed merge would halt AND still close its issue as done; worse, on the
+      # red path it would close the very issue _reopen_reverted_issues had just
+      # reopened. Downgrading the outcome stops both, because the close is gated on it.
+      if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
+        note="${note:+$note; }$MERGE_UNREVIEWED_NOTE"
+        outcome=escalated
+      fi
       _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
     fi
   fi
@@ -4085,8 +4214,17 @@ SH
 #!/usr/bin/env bash
 # fake gh for merge_ready_pr: $FAKE_MERGEABLE controls mergeability; FAKE_GH_LOG records status posts.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if printf '%s\n' "$@" | grep -q 'state,headRefOid'; then
+    # #71 reconciliation probe. FAKE_PR_STATE / FAKE_PR_HEAD model what GitHub says the
+    # PR actually looks like after a merge attempt whose client call failed.
+    printf '%s|%s\n' "${FAKE_PR_STATE:-OPEN}" "${FAKE_PR_HEAD:-headsha1234567}"; exit 0
+  fi
   if printf '%s\n' "$@" | grep -q 'headRefOid'; then echo "headsha1234567"
   elif printf '%s\n' "$@" | grep -q 'mergeCommit'; then
+    # FAKE_SHA_RC=1 fails ONLY this lookup. The test used to force the timeout binary
+    # missing, which since #71 makes the PRE-merge calls refuse too -- so it deferred
+    # long before reaching the merge-sha lookup it meant to exercise.
+    [ "${FAKE_SHA_RC:-0}" = 0 ] || exit 1
     # FAKE_NO_SHA models GitHub answering the lookup SUCCESSFULLY with no oid --
     # distinct from the transport failing, and the case that used to return rc 0.
     [ "${FAKE_NO_SHA:-0}" = 1 ] && { echo ""; exit 0; }
@@ -4101,7 +4239,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   else echo "${FAKE_MERGEABLE:-MERGEABLE}"; fi
   exit 0
 fi
-if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then exit "${FAKE_MERGE_RC:-0}"; fi
 if [ "$1" = "api" ]; then
   # a statuses POST -> record it (log + make it visible to the read-back);
   # a commits/<sha>/status GET -> return the recorded contexts (verify);
@@ -4146,7 +4284,7 @@ SH
   # read as success. Before the fix, `_ci_gh`'s rc 1 fell into the empty-sha branch and
   # returned 0.
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s4" \
-    _TIMEOUT_BIN_LOADED=1 _TIMEOUT_BIN_CACHE= \
+    FAKE_SHA_RC=1 \
     merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?
     [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
@@ -4161,6 +4299,54 @@ SH
     rc=$?
     [ "$rc" -eq 2 ] && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
     || { echo "FAIL #62: an EMPTY merge sha (rc 0) must halt too, not report the merge successful"; exit 1; }
+  # --- #71: a failed merge ATTEMPT is not a failed MERGE -----------------------
+  # `gh pr merge` can complete server-side and then have its client die. Treating that
+  # as failure left a PR that IS merged recorded as deferred, with its merge commit
+  # never watched -- the same false-success class #62 closed two of.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/r1" \
+    BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 FAKE_PR_STATE=MERGED FAKE_PR_HEAD=headsha1234567 \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 0 ] && [ "${MERGE_UNREVIEWED:-0}" = 0 ] ) \
+    || { echo "FAIL #71: a client-side merge failure with the PR actually MERGED must reconcile and continue"; exit 1; }
+  # Genuinely not merged -> still defers, as before.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/r2" \
+    BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 FAKE_PR_STATE=OPEN \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 0 ] && printf '%s' "$MERGE_NOTE" | grep -q 'merge deferred' ) \
+    || { echo "FAIL #71: a genuinely unmerged PR must still defer"; exit 1; }
+  # MERGED AT A HEAD WE NEVER REVIEWED. The code is on main so it must still be watched,
+  # but it can never be reported as success -- green CI proves the build is healthy, not
+  # that review covered what landed. This is the arm that returns 0 without the guard.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/r3" \
+    BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 FAKE_PR_STATE=MERGED FAKE_PR_HEAD=someoneelsehead \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ] && [ "${MERGE_UNREVIEWED:-0}" = 1 ] \
+      && printf '%s' "$MERGE_UNREVIEWED_NOTE" | grep -q 'NOT the reviewed head' ) \
+    || { echo "FAIL #71: an unreviewed merge must halt (rc 2) with durable evidence, even on GREEN main CI"; exit 1; }
+  # The EVIDENCE must survive every later outcome. MERGE_NOTE is reassigned by the
+  # sha-lookup-failure, revert and unresolved arms, so a note set at detection would be
+  # lost on exactly the paths that matter most.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/r4" \
+    BIRCHER_STATUS_BACKOFF=0 FAKE_MERGE_RC=1 FAKE_PR_STATE=MERGED FAKE_PR_HEAD=someoneelsehead \
+    FAKE_SHA_RC=1 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    rc=$?
+    [ "$rc" -eq 2 ] && [ "${MERGE_UNREVIEWED:-0}" = 1 ] \
+      && printf '%s' "$MERGE_UNREVIEWED_NOTE" | grep -q 'NOT the reviewed head' \
+      && printf '%s' "$MERGE_NOTE" | grep -q 'UNWATCHED' ) \
+    || { echo "FAIL #71: the unreviewed evidence must survive a later MERGE_NOTE reassignment"; exit 1; }
+  # THE EVIDENCE MUST NOT LEAK TO THE NEXT ITEM. Both globals are reset on entry; without
+  # that, one unreviewed merge would mark every subsequent item in the run as unreviewed
+  # too -- halting a healthy wave and escalating items nothing was wrong with. Two calls
+  # in the SAME shell, because a subshell per call would hide the leak entirely.
+  ( PATH="$mdir:$PATH"; REPO=demo/demo; MAIN_CI_TIMEOUT=31; export PATH
+    BIRCHER_STATUS_BACKOFF=0
+    FAKE_STATUS_STORE="$mdir/l1" FAKE_MERGE_RC=1 FAKE_PR_STATE=MERGED FAKE_PR_HEAD=someoneelsehead \
+      merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "${MERGE_UNREVIEWED:-0}" = 1 ] || { echo "setup: first merge should have flagged"; exit 1; }
+    FAKE_STATUS_STORE="$mdir/l2" merge_ready_pr demo 8 headsha1234567 >/dev/null 2>&1
+    [ "${MERGE_UNREVIEWED:-0}" = 0 ] && [ -z "${MERGE_UNREVIEWED_NOTE:-}" ] ) \
+    || { echo "FAIL #71: the unreviewed flag/evidence leaked into the next item"; exit 1; }
   # ...but NOT on first sight. GitHub's PR representation is eventually consistent, so a
   # transient empty oid must be retried, not treated as persistent absence -- halting
   # immediately would strand healthy merges. Two empties then the real oid must proceed.
@@ -5103,6 +5289,76 @@ SH
   [ "$(_clamp_int 100000 5 1 20)"  = 5 ]    || { echo "FAIL #62: an oversized retry count must clamp"; exit 1; }
   # (The call sites are asserted structurally at the top of the suite -- unit-testing
   # the helper proves nothing about whether the loops route through it.)
+  # --- #71: generalised deadline helpers + the pre-merge phase bound -----------
+  [ "$(_cap_to 120 '')" = 120 ]            || { echo "FAIL #71: an unarmed deadline must yield the default cap"; exit 1; }
+  [ "$(_cap_to 120 abc)" = 120 ]           || { echo "FAIL #71: an unusable epoch must yield the default cap"; exit 1; }
+  [ "$(_cap_to 120 "$(( $(date +%s) + 30 ))")" -le 31 ] \
+    || { echo "FAIL #71: the cap must shrink to the remaining budget"; exit 1; }
+  # THE DEFECT THIS EXISTS FOR: a remainder of 1-4s used to be treated as garbage and
+  # replaced with the 300s default, so a call could run five minutes past the very
+  # deadline the remainder was protecting.
+  for _r in 1 2 3 4; do
+    _c=$(_cap_to 120 "$(( $(date +%s) + _r ))")
+    { [ "$_c" -ge 1 ] && [ "$_c" -le "$_r" ]; } \
+      || { echo "FAIL #71: a ${_r}s remainder must pass through as ${_r}s, not expand (got '$_c')"; exit 1; }
+  done
+  # NEVER zero: `timeout 0` means NO LIMIT, so a zero cap would remove the bound at
+  # exactly the moment the budget ran out.
+  [ "$(_cap_to 120 "$(( $(date +%s) - 500 ))")" -ge 1 ] \
+    || { echo "FAIL #71: an expired deadline must still yield a POSITIVE cap"; exit 1; }
+  # ...and _net_run must not clamp a small computed cap back up.
+  local _n71; _n71=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' \
+    'printf "%s\n" "$1" >> "$TO_LOG"' 'shift' 'exec "$@"' > "$_n71/timeout"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$_n71/gh"; chmod +x "$_n71/timeout" "$_n71/gh"
+  for _r in 1 3 5; do
+    : > "$_n71/caps"
+    ( PATH="$_n71:$PATH" TO_LOG="$_n71/caps" _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
+      _net_run "$_r" gh x >/dev/null 2>&1 )
+    [ "$(cat "$_n71/caps")" = "$_r" ] \
+      || { echo "FAIL #71: _net_run expanded a computed cap of ${_r}s to '$(cat "$_n71/caps")'"; rm -rf "$_n71"; exit 1; }
+  done
+  rm -rf "$_n71"; unset _n71 _r _c
+  # The generalised arming must reach a caller's local, and leave it empty (never
+  # `unset`, which re-exposes an outer value) when the clock cannot be read.
+  _arm_probe() { local D=""; _arm_deadline D 600 2>/dev/null; printf '%s' "${D:-UNARMED}"; }
+  _ap=$(_arm_probe); { [ "$_ap" != UNARMED ] && [ "$_ap" -gt "$(date +%s)" ]; } \
+    || { echo "FAIL #71: _arm_deadline must set the caller's variable to a future instant"; exit 1; }
+  local _dd; _dd=$(mktemp -d); printf '#!/usr/bin/env bash\nexit 1\n' > "$_dd/date"; chmod +x "$_dd/date"
+  _ap=$( D=$(( $(date +%s) - 9999 )); export D; PATH="$_dd:$PATH" _arm_probe )
+  [ "$_ap" = UNARMED ] \
+    || { echo "FAIL #71: a dead clock must leave the deadline unarmed, not expose a stale outer value (got '$_ap')"; rm -rf "$_dd"; exit 1; }
+  rm -rf "$_dd"; unset -f _arm_probe; unset _ap _dd
+  # EVERY pre-merge loop must consult the PHASE deadline, not only its own sleep
+  # counter. A per-call cap does not bound a loop: five status attempts x (POST +
+  # verify) at 60s each is ten minutes inside a "60-second" ceiling. Asserted
+  # structurally because the behavioural version is timing-dependent -- with backoff
+  # disabled the sleep counter wins instantly, and with it enabled the test would race
+  # the clock and flake.
+  _mb=$(declare -f merge_ready_pr)
+  [ "$(printf '%s\n' "$_mb" | grep -c '_deadline_passed "\$PREMERGE_DEADLINE_AT"')" -ge 4 ] \
+    || { echo "FAIL #71: merge_ready_pr's pre-merge loops must all consult the phase deadline"; exit 1; }
+  printf '%s\n' "$_mb" | grep -q '_arm_deadline PREMERGE_DEADLINE_AT' \
+    || { echo "FAIL #71: the pre-merge deadline must be armed"; exit 1; }
+  # Armed BEFORE the first network call, or the phase it bounds has already started.
+  _al=$(printf '%s\n' "$_mb" | grep -n '_arm_deadline PREMERGE_DEADLINE_AT' | head -1 | cut -d: -f1)
+  _fl=$(printf '%s\n' "$_mb" | grep -n 'gh pr view' | head -1 | cut -d: -f1)
+  { [ -n "$_al" ] && [ -n "$_fl" ] && [ "$_al" -lt "$_fl" ]; } \
+    || { echo "FAIL #71: the pre-merge deadline must be armed before the first network call (arm=$_al call=$_fl)"; exit 1; }
+  # And no pre-merge gh call may bypass the bounded wrapper. Anchored to COMMAND
+  # position -- a looser pattern matched "gh pr merge failed" inside a MERGE_NOTE string
+  # and "gh rc=$rc" inside a diagnostic, i.e. prose ABOUT gh rather than calls to it.
+  _ub=$(printf '%s\n' "$_mb" | grep -E '(^[[:space:]]*|[;&|(]|\$\()[[:space:]]*gh (pr|api) ' | grep -v '_net_run\|_ci_gh')
+  [ -z "${_ub//[[:space:]]/}" ] \
+    || { echo "FAIL #71: unbounded gh call in merge_ready_pr: $_ub"; exit 1; }
+  _pc=$(declare -f _post_cross_review_status)
+  _ub=$(printf '%s\n' "$_pc" | grep -E '(^[[:space:]]*|[;&|(]|\$\()[[:space:]]*gh (pr|api) ' | grep -v '_net_run\|_ci_gh')
+  [ -z "${_ub//[[:space:]]/}" ] \
+    || { echo "FAIL #71: unbounded gh call in _post_cross_review_status: $_ub"; exit 1; }
+  printf '%s\n' "$_pc" | grep -q '_deadline_passed "\${PREMERGE_DEADLINE_AT:-}"' \
+    || { echo "FAIL #71: the status post+verify retry loop must consult the phase deadline"; exit 1; }
+  unset _mb _pc _ub _al _fl
+  echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
   # --- #359: _revert_git_args guards empty sha + adds -m 1 for merge commits -----
