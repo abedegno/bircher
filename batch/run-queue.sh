@@ -566,6 +566,9 @@ _net_run() {
   # minutes past the very deadline the remainder was protecting. Operator-configured
   # defaults are validated separately, at load, where a 1-second value IS an error.
   cap=$(_clamp_int "$cap" 300 1 3600)
+  # -k's grace is CLAMPED: it is added to every capped call, so an operator setting it
+  # to an hour would make the phase bound arbitrarily weak -- the honest statement of
+  # the bound is "deadline plus at most one clamped kill grace".
   # -k: plain `timeout` sends only SIGTERM and then KEEPS WAITING if the child ignores
   # it, so it is not a bound at all against exactly the hung transport this exists to
   # stop. A `git push` stuck in credential negotiation that does not die on TERM would
@@ -574,7 +577,7 @@ _net_run() {
     echo "[batch] WARN: no usable timeout(1) -> refusing to run '$1' UNBOUNDED" >&2
     return 1
   }
-  "$tb" -k "${BIRCHER_KILL_GRACE:-10}" "$cap" "$@"
+  "$tb" -k "$(_clamp_int "${BIRCHER_KILL_GRACE:-10}" 10 1 60)" "$cap" "$@"
 }
 # Validated once, here, rather than at each use: these are OPERATOR-configured, so a
 # 1-second value is a mistake and must fall back -- unlike a computed deadline remainder,
@@ -617,7 +620,7 @@ _ci_gh() {
     echo "[batch] WARN: no usable timeout(1) -> refusing to run 'gh $1' UNBOUNDED" >&2
     return 1
   }
-  "$tb" -k "${BIRCHER_KILL_GRACE:-10}" "$cap" gh "$@"   # -k: see _net_run
+  "$tb" -k "$(_clamp_int "${BIRCHER_KILL_GRACE:-10}" 10 1 60)" "$cap" gh "$@"   # -k: see _net_run
 }
 
 # _ci_fetch_records <api-path> <list-field> -> every record in <list-field>, across
@@ -1220,10 +1223,19 @@ _post_cross_review_status() {
   # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
   # non-transient cause is diagnosable next time.
   for attempt in 1 2 3 4 5; do
+    # #71: BEFORE the POST, not only after the pair. Checked only at the bottom, a
+    # deadline expiring during the 32s backoff still let attempt 5 start both calls --
+    # ~53s of overrun (the sleep plus two expired-but-still-issued calls), where the
+    # bound promises at most one in-flight call.
+    _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
     err=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
             gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
             -f context=bircher/cross-review \
             -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
+    # ...and before the verification too. Skipping it after a successful POST costs a
+    # confirmation, so the caller merges best-effort and branch protection decides --
+    # which is the existing conservative path, not a new one.
+    _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
     if _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
          gh api "repos/$REPO/commits/$sha/status" \
          -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
@@ -1236,7 +1248,10 @@ _post_cross_review_status() {
     # must not overrun it either -- five attempts x (POST + verify) could otherwise
     # spend ten minutes inside a "60-second" per-call cap.
     _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
-    [ "$attempt" -lt 5 ] && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * attempt * 2)); }
+    # A FIXED sleep can outlast the deadline on its own. Capped to what remains, so
+    # the phase cannot be overrun by waiting rather than by working.
+    [ "$attempt" -lt 5 ] && { [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] \
+      || sleep "$(_cap_to $((attempt * attempt * 2)) "${PREMERGE_DEADLINE_AT:-}")"; }
   done
   echo "[batch:merge] ERROR $item: could NOT post bircher/cross-review on PR #$pr after 5 attempts -> ESCALATE (ready, needs human merge)" >&2
   return 1
@@ -5358,6 +5373,71 @@ SH
   printf '%s\n' "$_pc" | grep -q '_deadline_passed "\${PREMERGE_DEADLINE_AT:-}"' \
     || { echo "FAIL #71: the status post+verify retry loop must consult the phase deadline"; exit 1; }
   unset _mb _pc _ub _al _fl
+  # NO NETWORK CALL AFTER EXPIRY. The deadline used to be checked only after each
+  # POST+verify pair, so one expiring during the 32s backoff still let the next attempt
+  # start BOTH calls -- ~53s of overrun where the bound promises at most one in-flight
+  # call. Driven behaviourally: an already-expired deadline must produce zero calls.
+  local _sd; _sd=$(mktemp -d); : > "$_sd/calls"
+  printf '#!/usr/bin/env bash\necho "$*" >> "$GH_CALLS"\nexit 1\n' > "$_sd/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_sd/timeout"
+  chmod +x "$_sd/gh" "$_sd/timeout"
+  ( PATH="$_sd:$PATH"; export PATH; GH_CALLS="$_sd/calls"; export GH_CALLS
+    REPO=demo/demo; PREMERGE_DEADLINE_AT=$(( $(date +%s) - 5 ))
+    _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
+    _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ ! -s "$_sd/calls" ] \
+    || { echo "FAIL #71: status post made $(wc -l < "$_sd/calls") network calls after the deadline expired"; rm -rf "$_sd"; exit 1; }
+  # ...and with time left it must still work, or the assertion above would pass for a
+  # function that never does anything.
+  : > "$_sd/calls"
+  ( PATH="$_sd:$PATH"; export PATH; GH_CALLS="$_sd/calls"; export GH_CALLS
+    REPO=demo/demo; PREMERGE_DEADLINE_AT=$(( $(date +%s) + 600 )); BIRCHER_STATUS_BACKOFF=0
+    _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
+    _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ -s "$_sd/calls" ] \
+    || { echo "FAIL #71: with budget remaining, the status post must still reach gh"; rm -rf "$_sd"; exit 1; }
+  # THE CHECK BEFORE THE VERIFICATION needs the deadline to expire DURING the POST --
+  # an already-expired one breaks at the first check and never reaches it. So the fake
+  # POST outlives the remaining budget, and exactly ONE call must be made.
+  local _sd2; _sd2=$(mktemp -d); : > "$_sd2/calls"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$GH_CALLS"' \
+    'case "$*" in *statuses*) sleep 2 ;; esac' 'exit 1' > "$_sd2/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_sd2/timeout"
+  chmod +x "$_sd2/gh" "$_sd2/timeout"
+  ( PATH="$_sd2:$PATH"; export PATH; GH_CALLS="$_sd2/calls"; export GH_CALLS
+    REPO=demo/demo; PREMERGE_DEADLINE_AT=$(( $(date +%s) + 1 ))
+    _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
+    _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
+  [ "$(wc -l < "$_sd2/calls" | tr -d ' ')" = 1 ] \
+    || { echo "FAIL #71: a deadline expiring during the POST must stop before the verification (got $(wc -l < "$_sd2/calls") calls)"; rm -rf "$_sd2"; exit 1; }
+  rm -rf "$_sd2"; unset _sd2
+  # THE BACKOFF must be capped to what remains. Unbounded, attempt 2's 8s sleep starts
+  # while ~1s of budget is left and overruns by seven -- the phase exceeded by WAITING
+  # rather than by working, which the per-call caps cannot see.
+  local _sd3 _t0 _t1; _sd3=$(mktemp -d)
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$_sd3/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_sd3/timeout"
+  chmod +x "$_sd3/gh" "$_sd3/timeout"
+  _t0=$(date +%s)
+  ( PATH="$_sd3:$PATH"; export PATH; REPO=demo/demo
+    PREMERGE_DEADLINE_AT=$(( $(date +%s) + 3 )); BIRCHER_STATUS_BACKOFF=1
+    _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
+    _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
+  _t1=$(date +%s)
+  [ "$(( _t1 - _t0 ))" -le 6 ] \
+    || { echo "FAIL #71: the status backoff overran the phase deadline ($(( _t1 - _t0 ))s for a 3s budget)"; rm -rf "$_sd3"; exit 1; }
+  rm -rf "$_sd3"; unset _sd3 _t0 _t1
+  rm -rf "$_sd"; unset _sd
+  # The kill grace is added to EVERY capped call, so an unvalidated one weakens the
+  # whole bound. The honest statement is "deadline plus at most one clamped grace".
+  [ "$(_clamp_int "${BIRCHER_KILL_GRACE:-10}" 10 1 60)" = 10 ] \
+    || { echo "FAIL #71: the default kill grace must be 10"; exit 1; }
+  [ "$(_clamp_int 99999 10 1 60)" = 10 ] \
+    || { echo "FAIL #71: an oversized kill grace must clamp"; exit 1; }
+  _kg=$(declare -f _net_run _ci_gh | grep -c '_clamp_int "${BIRCHER_KILL_GRACE:-10}" 10 1 60')
+  [ "$_kg" = 2 ] \
+    || { echo "FAIL #71: both timeout wrappers must clamp the kill grace (found $_kg)"; exit 1; }
+  unset _kg
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
