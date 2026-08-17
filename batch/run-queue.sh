@@ -5557,14 +5557,22 @@ SH
   # looks identical to a capped one. Asserting the ARGUMENT catches it however it is
   # spelled: `sleep 5`, `_d=5; sleep "$_d"`, `command sleep "$((5))"` all log 5.
   # DATE_OFFSET=598 against a 600s budget leaves ~2s remaining for the whole run.
-  : > "$_bd/sleeps"; : > "$_bd/n3"
+  : > "$_bd/sleeps"; : > "$_bd/ghcalls"; : > "$_bd/n3"
   ( PATH="$_bd:$PATH"; export PATH
     DATE_N="$_bd/n3"; DATE_OFFSET="$_off"; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
     BIRCHER_PREMERGE_BUDGET="$_bud"; export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS BIRCHER_PREMERGE_BUDGET
     REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
       merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
-  _check_sleeps() { # <log> <label>
+  _check_sleeps() { # <log> <label> [required-gh-substring]
     local _slp
+    # A shared sleep log cannot tell WHICH phase slept: `_post_cross_review_status` runs
+    # before the merge loop and logs its own backoff, so the run labelled "the merge
+    # retry loop" could pass on status sleeps alone without ever dispatching a merge.
+    # Each scenario now proves it reached its own phase.
+    if [ -n "${3:-}" ]; then
+      _contains "$(cat "$_bd/ghcalls" 2>/dev/null)" "$3" \
+        || { echo "FAIL #71: $2 never reached its phase (no '"'"'$3'"'"' in the gh log)"; rm -rf "$_bd"; exit 1; }
+    fi
     [ -s "$1" ] \
       || { echo "FAIL #71: $2 logged NO sleep -- the test never reached the path it asserts on"; rm -rf "$_bd"; exit 1; }
     while IFS= read -r _slp; do
@@ -5574,18 +5582,18 @@ SH
         || { echo "FAIL #71: $2 slept ${_slp}s with only ~2s of phase budget left -- not capped to the remainder"; rm -rf "$_bd"; exit 1; }
     done < "$1"
   }
-  _check_sleeps "$_bd/sleeps" "the merge retry loop"
+  _check_sleeps "$_bd/sleeps" "the merge retry loop" "pr merge"
   # ...and again with mergeability never resolving, which is the ONLY way to reach the
   # mergeability poll's own sleep. One shim cannot exercise both loops: answering
   # MERGEABLE skips that poll entirely, and not answering it never reaches the merge.
-  : > "$_bd/sleeps"; : > "$_bd/n4"
+  : > "$_bd/sleeps"; : > "$_bd/ghcalls"; : > "$_bd/n4"
   ( PATH="$_bd:$PATH"; export PATH
     DATE_N="$_bd/n4"; DATE_OFFSET="$_off"; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
     FAKE_MERGEABLE_OUT=UNKNOWN; BIRCHER_PREMERGE_BUDGET="$_bud"
     export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS FAKE_MERGEABLE_OUT BIRCHER_PREMERGE_BUDGET
     REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
       merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
-  _check_sleeps "$_bd/sleeps" "the mergeability poll"
+  _check_sleeps "$_bd/sleeps" "the mergeability poll" "--json mergeable"
   unset -f _check_sleeps
   # ...and the control: with the clock running normally it MUST do work, or the
   # assertion above would hold for a function that does nothing at all.
