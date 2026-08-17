@@ -2872,9 +2872,12 @@ ${prompt}"
       # earlier run must not short-circuit the session now in flight.
       local body; body=$(_marker_bodies_since "$pr" "$start")
       if _contains "$body" 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
+      # Last of the status-deciding pipelines (see _contains). This one is only a
+      # stale-marker diagnostic -- a SIGPIPE false negative cannot adopt a marker,
+      # change an outcome or authorise a merge -- but leaving a known instance of the
+      # class behind after removing the rest is how it grows back.
       if [ "$polls" = 1 ] \
-         && gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null \
-            | grep -q 'bircher-status:'; then
+         && _contains "$(gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null)" 'bircher-status:'; then
         echo "[batch] $item: PR #$pr carries a marker predating this run - ignoring it and waiting for a fresh verdict" >&2
       fi
     fi
