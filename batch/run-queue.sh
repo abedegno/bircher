@@ -2266,6 +2266,14 @@ _expected_set() {
   [ -n "${want//[[:space:]]/}" ] || return 0
   [ "$st" = known ] || [ "$st" = empty ] || return 0
   while IFS= read -r line; do
+    # Strip ONE trailing CR. `read -r` preserves it, so a list pasted from a CRLF source
+    # yields `unit\r`, the exact intersection rejects every entry, `_expected_set` returns
+    # empty -- and an empty set means NO GATE. The feature would silently become a no-op
+    # on an opted-in repo, which is the worst failure direction available to it: not a
+    # wrong verdict, but the quiet absence of the check that was supposed to prevent one.
+    # Only \r, and only one: any other whitespace is significant, because these are
+    # literal check names and GitHub allows leading and trailing spaces in them.
+    line=${line%$'\r'}
     case "$line" in ''|*[![:space:]]*) ;; *) continue ;; esac
     [ -n "$line" ] || continue
     printf '%s\n' "$line" \
@@ -5967,6 +5975,17 @@ plugins (python) gate|in_progress|'
   # exists because Dependabot's check-runs once turned a healthy main red.
   [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nDependabot')" _expected_set known "$(printf 'a\nDependabot')" | tr -d '\n')" = a ] \
     || { echo "FAIL #70: an ignore-listed context must be subtracted from the expected set"; exit 1; }
+  # CRLF. `read -r` preserves the carriage return, so a list pasted from a CRLF source
+  # becomes `unit\r` / `e2e\r`, the exact intersection rejects every entry, and the
+  # expected set comes back EMPTY -- which means no gate at all. Silently disabling a
+  # safety feature is worse than breaking it loudly.
+  [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'unit\r\ne2e\r\n')" \
+       _expected_set known "$(printf 'unit\ne2e')" | tr -d '\n')" = unite2e ] \
+    || { echo "FAIL #70: a CRLF expected-context list must still produce the expected set, not silently empty it"; exit 1; }
+  # ...and only ONE trailing CR is stripped: other whitespace is significant, because
+  # GitHub permits leading and trailing spaces in check names.
+  [ -z "$(BIRCHER_MAIN_EXPECTED_CONTEXTS='unit ' _expected_set known 'unit' | tr -d '\n')" ] \
+    || { echo "FAIL #70: a trailing SPACE must remain significant -- 'unit ' is not 'unit'"; exit 1; }
   unset _ec_lines
   # OPT-OUT MUST COST NOTHING. With the list unset, an unreadable protection endpoint
   # must not add a lookup per poll: `mreq` was fetched once per phase before #70, and a
