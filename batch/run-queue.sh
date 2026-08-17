@@ -528,6 +528,18 @@ _past_ci_deadline() { _deadline_passed "${MAIN_CI_DEADLINE_AT:-}"; }
 #   * range checked, because a syntactically fine value can still be operationally
 #     absurd -- a 1-second deadline or a 0-second poll interval.
 # Anything failing any of those falls back to the default rather than being honoured.
+# _contains <haystack> <literal-needle> -> rc 0 if present. PIPE-FREE, deliberately.
+#
+# `producer | grep -q needle` is FLAKY under `set -o pipefail` (line 5): grep exits the
+# moment it matches, and if the producer still has buffered output it takes SIGPIPE and
+# returns non-zero, which pipefail then propagates as a failed pipeline -- despite the
+# match. Whether it fires depends on buffer sizes and scheduling, so it presents as a
+# rare, unreproducible failure. That is exactly what a `declare -f | grep -q` assertion
+# in this suite did: failed once on the Linux runner, then passed four runs.
+#
+# `case` does literal substring matching in-process, with no second process to signal.
+_contains() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
+
 _clamp_int() {
   local v="$1" def="$2" lo="$3" hi="$4"
   case "$v" in ''|*[!0-9]*) printf '%s' "$def"; return ;; esac
@@ -3071,11 +3083,11 @@ self_test() {
   # it says nothing about what broke, and it burns API quota to say it. This fails in
   # milliseconds and names the call site.
   _cs=$(declare -f merge_ready_pr)
-  printf '%s\n' "$_cs" | grep -q '_sha_max=\$(_clamp_int' \
+  _contains "$_cs" '_sha_max=$(_clamp_int' \
     || { echo "FAIL #62: the merge-sha retry count must go through _clamp_int (a raw value hot-loops to the deadline)"; exit 1; }
   for _fn in merge_ready_pr _rerun_main_ci _poll_ci; do
     _cs=$(declare -f "$_fn")
-    printf '%s\n' "$_cs" | grep -q 'MAIN_CI_POLL_INTERVAL' || continue
+    _contains "$_cs" 'MAIN_CI_POLL_INTERVAL' || continue
     printf '%s\n' "$_cs" | grep 'MAIN_CI_POLL_INTERVAL' | grep -qv '_clamp_int' \
       && { echo "FAIL #62: $_fn uses MAIN_CI_POLL_INTERVAL without _clamp_int"; exit 1; }
   done
@@ -3117,7 +3129,7 @@ self_test() {
   _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T14:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T14:00:00Z' +%s)")
   [ "$(parse_marker "$_mb" | cut -d'|' -f1)" = "ready" ] \
     || { echo "FAIL #47: fresh marker should win, got '$(parse_marker "$_mb")'"; exit 1; }
-  printf '%s' "$_mb" | grep -q 'stale' && { echo "FAIL #47: stale marker leaked through the filter"; exit 1; }
+  _contains "$_mb" 'stale' && { echo "FAIL #47: stale marker leaked through the filter"; exit 1; }
   # since = after BOTH -> nothing survives, so the caller keeps polling instead of
   # adopting a verdict no run produced.
   _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T23:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T23:00:00Z' +%s)")
@@ -5154,11 +5166,13 @@ SH
   # unset, so nothing downstream could ever time it out. Asserted structurally because
   # the alternative is driving a full merge with a blocking shim.
   _body=$(declare -f merge_ready_pr); _body_rc=$?
-  _arm_ln=$(printf '%s\n' "$_body" | grep -n '_arm_ci_deadline' | head -1 | cut -d: -f1)
-  _view_ln=$(printf '%s\n' "$_body" | grep -n 'pr view .*mergeCommit' | head -1 | cut -d: -f1)
+  # No `| head -1`: head closes the pipe early and SIGPIPEs grep, the same pipefail
+  # hazard as `grep -q`. Take the first line with parameter expansion instead.
+  _arm_ln=$(printf '%s\n' "$_body" | grep -n '_arm_ci_deadline' | cut -d: -f1); _arm_ln=${_arm_ln%%$'\n'*}
+  _view_ln=$(printf '%s\n' "$_body" | grep -n 'pr view .*mergeCommit' | cut -d: -f1); _view_ln=${_view_ln%%$'\n'*}
   { [ -n "$_arm_ln" ] && [ -n "$_view_ln" ] && [ "$_arm_ln" -lt "$_view_ln" ]; } \
     || { echo "FAIL #62: _arm_ci_deadline must precede the merge-sha lookup (arm=$_arm_ln view=$_view_ln)"; rm -rf "$_tdir"; exit 1; }
-  printf '%s\n' "$_body" | grep -q 'sha=$(_ci_gh pr view' \
+  _contains "$_body" 'sha=$(_ci_gh pr view' \
     || { echo "FAIL #62: the merge-sha lookup must be bounded"; rm -rf "$_tdir"; exit 1; }
   # NO LEAK ACROSS ITEMS. The deadline used to be an exported global that nothing
   # cleared, so an EXPIRED one from a previous merge shrank the next item's
@@ -5171,12 +5185,12 @@ SH
   # passed four consecutive runs, with the source and `declare -f` rendering verified
   # identical on both platforms. Unexplained, so a recurrence must say what it actually
   # saw rather than only that it did not match.
-  printf '%s\n' "$_body" | grep -q 'local MAIN_CI_DEADLINE_AT' \
+  _contains "$_body" 'local MAIN_CI_DEADLINE_AT' \
     || { echo "FAIL #62: MAIN_CI_DEADLINE_AT must be LOCAL to merge_ready_pr, or it leaks into the next item"
          echo "  diag: _body is ${#_body} chars; declare -f rc was ${_body_rc:-?}; bash ${BASH_VERSION}"
          printf '  diag: first 3 lines of _body: %s\n' "$(printf '%s\n' "$_body" | head -3 | tr '\n' '~')"
          rm -rf "$_tdir"; exit 1; }
-  declare -f _arm_ci_deadline | grep -q 'export MAIN_CI_DEADLINE_AT' \
+  _contains "$(declare -f _arm_ci_deadline)" 'export MAIN_CI_DEADLINE_AT' \
     && { echo "FAIL #62: _arm_ci_deadline must not EXPORT the deadline (that is the leak)"; rm -rf "$_tdir"; exit 1; }
   # Prove the scoping actually works both ways: visible to a helper called through a
   # command substitution, and gone once the arming frame returns.
@@ -5205,9 +5219,9 @@ SH
   # it one second and guarantee failure. `git fetch`, `git worktree add` against a
   # remote-tracking ref and `git push` are all network operations; calling them "not
   # network-facing" was simply wrong.
-  printf '%s\n' "$_body" | grep -q '_net_run "$BIRCHER_NET_TIMEOUT" git fetch origin' \
+  _contains "$_body" '_net_run "$BIRCHER_NET_TIMEOUT" git fetch origin' \
     || { echo "FAIL #62: the recovery git fetch must be bounded"; rm -rf "$_tdir"; exit 1; }
-  printf '%s\n' "$_body" | grep -q '_net_run "$BIRCHER_NET_TIMEOUT" git push origin' \
+  _contains "$_body" '_net_run "$BIRCHER_NET_TIMEOUT" git push origin' \
     || { echo "FAIL #62: the recovery git push must be bounded"; rm -rf "$_tdir"; exit 1; }
   # EVERY gh invocation in there, not just one: an assertion that merely finds
   # `_net_run` somewhere passes while a second call sits unbounded next to it.
@@ -5376,11 +5390,11 @@ SH
   # recognised the spellings I happened to write, and would have missed
   # `delay=5; sleep "$delay"` or `command sleep 5`. The property is enforced
   # BEHAVIOURALLY below instead.
-  printf '%s\n' "$_mb" | grep -q '_arm_deadline PREMERGE_DEADLINE_AT' \
+  _contains "$_mb" '_arm_deadline PREMERGE_DEADLINE_AT' \
     || { echo "FAIL #71: the pre-merge deadline must be armed"; exit 1; }
   # Armed BEFORE the first network call, or the phase it bounds has already started.
-  _al=$(printf '%s\n' "$_mb" | grep -n '_arm_deadline PREMERGE_DEADLINE_AT' | head -1 | cut -d: -f1)
-  _fl=$(printf '%s\n' "$_mb" | grep -n 'gh pr view' | head -1 | cut -d: -f1)
+  _al=$(printf '%s\n' "$_mb" | grep -n '_arm_deadline PREMERGE_DEADLINE_AT' | cut -d: -f1); _al=${_al%%$'\n'*}
+  _fl=$(printf '%s\n' "$_mb" | grep -n 'gh pr view' | cut -d: -f1); _fl=${_fl%%$'\n'*}
   { [ -n "$_al" ] && [ -n "$_fl" ] && [ "$_al" -lt "$_fl" ]; } \
     || { echo "FAIL #71: the pre-merge deadline must be armed before the first network call (arm=$_al call=$_fl)"; exit 1; }
   # And no pre-merge gh call may bypass the bounded wrapper. Anchored to COMMAND
@@ -5393,7 +5407,7 @@ SH
   _ub=$(printf '%s\n' "$_pc" | grep -E '(^[[:space:]]*|[;&|(]|\$\()[[:space:]]*gh (pr|api) ' | grep -v '_net_run\|_ci_gh')
   [ -z "${_ub//[[:space:]]/}" ] \
     || { echo "FAIL #71: unbounded gh call in _post_cross_review_status: $_ub"; exit 1; }
-  printf '%s\n' "$_pc" | grep -q '_deadline_passed "\${PREMERGE_DEADLINE_AT:-}"' \
+  _contains "$_pc" '_deadline_passed "${PREMERGE_DEADLINE_AT:-}"' \
     || { echo "FAIL #71: the status post+verify retry loop must consult the phase deadline"; exit 1; }
   unset _mb _pc _ub _al _fl
   # NO NETWORK CALL AFTER EXPIRY. The deadline used to be checked only after each
@@ -5455,6 +5469,15 @@ SH
   # and `sleep` and `gh` are instrumented, so ANY wait or call after expiry is caught
   # however it is written. This replaces a grep for `sleep <digit>`, which only ever
   # tested the spellings I had used.
+  # An explicit budget, and a required non-empty log. Both were implicit before: the
+  # test assumed BIRCHER_PREMERGE_BUDGET was 600 without setting it, and
+  # BIRCHER_PREMERGE_BUDGET is a supported override clamped as low as 60. At 60 the
+  # first guard would see the phase already expired, neither run would sleep at all,
+  # and an empty log passed -- so an uncapped sleep in either loop could sail through a
+  # test whose whole purpose was to catch exactly that.
+  local _bud=600 _off=598
+  # BIRCHER_PREMERGE_BUDGET is consumed at load into the clamped constant, so a subshell
+  # override of the env var alone would not reach merge_ready_pr -- set both.
   local _bd; _bd=$(mktemp -d); : > "$_bd/sleeps"; : > "$_bd/ghcalls"; : > "$_bd/n"
   printf '%s\n' '#!/usr/bin/env bash' \
     'n=$(cat "$DATE_N" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$DATE_N"' \
@@ -5487,12 +5510,14 @@ SH
   # DATE_OFFSET=598 against a 600s budget leaves ~2s remaining for the whole run.
   : > "$_bd/sleeps"; : > "$_bd/n3"
   ( PATH="$_bd:$PATH"; export PATH
-    DATE_N="$_bd/n3"; DATE_OFFSET=598; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
-    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS
+    DATE_N="$_bd/n3"; DATE_OFFSET="$_off"; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
+    BIRCHER_PREMERGE_BUDGET="$_bud"; export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS BIRCHER_PREMERGE_BUDGET
     REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
       merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
   _check_sleeps() { # <log> <label>
     local _slp
+    [ -s "$1" ] \
+      || { echo "FAIL #71: $2 logged NO sleep -- the test never reached the path it asserts on"; rm -rf "$_bd"; exit 1; }
     while IFS= read -r _slp; do
       [ -n "$_slp" ] || continue
       case "$_slp" in ''|*[!0-9]*) echo "FAIL #71: non-numeric sleep argument '$_slp' ($2)"; rm -rf "$_bd"; exit 1 ;; esac
@@ -5506,9 +5531,9 @@ SH
   # MERGEABLE skips that poll entirely, and not answering it never reaches the merge.
   : > "$_bd/sleeps"; : > "$_bd/n4"
   ( PATH="$_bd:$PATH"; export PATH
-    DATE_N="$_bd/n4"; DATE_OFFSET=598; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
-    FAKE_MERGEABLE_OUT=UNKNOWN
-    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS FAKE_MERGEABLE_OUT
+    DATE_N="$_bd/n4"; DATE_OFFSET="$_off"; SLEEP_LOG="$_bd/sleeps"; GH_CALLS="$_bd/ghcalls"
+    FAKE_MERGEABLE_OUT=UNKNOWN; BIRCHER_PREMERGE_BUDGET="$_bud"
+    export DATE_N DATE_OFFSET SLEEP_LOG GH_CALLS FAKE_MERGEABLE_OUT BIRCHER_PREMERGE_BUDGET
     REPO=demo/demo BIRCHER_STATUS_BACKOFF=1 \
       merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
   _check_sleeps "$_bd/sleeps" "the mergeability poll"
