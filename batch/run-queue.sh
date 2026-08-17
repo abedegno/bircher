@@ -1583,17 +1583,56 @@ merge_ready_pr() {
     return 2
   }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
-  local waited=0 state=pending lines mreq _iv
-  mreq=$(_required_contexts)   # once, not on every 30s poll
+  local waited=0 state=pending lines mreq _iv _snap _miss _exp
+  # #70: ONE snapshot, tri-state. `known`/`empty` are authoritative answers and are
+  # cached for the phase; `unknown` is a cached DEPENDENCY FAILURE, not a verdict, and is
+  # refreshed every poll below -- backoff by poll count was tried and rejected because at
+  # a 30s interval its sixth attempt lands at 930s, past the rerun phase's entire budget,
+  # so a dependency that recovered early would never be re-observed.
+  # Declared local so `_rerun_main_ci` inherits them through the command substitution
+  # (dynamic scoping, the same route MAIN_CI_DEADLINE_AT already takes) rather than
+  # re-deriving a second, possibly different, required set mid-recovery.
+  local MAIN_SNAP_STATE MAIN_SNAP_NAMES
+  _snap=$(_required_contexts_snapshot)
+  MAIN_SNAP_STATE=${_snap%%$'\n'*}
+  MAIN_SNAP_NAMES=${_snap#*$'\n'}; [ "$MAIN_SNAP_STATE" = known ] || MAIN_SNAP_NAMES=""
+  mreq="$MAIN_SNAP_NAMES"   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
     _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
     sleep "$_iv"; waited=$((waited + _iv))
     # #67: check-runs AND commit statuses -- a required status was invisible here.
     # rc 1 (either fetch failed) leaves `lines` empty, which _checkrun_state reads
     # as pending, so a failed lookup keeps polling rather than reading green.
+    # A failed protection lookup is recoverable: retry it EVERY poll (the 30s interval
+    # already rate-limits it to the same cadence as the CI fetch beside it) until it
+    # answers, so a transient outage does not cost the whole phase.
+    if [ "$MAIN_SNAP_STATE" = unknown ]; then
+      _snap=$(_required_contexts_snapshot)
+      MAIN_SNAP_STATE=${_snap%%$'\n'*}
+      MAIN_SNAP_NAMES=${_snap#*$'\n'}; [ "$MAIN_SNAP_STATE" = known ] || MAIN_SNAP_NAMES=""
+      mreq="$MAIN_SNAP_NAMES"
+    fi
     lines=$(_commit_ci_lines "$sha" "$mreq") || lines=""
-    lines=$(_keep_blocking_checks "$lines" "$mreq")
-    state=$(_checkrun_state "$lines")
+    state=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$mreq")")
+    # #70: green needs the EXPECTED set complete, not merely the registered subset green.
+    # A required context gated behind `needs:` registers after faster ones finish -- an
+    # 11-second margin measured on muesli, and structurally unbounded elsewhere -- so
+    # `_keep_blocking_checks` sees only the fast ones, all green, and the watcher breaks
+    # out before the slow one can report. Red is untouched and still breaks at once: a
+    # terminal red is authoritative whether or not the rest has registered.
+    if [ "$state" = green ]; then
+      _exp=$(_expected_set "$MAIN_SNAP_STATE" "$MAIN_SNAP_NAMES")
+      if [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] && [ "$MAIN_SNAP_STATE" = unknown ]; then
+        echo "[batch:merge] $item: main CI green but branch protection is unreadable -> not accepting green yet" >&2
+        state=pending
+      elif [ -n "$_exp" ]; then
+        _miss=$(_expected_incomplete "$lines" "$_exp")
+        [ -n "$_miss" ] && {
+          echo "[batch:merge] $item: main CI green so far, but expected context '$_miss' has not finished -> waiting" >&2
+          state=pending
+        }
+      fi
+    fi
     [ "$state" != "pending" ] && break
   done
   local decision
@@ -2151,6 +2190,98 @@ _render_issue_item() {
 # cannot drift.
 _REQUIRED_CONTEXTS_CACHE=""
 _REQUIRED_CONTEXTS_LOADED=""
+# _required_contexts_snapshot -> line 1: known | empty | unknown ; line 2+: the contexts.
+#
+# #70: `_required_contexts` returns the SAME empty string for "this branch has no
+# required checks", "the token cannot see protection", and "the request failed". That
+# ambiguity is harmless while nothing depends on it -- and became load-bearing the
+# moment an expected-context list had to be intersected with the required set, because
+# an empty intersection would silently disable the completeness check during exactly the
+# degraded access that makes a partially registered set most likely.
+#
+# The state is FRAMED, not sentinelled: always line 1, always one of three fixed words,
+# names strictly on line 2+. Position carries the meaning, so a context literally named
+# `known` cannot be mistaken for the state -- the distinction #67's __MALFORMED_CONTEXT__
+# failure was actually about.
+#
+# 404 is an ANSWER, not a failure: an unprotected branch returns it, and treating that as
+# `unknown` would hold every merge on a repo that simply has no branch protection. Any
+# other error is `unknown`.
+_required_contexts_snapshot() {
+  # ONE call. A first cut ran gh twice -- once for stderr, once for stdout -- which both
+  # doubles the cost and lets the two observations disagree. stderr goes to a temp file
+  # so the context list on stdout stays clean; folding them with 2>&1 would let any gh
+  # warning become a bogus context name.
+  local out err rc tmp
+  tmp=$(mktemp 2>/dev/null) || { printf 'unknown\n'; return; }
+  out=$(_ci_gh api "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
+        --jq '.required_status_checks.contexts[]?' 2>"$tmp"); rc=$?
+  err=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
+  if [ "$rc" -ne 0 ]; then
+    if _contains "$err" 'Branch not protected' || _contains "$err" 'HTTP 404'; then
+      printf 'empty\n'
+    else
+      printf 'unknown\n'
+    fi
+    return
+  fi
+  case "$out" in *[![:space:]]*) printf 'known\n%s\n' "$out" ;; *) printf 'empty\n' ;; esac
+}
+
+# _expected_set <snap_state> <snap_names> -> the contexts whose presence gates GREEN.
+#
+# Empty when the operator has not opted in, so every repo behaves exactly as before.
+# Otherwise the declared list, restricted:
+#   * to what branch protection REQUIRES (so the list can never grant blocking authority
+#     branch protection did not) -- unless protection legitimately lists nothing, in
+#     which case there is nothing to intersect with and the declaration stands;
+#   * minus anything on the ignore list, because waiting for a context
+#     `_keep_blocking_checks` is documented to ignore would bypass load-bearing ignore
+#     behaviour -- that filter exists because Dependabot's check-runs once turned a
+#     healthy main red and triggered an auto-revert.
+_expected_set() {
+  local st="$1" names="$2" want="${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" line out=""
+  [ -n "${want//[[:space:]]/}" ] || return 0
+  [ "$st" = known ] || [ "$st" = empty ] || return 0
+  while IFS= read -r line; do
+    case "$line" in ''|*[![:space:]]*) ;; *) continue ;; esac
+    [ -n "$line" ] || continue
+    printf '%s\n' "$line" \
+      | grep -qE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})$" && continue
+    if [ "$st" = known ]; then
+      _contains "$(printf '\n%s\n' "$names")" "$(printf '\n%s\n' "$line")" || continue
+    fi
+    out="${out}${line}
+"
+  done <<EOF
+$want
+EOF
+  printf '%s' "$out"
+}
+
+# _expected_incomplete <lines> <expected> -> the first expected context that is ABSENT or
+# not terminal, or "" when all are present and done. `lines` are unfiltered
+# "name|status|conclusion" rows, because _keep_blocking_checks strips the names this
+# needs.
+_expected_incomplete() {
+  local lines="$1" expected="$2" want row found st
+  while IFS= read -r want; do
+    [ -n "${want//[[:space:]]/}" ] || continue
+    found=0
+    while IFS= read -r row; do
+      [ "${row%%|*}" = "$want" ] || continue
+      st="${row#*|}"; st="${st%%|*}"
+      [ "$st" = completed ] && found=1
+      break
+    done <<ROWS
+$lines
+ROWS
+    [ "$found" = 1 ] || { printf '%s' "$want"; return; }
+  done <<EOF
+$expected
+EOF
+}
+
 _required_contexts() {
   if [ -z "$_REQUIRED_CONTEXTS_LOADED" ]; then
     _REQUIRED_CONTEXTS_LOADED=1
@@ -2368,7 +2499,7 @@ _revert_git_args() {
 # run for the merge commit ONCE, then re-polls the commit's check-runs. Used to
 # distinguish a flaky red/hung main from a genuine one before reverting/halting.
 _rerun_main_ci() {
-  local sha="$1" full="${2:-}" rid w=0 lines st _iv
+  local sha="$1" full="${2:-}" rid w=0 lines st _iv _rr_exp
   # #62: check BEFORE dispatching. This function costs a `gh run list`, a `gh run
   # rerun` and a 20s startup sleep before it reaches its poll loop, so a check only at
   # the loop would let all of that run past an expired deadline.
@@ -2392,16 +2523,38 @@ _rerun_main_ci() {
   # Once, not per poll: inside the loop's command substitution the cache in
   # _required_contexts dies with the subshell, so it re-requested branch
   # protection every 30s -- the exact hazard the comment on _poll_ci warns about.
-  local _rr_req; _rr_req=$(_required_contexts)
+  # #70: INHERIT the watcher's snapshot rather than re-deriving one. A second lookup is a
+  # second failure window, and it can observe a protection edit made mid-watch -- judging
+  # the rerun against a different required set than the one that produced the red. Only
+  # an inherited `unknown` (or a direct call, e.g. from the self-test) refreshes.
+  local _rr_req _rr_snap _rr_state="${MAIN_SNAP_STATE:-unknown}" _rr_names="${MAIN_SNAP_NAMES:-}"
+  if [ "$_rr_state" = unknown ]; then
+    _rr_snap=$(_required_contexts_snapshot)
+    _rr_state=${_rr_snap%%$'\n'*}
+    _rr_names=${_rr_snap#*$'\n'}; [ "$_rr_state" = known ] || _rr_names=""
+  fi
+  _rr_req="$_rr_names"
   while [ "$w" -lt "$MAIN_CI_TIMEOUT" ] && ! _past_ci_deadline; do
     # #67: same helper AND same required set as the watcher. This used to poll
     # unnamed check-runs with no _keep_blocking_checks, so a non-required failure
     # could contradict the watch that triggered it -- and re-create the #43 stall
     # that filtering exists to prevent. Selecting a workflow to re-run and
     # deciding whether main is green are separate concerns.
+    if [ "$_rr_state" = unknown ]; then
+      _rr_snap=$(_required_contexts_snapshot)
+      _rr_state=${_rr_snap%%$'\n'*}
+      _rr_names=${_rr_snap#*$'\n'}; [ "$_rr_state" = known ] || _rr_names=""
+      _rr_req="$_rr_names"
+    fi
     lines=$(_commit_ci_lines "$sha" "$_rr_req") || lines=""
-    lines=$(_keep_blocking_checks "$lines" "$_rr_req")
-    st=$(_checkrun_state "$lines")
+    st=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$_rr_req")")
+    if [ "$st" = green ] && [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ]; then
+      if [ "$_rr_state" = unknown ]; then st=pending
+      else
+        _rr_exp=$(_expected_set "$_rr_state" "$_rr_names")
+        [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp")" ] && st=pending
+      fi
+    fi
     [ "$st" != pending ] && { echo "$st"; return; }
     _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
     sleep "$_iv"; w=$((w + _iv))
@@ -4276,7 +4429,18 @@ if [ "$1" = "api" ]; then
   if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; fi
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
   # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # The default is assigned to a variable, not written inline: `${VAR:-...}` ends at the
+  # first `}` and this JSON is full of them, while escaping them inside a QUOTED heredoc
+  # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
+  # and a stall in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
+  # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
+  printf '%s\n' "$@" | grep -q '/protection' && {
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -4339,13 +4503,23 @@ if [ "$1" = "api" ]; then
     exit 0
   fi
   if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
-  # Demo repo has no branch protection -> empty required set, so _keep_blocking_checks
-  # falls back to ignore-list-only. Without this the catch-all below hands back
-  # "completed|success" as though it were a required-contexts list.
-  if printf '%s\n' "$@" | grep -q '/protection'; then exit 0; fi
-  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
-  # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # Branch protection. By default the demo repo has none -> a successfully EMPTY
+  # required set. FAKE_PROT_CONTEXTS declares one; FAKE_PROT_RC=1 makes the endpoint
+  # unreadable, which is a different thing entirely (#70's tri-state).
+  if printf '%s\n' "$@" | grep -q '/protection'; then
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && printf '%s\n' "$FAKE_PROT_CONTEXTS"
+    exit 0
+  fi
+  # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the catch-all's
+  # bare "name|status|conclusion" lines will not do here. The default is assigned to a
+  # variable rather than written inline: `${VAR:-...}` ends at the first `}`, which this
+  # JSON is full of, and escaping them inside a QUOTED heredoc emits literal backslashes
+  # -- which produced invalid JSON, a permanently pending watch, and a 16-minute stall
+  # in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -4366,6 +4540,60 @@ SH
   _t1=$(date +%s)
   [ "$(( _t1 - _t0 ))" -le 15 ] \
     || { echo "FAIL #62: the main-CI watch took $(( _t1 - _t0 ))s -- MAIN_CI_POLL_INTERVAL is not being honoured"; exit 1; }
+  unset _t0 _t1
+  # #70 END-TO-END, through the real watcher. `e2e-desktop` is required and expected but
+  # has NOT registered; the two that have are green. Before this, _keep_blocking_checks
+  # saw only those two, _checkrun_state said green, and the watcher broke out. Now the
+  # watcher must keep polling and time out rather than declaring main green.
+  _t0=$(date +%s)
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e1" \
+    FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #70: main declared GREEN while the expected context 'e2e-desktop' had never registered"; exit 1; }
+  _t1=$(date +%s)
+  [ "$(( _t1 - _t0 ))" -le 30 ] \
+    || { echo "FAIL #70: the completeness wait was not bounded by the settle budget ($(( _t1 - _t0 ))s)"; exit 1; }
+  # ...and once it DOES register and finish, the same setup goes green. Without this the
+  # assertion above would hold for a gate that never passes anything.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e2" \
+    FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"},{"name":"e2e-desktop","status":"completed","conclusion":"success"}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #70: a COMPLETE expected set must go green"; exit 1; }
+  # RED still breaks immediately -- a terminal red is authoritative whether or not the
+  # rest has registered, so a regression is never left unreverted awaiting a straggler.
+  _t0=$(date +%s)
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=60 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e3" \
+    FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"failure"}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  _t1=$(date +%s)
+  [ "$(( _t1 - _t0 ))" -le 20 ] \
+    || { echo "FAIL #70: a RED main was held waiting for an unregistered context ($(( _t1 - _t0 ))s)"; exit 1; }
+  # AN UNREADABLE required set must never yield green while the list is set.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e4" FAKE_PROT_RC=1 \
+    BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)')" \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #70: green accepted while branch protection was unreadable"; exit 1; }
+  # OPT-IN: with the list UNSET the identical incomplete setup goes green, exactly as
+  # today. This is the assertion that protects every repo nobody has opted in.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e5" \
+    FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #70: with the list UNSET, behaviour must be unchanged (green)"; exit 1; }
   unset _t0 _t1
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
@@ -4501,7 +4729,18 @@ if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; exit 0; }   # read-back empty -> _post fails
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
   # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # The default is assigned to a variable, not written inline: `${VAR:-...}` ends at the
+  # first `}` and this JSON is full of them, while escaping them inside a QUOTED heredoc
+  # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
+  # and a stall in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
+  # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
+  printf '%s\n' "$@" | grep -q '/protection' && {
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -4562,7 +4801,18 @@ if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
   # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # The default is assigned to a variable, not written inline: `${VAR:-...}` ends at the
+  # first `}` and this JSON is full of them, while escaping them inside a QUOTED heredoc
+  # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
+  # and a stall in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
+  # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
+  printf '%s\n' "$@" | grep -q '/protection' && {
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -4660,7 +4910,18 @@ if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; }
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
   # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # The default is assigned to a variable, not written inline: `${VAR:-...}` ends at the
+  # first `}` and this JSON is full of them, while escaping them inside a QUOTED heredoc
+  # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
+  # and a stall in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
+  # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
+  printf '%s\n' "$@" | grep -q '/protection' && {
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -4861,7 +5122,18 @@ if [ "$1" = "api" ]; then
   printf '%s\n' "$@" | grep -q '/status' && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${STORE:-/dev/null}" 2>/dev/null; exit 0; }
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
   # catch-all's bare "name|status|conclusion" lines will not do here.
-  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'; exit 0; }
+  # The default is assigned to a variable, not written inline: `${VAR:-...}` ends at the
+  # first `}` and this JSON is full of them, while escaping them inside a QUOTED heredoc
+  # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
+  # and a stall in the rerun path's 300s delays.
+  CR="${FAKE_CHECKRUNS:-}"
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
+  # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
+  printf '%s\n' "$@" | grep -q '/protection' && {
+    [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
+    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -5634,6 +5906,47 @@ SH
       || { echo "FAIL #71: BUDGET='$_lz' armed ${_span}s, expected ~${_c}s (octal re-interpretation?)"; exit 1; }
   done
   unset _lz _c _armed _span
+  # --- #70: an expected context that has not registered must not read green ------
+  # The defect: a required context gated behind `needs:` registers AFTER faster ones
+  # finish. `_keep_blocking_checks` then sees only the fast ones, all green, and the
+  # watcher breaks out before the slow one reports. Measured on muesli the margin is 11
+  # seconds; it is structurally unbounded on a repo with deeper job staging.
+  _ec_lines='server (go)|completed|success
+client (node)|completed|success
+plugins (python) gate|in_progress|'
+  [ -z "$(_expected_incomplete "$_ec_lines" 'server (go)')" ] \
+    || { echo "FAIL #70: a present, terminal context must not read as incomplete"; exit 1; }
+  [ "$(_expected_incomplete "$_ec_lines" 'plugins (python) gate')" = 'plugins (python) gate' ] \
+    || { echo "FAIL #70: a REGISTERED but unfinished context must read as incomplete"; exit 1; }
+  [ "$(_expected_incomplete "$_ec_lines" 'e2e-desktop')" = 'e2e-desktop' ] \
+    || { echo "FAIL #70: an ABSENT context must read as incomplete -- this is the bug"; exit 1; }
+  [ -z "$(_expected_incomplete "$_ec_lines" '')" ] \
+    || { echo "FAIL #70: an empty expected set must never block"; exit 1; }
+  # Names contain spaces and parentheses; matching must be exact and literal.
+  [ "$(_expected_incomplete "$_ec_lines" 'server')" = 'server' ] \
+    || { echo "FAIL #70: matching must be EXACT -- 'server' is not 'server (go)'"; exit 1; }
+  # OPT-IN. Unset means every repo behaves exactly as it does today.
+  [ -z "$(_expected_set known 'a')" ] \
+    || { echo "FAIL #70: an unset list must produce an empty expected set"; exit 1; }
+  [ -z "$(BIRCHER_MAIN_EXPECTED_CONTEXTS='   ' _expected_set known 'a')" ] \
+    || { echo "FAIL #70: a whitespace-only list must produce an empty expected set"; exit 1; }
+  # The list can never grant blocking authority branch protection did not.
+  [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nb')" _expected_set known 'a' | tr -d '\n')" = a ] \
+    || { echo "FAIL #70: a listed context that is NOT required must be dropped"; exit 1; }
+  # ...but a successfully-unprotected branch has nothing to intersect with, so the
+  # declaration stands on its own.
+  [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nb')" _expected_set empty '' | tr -d '\n')" = ab ] \
+    || { echo "FAIL #70: with no protection the declared list must stand"; exit 1; }
+  # UNKNOWN is a failed lookup, not "nothing expected". It must never yield a set that
+  # silently disables the check -- the caller holds the verdict pending instead.
+  [ -z "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nb')" _expected_set unknown '')" ] \
+    || { echo "FAIL #70: an unreadable required set must not produce an expected set"; exit 1; }
+  # Ignore-listed contexts are subtracted: waiting for one would bypass the filter that
+  # exists because Dependabot's check-runs once turned a healthy main red.
+  [ "$(BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'a\nDependabot')" _expected_set known "$(printf 'a\nDependabot')" | tr -d '\n')" = a ] \
+    || { echo "FAIL #70: an ignore-listed context must be subtracted from the expected set"; exit 1; }
+  unset _ec_lines
+  echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
   echo "_past_ci_deadline OK (#62 shared wall clock)"
