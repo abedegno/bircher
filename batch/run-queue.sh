@@ -748,19 +748,26 @@ _commit_ci_lines() {
     return 1
   }
   recs=$(jq -c -n --argjson runs "$runs_json" --argjson sts "$sts_json" '
-      [ $runs[] | {name, status, conclusion: (.conclusion // "")} ]
+      [ $runs[] | {name, status, conclusion: (.conclusion // ""),
+                   app: ((.app.id // "") | tostring)} ]
     + [ $sts | to_entries | map(.value + {_i: .key})
         | group_by(.context) | map(sort_by([.updated_at, (0 - ._i)]) | last)[]
         | {name: .context,
            status: (if .state == "pending" then "in_progress" else "completed" end),
            conclusion: (if .state == "pending" then ""
                         elif .state == "success" then "success"
-                        else "failure" end)} ]' 2>/dev/null) || return 1
+                        else "failure" end),
+           # #73: commit statuses carry NO producing app -- verified against the live
+           # API, where a real status object is {context, state, creator:null} with no
+           # `app` key at all. Empty is therefore not "unknown", it is "unbindable", and
+           # the matcher treats such a record as eligible for ANY requirement. That
+           # mirrors branch protection, which can only pin a `checks[]` entry.
+           app: ""} ]' 2>/dev/null) || return 1
   # A record whose name or status is not a string would emit `null|...` and classify
   # as an unrecognised - therefore green - line. Never guess at a malformed record.
   printf '%s' "$recs" | jq -e '
       all(.[]; (.name|type) == "string" and (.status|type) == "string"
-               and (.conclusion|type) == "string")' >/dev/null 2>&1 || {
+               and (.conclusion|type) == "string" and (.app|type) == "string")' >/dev/null 2>&1 || {
     echo "[batch] WARN: a CI record on $sha has a non-string name/status -> failing closed" >&2
     return 1
   }
@@ -798,7 +805,7 @@ EOF
   fi
   printf '%s' "$recs" | jq -r '
       .[] | select(.name | test("[|]") | not)
-          | "\(.name)|\(.status)|\(.conclusion)"' 2>/dev/null
+          | "\(.name)|\(.status)|\(.conclusion)|\(.app)"' 2>/dev/null
 }
 
 # _poll_ci <pr> <timeout_s> -> green|red|pending
@@ -1596,7 +1603,11 @@ merge_ready_pr() {
   _snap=$(_required_contexts_snapshot)
   MAIN_SNAP_STATE=${_snap%%$'\n'*}
   MAIN_SNAP_NAMES=${_snap#*$'\n'}; [ "$MAIN_SNAP_STATE" = known ] || MAIN_SNAP_NAMES=""
-  mreq="$MAIN_SNAP_NAMES"   # once, not on every 30s poll
+  # #73: MAIN_SNAP_NAMES is TYPED (bound<TAB>ctx<TAB>app / unbound<TAB>ctx). Everything
+  # that only cares about names takes field 2; the completeness gate keeps the typing,
+  # which is the whole point -- flattening it here would put the trust boundary straight
+  # back in the bin.
+  mreq=$(_req_names "$MAIN_SNAP_NAMES")   # once, not on every 30s poll
   while [ "$waited" -lt "$MAIN_CI_SETTLE_TIMEOUT" ] && ! _past_ci_deadline; do
     _iv=$(_clamp_int "$MAIN_CI_POLL_INTERVAL" 30 1 300)
     sleep "$_iv"; waited=$((waited + _iv))
@@ -1614,7 +1625,7 @@ merge_ready_pr() {
       _snap=$(_required_contexts_snapshot)
       MAIN_SNAP_STATE=${_snap%%$'\n'*}
       MAIN_SNAP_NAMES=${_snap#*$'\n'}; [ "$MAIN_SNAP_STATE" = known ] || MAIN_SNAP_NAMES=""
-      mreq="$MAIN_SNAP_NAMES"
+      mreq=$(_req_names "$MAIN_SNAP_NAMES")
     fi
     lines=$(_commit_ci_lines "$sha" "$mreq") || lines=""
     state=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$mreq")")
@@ -1630,7 +1641,7 @@ merge_ready_pr() {
         echo "[batch:merge] $item: main CI green but branch protection is unreadable -> not accepting green yet" >&2
         state=pending
       elif [ -n "$_exp" ]; then
-        _miss=$(_expected_incomplete "$lines" "$_exp")
+        _miss=$(_expected_incomplete "$lines" "$_exp" "$MAIN_SNAP_NAMES")
         [ -n "$_miss" ] && {
           echo "[batch:merge] $item: main CI green so far, but expected context '$_miss' has not finished -> waiting" >&2
           state=pending
@@ -2208,13 +2219,18 @@ _REQUIRED_CONTEXTS_LOADED=""
 # `known` cannot be mistaken for the state -- the distinction #67's __MALFORMED_CONTEXT__
 # failure was actually about.
 #
-# BOTH representations. GitHub's `status-check-policy` carries `contexts` (names) AND
-# `checks` (`{context, app_id}`, which pins a check to a producing app). Reading only
-# `contexts` would drop any check configured through the app-bound form: the operator's
-# declared context would then fail the intersection, be silently removed from the
-# expected set, and #70's gate would not apply to it at all -- the exact defect this
-# issue exists to close, reintroduced one layer down. Unioned and deduplicated, so the
-# two agree when GitHub keeps them in sync and nothing is lost when it does not.
+# BOTH representations, and TYPED rather than flattened (#73). GitHub's
+# `status-check-policy` carries `contexts` (bare names -- ANY producer satisfies them)
+# and `checks` (`{context, app_id}` -- a SPECIFIC producer does). #70 unioned them into
+# a name list, which closed one gap and erased a trust boundary: a same-named check from
+# the wrong app could satisfy an app-bound requirement.
+#
+# This is not hypothetical on the repo it was built for. Every one of muesli's seven
+# required checks is declared app-bound to app_id 15368, and `contexts` merely mirrors
+# them -- so the name-only matcher was ignoring the binding on every merge.
+#
+# Each line is therefore `bound<TAB>context<TAB>app_id` or `unbound<TAB>context`.
+# Callers that only want names take field 2.
 #
 # 404 is an ANSWER, not a failure: an unprotected branch returns it, and treating that as
 # `unknown` would hold every merge on a repo that simply has no branch protection. Any
@@ -2229,7 +2245,8 @@ _required_contexts_snapshot() {
   local out err rc tmp
   tmp=$(mktemp 2>/dev/null) || { printf 'unknown\n'; return; }
   out=$(_ci_gh api "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
-        --jq '[.required_status_checks.contexts[]?, .required_status_checks.checks[]?.context] | unique[]' 2>"$tmp"); rc=$?
+        --jq '[(.required_status_checks.checks[]? | "bound\t\(.context)\t\(.app_id // "")"),
+           (.required_status_checks.contexts[]? | "unbound\t\(.)")] | unique[]' 2>"$tmp"); rc=$?
   err=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
   if [ "$rc" -ne 0 ]; then
     # ONLY the message GitHub returns for a genuinely unprotected branch counts as an
@@ -2250,6 +2267,21 @@ _required_contexts_snapshot() {
   case "$out" in *[![:space:]]*) printf 'known\n%s\n' "$out" ;; *) printf 'empty\n' ;; esac
 }
 
+# _req_names <typed-requirements> -> just the context names, deduplicated.
+# Everything that predates #73 keys on names; only the completeness gate needs the type.
+_req_names() {
+  printf '%s\n' "$1" | awk -F'\t' 'NF>1 && $2 != "" { print $2 }' | awk '!seen[$0]++'
+}
+
+# _req_app <typed-requirements> <context> -> the required app id, or "" when the
+# requirement is unbound. A context declared BOTH ways (GitHub mirrors `checks` into
+# `contexts`, so muesli declares all seven twice) resolves to the BOUND form: it is the
+# stricter of the two, and taking the looser one would silently discard the binding.
+_req_app() {
+  printf '%s\n' "$1" | awk -F'\t' -v c="$2" '$2 == c && $1 == "bound" { print $3; found=1 }
+                                               END { if (!found) print "" }' | head -1
+}
+
 # _expected_set <snap_state> <snap_names> -> the contexts whose presence gates GREEN.
 #
 # Empty when the operator has not opted in, so every repo behaves exactly as before.
@@ -2263,6 +2295,10 @@ _required_contexts_snapshot() {
 #     healthy main red and triggered an auto-revert.
 _expected_set() {
   local st="$1" names="$2" want="${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" line out=""
+  # #73: the snapshot is TYPED now. Intersect on bare names -- the binding is applied
+  # later, by the matcher, which is the only place that can weigh a producer against the
+  # rows that actually reported.
+  case "$names" in *"$(printf '\t')"*) names=$(_req_names "$names") ;; esac
   [ -n "${want//[[:space:]]/}" ] || return 0
   [ "$st" = known ] || [ "$st" = empty ] || return 0
   while IFS= read -r line; do
@@ -2289,24 +2325,54 @@ EOF
   printf '%s' "$out"
 }
 
-# _expected_incomplete <lines> <expected> -> the first expected context that is ABSENT or
-# not terminal, or "" when all are present and done. `lines` are unfiltered
-# "name|status|conclusion" rows, because _keep_blocking_checks strips the names this
-# needs.
+# _expected_incomplete <lines> <expected> [typed-requirements] -> the first expected
+# context not yet satisfied, or "" when all are.
+#
+# `lines` are unfiltered "name|status|conclusion|app" rows, because _keep_blocking_checks
+# strips the name this needs.
+#
+# #73 -- PRODUCER MATCHING. A requirement declared as `checks[]` is pinned to an app_id;
+# one declared as `contexts[]` is satisfied by any producer. Matching on name alone let a
+# same-named check from the WRONG app satisfy a pinned requirement, which is not
+# theoretical: every one of muesli's required checks is app-bound.
+#
+# For a BOUND requirement the eligible rows are:
+#   * check-runs whose app id equals the required one, and
+#   * rows with NO producer identity -- commit statuses, which the API gives no app at
+#     all, so they cannot be pinned and must not be excluded by a pin.
+# Rows from a different app are IGNORED: not evidence for, and not evidence against.
+#
+# Eligible rows are then aggregated conservatively, worst-first:
+#   any red        -> unsatisfied (report it, so the caller keeps polling and the red
+#                     surfaces through the normal verdict path)
+#   any pending    -> unsatisfied
+#   none at all    -> unsatisfied  (absence is never satisfaction -- the whole point)
+#   otherwise      -> satisfied
+# So required-app green + stray-app red PASSES, required-app red + stray-app green FAILS,
+# and only-stray-app green HOLDS. That is what branch protection itself would do.
 _expected_incomplete() {
-  local lines="$1" expected="$2" want row found st
+  local lines="$1" expected="$2" typed="${3:-}" want row need st app
   while IFS= read -r want; do
     [ -n "${want//[[:space:]]/}" ] || continue
-    found=0
+    need=$(_req_app "$typed" "$want")
+    local seen=0 red=0 pend=0 good=0
     while IFS= read -r row; do
       [ "${row%%|*}" = "$want" ] || continue
-      st="${row#*|}"; st="${st%%|*}"
-      [ "$st" = completed ] && found=1
-      break
+      st=${row#*|}; app=${st##*|}; st=${st%|*}      # st -> status|conclusion, app -> id
+      # A bound requirement ignores other producers entirely; an unbindable row (a
+      # status, which has no app) stays eligible because protection cannot pin it.
+      if [ -n "$need" ] && [ -n "$app" ] && [ "$app" != "$need" ]; then continue; fi
+      seen=1
+      case "$st" in
+        completed\|success|completed\|neutral|completed\|skipped) good=1 ;;
+        completed\|*)                                              red=1 ;;
+        *)                                                          pend=1 ;;
+      esac
     done <<ROWS
 $lines
 ROWS
-    [ "$found" = 1 ] || { printf '%s' "$want"; return; }
+    { [ "$red" = 1 ] || [ "$pend" = 1 ] || [ "$seen" = 0 ] || [ "$good" = 0 ]; } \
+      && { printf '%s' "$want"; return; }
   done <<EOF
 $expected
 EOF
@@ -2345,18 +2411,23 @@ _required_contexts() {
 # errs toward calling things red. Failing closed matters here: inverting it would make
 # every genuinely red PR look green.
 _keep_blocking_checks() {
-  local lines="$1" required="$2" filtered name
+  local lines="$1" required="$2" filtered name _r
   filtered=$(printf '%s\n' "$lines" \
     | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|")
   if [ -z "$required" ]; then
-    printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
+    printf '%s\n' "$filtered" | cut -d'|' -f2,3
     return
   fi
   local kept
   kept=$(printf '%s\n' "$filtered" | while IFS= read -r line; do
     [ -n "$line" ] || continue
     name="${line%%|*}"
-    printf '%s\n' "$required" | grep -Fxq "$name" && printf '%s\n' "${line#*|}"
+    if printf '%s\n' "$required" | grep -Fxq "$name"; then
+      # PROJECT to exactly status|conclusion. #73 added a fourth field (the producing
+      # app), and `_checkrun_state`'s allowlist is strict by design since #67 -- handing
+      # it `status|conclusion|app` would match nothing and read RED for every check.
+      _r=${line#*|}; printf '%s\n' "${_r%|*}"
+    fi
   done)
   # A required-set that matches NOTHING is a misconfiguration or a naming mismatch
   # (contexts that never run on this event, a renamed job), not a genuine "no checks".
@@ -2373,7 +2444,7 @@ _keep_blocking_checks() {
   # completeness this function CANNOT provide is instead enforced upstream, by
   # _commit_ci_lines failing closed on any response that is not whole.
   if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
-    printf '%s\n' "$filtered" | sed 's/^[^|]*|//'
+    printf '%s\n' "$filtered" | cut -d'|' -f2,3
     return
   fi
   printf '%s\n' "$kept"
@@ -2394,7 +2465,7 @@ _keep_blocking_checks() {
 _drop_non_ci_checkruns() {
   printf '%s\n' "$1" \
     | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|" \
-    | sed 's/^[^|]*|//'
+    | cut -d'|' -f2,3
 }
 
 # _rerun_main_ci_until_green <sha> [budget] [delay_s] -> green|red|pending|unknown
@@ -2563,7 +2634,7 @@ _rerun_main_ci() {
     _rr_state=${_rr_snap%%$'\n'*}
     _rr_names=${_rr_snap#*$'\n'}; [ "$_rr_state" = known ] || _rr_names=""
   fi
-  _rr_req="$_rr_names"
+  _rr_req=$(_req_names "$_rr_names")
   while [ "$w" -lt "$MAIN_CI_TIMEOUT" ] && ! _past_ci_deadline; do
     # #67: same helper AND same required set as the watcher. This used to poll
     # unnamed check-runs with no _keep_blocking_checks, so a non-required failure
@@ -2574,7 +2645,7 @@ _rerun_main_ci() {
       _rr_snap=$(_required_contexts_snapshot)
       _rr_state=${_rr_snap%%$'\n'*}
       _rr_names=${_rr_snap#*$'\n'}; [ "$_rr_state" = known ] || _rr_names=""
-      _rr_req="$_rr_names"
+      _rr_req=$(_req_names "$_rr_names")
     fi
     lines=$(_commit_ci_lines "$sha" "$_rr_req") || lines=""
     st=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$_rr_req")")
@@ -2582,7 +2653,7 @@ _rerun_main_ci() {
       if [ "$_rr_state" = unknown ]; then st=pending
       else
         _rr_exp=$(_expected_set "$_rr_state" "$_rr_names")
-        [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp")" ] && st=pending
+        [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp" "$_rr_names")" ] && st=pending
       fi
     fi
     [ "$st" != pending ] && { echo "$st"; return; }
@@ -4240,26 +4311,26 @@ SH
   _st_json() { printf '{"statuses":[{"context":"ext-ci","state":"%s","updated_at":"2026-01-01T00:00:00Z"}]}' "$1"; }
   _cl() { PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123; }
   # Each status state maps to the right check-run shape -- via the real jq.
-  [ "$(FAKE_STATUS_JSON="$(_st_json success)" _cl)" = "ext-ci|completed|success" ] \
+  [ "$(FAKE_STATUS_JSON="$(_st_json success)" _cl)" = "ext-ci|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: success mapping"; rm -rf "$cdir"; exit 1; }
-  [ "$(FAKE_STATUS_JSON="$(_st_json failure)" _cl)" = "ext-ci|completed|failure" ] \
+  [ "$(FAKE_STATUS_JSON="$(_st_json failure)" _cl)" = "ext-ci|completed|failure|" ] \
     || { echo "FAIL _commit_ci_lines: failure mapping"; rm -rf "$cdir"; exit 1; }
   # THE TRAP: `error` passed through as a conclusion would read GREEN, because
   # _checkrun_state matches only check-run failure conclusions.
-  [ "$(FAKE_STATUS_JSON="$(_st_json error)" _cl)" = "ext-ci|completed|failure" ] \
+  [ "$(FAKE_STATUS_JSON="$(_st_json error)" _cl)" = "ext-ci|completed|failure|" ] \
     || { echo "FAIL _commit_ci_lines: status 'error' must map to failure, not pass through"; rm -rf "$cdir"; exit 1; }
   [ "$(_checkrun_state "$(FAKE_STATUS_JSON="$(_st_json error)" _cl | sed 's/^[^|]*|//')")" = red ] \
     || { echo "FAIL _commit_ci_lines: status 'error' must make the verdict red"; rm -rf "$cdir"; exit 1; }
-  [ "$(FAKE_STATUS_JSON="$(_st_json pending)" _cl)" = "ext-ci|in_progress|" ] \
+  [ "$(FAKE_STATUS_JSON="$(_st_json pending)" _cl)" = "ext-ci|in_progress||" ] \
     || { echo "FAIL _commit_ci_lines: pending mapping"; rm -rf "$cdir"; exit 1; }
   # Newest-per-context only: a stale duplicate must not flip the verdict.
   [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"ext-ci","state":"failure","updated_at":"2026-01-01T00:00:00Z"},{"context":"ext-ci","state":"success","updated_at":"2026-01-02T00:00:00Z"}]}' _cl)" \
-    = "ext-ci|completed|success" ] \
+    = "ext-ci|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: must take the NEWEST status per context"; rm -rf "$cdir"; exit 1; }
   # Statuses merge with check-runs.
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
        FAKE_STATUS_JSON="$(_st_json success)" _cl | sort | tr '\n' ' ')" \
-    = "ext-ci|completed|success server|completed|success " ] \
+    = "ext-ci|completed|success| server|completed|success| " ] \
     || { echo "FAIL _commit_ci_lines: statuses not merged with check-runs"; rm -rf "$cdir"; exit 1; }
   # FAIL CLOSED: either fetch failing must not yield a partial (false-green) list.
   FAKE_STATUS_RC=1 _cl >/dev/null 2>&1 \
@@ -4269,13 +4340,13 @@ SH
   # Zero statuses is NORMAL -- merge commits legitimately carry none (verified
   # against muesli: merge commits have 0, PR heads carry review-gate).
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' _cl)" \
-    = "server|completed|success" ] \
+    = "server|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: zero statuses must be normal, not an error"; rm -rf "$cdir"; exit 1; }
   # EQUAL timestamps: GitHub returns newest-first, and max_by picks the LAST equal
   # maximum -- so `[failure, success]` at the same second selected the stale
   # success and read GREEN. Tie-break is now by input order.
   [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"ext-ci","state":"failure","updated_at":"2026-01-01T00:00:00Z"},{"context":"ext-ci","state":"success","updated_at":"2026-01-01T00:00:00Z"}]}' _cl)" \
-    = "ext-ci|completed|failure" ] \
+    = "ext-ci|completed|failure|" ] \
     || { echo "FAIL _commit_ci_lines: equal timestamps must take the FIRST (newest) entry"; rm -rf "$cdir"; exit 1; }
   # A context carrying the field delimiter cannot be represented; emitting it
   # anyway turned a required PENDING status into GREEN. Must fail closed.
@@ -4289,20 +4360,20 @@ SH
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
        FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' \
        PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
-    = "server|completed|success" ] \
+    = "server|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing context must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   # An absent .statuses key is a malformed response, not "no statuses".
   FAKE_STATUS_JSON='{}' _cl >/dev/null 2>&1 \
     && { echo "FAIL _commit_ci_lines: absent .statuses must fail closed"; rm -rf "$cdir"; exit 1; }
   # A state GitHub may add later must not read as success.
-  [ "$(FAKE_STATUS_JSON="$(_st_json some_new_state)" _cl)" = "ext-ci|completed|failure" ] \
+  [ "$(FAKE_STATUS_JSON="$(_st_json some_new_state)" _cl)" = "ext-ci|completed|failure|" ] \
     || { echo "FAIL _commit_ci_lines: an unknown state must not read as success"; rm -rf "$cdir"; exit 1; }
   # The exact false-green the sentinel design allowed: a REAL context whose name
   # merely begins with the old sentinel string was deleted by the cleanup while
   # not being recognised as malformed, so a required FAILING status vanished and
   # the verdict read green. Control records no longer share a namespace with data.
   [ "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl)" \
-    = "__MALFORMED_CONTEXT__prod|completed|failure" ] \
+    = "__MALFORMED_CONTEXT__prod|completed|failure|" ] \
     || { echo "FAIL _commit_ci_lines: a context named like the old sentinel must survive as a normal record"; rm -rf "$cdir"; exit 1; }
   [ "$(_checkrun_state "$(FAKE_STATUS_JSON='{"statuses":[{"context":"__MALFORMED_CONTEXT__prod","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' _cl | sed 's/^[^|]*|//')")" = red ] \
     || { echo "FAIL _commit_ci_lines: sentinel-named failing context must still read red"; rm -rf "$cdir"; exit 1; }
@@ -4332,16 +4403,16 @@ SH
   # ...but a well-formed EMPTY list on either side is legitimate: merge commits carry
   # no statuses, and a commit with no CI at all carries no check-runs (-> pending).
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
-       FAKE_STATUS_BODY='[{"statuses":[]}]' _cl)" = "server|completed|success" ] \
+       FAKE_STATUS_BODY='[{"statuses":[]}]' _cl)" = "server|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: an empty statuses ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
   [ "$(FAKE_RUNS_BODY='[{"check_runs":[]}]' FAKE_STATUS_JSON="$(_st_json success)" _cl)" \
-    = "ext-ci|completed|success" ] \
+    = "ext-ci|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: an empty check_runs ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
   # PAGINATION. GitHub serves 30 records per page; muesli's main commit already
   # carries 28 check-runs. Without --paginate a required FAILURE on page 2 is simply
   # not fetched, page 1 is all green, and the verdict reads green.
   [ "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
-       _cl | sort | tr '\n' ' ')" = "p1|completed|success p2|completed|failure " ] \
+       _cl | sort | tr '\n' ' ')" = "p1|completed|success| p2|completed|failure| " ] \
     || { echo "FAIL _commit_ci_lines: records beyond page 1 must be fetched"; rm -rf "$cdir"; exit 1; }
   [ "$(_checkrun_state "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
        _cl | sed 's/^[^|]*|//')")" = red ] \
@@ -4380,7 +4451,7 @@ SH
     && { echo "FAIL _commit_ci_lines: a REQUIRED pipe-bearing check-run must fail closed"; rm -rf "$cdir"; exit 1; }
   [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null},{"name":"server","status":"completed","conclusion":"success"}]}' \
        PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
-    = "server|completed|success" ] \
+    = "server|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing check-run must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
@@ -5941,9 +6012,11 @@ SH
   # finish. `_keep_blocking_checks` then sees only the fast ones, all green, and the
   # watcher breaks out before the slow one reports. Measured on muesli the margin is 11
   # seconds; it is structurally unbounded on a repo with deeper job staging.
-  _ec_lines='server (go)|completed|success
-client (node)|completed|success
-plugins (python) gate|in_progress|'
+  # Four fields since #73: name|status|conclusion|app. These fixtures are app-less, which
+  # is the unbindable case -- eligible for any requirement, bound or not.
+  _ec_lines='server (go)|completed|success|
+client (node)|completed|success|
+plugins (python) gate|in_progress||'
   [ -z "$(_expected_incomplete "$_ec_lines" 'server (go)')" ] \
     || { echo "FAIL #70: a present, terminal context must not read as incomplete"; exit 1; }
   [ "$(_expected_incomplete "$_ec_lines" 'plugins (python) gate')" = 'plugins (python) gate' ] \
@@ -6089,6 +6162,56 @@ plugins (python) gate|in_progress|'
   rm -rf "$_rc2"; unset _rc2 _rcout
   rm -rf "$_p4"; unset _p4
   rm -rf "$_ad"; unset _ad
+  # --- #73: producer matching, table-driven -----------------------------------
+  # A `checks[]` requirement is pinned to an app_id; a `contexts[]` one is not. Matching
+  # on name alone let a same-named check from the WRONG app satisfy a pinned requirement.
+  # Not hypothetical: every one of muesli's seven required checks is app-bound.
+  #
+  # Columns: typed-requirement | rows | expected-result ("" = satisfied, else the name).
+  _pm() { _expected_incomplete "$2" "$3" "$1"; }
+  _B=$(printf 'bound\te2e\t15368'); _U=$(printf 'unbound\te2e')
+  # the defect itself: only the WRONG producer reported, and it is green
+  [ "$(_pm "$_B" 'e2e|completed|success|999' e2e)" = e2e ] \
+    || { echo "FAIL #73: a wrong-app green must NOT satisfy an app-bound requirement"; exit 1; }
+  [ -z "$(_pm "$_B" 'e2e|completed|success|15368' e2e)" ] \
+    || { echo "FAIL #73: the required app's green must satisfy it"; exit 1; }
+  # a stray producer must not be able to VETO the required one either
+  [ -z "$(_pm "$_B" "$(printf 'e2e|completed|success|15368\ne2e|completed|failure|999')" e2e)" ] \
+    || { echo "FAIL #73: a stray wrong-app RED must not block a satisfied requirement"; exit 1; }
+  # ...but the required app's own red must hold, whatever else is green
+  [ "$(_pm "$_B" "$(printf 'e2e|completed|failure|15368\ne2e|completed|success|999')" e2e)" = e2e ] \
+    || { echo "FAIL #73: the required app's RED must not be masked by a stray green"; exit 1; }
+  # order must not matter -- the aggregation is worst-first, not first-wins
+  [ "$(_pm "$_B" "$(printf 'e2e|completed|success|999\ne2e|completed|failure|15368')" e2e)" = e2e ] \
+    || { echo "FAIL #73: reversing row order changed the verdict"; exit 1; }
+  # a commit STATUS has no app at all and cannot be pinned by protection, so it stays
+  # eligible for a bound requirement rather than being excluded by the pin
+  [ -z "$(_pm "$_B" 'e2e|completed|success|' e2e)" ] \
+    || { echo "FAIL #73: an unbindable row (a status) must remain eligible for a bound requirement"; exit 1; }
+  # pending from the required app holds; pending from a stray does not satisfy
+  [ "$(_pm "$_B" 'e2e|in_progress||15368' e2e)" = e2e ] \
+    || { echo "FAIL #73: the required app still running must hold"; exit 1; }
+  [ "$(_pm "$_B" 'e2e|in_progress||999' e2e)" = e2e ] \
+    || { echo "FAIL #73: a stray app running is not satisfaction"; exit 1; }
+  # UNBOUND requirements keep the old behaviour: any producer satisfies
+  [ -z "$(_pm "$_U" 'e2e|completed|success|999' e2e)" ] \
+    || { echo "FAIL #73: an UNBOUND requirement must accept any producer"; exit 1; }
+  # a context declared BOTH ways resolves to the bound form -- GitHub mirrors checks[]
+  # into contexts[], so muesli declares all seven twice, and taking the looser one would
+  # discard every binding on the repo this was built for
+  [ "$(_pm "$(printf 'bound\te2e\t15368\nunbound\te2e')" 'e2e|completed|success|999' e2e)" = e2e ] \
+    || { echo "FAIL #73: a doubly-declared context must resolve to the BOUND requirement"; exit 1; }
+  # ...IN EITHER ORDER. The snapshot's `unique[]` sorts, so "bound" happens to precede
+  # "unbound" today and a first-wins lookup would pass this by luck of the alphabet. That
+  # is not a property worth depending on: it makes the guard untestable and would break
+  # silently if the jq ever stopped sorting. Reversed, so the preference is real.
+  [ "$(_pm "$(printf 'unbound\te2e\nbound\te2e\t15368')" 'e2e|completed|success|999' e2e)" = e2e ] \
+    || { echo "FAIL #73: BOUND must win regardless of declaration order, not by sort luck"; exit 1; }
+  # absence is still never satisfaction
+  [ "$(_pm "$_B" 'other|completed|success|15368' e2e)" = e2e ] \
+    || { echo "FAIL #73: an absent expected context must remain unsatisfied"; exit 1; }
+  unset -f _pm; unset _B _U
+  echo "_expected_incomplete producer matching OK (#73)"
   echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
   echo "_clamp_int OK (#62 one validated path for every numeric knob)"
