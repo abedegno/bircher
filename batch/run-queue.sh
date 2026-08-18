@@ -1628,6 +1628,12 @@ merge_ready_pr() {
       mreq=$(_req_names "$MAIN_SNAP_NAMES")
     fi
     lines=$(_commit_ci_lines "$sha" "$mreq") || lines=""
+    # #73: drop rows from an app the requirement did not name BEFORE classifying, or a
+    # stray wrong-app failure turns main red and can trigger an auto-revert that branch
+    # protection itself would never have asked for. Gated on opt-in, so a repo that has
+    # not declared its expected contexts keeps exactly its previous behaviour.
+    [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] \
+      && lines=$(_drop_wrong_producer "$lines" "$MAIN_SNAP_NAMES")
     state=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$mreq")")
     # #70: green needs the EXPECTED set complete, not merely the registered subset green.
     # A required context gated behind `needs:` registers after faster ones finish -- an
@@ -2366,6 +2372,36 @@ EOF
   printf '%s' "$out"
 }
 
+# _drop_wrong_producer <lines> <typed-requirements> -> the same lines, minus check-run
+# rows from an app that a BOUND requirement did not name.
+#
+# #73: producer matching has to happen BEFORE the verdict, not only inside the
+# completeness check. `_expected_incomplete` runs only once `_checkrun_state` has already
+# said green -- and `_checkrun_state` sees every row with a matching NAME, so a stray
+# wrong-app failure made main red before the producer-aware rule got a turn. Branch
+# protection would have accepted the required app's success; bircher would have reverted.
+# The unit test missed it exactly because it exercised the matcher in isolation.
+#
+# A row is dropped only when its context has a bound requirement AND the row names a
+# different app. Unbound contexts, unknown contexts, and app-less rows are untouched
+# here -- eligibility of app-less rows for a bound requirement is the matcher's business,
+# and dropping them at this stage would make an absent required check look like a green
+# one.
+_drop_wrong_producer() {
+  local lines="$1" typed="$2" row name app need
+  [ -n "${typed//[[:space:]]/}" ] || { printf '%s' "$lines"; return; }
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    name=${row%%|*}
+    app=${row##*|}
+    need=$(_req_app "$typed" "$name")
+    if [ -n "$need" ] && [ -n "$app" ] && [ "$app" != "$need" ]; then continue; fi
+    printf '%s\n' "$row"
+  done <<EOF
+$lines
+EOF
+}
+
 # _expected_incomplete <lines> <expected> [typed-requirements] -> the first expected
 # context not yet satisfied, or "" when all are.
 #
@@ -2695,6 +2731,8 @@ _rerun_main_ci() {
       _rr_req=$(_req_names "$_rr_names")
     fi
     lines=$(_commit_ci_lines "$sha" "$_rr_req") || lines=""
+    [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] \
+      && lines=$(_drop_wrong_producer "$lines" "$_rr_names")
     st=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$_rr_req")")
     if [ "$st" = green ] && [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ]; then
       if [ "$_rr_state" = unknown ]; then st=pending
@@ -4755,6 +4793,35 @@ SH
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
     || { echo "FAIL #70: with the list UNSET, behaviour must be unchanged (green)"; exit 1; }
   unset _t0 _t1
+  # #73 END-TO-END: a stray wrong-app FAILURE must not veto the required app's success.
+  # The unit table asserted this of _expected_incomplete, and missed the real defect
+  # entirely, because that function only runs once _checkrun_state has already returned
+  # green -- and _checkrun_state saw BOTH rows (it filters by name) and said RED first.
+  # Branch protection would have accepted app 15368's success; bircher would have
+  # reverted a healthy main. Only an integration test can see that.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p1" \
+    FAKE_PROT_CONTEXTS='e2e' BIRCHER_MAIN_EXPECTED_CONTEXTS='e2e' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"e2e","status":"completed","conclusion":"success","app":{"id":15368}},{"name":"e2e","status":"completed","conclusion":"failure","app":{"id":999}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #73: a stray wrong-app RED vetoed the required app's green -- protection would have accepted it"; exit 1; }
+  # ...and the converse still holds: the REQUIRED app's red is authoritative however many
+  # greens another producer posts.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p2" \
+    FAKE_PROT_CONTEXTS='e2e' BIRCHER_MAIN_EXPECTED_CONTEXTS='e2e' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"e2e","status":"completed","conclusion":"failure","app":{"id":15368}},{"name":"e2e","status":"completed","conclusion":"success","app":{"id":999}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #73: the required app's RED was masked by a stray producer's green"; exit 1; }
+  # ...and only the WRONG app reporting is not satisfaction: it must hold, not go green.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p3" \
+    FAKE_PROT_CONTEXTS='e2e' BIRCHER_MAIN_EXPECTED_CONTEXTS='e2e' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"e2e","status":"completed","conclusion":"success","app":{"id":999}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #73: only the WRONG app reported and the watcher accepted green"; exit 1; }
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
   # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
