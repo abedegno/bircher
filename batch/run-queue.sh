@@ -2245,8 +2245,7 @@ _required_contexts_snapshot() {
   local out err rc tmp
   tmp=$(mktemp 2>/dev/null) || { printf 'unknown\n'; return; }
   out=$(_ci_gh api "repos/$REPO/branches/${MAIN_BRANCH:-main}/protection" \
-        --jq '[(.required_status_checks.checks[]? | "bound\t\(.context)\t\(.app_id // "")"),
-           (.required_status_checks.contexts[]? | "unbound\t\(.)")] | unique[]' 2>"$tmp"); rc=$?
+        2>"$tmp"); rc=$?
   err=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
   if [ "$rc" -ne 0 ]; then
     # ONLY the message GitHub returns for a genuinely unprotected branch counts as an
@@ -2264,6 +2263,26 @@ _required_contexts_snapshot() {
     fi
     return
   fi
+  # VALIDATE BEFORE SERIALISING. The typed protocol uses TAB as its field separator, so
+  # a context containing a TAB would be read as extra fields: `build<TAB>linux` becomes
+  # name `build`, the declared list can no longer intersect it, the expected set comes
+  # back EMPTY -- and an empty set means no gate. Silently disabling the check on an
+  # opted-in repo is the worst outcome available, and it is exactly #67's lesson about a
+  # name that cannot be represented in a delimiter protocol.
+  #
+  # Every line here IS a requirement, so there is no "drop the non-required one" option
+  # as #67 had: an unrepresentable context means the requirements cannot be described at
+  # all, and the honest answer is `unknown` -- which holds pending and says why.
+  printf '%s' "$out" | jq -e 'type == "object"' >/dev/null 2>&1 || { printf 'unknown\n'; return; }
+  if printf '%s' "$out" | jq -e '[.required_status_checks.contexts[]?,
+                                  .required_status_checks.checks[]?.context]
+                                 | any(test("[\\t\\n]"))' >/dev/null 2>&1; then
+    echo "[batch] WARN: a required context contains a tab or newline and cannot be represented -> treating branch protection as UNREADABLE" >&2
+    printf 'unknown\n'; return
+  fi
+  out=$(printf '%s' "$out" | jq -r '[(.required_status_checks.checks[]? | "bound\t\(.context)\t\(.app_id // "")"),
+                                     (.required_status_checks.contexts[]? | "unbound\t\(.)")] | unique[]' 2>/dev/null) \
+    || { printf 'unknown\n'; return; }
   case "$out" in *[![:space:]]*) printf 'known\n%s\n' "$out" ;; *) printf 'empty\n' ;; esac
 }
 
@@ -4540,7 +4559,14 @@ if [ "$1" = "api" ]; then
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
     [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
-    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
+    # RAW protection JSON since #73 -- the snapshot validates the object before
+    # serialising its own typed form, so pre-flattened names no longer parse.
+    if [ -n "${FAKE_PROT_CONTEXTS:-}" ]; then
+      printf '%s\n' "$FAKE_PROT_CONTEXTS" \
+        | jq -R . | jq -s '{required_status_checks: {contexts: ., checks: [.[] | {context: ., app_id: 15368}]}}'
+    else
+      printf '%s' '{"required_status_checks":{"contexts":[],"checks":[]}}'
+    fi
     exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
@@ -4609,7 +4635,12 @@ if [ "$1" = "api" ]; then
   # unreadable, which is a different thing entirely (#70's tri-state).
   if printf '%s\n' "$@" | grep -q '/protection'; then
     [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
-    [ -n "${FAKE_PROT_CONTEXTS:-}" ] && printf '%s\n' "$FAKE_PROT_CONTEXTS"
+    if [ -n "${FAKE_PROT_CONTEXTS:-}" ]; then
+      printf '%s\n' "$FAKE_PROT_CONTEXTS" \
+        | jq -R . | jq -s '{required_status_checks: {contexts: ., checks: [.[] | {context: ., app_id: 15368}]}}'
+    else
+      printf '%s' '{"required_status_checks":{"contexts":[],"checks":[]}}'
+    fi
     exit 0
   fi
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the catch-all's
@@ -6098,12 +6129,10 @@ plugins (python) gate|in_progress||'
   printf '%s\n' '#!/usr/bin/env bash' \
     'case "$*" in' \
     '  *"/protection"*)' \
-    '    # Honour the caller'"'"'s --jq, as real `gh api` does. A first version applied' \
-    '    # the union expression INSIDE the shim, so it returned both contexts whatever' \
-    '    # the production code asked for -- and the mutation reverting the union to' \
-    '    # .contexts-only was scored as caught while never being exercised.' \
-    '    JQ=""; nx=0; for a in "$@"; do [ "$nx" = 1 ] && { JQ="$a"; nx=0; }; [ "$a" = "--jq" ] && nx=1; done' \
-    '    printf "%s" "$PROT_JSON" | jq -r "${JQ:-.}"; exit 0 ;;' \
+    '    # RAW json. Since #73 the snapshot fetches the whole protection object and' \
+    '    # validates it before serialising, so a shim that pre-applied --jq would be' \
+    '    # answering a question the production code no longer asks.' \
+    '    printf "%s" "$PROT_JSON"; exit 0 ;;' \
     '  *mergeable*) echo MERGEABLE; exit 0 ;;' \
     '  *mergeCommit*) echo mergesha7654321; exit 0 ;;' \
     '  *headRefOid*) echo headsha1234567; exit 0 ;;' \
@@ -6211,6 +6240,37 @@ plugins (python) gate|in_progress||'
   [ "$(_pm "$_B" 'other|completed|success|15368' e2e)" = e2e ] \
     || { echo "FAIL #73: an absent expected context must remain unsatisfied"; exit 1; }
   unset -f _pm; unset _B _U
+  # AN UNREPRESENTABLE CONTEXT MUST NOT SILENTLY DISABLE THE GATE. The typed protocol
+  # separates fields with TAB, so a context containing one would be read as extra fields:
+  # `build<TAB>linux` becomes name `build`, the declared list can no longer intersect it,
+  # the expected set comes back EMPTY -- and empty means no gate at all. That is #67's
+  # lesson about names that cannot be represented in a delimiter protocol, in a new
+  # delimiter. Every line here IS a requirement, so there is no "drop the non-required
+  # one" escape: the honest answer is `unknown`, which holds pending and says why.
+  local _tb; _tb=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *"/protection"*) printf "%s" "$PROT_JSON"; exit 0 ;; esac' 'exit 0' > "$_tb/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_tb/timeout"
+  chmod +x "$_tb/gh" "$_tb/timeout"
+  _tbout=$( PATH="$_tb:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":["ok"],"checks":[{"context":"build\tlinux","app_id":15368}]}}' \
+    _required_contexts_snapshot 2>/dev/null )
+  [ "$_tbout" = unknown ] \
+    || { echo "FAIL #73: a TAB-bearing required context must make protection UNREADABLE, not silently truncate (got '$_tbout')"; rm -rf "$_tb"; exit 1; }
+  # ...and a newline, for the same reason.
+  _tbout=$( PATH="$_tb:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":["a\nb"],"checks":[]}}' \
+    _required_contexts_snapshot 2>/dev/null )
+  [ "$_tbout" = unknown ] \
+    || { echo "FAIL #73: a newline-bearing required context must make protection UNREADABLE (got '$_tbout')"; rm -rf "$_tb"; exit 1; }
+  # ...but an ordinary name with SPACES and PARENTHESES -- which every muesli context has
+  # -- must still parse, or the guard would reject the real world.
+  _tbout=$( PATH="$_tb:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":["plugins (python) gate"],"checks":[{"context":"plugins (python) gate","app_id":15368}]}}' \
+    _required_contexts_snapshot 2>/dev/null | head -1 )
+  [ "$_tbout" = known ] \
+    || { echo "FAIL #73: a normal context with spaces and parens must parse (got '$_tbout')"; rm -rf "$_tb"; exit 1; }
+  rm -rf "$_tb"; unset _tb _tbout
   echo "_expected_incomplete producer matching OK (#73)"
   echo "_expected_set/_expected_incomplete OK (#70 completeness gate)"
   echo "_cap_to/_arm_deadline OK (#71 pre-merge phase bound)"
