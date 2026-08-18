@@ -1590,7 +1590,7 @@ merge_ready_pr() {
     return 2
   }
   # Watch main's CI on the merge commit (the #157 green-per-PR-red-on-main net).
-  local waited=0 state=pending lines mreq _iv _snap _miss _exp
+  local waited=0 state=pending lines mreq _iv _snap _miss _exp _cls
   # #70: ONE snapshot, tri-state. `known`/`empty` are authoritative answers and are
   # cached for the phase; `unknown` is a cached DEPENDENCY FAILURE, not a verdict, and is
   # refreshed every poll below -- backoff by poll count was tried and rejected because at
@@ -1632,9 +1632,13 @@ merge_ready_pr() {
     # stray wrong-app failure turns main red and can trigger an auto-revert that branch
     # protection itself would never have asked for. Gated on opt-in, so a repo that has
     # not declared its expected contexts keeps exactly its previous behaviour.
+    # Classification sees only ELIGIBLE rows; completeness keeps the originals, because
+    # a row dropped for ineligibility must not look the same as a check that never
+    # reported. Absence is precisely what the gate is for.
+    _cls="$lines"
     [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] \
-      && lines=$(_drop_wrong_producer "$lines" "$MAIN_SNAP_NAMES")
-    state=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$mreq")")
+      && _cls=$(_drop_wrong_producer "$lines" "$MAIN_SNAP_NAMES")
+    state=$(_checkrun_state "$(_keep_blocking_checks "$_cls" "$mreq")")
     # #70: green needs the EXPECTED set complete, not merely the registered subset green.
     # A required context gated behind `needs:` registers after faster ones finish -- an
     # 11-second margin measured on muesli, and structurally unbounded elsewhere -- so
@@ -2395,7 +2399,12 @@ _drop_wrong_producer() {
     name=${row%%|*}
     app=${row##*|}
     need=$(_req_app "$typed" "$name")
-    if [ -n "$need" ] && [ -n "$app" ] && [ "$app" != "$need" ]; then continue; fi
+    # EXACTLY the matcher's rule -- including excluding app-less rows from a bound
+    # requirement. Leaving them in was the same composition defect one case over: a
+    # same-named failing commit STATUS survived here, `_checkrun_state` went red, and the
+    # matcher that would have ignored it never ran. Two components disagreeing about
+    # eligibility means whichever runs first decides, which is not a design.
+    [ -n "$need" ] && [ "$app" != "$need" ] && continue
     printf '%s\n' "$row"
   done <<EOF
 $lines
@@ -2683,7 +2692,7 @@ _revert_git_args() {
 # run for the merge commit ONCE, then re-polls the commit's check-runs. Used to
 # distinguish a flaky red/hung main from a genuine one before reverting/halting.
 _rerun_main_ci() {
-  local sha="$1" full="${2:-}" rid w=0 lines st _iv _rr_exp
+  local sha="$1" full="${2:-}" rid w=0 lines st _iv _rr_exp _rr_cls
   # #62: check BEFORE dispatching. This function costs a `gh run list`, a `gh run
   # rerun` and a 20s startup sleep before it reaches its poll loop, so a check only at
   # the loop would let all of that run past an expired deadline.
@@ -2731,9 +2740,10 @@ _rerun_main_ci() {
       _rr_req=$(_req_names "$_rr_names")
     fi
     lines=$(_commit_ci_lines "$sha" "$_rr_req") || lines=""
+    _rr_cls="$lines"
     [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] \
-      && lines=$(_drop_wrong_producer "$lines" "$_rr_names")
-    st=$(_checkrun_state "$(_keep_blocking_checks "$lines" "$_rr_req")")
+      && _rr_cls=$(_drop_wrong_producer "$lines" "$_rr_names")
+    st=$(_checkrun_state "$(_keep_blocking_checks "$_rr_cls" "$_rr_req")")
     if [ "$st" = green ] && [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ]; then
       if [ "$_rr_state" = unknown ]; then st=pending
       else
@@ -4695,7 +4705,14 @@ if [ "$1" = "api" ]; then
     printf 'success\n' >> "${FAKE_STATUS_STORE:-/dev/null}"
     exit 0
   fi
-  if printf '%s\n' "$@" | grep -q '/status'; then if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+  # FAKE_STATUS_JSON lets a test put real commit STATUSES on the sha. It was hardcoded
+  # empty, so a test that set it exercised nothing and passed without ever creating the
+  # condition it named.
+  if printf '%s\n' "$@" | grep -q '/status'; then
+    if printf '%s\n' "$@" | grep -q -- '-q'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+    SJ="${FAKE_STATUS_JSON:-}"; [ -n "$SJ" ] || SJ='{"statuses":[]}'
+    printf '[%s]' "$SJ"; exit 0
+  fi
   # Branch protection. By default the demo repo has none -> a successfully EMPTY
   # required set. FAKE_PROT_CONTEXTS declares one; FAKE_PROT_RC=1 makes the endpoint
   # unreadable, which is a different thing entirely (#70's tri-state).
@@ -4822,6 +4839,18 @@ SH
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     [ "$?" -ne 0 ] ) \
     || { echo "FAIL #73: only the WRONG app reported and the watcher accepted green"; exit 1; }
+  # ...and the same composition, one case over: a same-named failing commit STATUS. It
+  # carries no app, so it is not evidence about app 15368 either way -- but it survived
+  # the wrong-app filter, `_checkrun_state` went red, and the matcher that would have
+  # ignored it never ran. Two components disagreeing about eligibility means whichever
+  # runs first decides.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p4" \
+    FAKE_PROT_CONTEXTS='e2e' BIRCHER_MAIN_EXPECTED_CONTEXTS='e2e' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"e2e","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
+    FAKE_STATUS_JSON='{"statuses":[{"context":"e2e","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #73: an app-less RED status vetoed the required app's green -- protection would have accepted it"; exit 1; }
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
   # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
