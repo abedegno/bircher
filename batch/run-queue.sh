@@ -1650,8 +1650,11 @@ merge_ready_pr() {
       if [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ] && [ "$MAIN_SNAP_STATE" = unknown ]; then
         echo "[batch:merge] $item: main CI green but branch protection is unreadable -> not accepting green yet" >&2
         state=pending
-      elif [ -n "$_exp" ]; then
-        _miss=$(_expected_incomplete "$lines" "$_exp" "$MAIN_SNAP_NAMES")
+      elif [ -n "$_exp" ] || [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ]; then
+        # A required context whose only rows were FILTERED OUT has no eligible report at
+        # all -- and if it is not in the declared subset, nothing else will notice.
+        _miss=$(_emptied_by_filter "$lines" "$_cls" "$mreq")
+        [ -z "$_miss" ] && _miss=$(_expected_incomplete "$lines" "$_exp" "$MAIN_SNAP_NAMES")
         [ -n "$_miss" ] && {
           echo "[batch:merge] $item: main CI green so far, but expected context '$_miss' has not finished -> waiting" >&2
           state=pending
@@ -2411,6 +2414,33 @@ $lines
 EOF
 }
 
+# _emptied_by_filter <raw> <filtered> <required-names> -> the first required context that
+# HAD rows before producer filtering and has none after, or "" if none.
+#
+# #73: filtering removes ineligible rows, which is right for classification -- but it can
+# remove the ONLY rows for a required context, and if that context is not in the
+# operator's expected subset nothing downstream ever looks for it. Classification then
+# sees a smaller, all-green set and the merge is accepted while branch protection is
+# still waiting. Exact shape: protection requires A and B; the declared list names only
+# A; A is green from the required app and B reported ONLY from the wrong one.
+#
+# Deliberately narrow: it fires only where filtering actually removed something, so it
+# can never demand a context that legitimately never reports on a merge commit -- which
+# is the whole reason #70 had to be declared rather than inferred.
+_emptied_by_filter() {
+  local raw="$1" filt="$2" names="$3" c before after
+  [ -n "${names//[[:space:]]/}" ] || return 0
+  while IFS= read -r c; do
+    [ -n "${c//[[:space:]]/}" ] || continue
+    before=$(printf '%s\n' "$raw"  | awk -F'|' -v n="$c" '$1 == n' | grep -c .)
+    [ "$before" = 0 ] && continue
+    after=$(printf '%s\n' "$filt" | awk -F'|' -v n="$c" '$1 == n' | grep -c .)
+    [ "$after" = 0 ] && { printf '%s' "$c"; return; }
+  done <<EOF
+$names
+EOF
+}
+
 # _expected_incomplete <lines> <expected> [typed-requirements] -> the first expected
 # context not yet satisfied, or "" when all are.
 #
@@ -2748,7 +2778,9 @@ _rerun_main_ci() {
       if [ "$_rr_state" = unknown ]; then st=pending
       else
         _rr_exp=$(_expected_set "$_rr_state" "$_rr_names")
-        [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp" "$_rr_names")" ] && st=pending
+        if [ -n "$(_emptied_by_filter "$lines" "$_rr_cls" "$_rr_req")" ]; then st=pending
+        elif [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp" "$_rr_names")" ]; then st=pending
+        fi
       fi
     fi
     [ "$st" != pending ] && { echo "$st"; return; }
@@ -4851,6 +4883,28 @@ SH
     FAKE_STATUS_JSON='{"statuses":[{"context":"e2e","state":"failure","updated_at":"2026-01-01T00:00:00Z"}]}' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
     || { echo "FAIL #73: an app-less RED status vetoed the required app's green -- protection would have accepted it"; exit 1; }
+  # A REQUIRED CONTEXT OUTSIDE THE DECLARED SUBSET, whose only rows were filtered out.
+  # Protection requires A and B; the operator declared only A; A is green from the
+  # required app and B reported ONLY from the wrong one. Filtering removes B, so
+  # classification sees a smaller all-green set, and completeness only looks at A --
+  # green, while branch protection is still waiting for B. Neither component is wrong on
+  # its own; the composition is.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p5" \
+    FAKE_PROT_CONTEXTS="$(printf 'A\nB')" BIRCHER_MAIN_EXPECTED_CONTEXTS='A' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"A","status":"completed","conclusion":"success","app":{"id":15368}},{"name":"B","status":"completed","conclusion":"failure","app":{"id":999}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #73: a required context whose only rows were FILTERED OUT was accepted as green"; exit 1; }
+  # ...but a context that legitimately never reports on a merge commit must NOT be held
+  # by this guard, or it would demand review-gate on every merge -- the exact reason #70
+  # had to be declared rather than inferred.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p6" \
+    FAKE_PROT_CONTEXTS="$(printf 'A\nreview-gate')" BIRCHER_MAIN_EXPECTED_CONTEXTS='A' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"A","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #73: a required context that never reported at all must not be held by the filter guard"; exit 1; }
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
   # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
