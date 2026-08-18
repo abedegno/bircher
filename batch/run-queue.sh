@@ -2273,15 +2273,37 @@ _required_contexts_snapshot() {
   # Every line here IS a requirement, so there is no "drop the non-required one" option
   # as #67 had: an unrepresentable context means the requirements cannot be described at
   # all, and the honest answer is `unknown` -- which holds pending and says why.
-  printf '%s' "$out" | jq -e 'type == "object"' >/dev/null 2>&1 || { printf 'unknown\n'; return; }
-  if printf '%s' "$out" | jq -e '[.required_status_checks.contexts[]?,
-                                  .required_status_checks.checks[]?.context]
-                                 | any(test("[\\t\\n]"))' >/dev/null 2>&1; then
-    echo "[batch] WARN: a required context contains a tab or newline and cannot be represented -> treating branch protection as UNREADABLE" >&2
+  # VALIDATE THE WHOLE SCHEMA before serialising, and fail closed on anything unexpected.
+  # Every partial validation so far has leaked: a TAB truncated a name, and an EMPTY
+  # context serialised to `unbound<TAB>` which `_req_names` then dropped -- leaving a
+  # `known` snapshot with no gate at all. A malformed protection response must never
+  # become "nothing to wait for".
+  printf '%s' "$out" | jq -e '
+      (.required_status_checks // null) as $r
+      | if $r == null then true
+        else ($r | type) == "object"
+             and (($r.contexts // []) | type) == "array"
+             and (($r.checks   // []) | type) == "array"
+             and (($r.contexts // []) | all((type == "string") and (length > 0) and (test("[\t\n]") | not)))
+             and (($r.checks   // []) | all((type == "object")
+                    and ((.context | type) == "string") and ((.context | length) > 0)
+                    and ((.context | test("[\t\n]")) | not)
+                    and ((.app_id == null) or (((.app_id | type) == "number")
+                          and ((.app_id == -1) or (.app_id > 0))))))
+        end' >/dev/null 2>&1 || {
+    echo "[batch] WARN: branch protection did not match the expected schema (unrepresentable or malformed context, or a bad app_id) -> treating it as UNREADABLE" >&2
     printf 'unknown\n'; return
-  fi
-  out=$(printf '%s' "$out" | jq -r '[(.required_status_checks.checks[]? | "bound\t\(.context)\t\(.app_id // "")"),
-                                     (.required_status_checks.contexts[]? | "unbound\t\(.)")] | unique[]' 2>/dev/null) \
+  }
+  # app_id -1 is GitHub's documented WILDCARD -- "Pass -1 to explicitly allow any app to
+  # set the status" -- and an omitted app_id is likewise permissive. Both are recorded as
+  # UNBOUND, or the matcher would demand a producer literally called "-1" and hold every
+  # merge on a perfectly valid configuration.
+  out=$(printf '%s' "$out" | jq -r '
+      [ (.required_status_checks.checks[]?
+         | if (.app_id != null) and (.app_id > 0)
+           then "bound\t\(.context)\t\(.app_id)"
+           else "unbound\t\(.context)" end),
+        (.required_status_checks.contexts[]? | "unbound\t\(.)") ] | unique[]' 2>/dev/null) \
     || { printf 'unknown\n'; return; }
   case "$out" in *[![:space:]]*) printf 'known\n%s\n' "$out" ;; *) printf 'empty\n' ;; esac
 }
@@ -2378,9 +2400,15 @@ _expected_incomplete() {
     while IFS= read -r row; do
       [ "${row%%|*}" = "$want" ] || continue
       st=${row#*|}; app=${st##*|}; st=${st%|*}      # st -> status|conclusion, app -> id
-      # A bound requirement ignores other producers entirely; an unbindable row (a
-      # status, which has no app) stays eligible because protection cannot pin it.
-      if [ -n "$need" ] && [ -n "$app" ] && [ "$app" != "$need" ]; then continue; fi
+      # A BOUND requirement names the app that must provide the check, so ONLY that
+      # app's check-runs are evidence. An app-less row -- a commit status -- is not
+      # evidence that app N produced anything, and anyone able to post a status could
+      # otherwise satisfy this gate while branch protection itself stayed pending. An
+      # earlier cut accepted app-less rows here on the reasoning that protection cannot
+      # pin what it cannot identify; that had it backwards, and the self-test codified
+      # the mistake. Wildcard (-1) and omitted app_id are recorded UNBOUND upstream, so
+      # `need` is only ever a real app id.
+      [ -n "$need" ] && [ "$app" != "$need" ] && continue
       seen=1
       case "$st" in
         completed\|success|completed\|neutral|completed\|skipped) good=1 ;;
@@ -4347,9 +4375,9 @@ SH
     = "ext-ci|completed|success|" ] \
     || { echo "FAIL _commit_ci_lines: must take the NEWEST status per context"; rm -rf "$cdir"; exit 1; }
   # Statuses merge with check-runs.
-  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' \
        FAKE_STATUS_JSON="$(_st_json success)" _cl | sort | tr '\n' ' ')" \
-    = "ext-ci|completed|success| server|completed|success| " ] \
+    = "ext-ci|completed|success| server|completed|success|15368 " ] \
     || { echo "FAIL _commit_ci_lines: statuses not merged with check-runs"; rm -rf "$cdir"; exit 1; }
   # FAIL CLOSED: either fetch failing must not yield a partial (false-green) list.
   FAKE_STATUS_RC=1 _cl >/dev/null 2>&1 \
@@ -4358,8 +4386,8 @@ SH
     && { echo "FAIL _commit_ci_lines: check-run fetch failure must be rc 1"; rm -rf "$cdir"; exit 1; }
   # Zero statuses is NORMAL -- merge commits legitimately carry none (verified
   # against muesli: merge commits have 0, PR heads carry review-gate).
-  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' _cl)" \
-    = "server|completed|success|" ] \
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' _cl)" \
+    = "server|completed|success|15368" ] \
     || { echo "FAIL _commit_ci_lines: zero statuses must be normal, not an error"; rm -rf "$cdir"; exit 1; }
   # EQUAL timestamps: GitHub returns newest-first, and max_by picks the LAST equal
   # maximum -- so `[failure, success]` at the same second selected the stale
@@ -4376,10 +4404,10 @@ SH
   # A NON-required one is dropped, not fatal -- halting every verdict over a
   # cosmetic name in someone else's repo would be an outage, and it would be
   # filtered downstream anyway.
-  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' \
        FAKE_STATUS_JSON='{"statuses":[{"context":"a|b","state":"pending","updated_at":"2026-01-01T00:00:00Z"}]}' \
        PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
-    = "server|completed|success|" ] \
+    = "server|completed|success|15368" ] \
     || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing context must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   # An absent .statuses key is a malformed response, not "no statuses".
   FAKE_STATUS_JSON='{}' _cl >/dev/null 2>&1 \
@@ -4405,7 +4433,7 @@ SH
   for _body in "" "null" "{}" '[]' '{"statuses":[]}' '[{"statuses":null}]' \
                '[{"message":"Not Found"}]' '[{"statuses":[]}][{"statuses":[]}]' \
                '[{"message":"x"}][{"statuses":[]}]'; do
-    FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
+    FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' \
       FAKE_STATUS_BODY="$_body" _cl >/dev/null 2>&1 \
       && { echo "FAIL _commit_ci_lines: degraded status body '${_body:-<empty>}' must fail closed"; rm -rf "$cdir"; exit 1; }
   done
@@ -4421,8 +4449,8 @@ SH
   done
   # ...but a well-formed EMPTY list on either side is legitimate: merge commits carry
   # no statuses, and a commit with no CI at all carries no check-runs (-> pending).
-  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success"}]}' \
-       FAKE_STATUS_BODY='[{"statuses":[]}]' _cl)" = "server|completed|success|" ] \
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' \
+       FAKE_STATUS_BODY='[{"statuses":[]}]' _cl)" = "server|completed|success|15368" ] \
     || { echo "FAIL _commit_ci_lines: an empty statuses ARRAY must be accepted"; rm -rf "$cdir"; exit 1; }
   [ "$(FAKE_RUNS_BODY='[{"check_runs":[]}]' FAKE_STATUS_JSON="$(_st_json success)" _cl)" \
     = "ext-ci|completed|success|" ] \
@@ -4430,17 +4458,17 @@ SH
   # PAGINATION. GitHub serves 30 records per page; muesli's main commit already
   # carries 28 check-runs. Without --paginate a required FAILURE on page 2 is simply
   # not fetched, page 1 is all green, and the verdict reads green.
-  [ "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
-       _cl | sort | tr '\n' ' ')" = "p1|completed|success| p2|completed|failure| " ] \
+  [ "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success","app":{"id":15368}}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure","app":{"id":15368}}]}]' \
+       _cl | sort | tr '\n' ' ')" = "p1|completed|success|15368 p2|completed|failure|15368 " ] \
     || { echo "FAIL _commit_ci_lines: records beyond page 1 must be fetched"; rm -rf "$cdir"; exit 1; }
-  [ "$(_checkrun_state "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success"}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure"}]}]' \
+  [ "$(_checkrun_state "$(FAKE_RUNS_PAGES='[{"check_runs":[{"name":"p1","status":"completed","conclusion":"success","app":{"id":15368}}]},{"check_runs":[{"name":"p2","status":"completed","conclusion":"failure","app":{"id":15368}}]}]' \
        _cl | sed 's/^[^|]*|//')")" = red ] \
     || { echo "FAIL _commit_ci_lines: a page-2 failure must make the verdict red"; rm -rf "$cdir"; exit 1; }
   # A record with a non-string name/status would emit `null|...`, which classifies as
   # an unrecognised -- therefore GREEN -- line. Never guess at a malformed record.
-  for _body in '[{"check_runs":[{"status":"completed","conclusion":"success"}]}]' \
-               '[{"check_runs":[{"name":null,"status":"completed","conclusion":"success"}]}]' \
-               '[{"check_runs":[{"name":{"x":1},"status":"completed","conclusion":"success"}]}]' \
+  for _body in '[{"check_runs":[{"status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
+               '[{"check_runs":[{"name":null,"status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
+               '[{"check_runs":[{"name":{"x":1},"status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
                '[{"check_runs":[{"name":"server","status":null,"conclusion":"success"}]}]'; do
     FAKE_RUNS_BODY="$_body" _cl >/dev/null 2>&1 \
       && { echo "FAIL _commit_ci_lines: non-string record field must fail closed ($_body)"; rm -rf "$cdir"; exit 1; }
@@ -4468,9 +4496,9 @@ SH
   FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null}]}' \
     PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'a|b' >/dev/null 2>&1 \
     && { echo "FAIL _commit_ci_lines: a REQUIRED pipe-bearing check-run must fail closed"; rm -rf "$cdir"; exit 1; }
-  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null},{"name":"server","status":"completed","conclusion":"success"}]}' \
+  [ "$(FAKE_RUNS_JSON='{"check_runs":[{"name":"a|b","status":"queued","conclusion":null},{"name":"server","status":"completed","conclusion":"success","app":{"id":15368}}]}' \
        PATH="$cdir:$PATH" REPO=demo/demo _commit_ci_lines abc123 'server' 2>/dev/null)" \
-    = "server|completed|success|" ] \
+    = "server|completed|success|15368" ] \
     || { echo "FAIL _commit_ci_lines: a NON-required pipe-bearing check-run must be dropped, not fatal"; rm -rf "$cdir"; exit 1; }
   rm -rf "$cdir"; unset -f _cl _st_json
   echo "_commit_ci_lines OK (#67 statuses reach the verdict, fails closed)"
@@ -4554,7 +4582,7 @@ if [ "$1" = "api" ]; then
   # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
   # and a stall in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
@@ -4650,7 +4678,7 @@ if [ "$1" = "api" ]; then
   # -- which produced invalid JSON, a permanently pending watch, and a 16-minute stall
   # in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
@@ -4682,7 +4710,7 @@ SH
     MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e1" \
     FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
     BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
-    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     [ "$?" -ne 0 ] ) \
     || { echo "FAIL #70: main declared GREEN while the expected context 'e2e-desktop' had never registered"; exit 1; }
@@ -4695,7 +4723,7 @@ SH
     MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e2" \
     FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
     BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
-    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"},{"name":"e2e-desktop","status":"completed","conclusion":"success"}]}]' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success","app":{"id":15368}},{"name":"e2e-desktop","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
     || { echo "FAIL #70: a COMPLETE expected set must go green"; exit 1; }
   # RED still breaks immediately -- a terminal red is authoritative whether or not the
@@ -4705,7 +4733,7 @@ SH
     MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e3" \
     FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
     BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
-    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"failure"}]}]' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"failure","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
   _t1=$(date +%s)
   [ "$(( _t1 - _t0 ))" -le 20 ] \
@@ -4714,7 +4742,7 @@ SH
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
     MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e4" FAKE_PROT_RC=1 \
     BIRCHER_MAIN_EXPECTED_CONTEXTS="$(printf 'server (go)')" \
-    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     [ "$?" -ne 0 ] ) \
     || { echo "FAIL #70: green accepted while branch protection was unreadable"; exit 1; }
@@ -4723,7 +4751,7 @@ SH
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
     MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/e5" \
     FAKE_PROT_CONTEXTS="$(printf 'server (go)\ne2e-desktop')" \
-    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success"}]}]' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"server (go)","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
     || { echo "FAIL #70: with the list UNSET, behaviour must be unchanged (green)"; exit 1; }
   unset _t0 _t1
@@ -4866,7 +4894,7 @@ if [ "$1" = "api" ]; then
   # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
   # and a stall in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
@@ -4938,7 +4966,7 @@ if [ "$1" = "api" ]; then
   # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
   # and a stall in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
@@ -5047,7 +5075,7 @@ if [ "$1" = "api" ]; then
   # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
   # and a stall in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
@@ -5259,7 +5287,7 @@ if [ "$1" = "api" ]; then
   # emits literal backslashes. Both produce invalid JSON, a permanently pending watch,
   # and a stall in the rerun path's 300s delays.
   CR="${FAKE_CHECKRUNS:-}"
-  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}]'
+  [ -n "$CR" ] || CR='[{"check_runs":[{"name":"ci","status":"completed","conclusion":"success","app":{"id":15368}}]}]'
   printf '%s\n' "$@" | grep -q '/check-runs' && { printf '%s' "$CR"; exit 0; }
   # #70: branch protection. FAKE_PROT_RC=1 models an unreadable protection endpoint.
   printf '%s\n' "$@" | grep -q '/protection' && {
@@ -6213,10 +6241,15 @@ plugins (python) gate|in_progress||'
   # order must not matter -- the aggregation is worst-first, not first-wins
   [ "$(_pm "$_B" "$(printf 'e2e|completed|success|999\ne2e|completed|failure|15368')" e2e)" = e2e ] \
     || { echo "FAIL #73: reversing row order changed the verdict"; exit 1; }
-  # a commit STATUS has no app at all and cannot be pinned by protection, so it stays
-  # eligible for a bound requirement rather than being excluded by the pin
-  [ -z "$(_pm "$_B" 'e2e|completed|success|' e2e)" ] \
-    || { echo "FAIL #73: an unbindable row (a status) must remain eligible for a bound requirement"; exit 1; }
+  # A commit STATUS carries no app, so it is NOT evidence that the named app produced
+  # anything -- and anyone able to post a status could otherwise satisfy this gate while
+  # branch protection itself stayed pending. An earlier cut had this backwards and the
+  # test codified the mistake, which is why it is spelled out here.
+  [ "$(_pm "$_B" 'e2e|completed|success|' e2e)" = e2e ] \
+    || { echo "FAIL #73: an app-less row must NOT satisfy an app-bound requirement"; exit 1; }
+  # ...but for an UNBOUND requirement a status is perfectly good evidence.
+  [ -z "$(_pm "$_U" 'e2e|completed|success|' e2e)" ] \
+    || { echo "FAIL #73: an app-less row must satisfy an UNBOUND requirement"; exit 1; }
   # pending from the required app holds; pending from a stray does not satisfy
   [ "$(_pm "$_B" 'e2e|in_progress||15368' e2e)" = e2e ] \
     || { echo "FAIL #73: the required app still running must hold"; exit 1; }
@@ -6239,6 +6272,44 @@ plugins (python) gate|in_progress||'
   # absence is still never satisfaction
   [ "$(_pm "$_B" 'other|completed|success|15368' e2e)" = e2e ] \
     || { echo "FAIL #73: an absent expected context must remain unsatisfied"; exit 1; }
+  # app_id -1 is GitHub's documented WILDCARD ("Pass -1 to explicitly allow any app to
+  # set the status"), and an omitted app_id is likewise permissive. Treated as a literal
+  # binding, the matcher would demand a producer called "-1" and hold every merge on a
+  # valid configuration -- so both are normalised to UNBOUND at the snapshot.
+  _wild=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case "$*" in *"/protection"*) printf "%s" "$PROT_JSON"; exit 0 ;; esac' 'exit 0' > "$_wild/gh"
+  printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_wild/timeout"
+  chmod +x "$_wild/gh" "$_wild/timeout"
+  _w=$( PATH="$_wild:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":[],"checks":[{"context":"e2e","app_id":-1}]}}' \
+    _required_contexts_snapshot 2>/dev/null | tail -1 )
+  [ "$_w" = "$(printf 'unbound\te2e')" ] \
+    || { echo "FAIL #73: app_id -1 is the ANY-APP wildcard and must record as unbound (got '$_w')"; rm -rf "$_wild"; exit 1; }
+  _w=$( PATH="$_wild:$PATH" REPO=demo/demo \
+    PROT_JSON='{"required_status_checks":{"contexts":[],"checks":[{"context":"e2e","app_id":null}]}}' \
+    _required_contexts_snapshot 2>/dev/null | tail -1 )
+  [ "$_w" = "$(printf 'unbound\te2e')" ] \
+    || { echo "FAIL #73: an omitted app_id is permissive and must record as unbound (got '$_w')"; rm -rf "$_wild"; exit 1; }
+  # SCHEMA violations are UNREADABLE, never a gate-less `known`. An empty context used to
+  # serialise to `unbound<TAB>`, which _req_names then dropped -- a known snapshot with
+  # nothing in it, i.e. no gate.
+  for _bad in '{"required_status_checks":{"contexts":[""],"checks":[]}}' \
+              '{"required_status_checks":{"contexts":[123],"checks":[]}}' \
+              '{"required_status_checks":{"contexts":"nope","checks":[]}}' \
+              '{"required_status_checks":{"checks":[{"context":"e2e","app_id":0}]}}' \
+              '{"required_status_checks":{"checks":[{"context":"e2e","app_id":"15368"}]}}' \
+              '{"required_status_checks":{"checks":[{"app_id":15368}]}}'; do
+    _w=$( PATH="$_wild:$PATH" REPO=demo/demo PROT_JSON="$_bad" _required_contexts_snapshot 2>/dev/null )
+    [ "$_w" = unknown ] \
+      || { echo "FAIL #73: malformed protection must be UNREADABLE, not a gate-less known: $_bad -> '$_w'"; rm -rf "$_wild"; exit 1; }
+  done
+  # ...and a branch with no required checks at all is still a legitimate EMPTY.
+  _w=$( PATH="$_wild:$PATH" REPO=demo/demo PROT_JSON='{"required_status_checks":{"contexts":[],"checks":[]}}' _required_contexts_snapshot 2>/dev/null )
+  [ "$_w" = empty ] || { echo "FAIL #73: no required checks must be EMPTY, not unknown (got '$_w')"; rm -rf "$_wild"; exit 1; }
+  _w=$( PATH="$_wild:$PATH" REPO=demo/demo PROT_JSON='{"url":"x"}' _required_contexts_snapshot 2>/dev/null )
+  [ "$_w" = empty ] || { echo "FAIL #73: absent required_status_checks must be EMPTY (got '$_w')"; rm -rf "$_wild"; exit 1; }
+  rm -rf "$_wild"; unset _wild _w _bad
   unset -f _pm; unset _B _U
   # AN UNREPRESENTABLE CONTEXT MUST NOT SILENTLY DISABLE THE GATE. The typed protocol
   # separates fields with TAB, so a context containing one would be read as extra fields:
