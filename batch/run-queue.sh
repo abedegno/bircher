@@ -1653,7 +1653,9 @@ merge_ready_pr() {
       elif [ -n "$_exp" ] || [ -n "${BIRCHER_MAIN_EXPECTED_CONTEXTS:-}" ]; then
         # A required context whose only rows were FILTERED OUT has no eligible report at
         # all -- and if it is not in the declared subset, nothing else will notice.
-        _miss=$(_emptied_by_filter "$lines" "$_cls" "$mreq")
+        # After BOTH filters: a required context can be erased by the ignore list just
+        # as easily as by producer matching, and either way it stops being looked at.
+        _miss=$(_emptied_by_filter "$lines" "$(_drop_ignored "$_cls")" "$mreq")
         [ -z "$_miss" ] && _miss=$(_expected_incomplete "$lines" "$_exp" "$MAIN_SNAP_NAMES")
         [ -n "$_miss" ] && {
           echo "[batch:merge] $item: main CI green so far, but expected context '$_miss' has not finished -> waiting" >&2
@@ -2532,10 +2534,17 @@ _required_contexts() {
 # Unknown <required> falls back to ignore-list-only -- the previous behaviour, which
 # errs toward calling things red. Failing closed matters here: inverting it would make
 # every genuinely red PR look green.
+# _drop_ignored <lines> -> the same lines minus ignore-listed checks, names INTACT.
+# Extracted (#73) so the removal guard and the classifier apply the identical list: the
+# guard was comparing against a producer-filtered set only, so a required context removed
+# by the IGNORE list vanished silently and the merge went green while protection waited.
+_drop_ignored() {
+  printf '%s\n' "$1" | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|"
+}
+
 _keep_blocking_checks() {
   local lines="$1" required="$2" filtered name _r
-  filtered=$(printf '%s\n' "$lines" \
-    | grep -vE "^(${BIRCHER_CI_IGNORE_CHECKS:-Dependabot|review-gate})\|")
+  filtered=$(_drop_ignored "$lines")
   if [ -z "$required" ]; then
     printf '%s\n' "$filtered" | cut -d'|' -f2,3
     return
@@ -2778,7 +2787,7 @@ _rerun_main_ci() {
       if [ "$_rr_state" = unknown ]; then st=pending
       else
         _rr_exp=$(_expected_set "$_rr_state" "$_rr_names")
-        if [ -n "$(_emptied_by_filter "$lines" "$_rr_cls" "$_rr_req")" ]; then st=pending
+        if [ -n "$(_emptied_by_filter "$lines" "$(_drop_ignored "$_rr_cls")" "$_rr_req")" ]; then st=pending
         elif [ -n "$_rr_exp" ] && [ -n "$(_expected_incomplete "$lines" "$_rr_exp" "$_rr_names")" ]; then st=pending
         fi
       fi
@@ -4905,6 +4914,27 @@ SH
     FAKE_CHECKRUNS='[{"check_runs":[{"name":"A","status":"completed","conclusion":"success","app":{"id":15368}}]}]' \
     BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
     || { echo "FAIL #73: a required context that never reported at all must not be held by the filter guard"; exit 1; }
+  # AN IGNORE-LISTED REQUIRED CONTEXT that actually reported. Protection requires A and
+  # Dependabot; the declared subset names only A; Dependabot is on the ignore list and is
+  # still RUNNING. Producer filtering keeps it, `_keep_blocking_checks` removes it,
+  # classification goes green over A alone, and the removal guard -- comparing against
+  # the producer-filtered set, where it still existed -- saw nothing. Protection is still
+  # pending on it.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p7" \
+    FAKE_PROT_CONTEXTS="$(printf 'A\nDependabot')" BIRCHER_MAIN_EXPECTED_CONTEXTS='A' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"A","status":"completed","conclusion":"success","app":{"id":15368}},{"name":"Dependabot","status":"in_progress","conclusion":null,"app":{"id":15368}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
+    [ "$?" -ne 0 ] ) \
+    || { echo "FAIL #73: an ignore-listed REQUIRED context that reported was erased into green"; exit 1; }
+  # ...and the ignore list still does its job for a NON-required check: Dependabot's own
+  # failing runs must not turn a healthy main red, which is why that list exists.
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=2 MAIN_CI_SETTLE_TIMEOUT=2 \
+    MAIN_CI_POLL_INTERVAL=1 FAKE_STATUS_STORE="$mdir/p8" \
+    FAKE_PROT_CONTEXTS='A' BIRCHER_MAIN_EXPECTED_CONTEXTS='A' \
+    FAKE_CHECKRUNS='[{"check_runs":[{"name":"A","status":"completed","conclusion":"success","app":{"id":15368}},{"name":"Dependabot","status":"completed","conclusion":"failure","app":{"id":15368}}]}]' \
+    BIRCHER_MAIN_CI_RERUN=0 merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 ) \
+    || { echo "FAIL #73: a NON-required ignore-listed failure must not block the merge"; exit 1; }
   # #62 END-TO-END: a REFUSED merge-sha lookup (no usable timeout) must HALT, not skip
   # the watch and report success. The PR is already merged by this point, so reporting
   # rc 0 lets the queue move on with main unexamined -- the one outcome that must never
