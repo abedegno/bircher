@@ -85,7 +85,13 @@ Each event carries: event type, schema version, mechanism version, causal comman
 
 Specs, plans, reviews and implementation outputs are content-addressed. A review verdict binds to a tuple: artifact hash, base SHA, context-bundle hash, reviewer identity, policy version. **Changing any bound input invalidates the verdict.**
 
-This is the minimum mechanism preventing yesterday's approval from authorizing today's object. v1 already has the property in one place — `--recover-pr` pins its review worktree to an exact SHA and the reviewer refuses a mismatched checkout. v2 makes that the default rather than one subcommand's feature.
+This is the minimum mechanism preventing yesterday's approval from authorizing today's object.
+
+**v1 intends this property and does not have it.** `--recover-pr` captures a SHA and pins the eventual merge to it via `--match-head-commit`, which correctly prevents merging something *newer* than the reviewed head. But the review checkout itself is unverified: the generated commands are joined by semicolons rather than `&&`, so a failed fetch or `worktree add` continues anyway; `/tmp/review-$pr` is a deterministic path that is neither cleaned nor pruned, so the `cd` can land in a stale worktree at an older commit; and nothing compares `git rev-parse HEAD` to the captured SHA. "If that checkout fails, STOP" is an instruction to a model, not a mechanism.
+
+The merge marker has the same shape. `parse_marker` extracts `bircher-status:` from anywhere in a comment and the in-run merge fires on `outcome=ready`, with no schema validation, no provenance check, no reviewer-independence check, and no cross-check of the claimed head against anything the runner observed.
+
+Both are filed as v1 defects. They are recorded here because **this is the property v2 exists to make structural**: an approval authorizes a tuple of immutable inputs, and the evidence for it must be *observed by the mechanism*, not reported by the actor whose work it authorizes. Verifying the review worktree's actual HEAD, and validating the marker against a runner-issued attempt identity, are Milestone 1 acceptance tests.
 
 Hashing is over raw bytes or a precisely versioned canonical form. Never an informal serialization whose behaviour can drift.
 
@@ -157,7 +163,15 @@ Reversible, and not worth arguing about now: database engine, Python framework, 
 
 Until a concrete case demands them: a general workflow graph or DSL; parallel scheduling; distributed leases on every operation; fencing beyond optimistic aggregate versions and single-run ownership; full cancellation propagation; a budget reservation and charging ledger; a deadline hierarchy; general capability negotiation; uniform adapters for every provider and CI system; automated compensation or rollback; identity federation; exhaustive failure-taxonomy application; cross-run resource allocation.
 
-**v1's sequential runner is kept as a simplifier.** It removes most lease and scheduling pressure from the first slice, and there is no evidence yet that parallelism is needed.
+**v1's sequential runner is kept as a simplifier — for scheduling only.** It prevents two *newly scheduled* items overlapping. It does not prevent an already-issued provider session completing late after a timeout, cancellation, crash or restart, which is the exact failure this kernel exists to survive. v1's own singleton is an advisory local `flock` that explicitly proceeds unprotected when `flock` is unavailable, and process death releases it while remote work may still be alive.
+
+So while distributed leases and recallable cancellation stay deferred and cut respectively, **late-result rejection and authority fencing cannot be**. Milestone 1 requires:
+
+- durable single-run ownership, recorded rather than held in a process
+- credentials that make it impossible for a worker to perform a kernel-owned effect directly
+- attempt identity on every accepted result, so a late result can be attributed and refused
+- fencing at every kernel-controlled write boundary
+- an unconfirmed stop leaves the attempt **non-terminal**, and forbids replacement work that could conflict with it
 
 ## Cut as goals, not merely postponed
 
@@ -180,9 +194,27 @@ goal → grilled decisions → frozen spec → frozen plan
      → implementation → cross-vendor review → CI → merge authorization
 ```
 
-Every arrow is a durable transition. Execution, review and GitHub state are initially delegated to v1's machinery behind adapters. The front end is **supervised**: it grills, produces spec and plan under adversarial review, and exports a frozen bundle — a human inspects it and explicitly enqueues it.
+Every arrow is a durable transition.
 
-That supervised handoff *is* the authority boundary, which is what makes a front-end-first slice temporally safe with a kernel this small. The front end has no durable authority: it cannot merge, push, change labels, or launch implementation. Its approval is advisory. Enqueueing freezes the bundle; the coordinator rechecks base SHA and issue state; any change creates a new revision and invalidates earlier reviews.
+**v1 runs in a constrained execution mode, not behind a wrapper.** An earlier draft said execution, review and GitHub state could be "delegated to v1's machinery behind adapters". That is not achievable while the authority boundary holds: `run-queue.sh` launches a coordinator with a prompt, reads a model-authored `bircher-status:` comment, and calls `merge_ready_pr` on `outcome=ready`; it also changes labels, publishes the merge-authorizing commit status, closes issues and may revert. Wrapping that process in an adapter does not move those authorities into the kernel — it puts an unmediated authority holder behind one more process boundary.
+
+So Milestone 1 requires:
+
+- **v1 with dangerous effects disabled.** Merge, status publication, issue mutation and recovery writes are off. The kernel makes those calls, journalled, with persist-before-execute.
+- **The scar-bearing units ported, not called.** Review and CI classification and merge reconciliation carry behaviour learned from real failures — required-context resolution, check-run filtering, CI failure classification. Those are extracted with their fixtures and mutation tests. Calling the whole sequential runner is explicitly not an acceptable adapter.
+- **Pure or read-only v1 helpers may be called** where that is genuinely all they are.
+
+This decides open question 2, below.
+
+The front end is **supervised**: it grills, produces spec and plan under adversarial review, and exports a frozen bundle — a human inspects it and explicitly enqueues it.
+
+That supervised handoff is the authority boundary — **but only if something enforces it.** "Cannot merge, push, label or launch implementation" is an architectural intention until it is a property of credentials and process isolation. In v1 the runner and its prompt-driven workers share GitHub and session authority, so the same claim there would be false.
+
+The enforcement mechanism for Milestone 1: **front-end and judgement processes hold no GitHub mutation credentials and can only submit typed data to the kernel.** They may read. Every mutating effect is a kernel call.
+
+If credential confinement cannot be achieved in Milestone 1, the spec must say the authority boundary is **unproven** and must not claim the resulting audit establishes that models did not act directly. An unproven boundary recorded as proven is precisely the defect class this document is about.
+
+The frozen bundle must also be defined rather than gestured at. Milestone 1 fixes: which issue fields, comments and labels form the frozen input; how that snapshot is canonicalized for hashing; what counts as a relevant change; who creates a revision; whether implementation outputs invalidate spec or plan review; and the single transaction that joins artifact persistence, enqueue and the first durable transition.
 
 **Done means:** one real issue goes from vague goal to a merged PR — or to a documented, safe refusal to merge — with every transition durable, every verdict bound to a hash, and the merge authorized by the kernel rather than by a model.
 
@@ -222,5 +254,7 @@ One correction to an earlier harness sketch, recorded here so it is not rebuilt 
 ## Open questions
 
 1. **Where the kernel's state lives.** SQLite is sufficient for a single sequential runner and trivial to back up; Postgres is already a dependency of the downstream project and better if runs ever parallelize. The deferred list says parallelism is not needed yet, which argues SQLite — but the migration is real work if that changes.
-2. **How much of v1 is called versus ported.** The GitHub and CI logic in `run-queue.sh` encodes hard-won behaviour around required contexts, check-run filtering and CI classification. Calling it behind an adapter preserves it at the cost of keeping bash in the loop; porting it risks losing scars that are not written down.
-3. **Whether the front end's grill rounds are a kernel concern.** A grill is a conversation with a human, and the trial's ratio was four human decisions across a whole run. If grill state lives outside the kernel, resumption after a crash mid-grill is unspecified.
+2. ~~How much of v1 is called versus ported.~~ **Decided in Milestone 1, above.** Authority-bearing and journalled-effect seams are ported with their fixtures and mutation tests; pure or read-only helpers may be called. What remains genuinely open is *which* helpers qualify as pure, and that is answerable only by reading each one — a Milestone 1 task, not a design question.
+3. ~~Whether the front end's grill rounds are a kernel concern.~~ **Decided — this was not genuinely open.** Milestone 1 claims every arrow from the goal onward is a durable transition, and a conversation held only in model or UI state makes `goal → grilled decisions` neither durable nor auditable. Both claims cannot stand.
+
+   **Accepted human answers and grill decision packets are immutable kernel facts.** Conversational UI state may live outside the kernel; the decisions may not. The alternative — redefining Milestone 1 to begin at human enqueue — was considered and rejected, because it would abandon the audit trail over precisely the stage where five of eleven decisions were wrong as stated in the trial.
