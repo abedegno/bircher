@@ -134,11 +134,22 @@ The kernel validates the schema, confirms every referenced hash still matches, c
 
 `accept` from the judgement layer means "no unresolved blockers for the pinned review bundle". It does not mean merge.
 
-### 5. Effect journal, for the dangerous boundary only
+### 5. Effect journal, defined by semantic effect class
 
-For push, status publication and merge: persist intent before invoking the effect; carry an idempotency key; record the external object identifier; reconcile an uncertain result before retrying; revalidate authorization immediately before merge.
+Persist intent before invoking the effect; carry an idempotency key; record the external object identifier; reconcile an uncertain result before retrying; revalidate authorization immediately before merge.
 
-Not for every call. Only where the effect is irreversible or externally visible.
+An earlier revision scoped this to "push, status publication and merge" — three operations — while the rest of this document named PR creation, comments, labels, issue closing, recovery writes and reverts as dangerous or fenced. That is incoherent: **PR creation is one of the two implementer effects that motivated the credential boundary above, and it was absent from the journal.** The journal is therefore defined by effect class, not by an operation list:
+
+- ref creation and update; push
+- PR creation, head promotion, close and reopen, merge
+- statuses and checks
+- comments and review publications
+- issue and label mutations
+- reverts and recovery writes
+- credential issuance and revocation
+- session dispatch, stop, and reconciliation wherever ambiguity affects ownership
+
+Each class carries its own identity, generation, idempotency scope, reconciliation rule and authorization recheck. Not every call is journalled — reads are not — but every externally visible mutation is.
 
 ---
 
@@ -172,8 +183,11 @@ So while distributed leases and recallable cancellation stay deferred and cut re
 - **atomic ownership acquisition with a monotonically increasing fence generation.** "Ownership recorded" is not exclusion; acquisition must be a compare-and-swap, and dispatch must be tied to the generation it acquired.
 - **every accepted result *and every effect request* bound to that generation.** Binding results alone fences returned data, not the external effects an attempt already performed — which is the actual failure.
 - **fenced resources named explicitly**: run state, branch and ref, PR head, comments and statuses. "Every kernel-controlled write boundary" says nothing about writes that bypass the kernel, which is exactly the implementer push path above.
+- **a stated linearization point.** Binding an effect request to a generation only works if every request crosses a kernel enforcement point — and a credential already issued to an attempt can be used without submitting one. Revocation is not atomic with GitHub's authorization, and an in-flight request can survive it. So: the kernel imports an immutable artifact, atomically validates the ownership generation, persists effect intent, and submits the operation **from its exclusive credential domain**. A result arriving from an older generation is **observation-only and carries no reusable write capability** — which is a property of the domain separation above, not of the fence. The CAS design is real for kernel state; its claim over GitHub resources rests entirely on that separation.
 - **credentials that make a kernel-owned effect impossible for any model process** — see the authority boundary above. The minimum per-attempt credential provisioning and revocation needed for this is **carved out of the deferred identity-federation work**, not left adjacent to it.
-- **an unconfirmed stop leaves the attempt non-terminal and may permanently halt that run pending human reconciliation.** This is a deliberate liveness cost, stated rather than discovered. "Forbids replacement work that could conflict" is otherwise undefined: without resource identities and conflict rules it either stalls everything or protects nothing, and Milestone 1 takes the safe reading.
+- **an unconfirmed stop leaves the attempt non-terminal and halts that run pending human reconciliation** — as a durable `reconciliation_required` state, not a silent stall. Safety without an operating design is not enough for a system whose purpose is running overnight: a run that wedges at 03:00 and says nothing has failed the goal even though it correctly avoided conflicting work.
+
+  That state records the run, attempt, generation, affected resources, last confirmed observations, stop attempts and recommended operator actions. The runner emits an alert and a morning summary, and visibly retains the queue item. Milestone 1 must also state whether unrelated queued runs continue or the scheduler halts entirely — and the resolution itself is an **audited command with expected-version CAS**, never a manual state edit. "Forbids replacement work that could conflict" otherwise either stalls everything or protects nothing; Milestone 1 takes the safe reading and pays for it with the alert.
 
 ## Cut as goals, not merely postponed
 
@@ -204,10 +218,21 @@ So Milestone 1 requires:
 
 - **A constrained execution mode, which does not exist yet and is itself a Milestone 1 deliverable.** v1 has exactly one relevant switch, `BIRCHER_INRUN_MERGE=0`, which skips the in-run `merge_ready_pr` call and incidentally its status publication. It does **not** disable the `bircher:running` label write, outcome comments and label edits, issue closing, recovery comments, or implementer push and PR creation. There is no seam to name.
 
-  Building it means routing every effect through an injected effect adapter, or not running the coordinator at all and retaining only extracted logic. Its acceptance test: **run the full retained path with every mutation-capable command replaced by a trap, and prove none is reached.** Until that test passes, the kernel does not own those effects, and saying it does would move Critical 1 into an obligation without supplying an architecture.
+  Building it means routing every effect through an injected effect adapter, or not running the coordinator at all and retaining only extracted logic.
+
+  **A trap-based test cannot prove the boundary, and must not be presented as doing so.** A PATH shim in the coordinator says nothing about a model session, which is a separate process that can use an absolute path, another HTTP client, an SDK, or a language runtime. "Every mutation-capable command" is not enumerable — `python`, `node` and shell built-ins all originate network effects. And trapping `curl` breaks the retained path outright, since session creation, prompting, polling and stopping are themselves mutating POSTs.
+
+  So the acceptance criteria split into four:
+
+  1. **Structural routing tests** — every coordinator effect site invokes a typed effect adapter.
+  2. **Fault-injection tests** — every effect branch is driven and the adapter denies it.
+  3. **An end-to-end capability test** — model sessions run in their real execution domain and attempt mutations via `gh`, `git`, direct HTTPS, alternate clients, absolute paths and credential discovery. All must fail at the credential, network or repository boundary. **This is the authority-boundary proof; the other three are coverage evidence.**
+  4. **Provider-control effects classified explicitly** — session dispatch, prompting, polling and stopping are *permitted* kernel effects, tested separately from forbidden GitHub and repository mutations.
 - **The scar-bearing behaviour ported, not called — and the unit of preservation is behaviour, not functions.** There is no clean module boundary to port along. Genuinely pure leaves exist (`_classify_ci_failure`); other read-only units depend on the global `REPO`, on deadline state, on shell dynamic scope, on `gh` pagination and error conventions. The merge and CI scars are distributed across effectful orchestration: `merge_ready_pr` alone combines required-context discovery, status publication, mergeability polling, the merge, reconciliation, main-CI observation and possible revert.
 
   So the thing preserved is **behaviour captured by fixtures, transition tests and fault-injection tests**. A pure leaf may be called temporarily, but Milestone 1 inventories its globals, subprocesses and dynamic-scope dependencies first. **The port is complete only when a mutation of the corresponding v1 scar still fails an equivalent v2 test** — porting named classifiers while losing scars encoded in orchestration order, timeout handling and fail-closed error paths would satisfy the letter and lose the point.
+
+  That claim needs a manifest or it cannot be checked, and "the full retained path" can otherwise mean a happy path. **Milestone 1 produces a scar/effect matrix as a required artifact**: one row per v1 behaviour, giving its source location, the mutation that breaks it, the v2 owner, the test fixture, the injected fault, the expected durable events, and the effects it is permitted or forbidden to perform. Completion means every retained row passes and every excluded row carries an explicit disposition.
 
 This decides open question 2, below.
 
@@ -217,12 +242,24 @@ That supervised handoff is the authority boundary — **but only if something en
 
 An earlier revision proposed fencing **judgement** processes. That fences the wrong actor. The dangerous writer is the **implementer**: v1's agent bundles inherit the caller's environment (`os_env: type: caller_process`), run unsandboxed, and are explicitly instructed and permitted to `git push` and `gh pr create` — the configs say so in terms: *"Implementers open their own PRs, so push / gh pr create are allowed"*. An expired implementation attempt can therefore push a new head or open a duplicate PR **after** its result has been rejected, and rejecting returned data cannot undo an external mutation that already happened.
 
-So the enforcement mechanism for Milestone 1 is: **no model process holds credentials for a kernel-owned effect — implementers included.** Two implementations are viable and Milestone 1 must pick one and test it:
+So the enforcement mechanism for Milestone 1 is: **no model process holds credentials for a kernel-owned effect — implementers included.**
 
-- the implementer produces a local commit or bundle, and the **kernel** performs the push and the PR creation; or
-- each attempt receives a **narrowly scoped, revocable credential** and an attempt-specific ref that cannot update an authoritative PR head, followed by kernel-controlled promotion.
+An earlier revision offered two implementations and called both viable while marking the boundary UNPROVEN. That was a decision disguised as an admission: neither is viable as stated against the current topology, and the spec is capable of deciding now.
 
-**Until one of these exists and is tested, both the authority boundary and late-writer fencing are UNPROVEN, and this document does not claim otherwise.** A safe refusal to merge does not establish them: refusal governs the merge, and the unfenced effects are pushes, PRs and comments that occur before it.
+- **Scoped credentials do not exist for this.** A GitHub PAT or App installation token is not ref-scoped; repository `contents:write` generally permits updating any writable ref. "An attempt-specific ref that cannot update an authoritative PR head" is not a property ordinary GitHub credentials can express — and an attempt branch becomes the authoritative head the moment a PR targets it. Revocation also does not fence an already authenticated or in-flight git operation.
+- **Moving the push into "the kernel" is not sufficient on its own.** If the kernel runs in the same credential domain as the model sessions, nothing has been fenced: credentials remain reachable via `gh`'s credential store, git credential helpers, mounted files, sockets, and shared process and filesystem access. Scrubbing the environment does not address any of those.
+
+**The Milestone 1 security boundary, decided:**
+
+1. Model sessions run in a **credential-free** container or OS security domain.
+2. The kernel's GitHub adapter runs **outside** that domain, with credentials unreachable from it by environment, filesystem, credential helper, socket, process inspection or session tooling.
+3. The model hands off a **git object** through a one-way or kernel-copied channel.
+4. The kernel imports it, records and **verifies the immutable commit or tree hash**, and only then performs the push and the PR creation.
+5. Session termination and late workspace writes cannot alter the imported object — the handoff must be immutable once inspected, not a path, worktree, branch or bundle file in a shared workspace that a late process can rewrite.
+
+The scoped-credential option is retained **only** if it names a real enforcement mechanism — an isolated staging repository or fork, or a ref-enforcing proxy. Ordinary credentials plus an attempt-specific branch do not qualify.
+
+Until this domain separation is built and tested, the authority boundary and late-writer fencing are **UNPROVEN**, and a safe refusal to merge does not establish them: refusal governs the merge, and the unfenced effects are pushes, PRs and comments that happen before it.
 
 The frozen bundle must also be defined rather than gestured at. Milestone 1 fixes: which issue fields, comments and labels form the frozen input; how that snapshot is canonicalized for hashing; what counts as a relevant change; who creates a revision; whether implementation outputs invalidate spec or plan review; and the single transaction that joins artifact persistence, enqueue and the first durable transition.
 
