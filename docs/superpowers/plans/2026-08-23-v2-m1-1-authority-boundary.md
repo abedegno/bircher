@@ -154,9 +154,11 @@ the precondition this milestone must clear, not a defect in the test."
 
 - [ ] **Step 5: STOP — obtain human approval for the container change**
 
-**This step is a hard stop. Do not proceed without an explicit decision.** The change relaxes a security control on shared infrastructure, and the spec records the trade as one that must be made explicitly rather than absorbed.
+**Decision taken 2026-08-23: approved in principle — the human owns and applies the container change.** The implementer does not edit `docker-compose.yml` or the seccomp profile; steps 6 and 7 are the human's, and the implementer's job resumes at step 8, which *measures* the outcome.
 
-Present exactly this:
+**The gate still binds.** Approval is not the same as a passing probe. No later plan may run a model attempt until step 8 reports green, and step 8 must record whether one concession or two were required — the spec says that count was never measured, and asserting the cheaper answer without running the probe would be the exact defect this programme exists to catch.
+
+The trade as recorded, for the audit trail:
 
 > `omnigent-runner-bircher` needs `clone(CLONE_NEWUSER)` permitted so bubblewrap can create the sandbox that makes the model domain credential-free.
 >
@@ -166,7 +168,7 @@ Present exactly this:
 > - **Cost may be two concessions.** If AppArmor also blocks after seccomp is relaxed, `apparmor=unconfined` is needed too — blunter, since Docker has no per-service AppArmor tuning. Unknown until the probe re-runs.
 > - **No fallback.** Every alternative is eliminated in the spec. Refusing this means the design needs a new mechanism.
 
-If refused: record the refusal in the plan, stop Milestone 1, and open a design revision. Do not attempt a workaround.
+Steps 6 and 7 below document the change for the human applying it. If the probe cannot be made to pass, stop Milestone 1 and open a design revision rather than attempting a workaround — there is no fallback mechanism.
 
 - [ ] **Step 6: Derive the seccomp profile from the daemon default**
 
