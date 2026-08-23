@@ -53,7 +53,9 @@ The judgement layer never publishes a status, mutates authoritative state, start
 
 Three observations from a full end-to-end trial, in which one vague issue became a merged PR.
 
-**The parts of v1 that behaved perfectly were all mechanism.** A merge gate that refused to merge on an absent or ambiguous verdict — three times, each correctly. A review worktree pinned to an exact captured SHA, where the reviewer stops if the checkout does not match. The CI wait. Each is valuable *because* no judgement is involved: a layer asked "is this good enough to merge?" would have been talked into it at least once.
+**The parts of v1 that behaved well were mechanism, and one that looked like mechanism was not.** The merge gate refused to proceed on an absent or ambiguous verdict — three times, each correctly — and the CI wait behaved as specified. Each is valuable *because* no judgement is involved: a layer asked "is this good enough to merge?" would have been talked into it at least once.
+
+The recovery review's SHA pinning looked like a third example and is not one. It was **intended** to pin the checkout; a source audit found the guarantee absent (see §3 below). What was observed three times was a model choosing to obey an instruction. That distinction is the entire subject of this document, and it was missed by the author of this spec until review — which is the strongest available argument for the boundary it proposes.
 
 **The parts that needed judgement were done ad hoc.** Sixteen rulings across seven tasks, one of which was wrong. Deciding whether a finding was blocking, whether the loop had converged, whether a defect was in scope for this plan or a later one. None of it is expressible in bash, and all of it is what v2 must encode.
 
@@ -167,11 +169,11 @@ Until a concrete case demands them: a general workflow graph or DSL; parallel sc
 
 So while distributed leases and recallable cancellation stay deferred and cut respectively, **late-result rejection and authority fencing cannot be**. Milestone 1 requires:
 
-- durable single-run ownership, recorded rather than held in a process
-- credentials that make it impossible for a worker to perform a kernel-owned effect directly
-- attempt identity on every accepted result, so a late result can be attributed and refused
-- fencing at every kernel-controlled write boundary
-- an unconfirmed stop leaves the attempt **non-terminal**, and forbids replacement work that could conflict with it
+- **atomic ownership acquisition with a monotonically increasing fence generation.** "Ownership recorded" is not exclusion; acquisition must be a compare-and-swap, and dispatch must be tied to the generation it acquired.
+- **every accepted result *and every effect request* bound to that generation.** Binding results alone fences returned data, not the external effects an attempt already performed — which is the actual failure.
+- **fenced resources named explicitly**: run state, branch and ref, PR head, comments and statuses. "Every kernel-controlled write boundary" says nothing about writes that bypass the kernel, which is exactly the implementer push path above.
+- **credentials that make a kernel-owned effect impossible for any model process** — see the authority boundary above. The minimum per-attempt credential provisioning and revocation needed for this is **carved out of the deferred identity-federation work**, not left adjacent to it.
+- **an unconfirmed stop leaves the attempt non-terminal and may permanently halt that run pending human reconciliation.** This is a deliberate liveness cost, stated rather than discovered. "Forbids replacement work that could conflict" is otherwise undefined: without resource identities and conflict rules it either stalls everything or protects nothing, and Milestone 1 takes the safe reading.
 
 ## Cut as goals, not merely postponed
 
@@ -200,9 +202,12 @@ Every arrow is a durable transition.
 
 So Milestone 1 requires:
 
-- **v1 with dangerous effects disabled.** Merge, status publication, issue mutation and recovery writes are off. The kernel makes those calls, journalled, with persist-before-execute.
-- **The scar-bearing units ported, not called.** Review and CI classification and merge reconciliation carry behaviour learned from real failures — required-context resolution, check-run filtering, CI failure classification. Those are extracted with their fixtures and mutation tests. Calling the whole sequential runner is explicitly not an acceptable adapter.
-- **Pure or read-only v1 helpers may be called** where that is genuinely all they are.
+- **A constrained execution mode, which does not exist yet and is itself a Milestone 1 deliverable.** v1 has exactly one relevant switch, `BIRCHER_INRUN_MERGE=0`, which skips the in-run `merge_ready_pr` call and incidentally its status publication. It does **not** disable the `bircher:running` label write, outcome comments and label edits, issue closing, recovery comments, or implementer push and PR creation. There is no seam to name.
+
+  Building it means routing every effect through an injected effect adapter, or not running the coordinator at all and retaining only extracted logic. Its acceptance test: **run the full retained path with every mutation-capable command replaced by a trap, and prove none is reached.** Until that test passes, the kernel does not own those effects, and saying it does would move Critical 1 into an obligation without supplying an architecture.
+- **The scar-bearing behaviour ported, not called — and the unit of preservation is behaviour, not functions.** There is no clean module boundary to port along. Genuinely pure leaves exist (`_classify_ci_failure`); other read-only units depend on the global `REPO`, on deadline state, on shell dynamic scope, on `gh` pagination and error conventions. The merge and CI scars are distributed across effectful orchestration: `merge_ready_pr` alone combines required-context discovery, status publication, mergeability polling, the merge, reconciliation, main-CI observation and possible revert.
+
+  So the thing preserved is **behaviour captured by fixtures, transition tests and fault-injection tests**. A pure leaf may be called temporarily, but Milestone 1 inventories its globals, subprocesses and dynamic-scope dependencies first. **The port is complete only when a mutation of the corresponding v1 scar still fails an equivalent v2 test** — porting named classifiers while losing scars encoded in orchestration order, timeout handling and fail-closed error paths would satisfy the letter and lose the point.
 
 This decides open question 2, below.
 
@@ -210,9 +215,14 @@ The front end is **supervised**: it grills, produces spec and plan under adversa
 
 That supervised handoff is the authority boundary — **but only if something enforces it.** "Cannot merge, push, label or launch implementation" is an architectural intention until it is a property of credentials and process isolation. In v1 the runner and its prompt-driven workers share GitHub and session authority, so the same claim there would be false.
 
-The enforcement mechanism for Milestone 1: **front-end and judgement processes hold no GitHub mutation credentials and can only submit typed data to the kernel.** They may read. Every mutating effect is a kernel call.
+An earlier revision proposed fencing **judgement** processes. That fences the wrong actor. The dangerous writer is the **implementer**: v1's agent bundles inherit the caller's environment (`os_env: type: caller_process`), run unsandboxed, and are explicitly instructed and permitted to `git push` and `gh pr create` — the configs say so in terms: *"Implementers open their own PRs, so push / gh pr create are allowed"*. An expired implementation attempt can therefore push a new head or open a duplicate PR **after** its result has been rejected, and rejecting returned data cannot undo an external mutation that already happened.
 
-If credential confinement cannot be achieved in Milestone 1, the spec must say the authority boundary is **unproven** and must not claim the resulting audit establishes that models did not act directly. An unproven boundary recorded as proven is precisely the defect class this document is about.
+So the enforcement mechanism for Milestone 1 is: **no model process holds credentials for a kernel-owned effect — implementers included.** Two implementations are viable and Milestone 1 must pick one and test it:
+
+- the implementer produces a local commit or bundle, and the **kernel** performs the push and the PR creation; or
+- each attempt receives a **narrowly scoped, revocable credential** and an attempt-specific ref that cannot update an authoritative PR head, followed by kernel-controlled promotion.
+
+**Until one of these exists and is tested, both the authority boundary and late-writer fencing are UNPROVEN, and this document does not claim otherwise.** A safe refusal to merge does not establish them: refusal governs the merge, and the unfenced effects are pushes, PRs and comments that occur before it.
 
 The frozen bundle must also be defined rather than gestured at. Milestone 1 fixes: which issue fields, comments and labels form the frozen input; how that snapshot is canonicalized for hashing; what counts as a relevant change; who creates a revision; whether implementation outputs invalidate spec or plan review; and the single transaction that joins artifact persistence, enqueue and the first durable transition.
 
