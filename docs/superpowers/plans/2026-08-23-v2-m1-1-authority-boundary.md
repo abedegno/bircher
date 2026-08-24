@@ -171,7 +171,7 @@ load-bearing unverified assumption and it now has an answer."
 
 ---
 
-### Task 2: `NET_PORT` support in the landlock backend
+### Task 2: `NET_PORT` support in the landlock backend — ✅ DONE (fork PR #6, merged 463db302)
 
 Upstream change 1, in the fork `abedegno/omnigent`. Only start this once Task 1 passed.
 
@@ -213,7 +213,7 @@ Reference the landlock backend's own "out of scope" comments as the motivation, 
 
 ---
 
-### Task 3: Widen the egress backend gate
+### Task 3: Widen the egress backend gate — ✅ DONE (same PR)
 
 Upstream change 2. Three sites assert `egress_rules requires sandbox.type=linux_bwrap`.
 
@@ -257,6 +257,22 @@ def test_all_three_sites_use_the_same_predicate():
 - [ ] **Step 3: Run, mutation-test, commit, PR upstream**
 
 Mutate by reverting one of the three sites to a literal `== "linux_bwrap"` and confirm `test_all_three_sites_use_the_same_predicate` goes red.
+
+---
+
+## Deployment state (2026-08-24)
+
+Tasks 1-3 are complete and **live on `omnigent-runner-bircher`**.
+
+- Fork PR #6 merged to `nas-deploy` as `463db302`; images `ghcr.io/abedegno/omnigent-{server,host}:sha-463db30`.
+- `.env` bumped **the bircher lane only** — `OMNIGENT_BIRCHER_TAG=sha-463db30`. `OMNIGENT_TAG` stays `sha-f411980`, so the server and the general runner (the boundary for the native harnesses) were not touched. Stack redeploy recreated only `omnigent-runner-bircher`; Postgres kept 2 months of uptime.
+- Rollback is a repin to `sha-f411980` with **no dump restore** — the merge contains no migrations.
+- Verified live: `omnigent 0.9.0 (built 2026-08-24T20:14:57Z)`; ABI clamping returns 0 below ABI 4 and both TCP rights at ABI 6; landlock classified egress-capable **and** TCP-only; bwrap not TCP-only; the two sets disjoint.
+- Verified live: both the spec parser and the inner loader **accept** `linux_landlock` + `egress_rules` + `credential_proxy`, and both still **refuse** `type: none` — the control that distinguishes a widened gate from a broken one.
+
+**Two `.env` notes.** The bircher pin now keeps its detail on full-line comments: `deploy.sh:194` splits on the first `=` and passes everything after it as the value, so an inline comment ends up inside the value. `OMNIGENT_TAG` still does this and was left alone — pre-existing, evidently tolerated, and not worth changing the server lane's input to fix.
+
+**What is still unproven:** no model session has run under this sandbox. Every claim about Landlock's runtime behaviour rests on one probe executed before the code existed. Task 4 and Task 6 are what turn that into evidence.
 
 ---
 
