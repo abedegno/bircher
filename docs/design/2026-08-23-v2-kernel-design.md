@@ -303,9 +303,26 @@ That gap is what stands between this deployment and the boundary, and closing it
 
 Until both ship, **the enforcement mechanism does not run and no model attempt may run either.** That is a real dependency on work outside this repository, and unlike the earlier draft's version of that claim it names the exact code that must change.
 
-**What is verified, and what is not.** Verified by execution: bwrap is installed and cannot start; the kernel permits user namespaces and the container does not; Landlock reports ABI 6 here under default seccomp; the three parser sites refuse non-bwrap backends; the landlock backend declares its network support out of scope. **Not yet verified:** that a landlock `NET_PORT` deny-all-TCP ruleset leaves a bind-mounted Unix socket usable in practice. That is one experiment, it is the load-bearing assumption of this whole section, and Milestone 1 runs it **first** — before either upstream change is written, because both are worthless if it fails.
+**What is verified, and what is not.** Verified by execution on `omnigent-runner-bircher`: bwrap is installed and cannot start; the kernel permits user namespaces and the container does not; the three parser sites refuse non-bwrap backends; the landlock backend declares its network support out of scope.
 
-**If that experiment fails**, the fallback is the rejected bwrap route with its three relaxations, taken deliberately and recorded as a cost rather than absorbed — or the maintainers' stated end state, a `sandbox.provider` booting an isolated sandbox per session (`boxlite`, PR #102), which is a larger change than Milestone 1 should carry.
+**The load-bearing assumption is no longer an assumption.** Run 2026-08-24 inside the bircher runner, under the container's *default* hardening:
+
+```
+RESULT abi           PASS 6
+RESULT restrict_self PASS
+RESULT tcp_denied    PASS PermissionError
+RESULT unix_usable   PASS
+```
+
+with the control that makes the third line mean something:
+
+```
+CONTROL tcp_without_landlock PASS connected
+```
+
+TCP to `1.1.1.1:443` **succeeds** without the ruleset and raises `PermissionError` under it, so the denial is Landlock's and not a missing route — and the Unix socket remains connectable while all TCP is denied. **Landlock reproduces bwrap's sole-egress invariant with no namespaces, no mounts, no privileges and no container relaxations.** The design rests on a measured property rather than a plausible one.
+
+What remains unverified is downstream and ordinary: that omnigent's relay, once the backend emits `NET_PORT` rules, uses that Unix path unchanged. That is what the two upstream changes and the capability test establish.
 
 The frozen bundle must also be defined rather than gestured at. Milestone 1 fixes: which issue fields, comments and labels form the frozen input; how that snapshot is canonicalized for hashing; what counts as a relevant change; who creates a revision; whether implementation outputs invalidate spec or plan review; and the single transaction that joins artifact persistence, enqueue and the first durable transition.
 

@@ -42,7 +42,20 @@ This builds **one side** of the boundary — the credential-free model domain an
 
 ---
 
-### Task 1: The sole-egress experiment
+### Task 1: The sole-egress experiment — ✅ RUN 2026-08-24, PASSED
+
+**Result, measured on `omnigent-runner-bircher` under default container hardening:**
+
+```
+RESULT abi           PASS 6          CONTROL tcp_without_landlock PASS connected
+RESULT restrict_self PASS
+RESULT tcp_denied    PASS PermissionError
+RESULT unix_usable   PASS
+```
+
+The control is what makes this evidence rather than coincidence: TCP to `1.1.1.1:443` connects *without* the ruleset and raises `PermissionError` *under* it, so the denial is Landlock's and not an absent route. The Unix socket stays connectable with all TCP denied.
+
+**Tasks 2 and 3 are therefore unblocked.** The steps below are retained as the record of what was run and how to re-run it if the kernel or image changes.
 
 **The load-bearing assumption of the entire design, and it is unverified.** Landlock's `NET_PORT` restricts TCP; Unix sockets are a different address family and should be unaffected. "Should be" is not evidence. Tasks 2 and 3 are worthless if this fails, so it runs first and costs an hour rather than a week.
 
