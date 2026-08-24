@@ -1,0 +1,70 @@
+spec_version: 1
+name: v2_implementer
+description: >-
+  Bircher v2 implementer — implements a scoped task in its own worktree and
+  CANNOT push, open a PR, comment, or label. Kernel-owned effects are performed
+  by the kernel from its own credential domain, never by this session.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are the Bircher v2 implementer. You implement one scoped task in a
+  dedicated git worktree, then STOP and return your result.
+
+  You hold no GitHub write authority, and this is enforced rather than
+  requested. You cannot push, open a pull request, comment, edit labels or
+  close issues: the credential never enters this session, and the network
+  policy denies the paths those operations use. Do not attempt them, and do
+  not treat a failure to reach GitHub as a problem to work around — it is the
+  boundary working.
+
+  Commit your work locally. The kernel imports the commit you nominate, by its
+  object id, and performs every external effect itself.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    # linux_landlock, NOT linux_bwrap: bwrap cannot create a user namespace in
+    # this hardened container, and enabling it would need seccomp, apparmor and
+    # systempaths all unconfined. Landlock needs none of that.
+    #
+    # Landlock enforces this allow-list for TCP ONLY. UDP, raw sockets and any
+    # socket connected before restriction are NOT confined. That covers HTTP(S),
+    # which is what these rules govern, but it is not a complete network
+    # boundary -- see omnigent inner/datamodel.py TCP_ONLY_EGRESS_BACKENDS.
+    type: linux_landlock
+    write_paths:
+      - .
+    egress_rules:
+      # Fetch only. `git-receive-pack` is deliberately ABSENT: egress_rules are
+      # default-deny, so omitting it is what makes push impossible. Never add it
+      # to make a test pass -- that omission IS the enforcement.
+      - "GET,POST github.com/abedegno/muesli.git/git-upload-pack"
+      - "GET github.com/abedegno/muesli.git/info/refs"
+      # Read-only GitHub API. Every mutation is a non-GET, so this excludes PR
+      # creation, comments, labels, issue edits and GraphQL entirely.
+      - "GET api.github.com/repos/abedegno/muesli/**"
+    credential_proxy:
+      # Swap-on-access: the real token stays in the unsandboxed parent and is
+      # attached by the egress proxy on the way out. Nothing credential-shaped
+      # enters this session; `gh` sees only a host-bound oa_cred_* placeholder.
+      - type: gh_basic
+        source: {command: gh auth token}
+
+# The inverse of the v1 implementers, which set gate_pushes: false because
+# "implementers open their own PRs". This one must not, so pushes are gated
+# here as well as denied at the network -- two independent mechanisms, because
+# the network policy is TCP-only and this one is not.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: true
