@@ -1,0 +1,11 @@
+[project]
+name = "bircher-v2"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+markers = ["runner: integration test that executes against the live omnigent runner"]
+pythonpath = ["."]
