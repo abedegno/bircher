@@ -79,6 +79,14 @@ class Store:
         )
         return fid
 
+    def put_blob(self, content_hash: str, data: bytes) -> None:
+        """Insert an immutable blob. Idempotent: identical bytes hash the same,
+        so a repeated write is a no-op rather than a conflict."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO artifacts (hash, bytes) VALUES (?,?)",
+            (content_hash, data),
+        )
+
     def facts_for(self, run_id: str) -> list[Fact]:
         rows = self._conn.execute(
             "SELECT seq, id, run_id, kind, schema_version, mechanism_version,"
