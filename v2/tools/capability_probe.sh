@@ -39,6 +39,22 @@ _report() {  # name expect got verdict
 # policy denial from a broken network.
 _status() { curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$@" 2>/dev/null; }
 
+_expect_denied_at_l4() {  # name <curl args...>
+  local name="$1"; shift
+  local code; code=$(_status "$@")
+  case "$code" in
+    000)
+      if [ "$CONTROL_PASSED" = 1 ]; then
+        _report "$name" deny "no_route_l4" PASS
+      else
+        _report "$name" deny "no_response_control_failed" INCONCLUSIVE
+      fi ;;
+    403|407) _report "$name" deny "http_$code" PASS ;;
+    2*|3*)   _report "$name" deny "http_$code" FAIL ;;
+    *)       _report "$name" deny "http_$code" INCONCLUSIVE ;;
+  esac
+}
+
 _expect_denied() {  # name <curl args...>
   local name="$1"; shift
   local code; code=$(_status "$@")
@@ -53,9 +69,11 @@ _expect_denied() {  # name <curl args...>
 echo "=== control: the boundary must not simply be a dead network ==="
 
 # CONTROL. git ref discovery over the one allowed upload-pack path.
+CONTROL_PASSED=0
 code=$(_status "https://$REPO.git/info/refs?service=git-upload-pack")
 if [ "$code" = "200" ]; then
   _report fetch_allowed allow "http_200" PASS
+  CONTROL_PASSED=1
 else
   _report fetch_allowed allow "http_$code" FAIL
   echo "!! The control failed. Every deny result below is meaningless:" >&2
@@ -69,7 +87,14 @@ _expect_denied api_pr_create       "https://api.github.com/repos/abedegno/muesli
 _expect_denied api_comment         "https://api.github.com/repos/abedegno/muesli/issues/1/comments" -X POST --data '{}'
 _expect_denied api_label_edit      "https://api.github.com/repos/abedegno/muesli/issues/1" -X PATCH --data '{}'
 _expect_denied api_graphql         "https://api.github.com/graphql" -X POST --data '{}'
-_expect_denied unlisted_host       "https://example.com/"
+# An unlisted HOST is denied by Landlock at L4, not by the proxy at L7: there
+# is no allowed TCP route to it at all, so the connection never completes.
+# That is a different mechanism from an unlisted PATH on an allowed host, and
+# reporting it as a 403 would misdescribe the boundary. `no_response` counts
+# as a denial here ONLY because the control passed -- without a working
+# network the same result would mean nothing, which is exactly why the
+# control runs first and this check reads its result.
+_expect_denied_at_l4 unlisted_host    "https://example.com/"
 _expect_denied unlisted_repo       "https://api.github.com/repos/abedegno/bircher"
 _expect_denied redirect_to_denied  -L "https://$REPO.git/git-receive-pack"
 
@@ -100,9 +125,15 @@ fi
 echo "=== planted positive: the probe must be able to fail ==="
 
 # A deliberately allowed request routed through the same code path as every
-# deny check. If this reports PASS the checker is inverted or the transport is
-# dead, and every PASS above is worthless.
-code=$(_status "https://api.github.com/repos/abedegno/muesli")
+# deny check. If this FAILS the probe is not exercising the allowed path and
+# every denial above is worthless.
+#
+# The path matters. An earlier version used the bare `/repos/abedegno/muesli`,
+# which the rule `GET api.github.com/repos/abedegno/muesli/**` does NOT match:
+# the glob requires a segment beneath the repo. The probe reported FAIL and
+# refused to certify the run, which is the planted positive doing its job --
+# it caught a probe that was testing nothing, not a boundary that had broken.
+code=$(_status "https://api.github.com/repos/abedegno/muesli/branches/main")
 if [ "$code" = "200" ]; then
   _report planted_positive allow "http_200" PASS
 else
