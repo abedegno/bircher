@@ -10,6 +10,22 @@
 
 **Spec:** `docs/design/2026-08-23-v2-kernel-design.md` (branch `v2`, commit `6a2be96`)
 
+## STATUS: COMPLETE (2026-08-25)
+
+All five tasks implemented in `v2/`, 73 tests passing across the kernel. Every guard mutation-tested.
+
+**The ownership test took three attempts to bind, and the plan predicted only the first failure.**
+
+1. *Sampled.* Acquire twice sequentially, assert distinct generations. CAS and read-then-write both pass — no contention single-threaded. The plan anticipated this and said to add a forced-interleaving variant rather than declare the guard bound.
+2. *Hooked the wrong point.* Intercepting the `SELECT` fires **before** the victim reads, so the victim picks up the interloper's value and loses nothing; the mutation stayed green. The window is between the read and the write, so the hook must fire on the **write**.
+3. *Needed a different assertion.* Under read-then-write the victim writes `old+1` and clobbers the interloper, leaving both holding the **same number**. "No lost update" is therefore expressed as *two owners can never hold the same generation* — which is what the spec requires.
+
+Also: `sqlite3.Connection.execute` is read-only and cannot be monkeypatched, so the connection is wrapped in a delegating proxy; `Store._conn` is an ordinary attribute.
+
+**Mutations run, each caught by its named test:** version predicate dropped; generation check dropped; replay short-circuit removed; `head_git_sha` dropped from `BOUND_INPUTS` (exactly its own parametrization); journalling moved after execution; effect generation fence removed (both the refusal test *and* the no-row test, which is why that mutation is checked against two); halt made global rather than per-run.
+
+---
+
 ## Global Constraints
 
 - **Expected-version compare-and-swap on every mutating command.** Irreversible (spec, first-commit table): without it, stale decisions silently apply to newer state.
