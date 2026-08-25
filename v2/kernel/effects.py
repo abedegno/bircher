@@ -97,8 +97,16 @@ def _perform_unhalted(
     # journal cannot attribute is the same defect commands had -- in the half
     # of the system that actually touches the world.
     #
-    # Resolved BEFORE the idempotency read, so an unattributable caller cannot
-    # consume a key or read back another attempt's external object id.
+    # Resolved BEFORE the idempotency read, because that read RETURNS the
+    # external object id of a confirmed effect. An undispatched caller placed
+    # after it learns the id of a merge, PR or comment another attempt created
+    # -- refused, but only after being told what it asked for.
+    #
+    # It does NOT protect the key from being consumed: effect_by_key is a read
+    # and consumption happens at journal_intent, which is already past the
+    # refusal either way. An earlier comment here claimed otherwise, and a
+    # mutation moving the refusal below the read survived because the test
+    # written from that comment checked the property the code did not have.
     actor = actor_for(store, run_id, generation)
     if actor is None:
         raise NotAuthorized(

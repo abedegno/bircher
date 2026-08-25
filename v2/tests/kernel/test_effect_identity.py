@@ -10,7 +10,9 @@ import pytest
 
 from kernel.authz import NotAuthorized
 from kernel.dispatch import Role, dispatch
-from kernel.effects import EffectClass, UncertainEffect, perform
+from kernel.effects import (
+    EffectClass, UncertainEffect, _perform_unhalted, perform,
+)
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -76,7 +78,13 @@ def test_a_refused_effect_does_not_execute():
 
 
 def test_a_refused_effect_consumes_no_idempotency_key():
-    """An unattributable caller must not burn a key a live attempt needs."""
+    """An unattributable caller must not burn a key a live attempt needs.
+
+    NOTE: this passes with the refusal on either side of the idempotency read
+    -- effect_by_key is a read, and consumption happens at journal_intent,
+    which is past the refusal either way. Kept because the property matters;
+    the ORDERING is bound by the test below, not by this one.
+    """
     s = _store()
     dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER)
     self_fenced = acquire(s, "r", "claude")
@@ -85,6 +93,34 @@ def test_a_refused_effect_consumes_no_idempotency_key():
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
     assert perform(s, "r", gen, EffectClass.COMMENT, "shared", {},
                    lambda *a: "ok") == "ok"
+
+
+def test_an_undispatched_caller_is_not_told_a_confirmed_effect_s_external_id():
+    """THE ordering property. The idempotency read RETURNS the external object
+    id of a confirmed effect, so a refusal placed after it answers the question
+    before refusing it -- handing an unattributable caller the id of a merge,
+    PR or comment another attempt created."""
+    s = _store()
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    perform(s, "r", gen, EffectClass.PULL_REQUEST, "shared", {},
+            lambda *a: "https://github.com/o/r/pull/42")
+    self_fenced = acquire(s, "r", "claude")
+    with pytest.raises(NotAuthorized, match="no dispatched actor"):
+        perform(s, "r", self_fenced, EffectClass.PULL_REQUEST, "shared", {},
+                _never_runs)
+
+
+def test_an_undispatched_caller_is_not_told_an_effect_is_uncertain():
+    """The same leak through the other branch of the idempotency read."""
+    s = _store()
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    with pytest.raises(UncertainEffect):
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+                lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
+    self_fenced = acquire(s, "r", "claude")
+    with pytest.raises(NotAuthorized, match="no dispatched actor"):
+        _perform_unhalted(s, "r", self_fenced, EffectClass.PULL_REQUEST, "k",
+                          {}, _never_runs)
 
 
 def test_reconciliation_stays_a_human_fact():
