@@ -20,9 +20,17 @@ def test_dispatch_binds_an_actor_to_the_generation_it_acquired(store):
 
 
 def test_a_generation_with_no_dispatch_has_no_actor(store):
-    """An ungated caller must not inherit somebody else's identity."""
-    gen = acquire(store, "r", "attempt_1")
-    assert actor_for(store, "r", gen) is None
+    """An ungated caller must not inherit somebody else's identity.
+
+    The run MUST already hold a dispatch for another generation. Without
+    one, a lookup that fell back to 'the most recent dispatch' would still
+    return None -- for want of any row, not for want of the right one --
+    and this test would pass while the property it names was broken.
+    """
+    acquire(store, "r", "dispatched")
+    dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER)
+    ungated = acquire(store, "r", "ungated")
+    assert actor_for(store, "r", ungated) is None
 
 
 def test_each_generation_gets_its_own_actor(store):
