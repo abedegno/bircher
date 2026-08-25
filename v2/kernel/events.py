@@ -26,6 +26,8 @@ class EventKind:
     ATTEMPT_DISPATCHED = "attempt_dispatched"
     MERGE_AUTHORIZED = "merge_authorized"
     MODEL_QUESTION = "model_question"
+    ENQUEUE_PROPOSED = "enqueue_proposed"
+    RUN_ENQUEUED = "run_enqueued"
     REVISION_PROPOSED = "revision_proposed"
     BUNDLE_REVISED = "bundle_revised"
 
@@ -48,6 +50,8 @@ SCHEMA_VERSIONS = {
     EventKind.ATTEMPT_DISPATCHED: 1,
     EventKind.MERGE_AUTHORIZED: 1,
     EventKind.MODEL_QUESTION: 1,
+    EventKind.ENQUEUE_PROPOSED: 1,
+    EventKind.RUN_ENQUEUED: 1,
     EventKind.REVISION_PROPOSED: 1,
     EventKind.BUNDLE_REVISED: 1,
 }
