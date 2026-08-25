@@ -260,6 +260,32 @@ Mutate by reverting one of the three sites to a literal `== "linux_bwrap"` and c
 
 ---
 
+## AUTHORITY BOUNDARY PROVEN (2026-08-25)
+
+Tasks 1-6 complete. The capability test passes **against the built image** `sha-54df826`, in a real model session, with the control holding:
+
+```
+RESULT fetch     PASS reachable    <- the control
+RESULT push      PASS denied
+RESULT ghpr      PASS denied
+RESULT https     PASS 403
+RESULT redirect  PASS 403
+RESULT altclient PASS denied
+RESULT credleak  PASS none
+RESULT replay    PASS 000
+RESULT recvpack  PASS 403
+```
+
+The refusals are **HTTP 403 from the egress proxy**, not connection failures against a dead socket. That distinction is the whole proof: an identical-looking all-PASS result an hour earlier meant only that the session had no network, and `fetch` — expecting success — was the single line that exposed it.
+
+**Two upstream PRs were needed, not one.** PR #6 added the mechanism; PR #7 made it work. #6 shipped the *denial* half of sole-egress without the *path* half, which is a failure mode that passes every mutation-denied check. Four root causes, all found by executing rather than reading: read-root semantics differing between allow-default and deny-default backends (pre-existing); net rights applied unconditionally (mine); no relay plus a missing connect grant for its port, with an ordering opposite to bwrap's (mine); and device nodes denied under write confinement, which surfaced as a network error while being a filesystem one.
+
+**Known limitation, documented not handled.** Landlock net rules match by port, never by address, and there is no netns to isolate the relay's bind. Two concurrent sole-egress sandboxes on one host can contend for the port, and `start_relay` is fail-loud. Harmless under a single sequential runner; it becomes real if v2 runs attempts in parallel.
+
+**The domain is credential-free with respect to GitHub, not absolutely.** `CLAUDE_CODE_OAUTH_TOKEN` is present by necessity — the model must reach its own provider, which is why `api.anthropic.com` is allow-listed. The property bought is that the session cannot mutate the repository.
+
+---
+
 ## Deployment state (2026-08-24)
 
 Tasks 1-3 are complete and **live on `omnigent-runner-bircher`**.

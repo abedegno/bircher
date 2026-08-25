@@ -44,10 +44,27 @@ os_env:
       # default-deny, so omitting it is what makes push impossible. Never add it
       # to make a test pass -- that omission IS the enforcement.
       - "GET,POST github.com/abedegno/muesli.git/git-upload-pack"
-      - "GET github.com/abedegno/muesli.git/info/refs"
+      # NOTE the trailing glob: the egress proxy matches the COMPLETE request
+      # target including the query string, and git's ref discovery is
+      # GET /<repo>.git/info/refs?service=git-upload-pack. A bare
+      # ".../info/refs" rule does not match it and the fetch is denied.
+      - "GET github.com/abedegno/muesli.git/info/refs**"
       # Read-only GitHub API. Every mutation is a non-GET, so this excludes PR
       # creation, comments, labels, issue edits and GraphQL entirely.
       - "GET api.github.com/repos/abedegno/muesli/**"
+      # The session's own model provider. Without this the harness cannot think
+      # at all -- it fails with "Connection refused" before running anything.
+      #
+      # This is the point at which "credential-free model domain" needs stating
+      # precisely: the domain is free of GITHUB credentials, not of all
+      # credentials. CLAUDE_CODE_OAUTH_TOKEN is present here by necessity,
+      # because the model must authenticate to its own provider. The boundary
+      # this design buys is that the session cannot mutate the repository, not
+      # that it holds no secrets.
+      #
+      # Every additional allowed host widens the domain and needs its own
+      # review for state-changing GET endpoints.
+      - "GET,POST api.anthropic.com/**"
     credential_proxy:
       # Swap-on-access: the real token stays in the unsandboxed parent and is
       # attached by the egress proxy on the way out. Nothing credential-shaped
