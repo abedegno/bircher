@@ -99,6 +99,26 @@ def quote_mask(line: str, in_quote: str | None) -> tuple[list[bool], str | None]
                 mask.extend([True, True])
                 i += 2
                 continue
+            # A command substitution inside DOUBLE quotes is executed, so its
+            # contents are code. `captured="$(gh pr merge 401)"` is a real
+            # merge that the quote test otherwise suppressed as data. Single
+            # quotes do not interpolate, so `'$(...)'` stays data.
+            if q == '"' and c == "$" and line[i + 1:i + 2] == "(":
+                depth, j = 1, i + 2
+                mask.extend([True, True])
+                while j < len(line) and depth:
+                    if line[j] == "(":
+                        depth += 1
+                    elif line[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            mask.append(True)
+                            j += 1
+                            break
+                    mask.append(False)
+                    j += 1
+                i = j
+                continue
             mask.append(True)
             if c == q:
                 q = None
@@ -162,6 +182,43 @@ def code_lines(path: str):
         yield n, line, mask, False
 
 
+_SEPARATOR = re.compile(r"(?:\|\||&&|[;|])")
+
+
+def _segments(line: str, mask: list[bool]) -> list[tuple[str, int]]:
+    """Split a logical line at UNQUOTED shell separators.
+
+    Each segment is judged on its own, so a routed call exempts itself and not
+    whatever follows it on the same line. Offsets are returned so the quote
+    mask still applies to the original positions.
+    """
+    out, start, depth = [], 0, 0
+    i = 0
+    while i < len(line):
+        # Separators INSIDE a command substitution belong to its own pipeline
+        # and must not split the outer line -- otherwise
+        # `_effect comment "k:$(printf %s "$b" | shasum)" gh pr comment ...`
+        # splits at that pipe and the remainder loses its `_effect` prefix.
+        if line.startswith("$(", i):
+            depth += 1
+            i += 2
+            continue
+        if line[i] == ")" and depth:
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and not mask[i]:
+            m = _SEPARATOR.match(line, i)
+            if m:
+                out.append((line[start:i], start))
+                start = m.end()
+                i = m.end()
+                continue
+        i += 1
+    out.append((line[start:], start))
+    return out
+
+
 def scan(path: str) -> tuple[list[Finding], list[Suppressed]]:
     """Return (unrouted mutations, matches suppressed with the reason)."""
     findings: list[Finding] = []
@@ -193,23 +250,35 @@ def scan(path: str) -> tuple[list[Finding], list[Suppressed]]:
                 suppressed.append(Suppressed(n, stripped[:110], "comment"))
             continue
 
-        # EXCLUSION 3: already routed. Anchored to the call position.
-        # Blinds the detector to: a mutation on the same line AFTER a routed
-        # one. Planted positive covers it.
-        if ROUTED.search(line):
-            continue
-
         mask, quote = quote_mask(line, quote)
+
+        # EXCLUSION 3: already routed. Anchored to the call position.
+        #
+        # It used to skip the WHOLE line, which exempted anything after the
+        # routed call: `_effect comment k - true; gh pr merge 301` was
+        # invisible. The comment here claimed a planted positive covered that
+        # shape -- it did not; the positive covered `_effect` mentioned in a
+        # comment, which is a different shape. Found by codex in round 6.
+        #
+        # Now the line is split at UNQUOTED separators and each segment judged
+        # on its own, so a routed segment exempts only itself.
+        segments = _segments(line, mask)
 
         # EXCLUSION 4: quoted string literals. THE substantive one.
         # Tested on where the match STARTS, so a call whose verb is quoted --
         # `gh pr "merge" "$pr"` -- is still found. Suppressions are reported
         # rather than dropped, so a NEW one fails the test rather than joining
         # a list nobody re-reads.
-        outside = [m for m in MUTATION.finditer(line) if not mask[m.start()]]
-        if outside:
+        unrouted_hit = False
+        for seg, off in segments:
+            if ROUTED.search(seg):
+                continue
+            if any(not mask[off + m.start()] for m in MUTATION.finditer(seg)):
+                unrouted_hit = True
+                break
+        if unrouted_hit:
             findings.append(Finding(n, stripped[:110]))
-        elif MUTATION.search(line):
+        elif MUTATION.search(line) and not ROUTED.search(line):
             suppressed.append(Suppressed(n, stripped[:110], "inside a quoted string"))
 
     return findings, suppressed

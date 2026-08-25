@@ -159,3 +159,36 @@ def test_the_dispositioned_list_is_not_a_dumping_ground():
     unrouted = {f.line for f in find_direct_effects(str(RUN_QUEUE))}
     stale = sorted(dispositioned - unrouted)
     assert not stale, f"dispositioned lines that are not unrouted mutations: {stale}"
+
+
+# --- round 6: shapes that defeated a NAMED exclusion --------------------------
+
+def test_a_mutation_after_a_routed_call_on_the_same_line_is_found(tmp_path):
+    """CODEX, round 6. EXCLUSION 3 skipped the whole line once `_effect`
+    matched, so anything after it was exempt. The comment there claimed a
+    planted positive covered this shape; the positive covered `_effect`
+    mentioned in a COMMENT, which is a different shape."""
+    assert _scan(tmp_path, '_effect comment k - true; gh pr merge 301\n')
+
+
+def test_a_mutation_in_a_command_substitution_is_found(tmp_path):
+    """CODEX, round 6. `$(...)` inside double quotes is executed, so its
+    contents are code -- the quote test suppressed a real merge as data."""
+    assert _scan(tmp_path, 'captured="$(gh pr merge 401)"\n')
+
+
+def test_a_substitution_inside_single_quotes_stays_data(tmp_path):
+    """The other direction: single quotes do not interpolate."""
+    assert not _scan(tmp_path, """echo 'run $(gh pr merge 401) yourself'\n""")
+
+
+def test_a_routed_call_whose_key_contains_a_pipeline_is_not_flagged(tmp_path):
+    """The regression the segment fix introduced and then closed: a separator
+    inside `$(...)` must not split the line and strip the `_effect` prefix."""
+    assert not _scan(tmp_path,
+        '_effect comment "k:$(printf %s "$b" | shasum -a 256)" - '
+        'gh pr comment 7 --body x\n')
+
+
+def test_a_routed_call_still_exempts_itself(tmp_path):
+    assert not _scan(tmp_path, '_effect merge "m:1" - gh pr merge 1 --repo o/r\n')
