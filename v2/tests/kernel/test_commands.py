@@ -35,10 +35,16 @@ def test_command_at_the_current_version_is_accepted(store):
 
 
 def test_command_derived_from_an_older_version_is_refused(store):
-    """A command derived from version 12 cannot mutate version 15."""
+    """A command derived from version 12 cannot mutate version 15.
+
+    Uses a legal SEQUENCE (submit_spec then submit_plan) because commands are
+    now authorized against the run's state; re-issuing submit_spec would be
+    refused for being illegal rather than for being stale, and the test would
+    pass for the wrong reason.
+    """
     submit(store, _cmd(store, key="k1"))
     with pytest.raises(StaleVersion):
-        submit(store, _cmd(store, version=0, key="k2"))
+        submit(store, _cmd(store, name="submit_plan", version=0, key="k2"))
 
 
 def test_replaying_an_idempotency_key_returns_the_first_result(store):
@@ -64,7 +70,7 @@ def test_command_from_a_superseded_generation_is_refused(store):
 def test_a_rejected_command_records_a_fact(store):
     submit(store, _cmd(store, key="k1"))
     with pytest.raises(StaleVersion):
-        submit(store, _cmd(store, version=0, key="k2"))
+        submit(store, _cmd(store, name="submit_plan", version=0, key="k2"))
     assert "command_rejected" in [f.kind for f in store.facts_for("r")]
 
 

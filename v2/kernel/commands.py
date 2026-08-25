@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from kernel.authz import authorize
 from kernel.canon import canonical_hash
 from kernel.events import EventKind
 from kernel.ownership import OwnershipLost, current_generation
@@ -91,6 +92,12 @@ def submit(store, cmd: Command) -> Result:
     # with no command row, so the client's retry got StaleVersion for a
     # command that had been accepted -- idempotency failing in exactly the
     # crash it exists to survive.
+    # Command-specific authorization: is this legal HERE, and does anything
+    # authorize the effect it enables? Without this the kernel checked only the
+    # envelope, and request_merge on a queued run with an empty payload was
+    # accepted.
+    next_state = authorize(store, cmd)
+
     result = {"name": cmd.name}
     try:
         with store.transaction():
@@ -108,6 +115,13 @@ def submit(store, cmd: Command) -> Result:
                 payload={"command_name": cmd.name, "generation": cmd.generation,
                          "payload": cmd.payload},
             )
+            if next_state is not None:
+                store.append_fact(
+                    run_id=cmd.run_id, kind=EventKind.TRANSITION, actor="kernel",
+                    causal_command_id=cmd.idempotency_key,
+                    payload={"to": next_state, "via": cmd.name},
+                )
+                store.set_run_state(cmd.run_id, next_state)
             store.record_command(
                 cmd.idempotency_key, cmd.run_id, cmd.name, True, result,
                 request_hash=canonical_hash(

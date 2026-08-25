@@ -77,10 +77,14 @@ def test_the_same_key_in_two_runs_is_not_a_replay():
     submit(s, Command(name="submit_spec", run_id="runA", expected_version=0,
                       idempotency_key="shared", generation=gA, payload={}))
     gB = acquire(s, "runB", "b")
-    res = submit(s, Command(name="request_merge", run_id="runB", expected_version=0,
-                            idempotency_key="shared", generation=gB, payload={}))
+    # submit_spec on runB: same key, same name, different run. Uses a command
+    # legal from `queued` so the test exercises key scoping rather than
+    # tripping the state check.
+    res = submit(s, Command(name="submit_spec", run_id="runB", expected_version=0,
+                            idempotency_key="shared", generation=gB,
+                            payload={"spec_sha256": "b" * 64}))
     assert not res.replayed, "runB's command was answered with runA's result"
-    assert res.result["name"] == "request_merge"
+    assert res.result["name"] == "submit_spec"
 
 
 def test_reusing_a_key_for_a_different_command_in_one_run_is_refused():
@@ -89,7 +93,7 @@ def test_reusing_a_key_for_a_different_command_in_one_run_is_refused():
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
                       idempotency_key="k", generation=g, payload={}))
     with pytest.raises(ValueError, match="idempotency"):
-        submit(s, Command(name="request_merge", run_id="r", expected_version=1,
+        submit(s, Command(name="submit_plan", run_id="r", expected_version=1,
                           idempotency_key="k", generation=g, payload={}))
 
 

@@ -81,10 +81,42 @@ class Store:
         return fid
 
     def create_run(self, *, run_id: str, base_repo: str, base_sha: str) -> None:
+        """Create a run, and record the fact that says so.
+
+        The row alone is not the truth: without a RUN_STARTED fact the
+        projection has nothing to build from and returns None, so state is
+        rebuildable only in principle. Facts are the truth; the row is
+        derived.
+        """
+        from kernel.events import EventKind
+
         self._conn.execute(
             "INSERT INTO runs (run_id, state, base_repo, base_sha, created_at_us)"
             " VALUES (?,?,?,?,?)",
             (run_id, "queued", base_repo, base_sha, self._clock.now_us()),
+        )
+        self.append_fact(
+            run_id=run_id, kind=EventKind.RUN_STARTED, actor="kernel",
+            causal_command_id=None,
+            payload={"base_sha": base_sha, "base_repo": base_repo, "state": "queued"},
+        )
+
+    def run_state(self, run_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT state FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no such run: {run_id}")
+        return row[0]
+
+    def set_run_state(self, run_id: str, state: str) -> None:
+        """Keep the aggregate row in step with the transition facts.
+
+        runs.state was written once as 'queued' and never updated, so a reader
+        of the aggregate was misled while the real state lived only in facts.
+        """
+        self._conn.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?", (state, run_id)
         )
 
     def run_version(self, run_id: str) -> int:
