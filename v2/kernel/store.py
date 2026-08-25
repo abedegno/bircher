@@ -208,12 +208,11 @@ class Store:
         ).fetchone()
         return None if row is None else row[0]
 
-    def dispatch_role_actor(self, run_id: str, role: str) -> str | None:
-        """The actor most recently dispatched in *role* for this run."""
+    def dispatch_role(self, run_id: str, generation: int) -> str | None:
+        """The role dispatched for EXACTLY this generation."""
         row = self._conn.execute(
-            "SELECT actor FROM dispatches WHERE run_id = ? AND role = ?"
-            " ORDER BY at_us DESC LIMIT 1",
-            (run_id, role),
+            "SELECT role FROM dispatches WHERE run_id = ? AND generation = ?",
+            (run_id, generation),
         ).fetchone()
         return None if row is None else row[0]
 

@@ -10,7 +10,6 @@ def _b(**over):
         artifact_hash="a" * 64,
         base_sha="b" * 40,
         context_bundle_hash="c" * 64,
-        reviewer_identity="codex@v1",
         policy_version=3,
     )
     base.update(over)
@@ -27,7 +26,6 @@ def test_identical_bindings_are_valid():
         ("artifact_hash", "d" * 64),
         ("base_sha", "e" * 40),
         ("context_bundle_hash", "f" * 64),
-        ("reviewer_identity", "someone-else@v1"),
         ("policy_version", 4),
     ],
 )

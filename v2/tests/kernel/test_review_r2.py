@@ -6,6 +6,7 @@ from kernel.commands import Command, submit
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform, reconcile,
 )
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -24,7 +25,7 @@ def test_confirming_one_runs_effect_does_not_touch_another_runs():
     """Reads and uniqueness were scoped per run; the UPDATE was not, so
     confirming run B's effect also confirmed run A's identically-keyed one."""
     s = _store("A", "B")
-    gA, gB = acquire(s, "A", "a"), acquire(s, "B", "b")
+    gA, gB = dispatch(s, "A", actor="a", role=Role.IMPLEMENTER).generation, dispatch(s, "B", actor="b", role=Role.IMPLEMENTER).generation
     # A journals an intent that never completes.
     s.journal_intent("eff_a", "A", gA, EffectClass.COMMENT, "shared", {})
     perform(s, "B", gB, EffectClass.COMMENT, "shared", {}, lambda *a: "external-b")
@@ -41,7 +42,7 @@ def test_an_interrupted_effect_demands_reconciliation_rather_than_replaying():
     that as a completed replay returns a null external id and neither executes
     nor demands reconciliation -- the run is silently wedged."""
     s = _store()
-    gen = acquire(s, "r", "a")
+    gen = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
 
     def interrupt(*a):
         raise KeyboardInterrupt("crash mid-effect")
@@ -69,7 +70,7 @@ def test_reconcile_is_atomic(monkeypatch):
     operations: a crash could clear the safety halt and consume the version
     with no audit event."""
     s = _store()
-    gen = acquire(s, "r", "a")
+    gen = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
         perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
@@ -93,7 +94,7 @@ def test_reusing_a_key_for_the_same_command_with_a_different_payload_is_refused(
     """Replay compared only the stored name, so the same command with a
     DIFFERENT payload was answered with the first result."""
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
                       idempotency_key="k", generation=g, payload={"hash": "A"}))
     with pytest.raises(ValueError, match="idempotency"):

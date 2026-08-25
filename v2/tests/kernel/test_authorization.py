@@ -14,6 +14,7 @@ from kernel.authz import NotAuthorized, legal_states_for, next_state_for
 from kernel.effects import EffectClass, perform
 from kernel.commands import Command, submit
 from kernel.effects import EffectClass, perform
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.projection import project
@@ -32,17 +33,28 @@ def _store():
     return s
 
 
-def _submit(s, name, key, **payload):
+def _submit(s, name, key, actor=None, **payload):
+    """Dispatch, then submit under the generation the kernel handed back.
+
+    Tests no longer name an identity in a payload -- the kernel refuses that
+    outright -- so the actor is chosen HERE, where the supervisor chooses it,
+    and the command inherits it.
+    """
+    role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
+    if actor is None:
+        actor = "codex" if role == Role.REVIEWER else "claude"
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
-        idempotency_key=key, generation=acquire(s, "r", "a"), payload=payload,
+        idempotency_key=key,
+        generation=dispatch(s, "r", actor=actor, role=role).generation,
+        payload=payload,
     ))
 
 
 def _advance_to_reviewing(s):
     _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
     _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
-    _submit(s, "start_implementation", "k3", implementer_identity="claude")
+    _submit(s, "start_implementation", "k3", actor="claude")
     return s
 
 
@@ -61,10 +73,10 @@ def test_the_full_lifecycle_advances_to_a_terminal_state():
     s = _advance_to_reviewing(_store())
     _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
-            base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
+            base_sha=BASE, context_bundle_hash=BUNDLE, actor="codex",
             policy_version=1)
     _submit(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
-            context_bundle_hash=BUNDLE, reviewer_identity="codex", policy_version=1)
+            context_bundle_hash=BUNDLE, policy_version=1)
     assert s.run_state("r") == "merge_requested"
     # The merge effect must actually happen before its outcome is reported.
     perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
@@ -95,16 +107,14 @@ def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
     steps = [
         ("specified", "submit_spec", {"spec_sha256": SPEC}),
         ("planned", "submit_plan", {"plan_sha256": PLAN}),
-        ("implementing", "start_implementation", {"implementer_identity": "claude"}),
+        ("implementing", "start_implementation", {}),
         ("reviewing", "record_review", {"verdict": "accept",
                                         "artifact_hash": SPEC, "base_sha": BASE,
                                         "context_bundle_hash": BUNDLE,
-                                        "reviewer_identity": "codex",
                                         "policy_version": 1}),
         ("merge_requested", "request_merge", {"artifact_hash": SPEC,
                                               "base_sha": BASE,
                                               "context_bundle_hash": BUNDLE,
-                                              "reviewer_identity": "codex",
                                               "policy_version": 1,
                                               "head_git_sha": HEAD}),
     ]
@@ -149,10 +159,10 @@ def test_request_merge_without_an_accepted_review_is_refused():
     # state and the test would pass without ever reaching the approval check.
     _submit(s, "record_review", "k4", verdict="reject",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-            reviewer_identity="codex", policy_version=1)
+            actor="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
         _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
-                context_bundle_hash=BUNDLE, reviewer_identity="codex",
+                context_bundle_hash=BUNDLE,
                 policy_version=1)
 
 
@@ -161,9 +171,9 @@ def test_request_merge_with_an_accepted_review_is_authorized():
     _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-            reviewer_identity="codex", policy_version=1)
+            actor="codex", policy_version=1)
     assert _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
-                   context_bundle_hash=BUNDLE, reviewer_identity="codex",
+                   context_bundle_hash=BUNDLE,
                    policy_version=1).accepted
     assert s.run_state("r") == "merge_requested"
 
@@ -175,10 +185,10 @@ def test_a_verdict_bound_to_different_inputs_does_not_authorize_a_merge():
     _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-            reviewer_identity="codex", policy_version=1)
+            actor="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
         _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash="f" * 64, base_sha=BASE,
-                context_bundle_hash=BUNDLE, reviewer_identity="codex",
+                context_bundle_hash=BUNDLE,
                 policy_version=1)
 
 
@@ -189,5 +199,5 @@ def test_the_projection_matches_the_stored_aggregate():
     assert project(s.facts_for("r")).state == s.run_state("r")
     _submit(s, "record_review", "kx", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-            reviewer_identity="codex", policy_version=1)
+            actor="codex", policy_version=1)
     assert project(s.facts_for("r")).state == s.run_state("r")

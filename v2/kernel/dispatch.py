@@ -6,18 +6,26 @@ commands by the kernel.
 
 A session receives no identity token and needs none. omnigent's agent-env
 allowlist admits only proxy/SSL/locale vars, HOME, PATH, TERM, TMPDIR,
-NODE_EXTRA_CA_CERTS and a bare OMNIGENT=1 marker, the runner's own auth
-secrets are stripped at every spawn boundary, and under the M1-1 egress rules
-a session cannot reach the server. There is nothing to authenticate WITH --
-and an assigned identity cannot be forged at all, whereas a presented one is
-only as good as its verification.
+NODE_EXTRA_CA_CERTS and a bare OMNIGENT=1 marker, and under the M1-1 egress
+rules a session cannot reach the server. There is nothing to authenticate
+WITH -- and an assigned identity cannot be forged at all, whereas a presented
+one is only as good as its verification.
+
+**Dispatch IS the acquisition.** A worker never acquires its own generation:
+`acquire(run_id, owner)` takes its owner from the caller, so identity read
+from it would be exactly as forgeable as a payload field, and a worker that
+acquired a fresh generation would orphan the dispatch bound to the previous
+one. The kernel fences and records who in one step; a generation obtained
+any other way has no dispatched actor, and every command under it is refused.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from kernel.events import EventKind
 from kernel.ids import new_id
-from kernel.ownership import current_generation
+from kernel.ownership import acquire
 
 
 class Role:
@@ -27,13 +35,22 @@ class Role:
     ALL = frozenset({IMPLEMENTER, REVIEWER, OPERATOR})
 
 
-def dispatch(store, run_id: str, *, actor: str, role: str) -> str:
-    """Bind *actor* to the run's current generation."""
+@dataclass(frozen=True)
+class Dispatch:
+    """What the kernel handed the worker: its fence, and who it thinks it is."""
+    dispatch_id: str
+    generation: int
+    actor: str
+    role: str
+
+
+def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
+    """Fence a new attempt and bind *actor* to it."""
     if role not in Role.ALL:
         raise ValueError(f"unknown role: {role!r}; expected one of {sorted(Role.ALL)}")
-    if not actor:
+    if not actor or not isinstance(actor, str):
         raise ValueError("an attempt must be dispatched to a named actor")
-    generation = current_generation(store, run_id)
+    generation = acquire(store, run_id, actor)
     did = new_id("dsp")
     store.record_dispatch(did, run_id, generation, actor, role)
     store.append_fact(
@@ -42,7 +59,7 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> str:
         payload={"dispatch_id": did, "generation": generation,
                  "actor": actor, "role": role},
     )
-    return did
+    return Dispatch(dispatch_id=did, generation=generation, actor=actor, role=role)
 
 
 def actor_for(store, run_id: str, generation: int) -> str | None:
@@ -50,6 +67,6 @@ def actor_for(store, run_id: str, generation: int) -> str | None:
     return store.dispatch_actor(run_id, generation)
 
 
-def actor_in_role(store, run_id: str, role: str) -> str | None:
-    """The actor most recently dispatched in *role*."""
-    return store.dispatch_role_actor(run_id, role)
+def role_for(store, run_id: str, generation: int) -> str | None:
+    """The role the kernel dispatched *generation* in, or None."""
+    return store.dispatch_role(run_id, generation)

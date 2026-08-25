@@ -10,10 +10,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from kernel.artifacts import binding_hash
-from kernel.authz import authorize, validate_review
+from kernel.authz import NotAuthorized, authorize, validate_review
 from kernel.canon import canonical_hash
+from kernel.dispatch import actor_for
 from kernel.events import EventKind
 from kernel.ownership import OwnershipLost, current_generation
+
+#: The label recorded for an attempt the kernel cannot name. It is a LABEL,
+#: never a gate: the gate is `actor is None`, so dispatching an actor whose
+#: name happens to be this string proves nothing and grants nothing. A string
+#: sentinel compared with `is` would have rested on CPython's interning of
+#: short literals -- an authorization decision resting on an implementation
+#: detail of the interpreter.
+UNDISPATCHED = "undispatched"
 
 COMMAND_NAMES = frozenset({
     "submit_spec", "submit_plan", "record_review", "start_implementation",
@@ -22,6 +31,16 @@ COMMAND_NAMES = frozenset({
     # and cancel_run was the only escape -- which misreports a run that merged.
     "record_merge_outcome",
 })
+
+
+#: Payload keys that would let a caller name an actor. Refused outright.
+#:
+#: If a caller can populate it, it is not identity. These two fields are how
+#: one caller named BOTH sides of its own independence check: a caller
+#: recorded as implementer submitted its own accept naming a different
+#: reviewer, and every comparison downstream was correctly implemented and
+#: proved nothing.
+ACTOR_FIELDS = frozenset({"actor", "implementer_identity", "reviewer_identity"})
 
 
 class StaleVersion(Exception):
@@ -45,13 +64,16 @@ class Result:
     replayed: bool = False
 
 
-def _record_rejection(store, cmd, reason: str, detail: str) -> None:
+def _record_rejection(store, cmd, reason: str, detail: str, actor: str) -> None:
     """Append the immutable record of a refusal.
 
     Outside any transaction: a rejection must survive whatever rolled back.
+    Attributed to the actor whose attempt was refused, not to "kernel" -- an
+    audit that cannot say WHO was refused cannot distinguish a worker retrying
+    from a worker probing.
     """
     store.append_fact(
-        run_id=cmd.run_id, kind=EventKind.COMMAND_REJECTED, actor="kernel",
+        run_id=cmd.run_id, kind=EventKind.COMMAND_REJECTED, actor=actor,
         causal_command_id=cmd.idempotency_key,
         payload={"command_name": cmd.name, "reason": reason, "detail": detail[:300]},
     )
@@ -61,6 +83,20 @@ def submit(store, cmd: Command) -> Result:
     if cmd.name not in COMMAND_NAMES:
         raise ValueError(f"unknown command: {cmd.name}")
 
+    named = ACTOR_FIELDS & cmd.payload.keys()
+    if named:
+        raise ValueError(
+            f"payload names an actor via {sorted(named)}: identity is assigned "
+            "by the kernel from its dispatch record, never carried in a payload"
+        )
+
+    # Identity is READ from the dispatch record, not taken from the command.
+    # An undispatched generation is an actor the kernel cannot name, and
+    # attributing its work to anyone -- including "kernel" -- would be a
+    # fabricated audit trail.
+    actor = actor_for(store, cmd.run_id, cmd.generation)
+    recorded_actor = UNDISPATCHED if actor is None else actor
+
     from kernel.effects import is_halted
 
     # Every attempt is observable, accepted or not. Recording only outcomes
@@ -68,7 +104,7 @@ def submit(store, cmd: Command) -> Result:
     # "command requested" alongside accepted and rejected). A fact is an
     # observation, not a mutation, so this is also correct on the replay path.
     store.append_fact(
-        run_id=cmd.run_id, kind=EventKind.COMMAND_REQUESTED, actor="kernel",
+        run_id=cmd.run_id, kind=EventKind.COMMAND_REQUESTED, actor=recorded_actor,
         causal_command_id=cmd.idempotency_key,
         payload={"name": cmd.name, "expected_version": cmd.expected_version},
     )
@@ -93,14 +129,25 @@ def submit(store, cmd: Command) -> Result:
             )
         return Result(accepted=bool(prior["accepted"]), result=prior["result"], replayed=True)
 
+    if actor is None:
+        _record_rejection(
+            store, cmd, "NotAuthorized", "no dispatched actor for this generation",
+            recorded_actor,
+        )
+        raise NotAuthorized(
+            f"generation {cmd.generation} has no dispatched actor: the kernel "
+            "cannot name who is acting, and will not attribute the work to "
+            "anyone"
+        )
+
     if is_halted(store, cmd.run_id) and cmd.name != "cancel_run":
-        _record_rejection(store, cmd, "halted", "run halted pending reconciliation")
+        _record_rejection(store, cmd, "halted", "run halted pending reconciliation", actor)
         raise RuntimeError(
             f"run {cmd.run_id} is halted pending reconciliation; resolve it first"
         )
 
     if cmd.generation != current_generation(store, cmd.run_id):
-        _record_rejection(store, cmd, "OwnershipLost", "superseded generation")
+        _record_rejection(store, cmd, "OwnershipLost", "superseded generation", actor)
         raise OwnershipLost(
             f"generation {cmd.generation} superseded; command carries no write capability"
         )
@@ -118,9 +165,9 @@ def submit(store, cmd: Command) -> Result:
     # transitions, malformed bindings and failed merge authorization
     # previously left no immutable trace of the decision.
     try:
-        next_state = authorize(store, cmd)
+        next_state = authorize(store, cmd, actor)
     except Exception as exc:
-        _record_rejection(store, cmd, type(exc).__name__, str(exc))
+        _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
         raise
 
     # A review is validated BEFORE it is recorded, and recorded as a verdict in
@@ -130,10 +177,12 @@ def submit(store, cmd: Command) -> Result:
     # something the mechanism observed.
     try:
         review_binding = (
-            validate_review(store, cmd) if cmd.name == "record_review" else None
+            validate_review(store, cmd, actor)
+            if cmd.name == "record_review"
+            else None
         )
     except Exception as exc:
-        _record_rejection(store, cmd, type(exc).__name__, str(exc))
+        _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
         raise
 
     result = {"name": cmd.name}
@@ -145,7 +194,7 @@ def submit(store, cmd: Command) -> Result:
                     "which has moved"
                 )
             store.append_fact(
-                run_id=cmd.run_id, kind=EventKind.COMMAND_ACCEPTED, actor="kernel",
+                run_id=cmd.run_id, kind=EventKind.COMMAND_ACCEPTED, actor=actor,
                 causal_command_id=cmd.idempotency_key,
                 # Payload is NESTED, not splatted: splatting let a payload key
                 # named like one of the command's own fields silently overwrite
@@ -153,25 +202,24 @@ def submit(store, cmd: Command) -> Result:
                 payload={
                     "command_name": cmd.name,
                     "generation": cmd.generation,
-                    # Hoisted out of the payload so independence checks read a
-                    # kernel-recorded field rather than re-parsing a nested blob.
-                    "implementer_identity": cmd.payload.get("implementer_identity"),
                     "payload": cmd.payload,
                 },
             )
             if review_binding is not None:
                 store.append_fact(
-                    run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor="kernel",
+                    run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor=actor,
                     causal_command_id=cmd.idempotency_key,
                     payload={
                         "verdict": cmd.payload.get("verdict"),
                         "binding_hash": binding_hash(review_binding),
-                        "reviewer_identity": review_binding.reviewer_identity,
+                        # From the dispatch record, not the binding: the
+                        # binding says WHAT was approved, this says WHO.
+                        "reviewer_identity": actor,
                     },
                 )
             if next_state is not None:
                 store.append_fact(
-                    run_id=cmd.run_id, kind=EventKind.TRANSITION, actor="kernel",
+                    run_id=cmd.run_id, kind=EventKind.TRANSITION, actor=actor,
                     causal_command_id=cmd.idempotency_key,
                     payload={"to": next_state, "via": cmd.name},
                 )
@@ -186,7 +234,7 @@ def submit(store, cmd: Command) -> Result:
         # Outside the transaction: the rejection must survive the rollback.
         _record_rejection(
             store, cmd, "stale_version",
-            f"expected version {cmd.expected_version}",
+            f"expected version {cmd.expected_version}", actor,
         )
         raise
 

@@ -6,6 +6,7 @@ from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit
 from kernel.effects import EffectClass, UncertainEffect, perform
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -19,10 +20,16 @@ def _store():
     return s
 
 
-def _sub(s, name, key, owner="impl", **payload):
+def _sub(s, name, key, actor=None, **payload):
+    """Dispatch, then submit under the generation the kernel handed back."""
+    role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
+    if actor is None:
+        actor = "codex" if role == Role.REVIEWER else "claude"
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
-        idempotency_key=key, generation=acquire(s, "r", owner), payload=payload,
+        idempotency_key=key,
+        generation=dispatch(s, "r", actor=actor, role=role).generation,
+        payload=payload,
     ))
 
 
@@ -30,14 +37,14 @@ def _to_reviewing(s, implementer="claude"):
     spec = put_artifact(s, b"# spec")
     _sub(s, "submit_spec", "a1", spec_sha256=spec)
     _sub(s, "submit_plan", "a2", plan_sha256=put_artifact(s, b"# plan"))
-    _sub(s, "start_implementation", "a3", implementer_identity=implementer)
+    _sub(s, "start_implementation", "a3", actor=implementer)
     return spec
 
 
 def _review(s, key, verdict, artifact, reviewer="codex", head=HEAD):
     _sub(s, "record_review", key, owner=reviewer, verdict=verdict,
          artifact_hash=artifact, base_sha=BASE, context_bundle_hash=BUNDLE,
-         reviewer_identity=reviewer, policy_version=1, head_git_sha=head)
+         actor=reviewer, policy_version=1, head_git_sha=head)
 
 
 # --- 2. independence must use the CURRENT implementer ------------------------
@@ -48,7 +55,7 @@ def test_a_second_implementer_cannot_review_its_own_revision():
     s = _store()
     spec = _to_reviewing(s, implementer="claude")
     _review(s, "rv1", "request_revision", spec)
-    _sub(s, "start_implementation", "a4", implementer_identity="codex")
+    _sub(s, "start_implementation", "a4", actor="codex")
     with pytest.raises(NotAuthorized, match="independen"):
         _review(s, "rv2", "accept", spec, reviewer="codex")
 
@@ -65,7 +72,7 @@ def test_a_later_rejection_invalidates_an_earlier_acceptance():
     _review(s, "rv2", "reject", spec)
     with pytest.raises(NotAuthorized, match="no accepted review"):
         _sub(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
-             context_bundle_hash=BUNDLE, reviewer_identity="codex",
+             context_bundle_hash=BUNDLE,
              policy_version=1)
 
 
@@ -80,7 +87,7 @@ def test_ci_success_on_a_different_head_does_not_authorize_merge():
     _review(s, "rv", "accept", spec)
     with pytest.raises(NotAuthorized, match="CI"):
         _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
-             context_bundle_hash=BUNDLE, reviewer_identity="codex",
+             context_bundle_hash=BUNDLE,
              policy_version=1, head_git_sha=HEAD)
 
 
@@ -123,7 +130,7 @@ def test_a_merge_effect_executes_once_the_kernel_has_authorized_it():
     _sub(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _review(s, "rv", "accept", spec)
     _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
-         context_bundle_hash=BUNDLE, reviewer_identity="codex",
+         context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     gen = acquire(s, "r", "impl")
     assert perform(s, "r", gen, EffectClass.MERGE, "m", {},
@@ -140,7 +147,7 @@ def test_record_merge_outcome_requires_a_confirmed_merge_effect():
     _sub(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _review(s, "rv", "accept", spec)
     _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
-         context_bundle_hash=BUNDLE, reviewer_identity="codex",
+         context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     with pytest.raises(NotAuthorized, match="confirmed"):
         _sub(s, "record_merge_outcome", "mo", outcome="merged")
@@ -155,7 +162,7 @@ def test_a_confirmed_NON_merge_effect_does_not_authorize_a_merge_outcome():
     _sub(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _review(s, "rv", "accept", spec)
     _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
-         context_bundle_hash=BUNDLE, reviewer_identity="codex",
+         context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     # A confirmed COMMENT, not a merge.
     perform(s, "r", acquire(s, "r", "impl"), EffectClass.COMMENT, "c", {},

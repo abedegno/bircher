@@ -15,6 +15,7 @@ a workflow language."
 from __future__ import annotations
 
 from kernel.artifacts import VerdictBinding, binding_hash
+from kernel.dispatch import Role, role_for
 from kernel.events import EventKind
 
 
@@ -97,7 +98,6 @@ def _binding_from(payload: dict) -> VerdictBinding:
             artifact_hash=payload["artifact_hash"],
             base_sha=payload["base_sha"],
             context_bundle_hash=payload["context_bundle_hash"],
-            reviewer_identity=payload["reviewer_identity"],
             policy_version=version,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -107,7 +107,7 @@ def _binding_from(payload: dict) -> VerdictBinding:
         raise NotAuthorized(f"malformed verdict binding: {exc}") from exc
 
 
-def validate_review(store, cmd) -> VerdictBinding:
+def validate_review(store, cmd, actor: str) -> VerdictBinding:
     """Validate a review BEFORE it is recorded, so the verdict is an
     observation rather than a claim.
 
@@ -116,6 +116,10 @@ def validate_review(store, cmd) -> VerdictBinding:
     two things the same actor said -- one caller could record its own
     approval, naming any reviewer and any hashes, then present the same tuple
     for merge.
+
+    *actor* is the reviewer, resolved by the kernel from its dispatch record.
+    It is a parameter rather than a payload field because a reviewer that can
+    name itself can name someone else.
     """
     verdict = cmd.payload.get("verdict")
     if verdict not in _VERDICTS:
@@ -143,11 +147,18 @@ def validate_review(store, cmd) -> VerdictBinding:
             "mechanism saw, not ones the actor asserts"
         )
 
-    implementer = _implementer_of(store, cmd.run_id)
-    if implementer is not None and binding.reviewer_identity == implementer:
+    if role_for(store, cmd.run_id, cmd.generation) != Role.REVIEWER:
         raise NotAuthorized(
-            f"reviewer independence violated: {binding.reviewer_identity!r} "
-            "implemented this run and cannot review its own work"
+            "a review must come from an attempt dispatched in the reviewer "
+            "role: the role is assigned with the fence, so an implementer "
+            "cannot elect itself reviewer"
+        )
+
+    implementer = _implementer_of(store, cmd.run_id)
+    if implementer is not None and actor == implementer:
+        raise NotAuthorized(
+            f"reviewer independence violated: {actor!r} implemented this run "
+            "and cannot review its own work"
         )
     return binding
 
@@ -160,6 +171,11 @@ def _implementer_of(store, run_id: str) -> str | None:
     most recently acquired the generation, i.e. usually the submitter -- so a
     reviewer submitting its own review was refused while the actual conflict
     went unchecked.
+
+    Reads the fact's ACTOR, which the kernel wrote from its dispatch record.
+    It previously read `implementer_identity` out of the payload -- a string
+    the implementer chose, so an implementer could name someone else as the
+    implementer and then review its own work as itself.
     """
     implementer = None
     for fact in store.facts_for(run_id):
@@ -170,7 +186,7 @@ def _implementer_of(store, run_id: str) -> str | None:
             # LAST, not first. Returning the first let the revision loop --
             # request_revision -> planned -> start_implementation -- put a new
             # implementer in place whose own review then passed the check.
-            implementer = fact.payload.get("implementer_identity")
+            implementer = fact.actor
     return implementer
 
 
@@ -216,18 +232,18 @@ def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
     return latest == "accept"
 
 
-def authorize(store, cmd) -> str | None:
+def authorize(store, cmd, actor: str) -> str | None:
     """Authorize *cmd* against the run's current state. Returns the next state.
 
     Raises :class:`NotAuthorized` when the command is illegal here, or when
     nothing authorizes the effect it would enable.
     """
-    if cmd.name == "start_implementation" and not cmd.payload.get(
-        "implementer_identity"
-    ):
+    if cmd.name == "start_implementation" and role_for(
+        store, cmd.run_id, cmd.generation
+    ) != Role.IMPLEMENTER:
         raise NotAuthorized(
-            "start_implementation must name its implementer_identity: "
-            "reviewer independence cannot be checked against an unknown actor"
+            "implementation must come from an attempt dispatched in the "
+            "implementer role"
         )
 
     allowed, next_state = _TRANSITIONS[cmd.name]

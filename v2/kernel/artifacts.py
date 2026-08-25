@@ -1,8 +1,15 @@
 """Content-addressed artifacts and the verdict binding tuple.
 
-A verdict binds five immutable inputs; changing any one invalidates it. This
+A verdict binds four immutable INPUTS; changing any one invalidates it. This
 is the minimum mechanism preventing yesterday's approval from authorizing
 today's object -- the property v1 intends and does not have.
+
+`reviewer_identity` was a fifth member and is not one any more. It was the
+only caller-supplied field in the tuple, and a binding is a statement about
+WHAT was approved; WHO approved it is a separate fact the kernel observes
+from its dispatch record and records beside the verdict. Keeping it here also
+forced a merge requester to NAME the reviewer it was relying on, which is a
+thing no requester should be able to choose.
 """
 
 from __future__ import annotations
@@ -21,7 +28,6 @@ class VerdictBinding:
     artifact_hash: str
     base_sha: str
     context_bundle_hash: str
-    reviewer_identity: str
     policy_version: int
 
     def __post_init__(self) -> None:

@@ -5,6 +5,7 @@ from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted,
     pending_reconciliation, perform, reconcile,
 )
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import OwnershipLost, acquire
 from kernel.store import Store
@@ -154,7 +155,7 @@ def test_unrelated_runs_continue(store):
     unconfirmed attempt holds that run's resources and nothing else."""
     _fail(store)
     assert not is_halted(store, "other")
-    gen = acquire(store, "other", "b")
+    gen = dispatch(store, "other", actor="claude", role=Role.IMPLEMENTER).generation
     assert submit(store, Command(
         name="submit_spec", run_id="other", expected_version=0,
         idempotency_key="ok", generation=gen, payload={},
@@ -182,7 +183,7 @@ def test_resolution_is_an_audited_cas_command(store):
 
 def test_a_halted_run_refuses_further_commands(store):
     _fail(store)
-    gen = acquire(store, "r", "a")
+    gen = dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
     with pytest.raises(RuntimeError, match="reconcil"):
         submit(store, Command(
             name="submit_spec", run_id="r", expected_version=1,

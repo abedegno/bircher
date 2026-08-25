@@ -1,6 +1,7 @@
 import pytest
 
 from kernel.commands import COMMAND_NAMES, Command, StaleVersion, submit
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import OwnershipLost, acquire
 from kernel.store import Store
@@ -16,7 +17,10 @@ def store():
 def _cmd(store, name="submit_spec", version=0, key="k1", generation=None, **payload):
     return Command(
         name=name, run_id="r", expected_version=version, idempotency_key=key,
-        generation=generation if generation is not None else acquire(store, "r", "a"),
+        generation=(
+            generation if generation is not None
+            else dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
+        ),
         payload=payload or {"spec_sha256": "a" * 64},
     )
 
@@ -67,8 +71,13 @@ def test_replay_does_not_advance_the_version(store):
 
 
 def test_command_from_a_superseded_generation_is_refused(store):
-    stale = acquire(store, "r", "a")
-    acquire(store, "r", "b")
+    """The stale generation IS dispatched, so this reaches the fence.
+
+    An undispatched one would be refused a step earlier for having no actor,
+    and the test would pass while proving nothing about fencing.
+    """
+    stale = dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    dispatch(store, "r", actor="gpt", role=Role.IMPLEMENTER)
     with pytest.raises(OwnershipLost):
         submit(store, _cmd(store, generation=stale, key="k9"))
 

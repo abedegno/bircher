@@ -7,6 +7,7 @@ from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.effects import EffectClass, perform
 from kernel.commands import Command, submit
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -23,17 +24,23 @@ def _store():
     return s
 
 
-def _sub(s, name, key, owner="implementer", **payload):
+def _sub(s, name, key, actor=None, **payload):
+    """Dispatch, then submit under the generation the kernel handed back."""
+    role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
+    if actor is None:
+        actor = "codex" if role == Role.REVIEWER else "claude"
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
-        idempotency_key=key, generation=acquire(s, "r", owner), payload=payload,
+        idempotency_key=key,
+        generation=dispatch(s, "r", actor=actor, role=role).generation,
+        payload=payload,
     ))
 
 
 def _to_implementing(s):
     _sub(s, "submit_spec", "k1", spec_sha256=SPEC)
     _sub(s, "submit_plan", "k2", plan_sha256=put_artifact(s, b"# plan"))
-    _sub(s, "start_implementation", "k3", implementer_identity="claude")
+    _sub(s, "start_implementation", "k3", actor="claude")
     return s
 
 
@@ -43,9 +50,9 @@ def test_a_self_asserted_review_does_not_authorize_a_merge():
     comparison is real; what it compares is two things the same actor said."""
     s = _to_implementing(_store())
     with pytest.raises(NotAuthorized, match="independen"):
-        _sub(s, "record_review", "k4", owner="claude", verdict="accept",
+        _sub(s, "record_review", "k4", verdict="accept",
              artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-             reviewer_identity="claude", policy_version=1)
+             actor="claude", policy_version=1)
 
 
 def test_a_review_naming_a_base_the_kernel_never_observed_is_refused():
@@ -53,9 +60,9 @@ def test_a_review_naming_a_base_the_kernel_never_observed_is_refused():
     binding some other base is binding to something that did not happen."""
     s = _to_implementing(_store())
     with pytest.raises(NotAuthorized, match="base"):
-        _sub(s, "record_review", "k4", owner="codex", verdict="accept",
+        _sub(s, "record_review", "k4", verdict="accept",
              artifact_hash=SPEC, base_sha="9" * 40, context_bundle_hash=BUNDLE,
-             reviewer_identity="codex", policy_version=1)
+             actor="codex", policy_version=1)
 
 
 def test_malformed_request_merge_is_rejected_not_crashed():
@@ -63,24 +70,23 @@ def test_malformed_request_merge_is_rejected_not_crashed():
     unhandled exception on a validation path. Fail-closed by accident is
     still a crash."""
     s = _to_implementing(_store())
-    _sub(s, "record_review", "k4", owner="codex", verdict="accept",
+    _sub(s, "record_review", "k4", verdict="accept",
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-         reviewer_identity="codex", policy_version=1)
+         actor="codex", policy_version=1)
     with pytest.raises(NotAuthorized):
-        _sub(s, "request_merge", "k5", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC)
+        _sub(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC)
 
 
 def test_policy_version_is_not_coerced_across_types():
     """int(1.9) == 1, so a float silently bound to a review recorded with 1 --
     in a system whose canonical form refuses floats outright."""
     s = _to_implementing(_store())
-    _sub(s, "record_review", "k4", owner="codex", verdict="accept",
+    _sub(s, "record_review", "k4", verdict="accept",
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-         reviewer_identity="codex", policy_version=1)
+         actor="codex", policy_version=1)
     with pytest.raises(NotAuthorized):
-        _sub(s, "request_merge", "k5", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC,
-             base_sha=BASE, context_bundle_hash=BUNDLE,
-             reviewer_identity="codex", policy_version=1.9)
+        _sub(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC,
+             base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1.9)
 
 
 @pytest.mark.parametrize("outcome,expected", [("merged", "merged"),
@@ -90,18 +96,18 @@ def test_merge_outcomes_move_the_run_where_they_should(outcome, expected):
     so mutating 'merged' to land back in 'reviewing' left it green. It
     asserted a table entry, not a behaviour."""
     s = _to_implementing(_store())
-    _sub(s, "record_review", "rv", owner="codex", verdict="accept",
+    _sub(s, "record_review", "rv", verdict="accept",
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-         reviewer_identity="codex", policy_version=1)
-    _sub(s, "record_ci_observation", "ci", owner="impl", status="success",
+         actor="codex", policy_version=1)
+    _sub(s, "record_ci_observation", "ci", status="success",
          head_git_sha=HEAD)
-    _sub(s, "request_merge", "rm", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC,
-         base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
+    _sub(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=SPEC,
+         base_sha=BASE, context_bundle_hash=BUNDLE,
          policy_version=1)
     if outcome == "merged":
         perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
                 lambda *a: "merged!")
-    _sub(s, "record_merge_outcome", "mo", owner="impl", outcome=outcome)
+    _sub(s, "record_merge_outcome", "mo", outcome=outcome)
     assert s.run_state("r") == expected
 
 
@@ -112,14 +118,14 @@ def test_the_recorded_verdict_carries_the_binding_that_authorizes_merge():
     from kernel.artifacts import VerdictBinding, binding_hash
 
     s = _to_implementing(_store())
-    _sub(s, "record_review", "k4", owner="codex", verdict="accept",
+    _sub(s, "record_review", "k4", verdict="accept",
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-         reviewer_identity="codex", policy_version=1)
+         actor="codex", policy_version=1)
     verdicts = [f for f in s.facts_for("r") if f.kind == "review_verdict"]
     assert len(verdicts) == 1
     expected = binding_hash(VerdictBinding(
         artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
-        reviewer_identity="codex", policy_version=1,
+        policy_version=1,
     ))
     assert verdicts[0].payload["binding_hash"] == expected
     assert verdicts[0].payload["verdict"] == "accept"

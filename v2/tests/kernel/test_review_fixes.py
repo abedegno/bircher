@@ -8,6 +8,7 @@ from kernel.commands import Command, submit
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform, reconcile,
 )
+from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -21,7 +22,7 @@ def _store(*runs):
 
 
 def _halt(s, run="r", key="k1"):
-    gen = acquire(s, run, "a")
+    gen = dispatch(s, run, actor="a", role=Role.IMPLEMENTER).generation
 
     def boom(*a):
         raise TimeoutError("no response")
@@ -73,10 +74,10 @@ def test_the_same_key_in_two_runs_is_not_a_replay():
     """Global scope silently returns one run's result to another run's
     command -- a misattribution of authority, not a replay."""
     s = _store("runA", "runB")
-    gA = acquire(s, "runA", "a")
+    gA = dispatch(s, "runA", actor="a", role=Role.IMPLEMENTER).generation
     submit(s, Command(name="submit_spec", run_id="runA", expected_version=0,
                       idempotency_key="shared", generation=gA, payload={}))
-    gB = acquire(s, "runB", "b")
+    gB = dispatch(s, "runB", actor="b", role=Role.IMPLEMENTER).generation
     # submit_spec on runB: same key, same name, different run. Uses a command
     # legal from `queued` so the test exercises key scoping rather than
     # tripping the state check.
@@ -89,7 +90,7 @@ def test_the_same_key_in_two_runs_is_not_a_replay():
 
 def test_reusing_a_key_for_a_different_command_in_one_run_is_refused():
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
                       idempotency_key="k", generation=g, payload={}))
     with pytest.raises(ValueError, match="idempotency"):
@@ -128,7 +129,7 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
     import kernel.commands as commands
 
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     v_before = s.run_version("r")
 
     real_record = s.record_command
@@ -154,7 +155,7 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
 def test_a_retry_after_a_crashed_submit_succeeds():
     """The point of the transaction: the retry must be able to succeed."""
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     v = s.run_version("r")
     real_record = s.record_command
     s.record_command = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash"))
@@ -173,7 +174,7 @@ def test_command_requested_is_recorded():
     Recording only outcomes means the audit cannot distinguish no retry from
     forty retries."""
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
                       idempotency_key="k", generation=g, payload={}))
     kinds = [f.kind for f in s.facts_for("r")]
@@ -185,7 +186,7 @@ def test_a_replayed_command_still_records_the_request():
     """A replay mutates nothing, but a fact is an observation, not a mutation:
     without it the audit cannot see the retry happened at all."""
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     c = Command(name="submit_spec", run_id="r", expected_version=0,
                 idempotency_key="k", generation=g, payload={})
     submit(s, c)
@@ -201,7 +202,7 @@ def test_a_payload_key_cannot_shadow_the_command_name():
     """Splatting the payload alongside the command's own keys let a payload
     field silently overwrite the recorded command name."""
     s = _store()
-    g = acquire(s, "r", "a")
+    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     submit(s, Command(
         name="submit_spec", run_id="r", expected_version=0, idempotency_key="k",
         generation=g, payload={"command_name": "request_merge", "generation": 999},
