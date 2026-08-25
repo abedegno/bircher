@@ -28,19 +28,29 @@ from dataclasses import dataclass
 MUTATION = re.compile(r"""
     gh\s+["']?(pr|issue)["']?\s+["']?(merge|close|reopen|comment|edit|create|review)
   | gh\s+["']?api["']?\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
-  | gh\s+["']?api["']?\b[^|\n]*statuses
+  | gh\s+["']?api["']?\b[^|\n]*\bstatuses/
   | git\s+(-C\s+\S+\s+)?["']?push
 """, re.VERBOSE)
+#: `statuses/` with the slash: the bare word also occurs in the jq filter
+#: `.statuses[] | select(...)` used to VERIFY a status, which is a GET. That
+#: match was being suppressed only because it happened to fall inside quotes --
+#: correct by accident, and it would have flagged the moment the filter was
+#: rewritten without them. The endpoint always has a SHA after it.
+#:
 #: Quotes are optional around every word. `gh pr "merge" "$pr"` is a real call
 #: whose verb happens to be quoted; a pattern requiring the verb adjacent to
 #: whitespace does not match it AT ALL, so no amount of quote-position analysis
 #: would have found it. The quote-START test below is what keeps this from
 #: re-flagging whole mutations embedded in strings.
 
-#: A call already routed through the adapter. Anchored to the call position --
-#: at line start, or after a pipeline/list operator, `then`, or `$(` -- so a
-#: line that merely MENTIONS `_effect` cannot launder a real mutation.
-ROUTED = re.compile(r"(^|\|\||&&|;|\bthen\b|\$\()\s*_effect\s")
+#: A call already routed through the adapter. Anchored to the call POSITION --
+#: line start, a pipeline/list operator, a compound-command keyword, or `$(` --
+#: so a line that merely MENTIONS `_effect` cannot launder a real mutation.
+#: `if`/`while`/`until`/`!` are command positions too: `if _effect ... ; then`
+#: is how a routed call gets its exit status tested.
+ROUTED = re.compile(
+    r"(^|\|\||&&|;|\{|\(|!|\b(then|else|do|if|elif|while|until)\b)\s*_effect\s"
+)
 
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
@@ -90,6 +100,32 @@ def quote_mask(line: str, in_quote: str | None) -> tuple[list[bool], str | None]
     return mask, q
 
 
+def logical_lines(path: str):
+    """Yield (first_physical_line, joined_text), joining `\\` continuations.
+
+    A line-oriented scan reads a continued command as several unrelated lines,
+    so `_effect ... \\` on one line and `gh pr merge ...` on the next looks
+    like an unrouted mutation -- and, worse, the reverse hides a real one
+    behind an unrelated routed call above it. Both of the coordinator's
+    authority-bearing sites are written across continuations, so this is not a
+    hypothetical shape.
+    """
+    buf, start = None, None
+    for n, raw in enumerate(open(path), 1):
+        line = raw.rstrip("\n")
+        if buf is None:
+            start = n
+            buf = line
+        else:
+            buf = buf[:-1] + " " + line.lstrip()
+        if buf.endswith("\\"):
+            continue
+        yield start, buf
+        buf = None
+    if buf is not None:
+        yield start, buf
+
+
 def scan(path: str) -> tuple[list[Finding], list[Suppressed]]:
     """Return (unrouted mutations, matches suppressed with the reason)."""
     findings: list[Finding] = []
@@ -97,8 +133,7 @@ def scan(path: str) -> tuple[list[Finding], list[Suppressed]]:
     quote: str | None = None
     heredoc: str | None = None
 
-    for n, raw in enumerate(open(path), 1):
-        line = raw.rstrip("\n")
+    for n, line in logical_lines(path):
         stripped = line.lstrip()
 
         # EXCLUSION 1: heredoc bodies. Prompt text and usage messages are data.

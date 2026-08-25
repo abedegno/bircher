@@ -13,6 +13,12 @@ _derive_bundle_dir() { ( cd "$(dirname "$1")/.." && pwd ); }
 REPO="${BIRCHER_REPO:-abedegno/muesli}"
 WORKDIR="${WORKDIR:-/workspaces/muesli}"                        # the WORK repo (target app)
 BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  # the bircher checkout
+# The effect adapter: the single seam every externally visible mutation passes
+# through. Sourced before anything can call `_effect`; the functions it calls
+# (`_net_run`) resolve at call time, so the order of definition does not bind.
+# shellcheck source=lib/effect-adapter.sh
+. "$BUNDLE_DIR/batch/lib/effect-adapter.sh"
+
 QUEUE="${QUEUE:-$BUNDLE_DIR/queue}"
 PROCESSED="$QUEUE/processed"
 SCORECARD="${SCORECARD:-$BUNDLE_DIR/.run/scorecard.jsonl}"
@@ -363,7 +369,7 @@ _reopen_reverted_issues() {
 	fi
 	while IFS= read -r n; do
 		[ -n "$n" ] || continue
-		if _net_run "$BIRCHER_NET_TIMEOUT" gh issue reopen "$n" --repo "$REPO" \
+		if _effect issue_or_label "reopen:$n" "$BIRCHER_NET_TIMEOUT" gh issue reopen "$n" --repo "$REPO" \
 			--comment "Reopening: the fix for this was merged in #$pr and then automatically reverted because main CI went red. The defect is live again." >/dev/null 2>&1; then
 			echo "[batch:merge] revert: reopened issue #$n (its fix was reverted)" >&2
 		else
@@ -1272,7 +1278,8 @@ _post_cross_review_status() {
     # ~53s of overrun (the sleep plus two expired-but-still-issued calls), where the
     # bound promises at most one in-flight call.
     _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
-    err=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+    err=$(_effect status_check "status:$sha" \
+            "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
             gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
             -f context=bircher/cross-review \
             -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
@@ -1499,7 +1506,8 @@ merge_ready_pr() {
   # review, so a race can never land unreviewed code.
   local merged=0 mt=0
   while [ "$mt" -lt 30 ] && ! _deadline_passed "$PREMERGE_DEADLINE_AT"; do
-    _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
+    _effect merge "merge:$pr:$expected_sha" \
+      "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
       gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
       --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
     # #71: a failed ATTEMPT is not a failed MERGE. The request can complete server-side
@@ -1704,7 +1712,7 @@ merge_ready_pr() {
         rargs=$(_revert_git_args "$sha" "$pc")
         # shellcheck disable=SC2086
         if [ -n "$rargs" ] && ( cd "$rw" && git revert $rargs \
-              && _net_run "$BIRCHER_NET_TIMEOUT" git push origin HEAD:main -q ); then
+              && _effect ref_update "revert-push:$pr" "$BIRCHER_NET_TIMEOUT" git push origin HEAD:main -q ); then
           echo "[batch:merge] $item: revert pushed to main (parents=$pc)" >&2; reverted=1
         else
           echo "[batch:merge] WARN $item: automatic revert FAILED (sha=$sha parents=$pc) - main is red; fix by hand" >&2
@@ -1797,7 +1805,7 @@ reconcile_deferred_ready() {
       echo "[batch:sweep] $item: PR #$pr BEHIND main -> update-branch" >&2
       # expected_head_sha makes GitHub REFUSE the update if the head moved since we
       # verified it, so a concurrent push cannot be silently folded into the update.
-      gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT -f expected_head_sha="$sha" >/dev/null 2>&1 \
+      _effect ref_update "update-branch:$pr:$sha" - gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT -f expected_head_sha="$sha" >/dev/null 2>&1 \
         || echo "[batch:sweep] WARN $item: update-branch call failed (head moved, already updating, or up to date)" >&2
       if _restamp_if_delta_unchanged "$item" "$pr" "$sha"; then
         # Pin every downstream step (the status, --match-head-commit) to the head we
@@ -1880,7 +1888,7 @@ recover_pr_cmd() {
   mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
   if [ "$mss" = "BEHIND" ]; then
     echo "[batch:recover-pr] $code: PR #$pr is BEHIND main -> update-branch" >&2
-    gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
+    _effect ref_update "update-branch:$pr" - gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
       || echo "[batch:recover-pr] WARN $code: update-branch call failed (already updating or up to date)" >&2
   fi
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
@@ -1960,7 +1968,7 @@ _reconcile_item_pr() {
   chosen="$green"
   for m in $matches; do
     [ "$m" = "$chosen" ] && continue
-    gh pr close "$m" --repo "$REPO" \
+    _effect pull_request "close-pr:$m" - gh pr close "$m" --repo "$REPO" \
       --comment "Superseded by #$chosen (Bircher recovery: item $code opened multiple PRs after a CI-red retry; adopting the CI-green one)." >/dev/null 2>&1 || true
   done
   echo "$chosen"
@@ -2119,7 +2127,7 @@ $marker_line"
 
 $marker_line"
     fi
-    gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
+    _effect comment "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
       || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
   fi
 
@@ -2961,9 +2969,9 @@ EOF
   [ -n "$review" ]   && body="$body review=$review"
   [ -n "$rounds" ]   && body="$body rounds=$rounds"
   [ -n "$pr" ]       && body="$body pr=#$pr"
-  gh issue comment "$issue" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
-  [ -n "$rm" ]  && gh issue edit "$issue" --repo "$REPO" --remove-label "$rm"  >/dev/null 2>&1 || true
-  [ -n "$add" ] && gh issue edit "$issue" --repo "$REPO" --add-label "$add"    >/dev/null 2>&1 || true
+  _effect comment "issue-outcome:$issue:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh issue comment "$issue" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
+  [ -n "$rm" ]  && _effect issue_or_label "unlabel:$issue:$rm" - gh issue edit "$issue" --repo "$REPO" --remove-label "$rm"  >/dev/null 2>&1 || true
+  [ -n "$add" ] && _effect issue_or_label "label:$issue:$add" - gh issue edit "$issue" --repo "$REPO" --add-label "$add"    >/dev/null 2>&1 || true
 }
 
 # _ensure_issue_closed <issue> <pr>: safety-net for the `Closes #N` auto-close
@@ -2979,7 +2987,7 @@ _ensure_issue_closed() {
   [ "$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)" = "MERGED" ] || return 0
   sleep "${BIRCHER_AUTOCLOSE_GRACE_S:-5}"
   [ "$(gh issue view "$issue" --repo "$REPO" --json state -q '.state' 2>/dev/null)" = "OPEN" ] || return 0
-  gh issue close "$issue" --repo "$REPO" \
+  _effect issue_or_label "close-issue:$issue" - gh issue close "$issue" --repo "$REPO" \
     --comment "Safety-net close: PR #$pr merged but GitHub did not auto-close this issue via \`Closes #$issue\`; the work is on main (bircher #3)." >/dev/null 2>&1 || true
   echo "[batch] safety-net: closed issue #$issue after PR #$pr merged (auto-close missed)" >&2
 }
@@ -3140,7 +3148,7 @@ run_item() {
   fi
   echo "[batch] === $item ==="
   local _iss; _iss=$(_item_issue "$prompt")
-  [ -n "$_iss" ] && gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
+  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
   # B-3 vendor dispatch: resolve THIS item's implementer and flip the reviewer to
   # the opposite vendor (cross-vendor integrity is invariant). A per-item queue tag
   # `bircher-implementer: <vendor>` wins over the runner-level PICKED_VENDOR (set by
@@ -3471,6 +3479,12 @@ EOF
 }
 
 self_test() {
+  # v1 orchestration is what this exercises, so effects execute directly. The
+  # adapter's default is `deny` -- correct for a real run, where an unset
+  # variable must not silently restore v1 authority -- and it would turn every
+  # behavioural assertion below into a refusal. Set here rather than left to the
+  # caller so `--self-test` means the same thing however it is invoked.
+  export BIRCHER_EFFECT_MODE="${BIRCHER_EFFECT_MODE:-legacy}"
   # #62: the wrappers now REFUSE to run a network command when no timeout(1) exists,
   # which is right in production and would otherwise make this whole suite unrunnable on
   # a box without GNU coreutils (stock macOS). Give it a passthrough so every existing
@@ -5885,15 +5899,25 @@ SH
   # network-facing" was simply wrong.
   _contains "$_body" '_net_run "$BIRCHER_NET_TIMEOUT" git fetch origin' \
     || { echo "FAIL #62: the recovery git fetch must be bounded"; rm -rf "$_tdir"; exit 1; }
-  _contains "$_body" '_net_run "$BIRCHER_NET_TIMEOUT" git push origin' \
-    || { echo "FAIL #62: the recovery git push must be bounded"; rm -rf "$_tdir"; exit 1; }
+  # v2: the push is ROUTED through the effect adapter, which takes the cap as its
+  # third argument and hands it to _net_run. The bound is unchanged; the shape is
+  # not, so this asserts the PROPERTY (routed, with a real cap) rather than the v1
+  # spelling. A cap of `-` means unbounded and must not satisfy it.
+  _contains "$_body" '_effect ref_update "revert-push:$pr" "$BIRCHER_NET_TIMEOUT" git push origin' \
+    || { echo "FAIL #62: the recovery git push must be routed AND bounded"; rm -rf "$_tdir"; exit 1; }
   # EVERY gh invocation in there, not just one: an assertion that merely finds
   # `_net_run` somewhere passes while a second call sits unbounded next to it.
   # `grep -v 'echo '` because `declare -f` re-emits diagnostic strings on their own
   # lines, and one of them contains the literal "gh rc=$rc" -- a message about gh, not
   # a call to it. Matching that was a false positive that failed the whole suite.
+  # v2: a call is bounded if it goes through _net_run directly, OR through
+  # _effect with a cap that is not `-`. The cap is _effect's third argument, so
+  # the pattern reads class, key, then a cap whose first character is not a bare
+  # dash -- an unbounded `-` cap deliberately still counts as unbounded here.
   _unbounded=$(declare -f _reopen_reverted_issues | grep -E '(^|[^_[:alnum:]])gh ' \
-                 | grep -v '_net_run' | grep -v 'echo ' || true)
+                 | grep -v '_net_run' \
+                 | grep -vE '_effect +[a-z_]+ +[^ ]+ +[^-]' \
+                 | grep -v 'echo ' || true)
   [ -z "${_unbounded//[[:space:]]/}" ] \
     || { echo "FAIL #62: unbounded gh call in _reopen_reverted_issues: $_unbounded"; rm -rf "$_tdir"; exit 1; }
   # _net_run's cap is INDEPENDENT of the CI deadline: an expired one must not shrink it.
