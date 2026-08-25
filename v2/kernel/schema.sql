@@ -75,3 +75,13 @@ CREATE TABLE IF NOT EXISTS reconciliation (
   evidence_json TEXT NOT NULL,
   at_us         INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS dispatches (
+  id         TEXT PRIMARY KEY,
+  run_id     TEXT    NOT NULL,
+  generation INTEGER NOT NULL,
+  actor      TEXT    NOT NULL,
+  role       TEXT    NOT NULL,
+  at_us      INTEGER NOT NULL,
+  UNIQUE (run_id, generation)
+);

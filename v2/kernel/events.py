@@ -23,6 +23,7 @@ class EventKind:
     EFFECT_CONFIRMED = "effect_confirmed"
     EFFECT_UNCERTAIN = "effect_uncertain"
     EFFECT_RECONCILED = "effect_reconciled"
+    ATTEMPT_DISPATCHED = "attempt_dispatched"
 
 
 SCHEMA_VERSIONS = {
@@ -40,6 +41,7 @@ SCHEMA_VERSIONS = {
     EventKind.EFFECT_CONFIRMED: 1,
     EventKind.EFFECT_UNCERTAIN: 1,
     EventKind.EFFECT_RECONCILED: 1,
+    EventKind.ATTEMPT_DISPATCHED: 1,
 }
 
 MECHANISM_VERSION = 1

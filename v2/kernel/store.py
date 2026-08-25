@@ -187,6 +187,36 @@ class Store:
         ).fetchone()
         return None if row is None else int(row[0])
 
+    def record_dispatch(
+        self, dispatch_id: str, run_id: str, generation: int, actor: str, role: str
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO dispatches (id, run_id, generation, actor, role, at_us)"
+            " VALUES (?,?,?,?,?,?)",
+            (dispatch_id, run_id, generation, actor, role, self._clock.now_us()),
+        )
+
+    def dispatch_actor(self, run_id: str, generation: int) -> str | None:
+        """The actor dispatched for EXACTLY this generation.
+
+        Exact match, deliberately: falling back to the most recent dispatch is
+        how one attempt inherits another attempt's identity.
+        """
+        row = self._conn.execute(
+            "SELECT actor FROM dispatches WHERE run_id = ? AND generation = ?",
+            (run_id, generation),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def dispatch_role_actor(self, run_id: str, role: str) -> str | None:
+        """The actor most recently dispatched in *role* for this run."""
+        row = self._conn.execute(
+            "SELECT actor FROM dispatches WHERE run_id = ? AND role = ?"
+            " ORDER BY at_us DESC LIMIT 1",
+            (run_id, role),
+        ).fetchone()
+        return None if row is None else row[0]
+
     def has_confirmed_effect(self, run_id: str, effect_class: str) -> bool:
         return self._conn.execute(
             "SELECT 1 FROM effects WHERE run_id = ? AND effect_class = ?"
