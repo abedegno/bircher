@@ -40,7 +40,7 @@ This plan was written before the identity substrate existed. Three things change
 **Interfaces:**
 - Consumes: `actor_for` (M1-3b).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_an_effect_fact_names_the_dispatched_actor():
@@ -64,13 +64,13 @@ def test_a_refused_effect_does_not_execute():
     """The witness: refusing after executing is not refusing."""
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 Resolve `actor = actor_for(store, run_id, generation)` at the top of `_perform_unhalted`, before the idempotency read; refuse with `NotAuthorized` when it is `None`; pass it to all three `append_fact` calls. `EFFECT_RECONCILED` keeps `actor="human"` — reconciliation is an operator action, and that is a fact about a human, not an attempt.
 
-- [ ] **Step 3: Migrate `test_effects.py`** from `acquire()` to `dispatch()`, exactly as M1-3b migrated the command tests. A test that self-fences will now be refused, which is the point.
+- [x] **Step 3: Migrate `test_effects.py`** from `acquire()` to `dispatch()`, exactly as M1-3b migrated the command tests. A test that self-fences will now be refused, which is the point.
 
-- [ ] **Step 4: Mutation-test**
+- [x] **Step 4: Mutation-test**
 
 Three mutations, each in isolation against a committed tree: record `actor="kernel"` again; drop the `actor is None` refusal; refuse *after* invoking the executor. Each must red exactly its named test.
 
@@ -105,7 +105,7 @@ Everything downstream depends on this list being complete, and a grep that misse
 **Interfaces:**
 - Produces: the inventory, with a total count the detector asserts against.
 
-- [ ] **Step 1: Enumerate, and do not trust a single pattern**
+- [x] **Step 1: Enumerate, and do not trust a single pattern**
 
 Run each of these separately and union the results. They overlap deliberately: one pattern's exclusion is another's inclusion, and *the filter is where detectors fail*.
 
@@ -118,7 +118,7 @@ grep -nE "git .*push" batch/run-queue.sh
 grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 ```
 
-- [ ] **Step 2: Record the inventory**
+- [x] **Step 2: Record the inventory**
 
 Write `docs/design/effect-site-inventory.md` with one row per site: line, command, effect class (from M1-3's eight), and whether it is a mutation or a read. These are the sites confirmed present at the time of writing — **re-run Step 1 and reconcile before relying on them**, because line numbers move:
 
@@ -140,7 +140,7 @@ Write `docs/design/effect-site-inventory.md` with one row per site: line, comman
 
 Record the total. Note explicitly which `gh api` calls are **reads** (e.g. 1331 `compare`, 1348 `git/trees`, 2262 `branches/protection`, 2512 required contexts) so a later reader can tell an omission from a classification.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/design/effect-site-inventory.md
@@ -164,7 +164,7 @@ from a classification."
 - Consumes: `perform`, `EffectClass`, `Store` (M1-3).
 - Produces: `_effect <class> <idempotency_key> <argv...>` in shell; `bircher-effect` CLI.
 
-- [ ] **Step 1: Write the adapter**
+- [x] **Step 1: Write the adapter**
 
 ```bash
 # batch/lib/effect-adapter.sh
@@ -199,7 +199,7 @@ _effect() {
 
 **Default is `deny`.** An unset variable must not silently restore v1 authority — fail closed, in the direction that stops work rather than the one that performs an unmediated mutation.
 
-- [ ] **Step 2: Write the CLI**
+- [x] **Step 2: Write the CLI**
 
 ```python
 # v2/kernel/cli.py
@@ -250,7 +250,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 3: Route one site, and prove the seam works before touching the rest**
+- [x] **Step 3: Route one site, and prove the seam works before touching the rest**
 
 Start with the merge-authorizing status publication at `batch/run-queue.sh:1276`, because it is the effect the spec singles out as authority-bearing.
 
@@ -268,11 +268,11 @@ Run the coordinator's own selftest to confirm nothing else broke:
 bash batch/run-queue.sh --selftest
 ```
 
-- [ ] **Step 4: Route every remaining site from the inventory**
+- [x] **Step 4: Route every remaining site from the inventory**
 
 Idempotency keys must be **derived from the object, not from a counter** — a retry after a crash must produce the same key, or the journal cannot suppress the duplicate. Use `<class>:<stable-object-id>`: `status:$sha`, `merge:$pr`, `comment:$pr:$(printf '%s' "$body" | sha256sum | cut -c1-16)`, `label:$issue:$add`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add batch/lib/effect-adapter.sh v2/kernel/cli.py batch/run-queue.sh
@@ -296,7 +296,7 @@ This is a **verification tool**, so it needs more adversarial review than the th
 **Interfaces:**
 - Produces: `find_direct_effects(path) -> list[Finding]`.
 
-- [ ] **Step 1: Write the detector**
+- [x] **Step 1: Write the detector**
 
 ```python
 # v2/tools/detect_direct_effects.py
@@ -344,7 +344,7 @@ def find_direct_effects(path: str) -> list[Finding]:
     return out
 ```
 
-- [ ] **Step 2: Write the tests, including a planted positive per exclusion**
+- [x] **Step 2: Write the tests, including a planted positive per exclusion**
 
 Each exclusion gets its own planted positive, drawn from the real shape it must not blind the detector to. A single "known bad line" test would pass while three exclusions went unchecked.
 
@@ -412,16 +412,16 @@ def test_criterion_1_run_queue_has_no_unrouted_mutation():
         f"  {f.line}: {f.text}" for f in findings)
 ```
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 Run: `cd v2 && python -m pytest tests/execution/test_routing.py -v`
 Expected: every planted positive passes, and criterion 1 passes once Task 2 routed all sites. If criterion 1 fails, the inventory was incomplete — go back to Task 1 rather than widening an exclusion.
 
-- [ ] **Step 4: Adversarially review the exclusions**
+- [x] **Step 4: Adversarially review the exclusions**
 
 For each of the three exclusions, write down in `v2/tools/detect_direct_effects.py` what shape it could blind the detector to, and confirm a test covers it. In a sibling programme four detectors passed vacuously and **in every case the analysis was correct and the exclusion was wrong**.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add v2/tools/detect_direct_effects.py v2/tests/execution/test_routing.py
@@ -442,7 +442,7 @@ Criteria 2 and 4. They belong together because the second exists to stop the fir
 **Files:**
 - Create: `v2/tests/execution/test_fault_injection.py`, `v2/tests/execution/test_provider_control.py`
 
-- [ ] **Step 1: Write the fault-injection tests**
+- [x] **Step 1: Write the fault-injection tests**
 
 ```python
 # v2/tests/execution/test_fault_injection.py
@@ -485,7 +485,7 @@ def test_unknown_mode_is_refused_rather_than_defaulting():
     assert r.returncode == 2
 ```
 
-- [ ] **Step 2: Write the provider-control tests**
+- [x] **Step 2: Write the provider-control tests**
 
 ```python
 # v2/tests/execution/test_provider_control.py
@@ -517,7 +517,7 @@ def test_session_control_is_permitted_and_journalled():
     assert EffectClass.SESSION_CONTROL in PERMITTED
 ```
 
-- [ ] **Step 3: Run and commit**
+- [x] **Step 3: Run and commit**
 
 Run: `cd v2 && python -m pytest tests/execution/ -v`
 
@@ -542,7 +542,7 @@ The required Milestone 1 artifact. Without it, "the full retained path" can mean
 **Files:**
 - Create: `docs/design/scar-effect-matrix.md`, `v2/tests/execution/test_scar_equivalence.py`
 
-- [ ] **Step 1: Build the matrix**
+- [x] **Step 1: Build the matrix**
 
 One row per v1 behaviour. Columns exactly as the spec names them: source location, the mutation that breaks it, the v2 owner, the test fixture, the injected fault, the expected durable events, and the effects it is permitted or forbidden to perform.
 
@@ -559,7 +559,7 @@ Seed it with the behaviours the spec names and the inventory found:
 
 Every row that is **excluded** from the port carries an explicit disposition and reason. Completion means every retained row passes and every excluded row is dispositioned.
 
-- [ ] **Step 2: Write the equivalence tests**
+- [x] **Step 2: Write the equivalence tests**
 
 ```python
 # v2/tests/execution/test_scar_equivalence.py
@@ -615,7 +615,7 @@ def test_every_retained_row_has_a_fixture_and_an_injected_fault():
         assert row[5].strip(), f"{row[0].strip()}: no injected fault"
 ```
 
-- [ ] **Step 3: Run the equivalence check for one scar end to end**
+- [x] **Step 3: Run the equivalence check for one scar end to end**
 
 Take the `_classify_ci_failure` row. Mutate v1 so an infrastructure failure classifies as a code failure, confirm v1's own selftest catches it (or record that it does not), then confirm the v2 test for the same behaviour fails under the equivalent mutation. Record both results in the matrix row.
 
@@ -633,7 +633,7 @@ git checkout batch/run-queue.sh && git status --short
 
 **If v1's selftest passes under that mutation, say so in the matrix.** It means the v1 scar was never bound by a test either, and the v2 test is new coverage rather than a port — a materially different claim, and one the matrix must not blur.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/design/scar-effect-matrix.md v2/tests/execution/test_scar_equivalence.py
@@ -655,3 +655,86 @@ claims and the artifact must not blur them."
 ## Done means
 
 Every mutation site in the inventory routes through `_effect`; the detector finds no unrouted mutation and carries a planted positive for each of its three exclusions; `deny` mode refuses all six mutating classes with a filesystem witness proving nothing executed, and an unset mode fails closed; all eight effect classes are partitioned into permitted and forbidden with none unclassified; and every scar/effect matrix row cites a real v1 line, names an injected fault, and has either a passing v2 equivalent or an explicit disposition. The authority-boundary proof remains M1-1's capability test — everything here is coverage evidence.
+
+
+---
+
+## Executed 2026-08-25 — what this plan got wrong
+
+Task 0 and Tasks 1–5 are implemented and committed. 249 kernel + execution
+tests pass; `bash batch/run-queue.sh --self-test` passes; the detector reports
+**0 unrouted mutations** across all 13 sites. Every guard carries a mutation
+that reds its named test, run one at a time against a committed tree with a
+dirty-tree abort in the harness.
+
+Seven things the plan specified incorrectly, each found by executing it:
+
+1. **`--selftest` does not exist.** The verification step in Task 2 named a
+   flag that appears nowhere in `run-queue.sh`; it is `--self-test`. Running
+   the plan's command starts a real queue run instead, which is how the error
+   surfaced — preflight refused, on a box with no `timeout(1)`.
+
+2. **`_effect` needed the cap as an argument.** Every routed site sits inside
+   `_net_run "$cap"`, which runs `timeout -k` and needs a real executable —
+   so neither `_net_run … _effect …` (a shell function) nor
+   `_effect … _net_run …` (the kernel would exec a function name) works. The
+   plan's three-mode adapter had no way to preserve the bound, and #62's scar
+   is that `timeout` *without* `-k` is not a bound at all.
+
+3. **Line 1503 is class `merge`, not `pull_request`.** M1-3 split merge into
+   its own class precisely so the authority-bearing operation would not share
+   a gate with the routine one, and it is the only class `perform()`
+   revalidates. Routing it as the plan specified would have moved the merge
+   through the adapter while bypassing every check the revalidation exists to
+   run — the letter satisfied, the point lost.
+
+4. **The detector as specified could never pass.** Its regex produces six
+   false positives on the real file — mutation-shaped text inside quoted
+   literals — and the plan's own instruction is to go back to Task 1 rather
+   than widen an exclusion. But the inventory was complete; the detector was
+   wrong. It now tests where a match *starts*, joins `\`-continuations into
+   logical lines (both authority-bearing sites are written across them), scans
+   heredocs fed to an interpreter, and reports suppressions instead of
+   dropping them.
+
+5. **`_classify_ci_failure` returns `infra`/`genuine`**, not
+   `infrastructure_failure`/`code_failure`. The plan's seed matrix row named a
+   mutation that cannot be applied — a claim about the source that is false,
+   which is the defect class this programme exists to catch.
+
+6. **`parse_marker` performs no author check.** The plan's row proposed
+   "accept a marker from any comment author" as the breaking mutation; there
+   is nothing there to break. This turned out to matter: the spec names
+   *"validating the marker against a runner-issued attempt identity"* as a
+   Milestone 1 acceptance test, and §4b established there is no runner-issued
+   identity to validate against. The matrix records the disposition rather
+   than leaving an acceptance test that would be satisfied by inspection.
+
+7. **The effect journal recorded `actor="kernel"` on every fact** — the gap
+   Task 0 was added to close. Commands got their identity substrate in M1-3b;
+   effects, the half of the system that touches the world, did not.
+
+Two process notes:
+
+- **A mutation survived, and the comment was the reason.** Moving the
+  undispatched-actor refusal below the idempotency read left the suite green:
+  the test asserted that a refused effect consumes no idempotency key, which
+  is true on both sides of the move. The comment claimed that property and the
+  test was written from the comment. The real property is an information leak
+  — the read *returns* a confirmed effect's external object id — and two tests
+  now bind it.
+- **One "survival" was an invalid mutation.** Repointing a `«top-level»`
+  citation from line 20 to line 19 kept it valid, because line 19 is the
+  `# shellcheck source=` comment: still top-level, still containing the
+  anchor. Rerun against a line inside a function, it reds correctly.
+
+## Carried forward
+
+- Seven routed sites pass a `-` cap, meaning unbounded — exactly as v1 left
+  them. They are spelled out rather than defaulted so they stay visible.
+- `recover_pr_cmd` chaining is unprobed and dispositioned in the matrix.
+- `_classify_ci_failure` and `parse_marker` are bound by v1's self-test but
+  not yet ported to v2; both are M1-5.
+- The four provenance residuals still stand. Routing status publication puts
+  the kernel next to a check run for the first time, but the kernel still
+  records what an actor reports rather than observing the run itself.
