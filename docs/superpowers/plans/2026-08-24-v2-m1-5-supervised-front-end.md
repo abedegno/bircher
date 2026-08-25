@@ -19,7 +19,46 @@
 - **Hashing is over raw bytes or a precisely versioned canonical form.** Never an informal serialization.
 - **UTC integer microseconds.** Carried from M1-2.
 
-**Depends on:** M1-2 (`Store`, `put_artifact`, `VerdictBinding`, `canonical_bytes`, `content_hash`), M1-3 (`Command`, `submit`, `acquire`).
+**Depends on:** M1-2 (`Store`, `put_artifact`, `VerdictBinding`, `canonical_bytes`, `content_hash`), M1-3 (`Command`, `submit`), M1-3b (`dispatch`, `actor_for`), M1-4 (the effect adapter, for what "no authority" is enforced by).
+
+## Reconciled against M1-3b, 2026-08-25
+
+This plan predates the identity substrate, and two of its four tasks
+reintroduce the defect M1-3b exists to remove.
+
+**Task 3 takes `asked_by` and `answered_by` as parameters. Task 4 takes
+`approved_by`.** These are caller-supplied identity strings — exactly what
+`implementer_identity` and `reviewer_identity` were, and exactly how one caller
+came to name both sides of its own independence check. `test_a_model_cannot_enqueue`
+cannot pass as designed: the model supplies `approved_by`, so it supplies
+`"human"`. The test would go green while proving nothing, which is the failure
+mode this whole programme is organised around.
+
+**The honest mechanism is not a dispatched actor.** A human approving an
+enqueue is not an attempt: at enqueue time the run does not exist, so there is
+no generation to dispatch against, and §4b's substrate does not reach here.
+What already exists in the kernel is the right precedent — `reconcile()`
+records `actor="human"` and the kernel accepts it, because reconciliation is
+invoked from the operator's own path and a model session cannot reach it. The
+enforcement is M1-1's boundary, not a string.
+
+So the reconciliation is:
+
+- **`approved_by` stops being a parameter.** The enqueue entry point stamps
+  `human` itself. There is no code path a model can call that stamps it, which
+  is what makes "the front end holds no authority" enforceable rather than
+  asserted. A payload naming an approver is refused the way `ACTOR_FIELDS` are.
+- **`record_answer` splits into two entry points**, `record_model_question` and
+  `record_human_answer`. The *function called* determines the recorded actor.
+  A model may call the first; the second lives behind the operator boundary.
+  This is what makes "a model-authored answer must not be indistinguishable
+  from a human one" a property of the mechanism rather than of a parameter the
+  model fills in.
+- **Every test asserting a model cannot do something must show the model
+  TRYING**, through the path a model actually has, and being refused. A test
+  that simply passes a different string is asserting Python's `==`.
+
+Tasks 1 and 2 are hashing and change-detection and are unaffected.
 
 ---
 
