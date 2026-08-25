@@ -107,7 +107,7 @@ def test_merge_outcomes_move_the_run_where_they_should(outcome, expected):
          base_sha=BASE, context_bundle_hash=BUNDLE,
          policy_version=1)
     if outcome == "merged":
-        perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
+        perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.MERGE, "m", {},
                 lambda *a: "merged!")
     _sub(s, "record_merge_outcome", "mo", outcome=outcome)
     assert s.run_state("r") == expected

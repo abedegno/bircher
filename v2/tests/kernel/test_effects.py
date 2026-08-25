@@ -52,14 +52,14 @@ def test_the_effect_classes_are_all_declared():
 
 
 def test_intent_is_persisted_before_the_effect_is_attempted(store):
-    gen = acquire(store, "r", "a")
+    gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     rec = Recorder(store)
     perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1", {"title": "x"}, rec)
     assert rec.calls == [("executed", ["intended"])]
 
 
 def test_confirmed_effect_records_the_external_object_id(store):
-    gen = acquire(store, "r", "a")
+    gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1", {}, Recorder(store))
     row = store._conn.execute(
         "SELECT state, external_object_id FROM effects WHERE idempotency_key='k1'"
@@ -68,8 +68,11 @@ def test_confirmed_effect_records_the_external_object_id(store):
 
 
 def test_a_superseded_generation_cannot_perform_an_effect(store):
-    stale = acquire(store, "r", "a")
-    acquire(store, "r", "b")
+    """Both generations ARE dispatched, so this reaches the fence. An
+    undispatched stale generation is refused a step earlier for having no
+    actor, and the test would pass while proving nothing about fencing."""
+    stale = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
+    dispatch(store, "r", actor="b", role=Role.IMPLEMENTER).generation
     with pytest.raises(OwnershipLost):
         perform(store, "r", stale, EffectClass.REF_UPDATE, "k2", {}, Recorder(store))
 
@@ -77,8 +80,8 @@ def test_a_superseded_generation_cannot_perform_an_effect(store):
 def test_a_superseded_generation_leaves_no_journal_row(store):
     """Fencing the refusal without fencing the write would let a superseded
     attempt consume an idempotency key a live generation still needs."""
-    stale = acquire(store, "r", "a")
-    acquire(store, "r", "b")
+    stale = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
+    dispatch(store, "r", actor="b", role=Role.IMPLEMENTER).generation
     with pytest.raises(OwnershipLost):
         perform(store, "r", stale, EffectClass.REF_UPDATE, "k3", {}, Recorder(store))
     assert store._conn.execute(
@@ -94,7 +97,7 @@ def test_an_uncertain_effect_blocks_retry_until_reconciled(store):
     key -- exercised by bypassing the halt, so removing either guard is
     visible here rather than masked by the other.
     """
-    gen = acquire(store, "r", "a")
+    gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
         perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {},
                 Recorder(store, fail=TimeoutError("no response")))
@@ -110,7 +113,7 @@ def test_an_uncertain_effect_blocks_retry_until_reconciled(store):
 
 
 def test_replaying_a_confirmed_key_does_not_re_execute(store):
-    gen = acquire(store, "r", "a")
+    gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     rec = Recorder(store)
     perform(store, "r", gen, EffectClass.COMMENT, "k5", {}, rec)
     perform(store, "r", gen, EffectClass.COMMENT, "k5", {}, rec)
@@ -118,7 +121,7 @@ def test_replaying_a_confirmed_key_does_not_re_execute(store):
 
 
 def _fail(store, run="r"):
-    gen = acquire(store, run, "a")
+    gen = dispatch(store, run, actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
         perform(store, run, gen, EffectClass.PULL_REQUEST, "k1", {},
                 Recorder(store, fail=TimeoutError("no response")))

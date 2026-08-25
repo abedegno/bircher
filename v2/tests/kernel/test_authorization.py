@@ -81,7 +81,7 @@ def test_the_full_lifecycle_advances_to_a_terminal_state():
             context_bundle_hash=BUNDLE, policy_version=1)
     assert s.run_state("r") == "merge_requested"
     # The merge effect must actually happen before its outcome is reported.
-    perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
+    perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.MERGE, "m", {},
             lambda *a: "merged!")
     _submit(s, "record_merge_outcome", "mo", outcome="merged")
     assert s.run_state("r") == "merged"

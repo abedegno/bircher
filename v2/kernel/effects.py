@@ -7,6 +7,7 @@ Every journalled mutation is a generation-fenced resource.
 
 from __future__ import annotations
 
+from kernel.dispatch import actor_for
 from kernel.events import EventKind
 from kernel.ids import new_id
 from kernel.ownership import OwnershipLost, current_generation
@@ -85,8 +86,25 @@ def _perform_unhalted(
     store, run_id, generation, effect_class, idempotency_key, intent, executor
 ):
     """The effect path with the run-level halt already checked by the caller."""
+    from kernel.authz import NotAuthorized
+
     if effect_class not in EffectClass.ALL:
         raise ValueError(f"unknown effect class: {effect_class}")
+
+    # Who asked. The journal recorded actor="kernel" on every effect fact,
+    # which section 4b permits only for facts the kernel ORIGINATES. An effect
+    # is requested by a dispatched attempt, and an external mutation the
+    # journal cannot attribute is the same defect commands had -- in the half
+    # of the system that actually touches the world.
+    #
+    # Resolved BEFORE the idempotency read, so an unattributable caller cannot
+    # consume a key or read back another attempt's external object id.
+    actor = actor_for(store, run_id, generation)
+    if actor is None:
+        raise NotAuthorized(
+            f"generation {generation} has no dispatched actor: an effect the "
+            "journal cannot attribute is an unattributable external mutation"
+        )
 
     existing = store.effect_by_key(idempotency_key, run_id=run_id)
     if existing is not None:
@@ -111,7 +129,7 @@ def _perform_unhalted(
     eid = new_id("eff")
     store.journal_intent(eid, run_id, generation, effect_class, idempotency_key, intent)
     store.append_fact(
-        run_id=run_id, kind=EventKind.EFFECT_INTENDED, actor="kernel",
+        run_id=run_id, kind=EventKind.EFFECT_INTENDED, actor=actor,
         causal_command_id=idempotency_key,
         payload={"effect_class": effect_class, "effect_id": eid},
     )
@@ -123,7 +141,7 @@ def _perform_unhalted(
         # unknown, and catching only Exception left them as bare `intended`.
         store.mark_effect(idempotency_key, "uncertain", None, run_id=run_id)
         store.append_fact(
-            run_id=run_id, kind=EventKind.EFFECT_UNCERTAIN, actor="kernel",
+            run_id=run_id, kind=EventKind.EFFECT_UNCERTAIN, actor=actor,
             causal_command_id=idempotency_key,
             payload={"effect_id": eid, "error": type(exc).__name__},
         )
@@ -150,7 +168,7 @@ def _perform_unhalted(
 
     store.mark_effect(idempotency_key, "confirmed", external_id, run_id=run_id)
     store.append_fact(
-        run_id=run_id, kind=EventKind.EFFECT_CONFIRMED, actor="kernel",
+        run_id=run_id, kind=EventKind.EFFECT_CONFIRMED, actor=actor,
         causal_command_id=idempotency_key,
         payload={"effect_id": eid, "external_object_id": external_id},
     )
@@ -192,6 +210,8 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
         if not pending_reconciliation(store, run_id):
             store.clear_reconciliation(run_id)
         store.append_fact(
-            run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
+            # "human", not an attempt: reconciliation is an operator action, and
+        # that is a fact about a person rather than about a dispatched actor.
+        run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
             causal_command_id=idempotency_key, payload={"resolution": resolution},
         )

@@ -99,7 +99,7 @@ def test_a_halt_refusal_records_a_rejection_fact():
     """The 'every authorization failure is recorded' claim excluded the halt,
     which is refused before the try/except."""
     s = _store()
-    gen = acquire(s, "r", "a")
+    gen = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
         perform(s, "r", gen, EffectClass.PULL_REQUEST, "eff", {},
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
@@ -121,7 +121,7 @@ def test_a_merge_effect_cannot_execute_without_kernel_authorization():
     external effect."""
     s = _store()
     _to_reviewing(s)
-    gen = acquire(s, "r", "impl")
+    gen = dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation
     with pytest.raises(NotAuthorized, match="merge"):
         perform(s, "r", gen, EffectClass.MERGE, "m", {}, lambda *a: "merged!")
 
@@ -134,7 +134,7 @@ def test_a_merge_effect_executes_once_the_kernel_has_authorized_it():
     _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
          context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
-    gen = acquire(s, "r", "impl")
+    gen = dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation
     assert perform(s, "r", gen, EffectClass.MERGE, "m", {},
                    lambda *a: "merged!") == "merged!"
 
@@ -167,7 +167,7 @@ def test_a_confirmed_NON_merge_effect_does_not_authorize_a_merge_outcome():
          context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     # A confirmed COMMENT, not a merge.
-    perform(s, "r", acquire(s, "r", "impl"), EffectClass.COMMENT, "c", {},
+    perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.COMMENT, "c", {},
             lambda *a: "comment-1")
     with pytest.raises(NotAuthorized, match="confirmed merge"):
         _sub(s, "record_merge_outcome", "mo", outcome="merged")
