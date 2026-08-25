@@ -42,6 +42,8 @@ def _to_implementing(s, implementer="claude"):
     _sub(s, "submit_spec", "k1", implementer, Role.IMPLEMENTER, spec_sha256=spec)
     _sub(s, "submit_plan", "k2", implementer, Role.IMPLEMENTER, plan_sha256=spec)
     _sub(s, "start_implementation", "k3", implementer, Role.IMPLEMENTER)
+    _sub(s, "record_implementation_output", "k3o", implementer,
+         Role.IMPLEMENTER, artifact_hash=spec)
     return spec
 
 

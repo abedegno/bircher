@@ -38,6 +38,8 @@ def _to_reviewing(s, implementer="claude"):
     _sub(s, "submit_spec", "a1", spec_sha256=spec)
     _sub(s, "submit_plan", "a2", plan_sha256=put_artifact(s, b"# plan"))
     _sub(s, "start_implementation", "a3", actor=implementer)
+    _sub(s, "record_implementation_output", "a3o", actor=implementer,
+         artifact_hash=spec)
     return spec
 
 

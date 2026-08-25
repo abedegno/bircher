@@ -187,6 +187,18 @@ class Store:
         ).fetchone()
         return None if row is None else int(row[0])
 
+    def set_current_artifact(self, run_id: str, artifact_hash: str) -> None:
+        self._conn.execute(
+            "UPDATE runs SET current_artifact_hash = ? WHERE run_id = ?",
+            (artifact_hash, run_id),
+        )
+
+    def current_artifact(self, run_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT current_artifact_hash FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else row[0]
+
     def record_dispatch(
         self, dispatch_id: str, run_id: str, generation: int, actor: str, role: str
     ) -> None:

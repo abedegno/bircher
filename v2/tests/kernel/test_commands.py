@@ -29,14 +29,22 @@ def test_the_command_interface_is_closed_and_explicit():
     """A narrow interface, not a general one. Growth here is a design change
     to be argued, not absorbed.
 
-    record_merge_outcome was added deliberately: merge_requested was a dead
-    end, so a merge that came back uncertain wedged the run and the only
-    escape recorded 'cancelled' for a run that had in fact merged.
+    Two commands were added deliberately, each with its argument:
+
+    record_merge_outcome -- merge_requested was a dead end, so a merge that
+    came back uncertain wedged the run and the only escape recorded
+    'cancelled' for a run that had in fact merged.
+
+    record_implementation_output -- nothing recorded what an implementation
+    PRODUCED, so the reviewer named the artifact it was reviewing and any blob
+    the store happened to hold satisfied the check. Without it there is no
+    such thing as "this run's current output", and every lineage check
+    downstream compares a caller's choice against itself.
     """
     assert sorted(COMMAND_NAMES) == sorted([
         "submit_spec", "submit_plan", "record_review", "start_implementation",
-        "record_ci_observation", "request_merge", "record_merge_outcome",
-        "cancel_run",
+        "record_implementation_output", "record_ci_observation",
+        "request_merge", "record_merge_outcome", "cancel_run",
     ])
 
 

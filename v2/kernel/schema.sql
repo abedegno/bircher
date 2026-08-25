@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at_us    INTEGER NOT NULL,
   version          INTEGER NOT NULL DEFAULT 0,
   owner_generation INTEGER NOT NULL DEFAULT 0,
-  owner            TEXT
+  owner            TEXT,
+  current_artifact_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS commands (
@@ -76,6 +77,8 @@ CREATE TABLE IF NOT EXISTS reconciliation (
   at_us         INTEGER NOT NULL
 );
 
+-- The artifact the CURRENT implementation attempt produced. A review binds
+-- this, not merely something the store happens to hold.
 CREATE TABLE IF NOT EXISTS dispatches (
   id         TEXT PRIMARY KEY,
   run_id     TEXT    NOT NULL,

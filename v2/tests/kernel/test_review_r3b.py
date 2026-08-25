@@ -38,6 +38,8 @@ def _to_implementing(s):
     _sub(s, "submit_spec", "k1", spec_sha256=spec)
     _sub(s, "submit_plan", "k2", plan_sha256=put_artifact(s, b"# plan"))
     _sub(s, "start_implementation", "k3", actor="claude")
+    _sub(s, "record_implementation_output", "k3o", actor="claude",
+         artifact_hash=spec)
     return s, spec
 
 

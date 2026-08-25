@@ -55,6 +55,8 @@ def _advance_to_reviewing(s):
     _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
     _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
     _submit(s, "start_implementation", "k3", actor="claude")
+    _submit(s, "record_implementation_output", "k3o", actor="claude",
+            artifact_hash=SPEC)
     return s
 
 
@@ -108,6 +110,7 @@ def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
         ("specified", "submit_spec", {"spec_sha256": SPEC}),
         ("planned", "submit_plan", {"plan_sha256": PLAN}),
         ("implementing", "start_implementation", {}),
+        (None, "record_implementation_output", {"artifact_hash": SPEC}),
         ("reviewing", "record_review", {"verdict": "accept",
                                         "artifact_hash": SPEC, "base_sha": BASE,
                                         "context_bundle_hash": BUNDLE,
@@ -146,6 +149,9 @@ def test_every_command_declares_its_legal_states():
         # command observes without transitioning.
         assert next_state_for(name) is not None or name in (
             "record_ci_observation", "record_merge_outcome", "record_review",
+            # Records what the implementation produced; the run stays in
+            # `implementing` until a review moves it.
+            "record_implementation_output",
         )
 
 
@@ -180,15 +186,21 @@ def test_request_merge_with_an_accepted_review_is_authorized():
 
 def test_a_verdict_bound_to_different_inputs_does_not_authorize_a_merge():
     """The whole point of the binding: yesterday's approval must not
-    authorize today's object."""
+    authorize today's object.
+
+    The input varied here is context_bundle_hash, NOT artifact_hash. A wrong
+    artifact is now refused a step earlier by the lineage guard, so varying it
+    would exercise that guard and leave the verdict binding untested -- the
+    test would still pass, for a reason other than the one it names.
+    """
     s = _advance_to_reviewing(_store())
     _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             actor="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
-        _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash="f" * 64, base_sha=BASE,
-                context_bundle_hash=BUNDLE,
+        _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC,
+                base_sha=BASE, context_bundle_hash="f" * 64,
                 policy_version=1)
 
 

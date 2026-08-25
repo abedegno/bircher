@@ -30,6 +30,15 @@ COMMAND_NAMES = frozenset({
     # Added with the merge-outcome transition: merge_requested was a dead end,
     # and cancel_run was the only escape -- which misreports a run that merged.
     "record_merge_outcome",
+    # Added because nothing recorded what an implementation PRODUCED. The
+    # reviewer named the artifact it was reviewing, so any blob the store
+    # happened to hold satisfied the check -- including one from another run,
+    # and including a superseded revision. The command set is closed and
+    # growth here is a design change to be argued: the argument is that
+    # without it there is no such thing as "this run's current output", and
+    # every lineage check downstream is comparing a caller's choice against
+    # itself.
+    "record_implementation_output",
 })
 
 
@@ -205,6 +214,8 @@ def submit(store, cmd: Command) -> Result:
                     "payload": cmd.payload,
                 },
             )
+            if cmd.name == "record_implementation_output":
+                store.set_current_artifact(cmd.run_id, cmd.payload["artifact_hash"])
             if review_binding is not None:
                 store.append_fact(
                     run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor=actor,

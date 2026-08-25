@@ -42,6 +42,9 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
     # for a run that in fact merged, corrupting the terminal outcome.
     "record_merge_outcome": (frozenset({"merge_requested"}), None),
+    # Records what the implementation produced; does not itself transition.
+    # The run stays in `implementing` until a review moves it.
+    "record_implementation_output": (frozenset({"implementing"}), None),
     "record_ci_observation": (frozenset({"implementing", "reviewing"}), None),
     "request_merge": (frozenset({"reviewing"}), "merge_requested"),
     # Cancellation is legal from anywhere: a run must always be stoppable.
@@ -137,6 +140,23 @@ def validate_review(store, cmd, actor: str) -> VerdictBinding:
             f"review binds artifact {binding.artifact_hash[:12]}..., which the "
             "kernel does not hold: an approval binds objects the mechanism has, "
             "not hashes the actor supplies"
+        )
+
+    # Existence is not identity. The old check asked only whether the store
+    # held the blob, so a review could bind an artifact from another run, or a
+    # superseded revision of this one, and the merge chain compared that
+    # caller-chosen hash against itself the whole way down.
+    current = store.current_artifact(cmd.run_id)
+    if current is None:
+        raise NotAuthorized(
+            "this run has recorded no implementation output: there is nothing "
+            "that is currently under review"
+        )
+    if binding.artifact_hash != current:
+        raise NotAuthorized(
+            f"review binds artifact {binding.artifact_hash[:12]}..., but this "
+            f"run's current output is {current[:12]}...: an approval binds what "
+            "the implementation produced, not any object the store holds"
         )
 
     observed_base = store.run_base_sha(cmd.run_id)
@@ -254,6 +274,20 @@ def authorize(store, cmd, actor: str) -> str | None:
             f"legal from {sorted(allowed)}"
         )
 
+    if cmd.name == "record_implementation_output":
+        if role_for(store, cmd.run_id, cmd.generation) != Role.IMPLEMENTER:
+            raise NotAuthorized(
+                "only an attempt dispatched in the implementer role may record "
+                "an implementation output"
+            )
+        artifact = cmd.payload.get("artifact_hash")
+        if not isinstance(artifact, str) or not store.has_artifact(artifact):
+            raise NotAuthorized(
+                f"implementation output {artifact!r} is not an artifact the "
+                "kernel holds"
+            )
+        return None
+
     if cmd.name == "record_review":
         verdict = cmd.payload.get("verdict")
         if verdict not in _VERDICTS:
@@ -276,6 +310,15 @@ def authorize(store, cmd, actor: str) -> str | None:
                 "reports what the mechanism observed, not what an actor claims"
             )
         return _MERGE_OUTCOMES[outcome]
+
+    if cmd.name == "request_merge":
+        current = store.current_artifact(cmd.run_id)
+        if cmd.payload.get("artifact_hash") != current:
+            raise NotAuthorized(
+                "merge binds an artifact that is not this run's current "
+                "output: a revision recorded after the approval supersedes it, "
+                "and an approval of the superseded object authorizes nothing"
+            )
 
     if cmd.name == "request_merge":
         if not _ci_is_green(store, cmd.run_id, cmd.payload.get("head_git_sha")):
