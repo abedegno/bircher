@@ -52,12 +52,18 @@ def test_reviewer_must_be_independent_of_the_implementer():
         validate_decision(None, _decision(), _observed(reviewer_identity="claude"))
 
 
-def test_accept_does_not_authorize_a_merge():
-    """'accept' means no unresolved blockers for the pinned bundle. Only the
-    kernel authorizes a merge, and only through request_merge."""
-    d = _decision(recommendation="accept")
-    validate_decision(None, d, _observed())
-    assert d["recommendation"] != "merge"
+def test_accept_is_a_legal_recommendation():
+    """'accept' means no unresolved blockers for the pinned bundle.
+
+    This asserts only that accept validates. The property that matters --
+    that no decision can recommend a merge at all -- is enforced by the
+    closed recommendation set and tested in
+    test_review_fixes.test_recommendation_is_constrained_to_a_closed_set.
+    An earlier version of this test built a fixture with
+    recommendation='accept' and asserted it was not 'merge', which is a
+    property of the fixture and not of the code.
+    """
+    validate_decision(None, _decision(recommendation="accept"), _observed())
 
 
 def test_unknown_decision_type_is_refused():

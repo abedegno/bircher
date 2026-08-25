@@ -124,11 +124,13 @@ A decision arrives as data, not as an action:
     "review_bundle_sha256": "..."
   },
   "finding_rulings": [
-    {"finding_id": "finding_12", "disposition": "blocking", "rationale": "...", "confidence": 0.86}
+    {"finding_id": "finding_12", "disposition": "blocking", "rationale": "...", "confidence_pct": 86}
   ],
   "recommendation": "request_revision"
 }
 ```
+
+Note `confidence_pct`: an integer, not a float. The canonical form refuses floats outright, because their textual encoding varies across versions and platforms and a hash that changes silently is worse than one that fails. An earlier revision of this example carried `"confidence": 0.86`, which the kernel's own rule could not hash -- the spec contradicted itself, and the kernel was right. Every numeric in a decision packet is an integer in its smallest meaningful unit.
 
 The kernel validates the schema, confirms every referenced hash still matches, confirms the decision type is legal in the current state, checks reviewer independence and authority, checks budgets and round limits, records the decision immutably, then computes and executes the resulting transition.
 

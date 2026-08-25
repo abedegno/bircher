@@ -22,14 +22,9 @@ def acquire(store, run_id: str, owner: str) -> int:
     statement, so concurrent callers serialise and each observes a distinct
     generation. A read-then-write would let two callers read the same value.
     """
-    row = store._conn.execute(
-        "UPDATE runs SET owner_generation = owner_generation + 1, owner = ?"
-        " WHERE run_id = ? RETURNING owner_generation",
-        (owner, run_id),
-    ).fetchone()
-    if row is None:
+    generation = store.acquire_generation(run_id, owner)
+    if generation is None:
         raise KeyError(f"no such run: {run_id}")
-    generation = int(row[0])
     store.append_fact(
         run_id=run_id,
         kind=EventKind.OWNERSHIP_ACQUIRED,
@@ -41,9 +36,7 @@ def acquire(store, run_id: str, owner: str) -> int:
 
 
 def current_generation(store, run_id: str) -> int:
-    row = store._conn.execute(
-        "SELECT owner_generation FROM runs WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    if row is None:
+    generation = store.current_generation(run_id)
+    if generation is None:
         raise KeyError(f"no such run: {run_id}")
-    return int(row[0])
+    return generation

@@ -119,14 +119,7 @@ def perform(
 
 
 def pending_reconciliation(store, run_id: str) -> list[dict]:
-    rows = store._conn.execute(
-        "SELECT idempotency_key, effect_class, generation FROM effects"
-        " WHERE run_id = ? AND state = 'uncertain' ORDER BY at_us",
-        (run_id,),
-    ).fetchall()
-    return [
-        {"idempotency_key": r[0], "effect_class": r[1], "generation": r[2]} for r in rows
-    ]
+    return store.uncertain_effects(run_id)
 
 
 def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> None:
@@ -144,11 +137,7 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
             f"{state!r}, expected 'uncertain'"
         )
 
-    cur = store._conn.execute(
-        "UPDATE runs SET version = version + 1 WHERE run_id = ? AND version = ?",
-        (run_id, expected_version),
-    )
-    if cur.rowcount == 0:
+    if not store.bump_version_cas(run_id, expected_version):
         raise StaleVersion(
             f"reconciliation derived from version {expected_version}, which has moved"
         )

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,64 @@ class Store:
                 "SELECT version FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()[0]
         )
+
+    @contextmanager
+    def transaction(self):
+        """One explicit transaction.
+
+        Store.open uses isolation_level=None (autocommit), so BEGIN must be
+        issued by hand. Without this, submit()'s CAS, fact and command-row
+        writes commit independently: a crash between them advances the version
+        with no command row, and the client's at-least-once retry then gets
+        StaleVersion for a command that was accepted -- idempotency failing in
+        exactly the crash it exists to survive.
+        """
+        self._conn.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
+    def bump_version_cas(self, run_id: str, expected_version: int) -> bool:
+        """Compare-and-swap the aggregate version. True when it applied."""
+        cur = self._conn.execute(
+            "UPDATE runs SET version = version + 1 WHERE run_id = ? AND version = ?",
+            (run_id, expected_version),
+        )
+        return cur.rowcount > 0
+
+    def acquire_generation(self, run_id: str, owner: str) -> int | None:
+        """Atomically bump and return the fence generation, or None if unknown.
+
+        A single statement: read-and-write in one, so concurrent callers
+        serialise and each observes a distinct generation.
+        """
+        row = self._conn.execute(
+            "UPDATE runs SET owner_generation = owner_generation + 1, owner = ?"
+            " WHERE run_id = ? RETURNING owner_generation",
+            (owner, run_id),
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def current_generation(self, run_id: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT owner_generation FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def uncertain_effects(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT idempotency_key, effect_class, generation FROM effects"
+            " WHERE run_id = ? AND state = 'uncertain' ORDER BY at_us",
+            (run_id,),
+        ).fetchall()
+        return [
+            {"idempotency_key": r[0], "effect_class": r[1], "generation": r[2]}
+            for r in rows
+        ]
 
     def command_result(self, idempotency_key: str, *, run_id: str) -> dict | None:
         """Look up a prior command result by key WITHIN a run.

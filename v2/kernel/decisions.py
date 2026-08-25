@@ -20,11 +20,24 @@ BOUND_INPUTS = (
 
 LEGAL_TYPES = frozenset({"review_ruling", "ci_ruling", "human_ruling"})
 
+#: A decision may recommend; it may never authorize. "accept" means "no
+#: unresolved blockers for the pinned review bundle" -- it does not mean merge,
+#: and there is deliberately no "merge" recommendation: only the kernel
+#: authorizes a merge, and only through the request_merge command.
+LEGAL_RECOMMENDATIONS = frozenset({"accept", "request_revision", "reject", "escalate"})
+
 
 def validate_decision(store, decision: dict, observed: dict) -> None:
     if decision.get("decision_type") not in LEGAL_TYPES:
         raise DecisionRejected(
             f"decision_type {decision.get('decision_type')!r} is not legal"
+        )
+
+    recommendation = decision.get("recommendation")
+    if recommendation not in LEGAL_RECOMMENDATIONS:
+        raise DecisionRejected(
+            f"recommendation {recommendation!r} is not legal; a decision may "
+            f"recommend but never authorize (legal: {sorted(LEGAL_RECOMMENDATIONS)})"
         )
 
     based_on = decision.get("based_on") or {}
