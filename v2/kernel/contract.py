@@ -34,11 +34,16 @@ def signature(argv: list[str]) -> str:
     """
     out = []
     for tok in argv[:3]:
-        # Flags end the signature; so does the first OPERAND. An operand is a
-        # shell expansion, a number, or anything path- or ref-shaped. Without
-        # this the target becomes part of the shape, and `gh issue reopen $n`
-        # would be a different shape from `gh issue reopen 7`.
-        if tok.startswith(("-", "$")) or not tok:
+        # Flags end the signature; so does the first OPERAND, so that a target
+        # cannot change the shape -- `gh issue reopen $n` and
+        # `gh issue reopen 7` are the same command.
+        #
+        # A `$`-expansion clause used to be here too. Removed: with the cap at
+        # three tokens and contracts matched as a prefix, no argv reaches a
+        # different verdict with or without it. A mutation removing it left the
+        # whole suite green, and unreachable code in a guard is worse than the
+        # absence of the guard -- it reads as protection.
+        if tok.startswith("-") or not tok:
             break
         if out and (tok[:1].isdigit() or "/" in tok or ":" in tok):
             break

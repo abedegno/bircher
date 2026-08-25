@@ -152,3 +152,24 @@ def test_the_authorization_fact_records_the_target():
     from kernel.authz import latest_merge_authorization
     a = latest_merge_authorization(s, "r")
     assert a["pr"] == PR and a["repo"] == REPO
+
+
+# --- the contract table itself ------------------------------------------------
+
+def test_a_class_with_no_contract_is_refused():
+    """T4. Nothing exercised the missing-contract path, because all nine
+    classes have one -- so a class added without a contract would have passed
+    silently, which is the fail-open direction."""
+    from kernel.contract import ContractViolation, check
+
+    with pytest.raises(ContractViolation, match="declares no argv contract"):
+        check("some_future_class", ["gh", "pr", "merge", "1"])
+
+
+def test_every_effect_class_has_a_contract():
+    """Adding a class must force adding a contract, rather than leaving one
+    class unconstrained until someone notices."""
+    from kernel.contract import CONTRACTS
+
+    missing = sorted(EffectClass.ALL - set(CONTRACTS))
+    assert not missing, f"effect classes with no argv contract: {missing}"
