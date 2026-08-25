@@ -43,6 +43,13 @@ def submit(store, cmd: Command) -> Result:
     if cmd.name not in COMMAND_NAMES:
         raise ValueError(f"unknown command: {cmd.name}")
 
+    from kernel.effects import is_halted
+
+    if is_halted(store, cmd.run_id) and cmd.name != "cancel_run":
+        raise RuntimeError(
+            f"run {cmd.run_id} is halted pending reconciliation; resolve it first"
+        )
+
     prior = store.command_result(cmd.idempotency_key)
     if prior is not None:
         # Replay: return the original outcome and mutate nothing. The version

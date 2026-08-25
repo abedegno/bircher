@@ -110,6 +110,57 @@ class Store:
              self._clock.now_us()),
         )
 
+    def journal_intent(
+        self, effect_id, run_id, generation, effect_class, idempotency_key, intent
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO effects (id, run_id, generation, effect_class,"
+            " idempotency_key, state, external_object_id, intent_json, at_us)"
+            " VALUES (?,?,?,?,?,'intended',NULL,?,?)",
+            (effect_id, run_id, generation, effect_class, idempotency_key,
+             json.dumps(intent, sort_keys=True), self._clock.now_us()),
+        )
+
+    def mark_effect(self, idempotency_key: str, state: str, external_object_id) -> None:
+        self._conn.execute(
+            "UPDATE effects SET state = ?, external_object_id = ?"
+            " WHERE idempotency_key = ?",
+            (state, external_object_id, idempotency_key),
+        )
+
+    def effect_by_key(self, idempotency_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT state, external_object_id FROM effects WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row is None else {"state": row[0], "external_object_id": row[1]}
+
+    def set_reconciliation(self, run_id: str, evidence: dict) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO reconciliation (run_id, evidence_json, at_us)"
+            " VALUES (?,?,?)",
+            (run_id, json.dumps(evidence, sort_keys=True), self._clock.now_us()),
+        )
+
+    def reconciliation_evidence(self, run_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT evidence_json FROM reconciliation WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def clear_reconciliation(self, run_id: str) -> None:
+        self._conn.execute("DELETE FROM reconciliation WHERE run_id = ?", (run_id,))
+
+    def last_confirmed(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT effect_class, external_object_id, at_us FROM effects"
+            " WHERE run_id = ? AND state = 'confirmed' ORDER BY at_us DESC LIMIT 10",
+            (run_id,),
+        ).fetchall()
+        return [
+            {"effect_class": r[0], "external_object_id": r[1], "at_us": r[2]} for r in rows
+        ]
+
     def put_blob(self, content_hash: str, data: bytes) -> None:
         """Insert an immutable blob. Idempotent: identical bytes hash the same,
         so a repeated write is a no-op rather than a conflict."""

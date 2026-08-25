@@ -49,3 +49,23 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE TRIGGER IF NOT EXISTS artifacts_no_update BEFORE UPDATE ON artifacts
 BEGIN SELECT RAISE(ABORT, 'artifacts are immutable'); END;
+
+CREATE TABLE IF NOT EXISTS effects (
+  id                 TEXT PRIMARY KEY,
+  run_id             TEXT NOT NULL,
+  generation         INTEGER NOT NULL,
+  effect_class       TEXT NOT NULL,
+  idempotency_key    TEXT NOT NULL UNIQUE,
+  state              TEXT NOT NULL,          -- intended | confirmed | uncertain | reconciled
+  external_object_id TEXT,
+  intent_json        TEXT NOT NULL,
+  at_us              INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS effects_no_delete BEFORE DELETE ON effects
+BEGIN SELECT RAISE(ABORT, 'the effect journal is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS reconciliation (
+  run_id        TEXT PRIMARY KEY,
+  evidence_json TEXT NOT NULL,
+  at_us         INTEGER NOT NULL
+);
