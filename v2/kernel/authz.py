@@ -161,16 +161,20 @@ def _implementer_of(store, run_id: str) -> str | None:
     reviewer submitting its own review was refused while the actual conflict
     went unchecked.
     """
+    implementer = None
     for fact in store.facts_for(run_id):
         if (
             fact.kind == EventKind.COMMAND_ACCEPTED
             and fact.payload.get("command_name") == "start_implementation"
         ):
-            return fact.payload.get("implementer_identity")
-    return None
+            # LAST, not first. Returning the first let the revision loop --
+            # request_revision -> planned -> start_implementation -- put a new
+            # implementer in place whose own review then passed the check.
+            implementer = fact.payload.get("implementer_identity")
+    return implementer
 
 
-def _ci_is_green(store, run_id: str) -> bool:
+def _ci_is_green(store, run_id: str, head_git_sha) -> bool:
     """True when the most recent CI observation for the run reports success.
 
     Merge authorization previously required only a matching verdict, so a run
@@ -182,8 +186,13 @@ def _ci_is_green(store, run_id: str) -> bool:
             fact.kind == EventKind.COMMAND_ACCEPTED
             and fact.payload.get("command_name") == "record_ci_observation"
         ):
-            latest = (fact.payload.get("payload") or {}).get("status")
-    return latest == "success"
+            latest = fact.payload.get("payload") or {}
+    if latest is None or latest.get("status") != "success":
+        return False
+    # CI must be green ON THE HEAD BEING MERGED. Reading only `status` and
+    # discarding head_git_sha let green CI on an unrelated or older head
+    # authorize the merge.
+    return latest.get("head_git_sha") == head_git_sha
 
 
 def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
@@ -195,14 +204,16 @@ def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
     nothing once any bound input has moved.
     """
     wanted = binding_hash(_binding_from(payload))
+    # The LATEST verdict for this binding decides. Scanning for any historical
+    # `accept` ignored a later `reject` or `request_revision` over the same
+    # inputs, so a withdrawn approval still authorized a merge.
+    latest = None
     for fact in store.facts_for(run_id):
         if fact.kind != EventKind.REVIEW_VERDICT:
             continue
-        if fact.payload.get("verdict") != "accept":
-            continue
         if fact.payload.get("binding_hash") == wanted:
-            return True
-    return False
+            latest = fact.payload.get("verdict")
+    return latest == "accept"
 
 
 def authorize(store, cmd) -> str | None:
@@ -241,13 +252,21 @@ def authorize(store, cmd) -> str | None:
             raise NotAuthorized(
                 f"outcome {outcome!r} is not one of {sorted(_MERGE_OUTCOMES)}"
             )
+        if outcome == "merged" and not store.has_confirmed_effect(
+            cmd.run_id, "merge"
+        ):
+            raise NotAuthorized(
+                "no confirmed merge effect for this run: a merge outcome "
+                "reports what the mechanism observed, not what an actor claims"
+            )
         return _MERGE_OUTCOMES[outcome]
 
     if cmd.name == "request_merge":
-        if not _ci_is_green(store, cmd.run_id):
+        if not _ci_is_green(store, cmd.run_id, cmd.payload.get("head_git_sha")):
             raise NotAuthorized(
-                "no successful CI observation for this run: a merge needs "
-                "evidence the mechanism observed, not only a review"
+                "no successful CI observation for the head being merged: a "
+                "merge needs evidence the mechanism observed, bound to the "
+                "object being merged"
             )
 
     if cmd.name == "request_merge" and not _merge_is_authorized(
