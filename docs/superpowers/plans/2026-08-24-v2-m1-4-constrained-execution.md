@@ -19,7 +19,62 @@
 - **`accept` never means merge.** Only the kernel authorizes a merge.
 - **Reads are not journalled; every externally visible mutation is.**
 
-**Depends on:** M1-3 (`EffectClass`, `perform`, `OwnershipLost`, `UncertainEffect`), M1-2 (`Store`). M1-1's gate must be green before any task here runs a model session.
+**Depends on:** M1-3 (`EffectClass`, `perform`, `OwnershipLost`, `UncertainEffect`), M1-3b (`dispatch`, `actor_for`, `revalidate_merge`), M1-2 (`Store`). M1-1's gate must be green before any task here runs a model session.
+
+## Reconciled against M1-3b, 2026-08-25
+
+This plan was written before the identity substrate existed. Three things changed under it:
+
+- **The effect journal still records `actor="kernel"` on every fact** — the same defect commands had, in the half of the system this plan is about. §4b makes `actor="kernel"` correct only for facts the kernel originates itself, and an effect is requested by a dispatched attempt. Task 0 below closes it, and everything downstream depends on it: an adapter that routes every mutation into a journal that cannot say *who* asked has moved the authority without making it auditable.
+- **A merge effect now revalidates its full authorization** immediately before executing (`revalidate_merge`). The CLI in Task 2 therefore cannot merge merely by being asked: the run must be in `merge_requested` with a standing approval over the current artifact and green CI on the authorized head. This is the intended behaviour and Task 4's fault injection should exercise it.
+- **The four residuals from M1-3b land here.** CI status and CI head are reported rather than observed; the context bundle hash is never seen by the kernel; the policy version is compared to nothing. `docs/design/provenance-table.md` names them and `test_the_residuals_are_the_ones_we_know_about` fails if a new one appears. M1-4 owns CI status and head, because routing status publication through the adapter is where the kernel first touches a check run.
+
+---
+
+### Task 0: The effect journal names who asked
+
+**Files:**
+- Modify: `v2/kernel/effects.py`, `v2/tests/kernel/test_effects.py`
+- Create: `v2/tests/kernel/test_effect_identity.py`
+
+**Interfaces:**
+- Consumes: `actor_for` (M1-3b).
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+def test_an_effect_fact_names_the_dispatched_actor():
+    s, gen = _dispatched("claude")
+    perform(s, "r", gen, EffectClass.COMMENT, "k", {}, lambda *a: "ok")
+    facts = [f for f in s.facts_for("r") if f.kind.startswith("effect_")]
+    assert {f.actor for f in facts} == {"claude"}
+
+
+def test_an_undispatched_generation_cannot_perform_an_effect():
+    """Fail closed, exactly as submit() does. An effect the journal cannot
+    attribute is an unattributable external mutation."""
+    s = _store()
+    dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER)
+    self_fenced = acquire(s, "r", "claude")
+    with pytest.raises(NotAuthorized, match="no dispatched actor"):
+        perform(s, "r", self_fenced, EffectClass.COMMENT, "k", {}, _never_runs)
+
+
+def test_a_refused_effect_does_not_execute():
+    """The witness: refusing after executing is not refusing."""
+```
+
+- [ ] **Step 2: Implement**
+
+Resolve `actor = actor_for(store, run_id, generation)` at the top of `_perform_unhalted`, before the idempotency read; refuse with `NotAuthorized` when it is `None`; pass it to all three `append_fact` calls. `EFFECT_RECONCILED` keeps `actor="human"` — reconciliation is an operator action, and that is a fact about a human, not an attempt.
+
+- [ ] **Step 3: Migrate `test_effects.py`** from `acquire()` to `dispatch()`, exactly as M1-3b migrated the command tests. A test that self-fences will now be refused, which is the point.
+
+- [ ] **Step 4: Mutation-test**
+
+Three mutations, each in isolation against a committed tree: record `actor="kernel"` again; drop the `actor is None` refusal; refuse *after* invoking the executor. Each must red exactly its named test.
+
+---
 
 **The approach decision, and its cost.** The spec offers two routes: route every effect through an injected adapter, or stop running the coordinator and retain only extracted logic. **This plan takes the adapter route**, because the scars the spec insists on preserving are distributed across effectful orchestration — `merge_ready_pr` alone combines required-context discovery, status publication, mergeability polling, the merge, reconciliation, main-CI observation and possible revert — and extracting logic from that would discard the orchestration order the scars live in. The cost is that `run-queue.sh` remains in the loop for Milestone 1, so its authority is removed rather than its code. M1-5 and later milestones may retire it.
 
