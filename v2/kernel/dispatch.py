@@ -8,8 +8,22 @@ A session receives no identity token and needs none. omnigent's agent-env
 allowlist admits only proxy/SSL/locale vars, HOME, PATH, TERM, TMPDIR,
 NODE_EXTRA_CA_CERTS and a bare OMNIGENT=1 marker, and under the M1-1 egress
 rules a session cannot reach the server. There is nothing to authenticate
-WITH -- and an assigned identity cannot be forged at all, whereas a presented
-one is only as good as its verification.
+WITH.
+
+**And an assigned identity is only as good as the restriction on who may
+assign it.** An earlier version of this docstring claimed it "cannot be forged
+at all"; that is false, and round 6 demonstrated it. `dispatch()` takes the
+actor as a caller-supplied string, so whoever can call it names BOTH sides of
+the independence check -- one actor dispatched itself as `mallory` and
+`mallory-the-reviewer`, passed independence, and reached `merge_requested`.
+That is the payload-field defect displaced one level, not removed.
+
+What IS true is narrower: identity is unforgeable *by a model session*,
+because a model session cannot write the kernel database. Landlock's
+`write_paths` confines its writes to its worktree, and `BIRCHER_KERNEL_DB` is
+required with no default, so the database never lands inside one. The property
+is "only the coordinator can assign identity", it rests on those two settings,
+and `tests/kernel/test_identity_precondition.py` is what checks them.
 
 **Dispatch IS the acquisition.** A worker never acquires its own generation:
 `acquire(run_id, owner)` takes its owner from the caller, so identity read

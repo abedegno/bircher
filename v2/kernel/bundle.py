@@ -88,7 +88,8 @@ def propose_revision(store, run_id: str, *, reason: str) -> None:
 def revise_bundle(store, run_id: str, *, new_snapshot: dict, reason: str) -> str:
     """The operator path. Re-freezes the input under a human's authority.
 
-    Reachable only from the operator's own path, on the other side of the
+    Reachable only from the operator's own path -- enforced by the
+    filesystem boundary, not the network one; see dispatch.py. On the other side of the
     M1-1 boundary from any model session -- the same enforcement `reconcile`
     already relies on. That is why `actor="human"` here is a record rather
     than a claim: there is no code path a model can call that reaches it.

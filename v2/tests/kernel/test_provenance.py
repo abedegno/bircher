@@ -7,7 +7,13 @@ actually observed. A table nobody verifies is prose, and prose asserting a
 property is the same defect in a different medium.
 
 The input list is derived from `kernel/authz.py` by AST walk, NOT from a
-hand-written list. A hand-written list checked against a hand-written table is
+hand-written list.
+
+The walk matches `store.X` syntactically, so it cannot see a read through an
+alias -- `s = store; s.run_owner(...)` is invisible, verified by executing it
+against the real extractor. Rather than leave a guarantee that holds only for
+one spelling, `test_the_store_is_never_aliased` enforces the assumption the
+walk rests on. A hand-written list checked against a hand-written table is
 prose checking prose: adding an unclassified input would satisfy both.
 """
 
@@ -138,3 +144,37 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['pr']",
         "cmd.payload['repo']",
     }
+
+
+
+def test_the_store_is_never_aliased_in_authz():
+    """The assumption the AST walk rests on, made enforceable.
+
+    `authorization_inputs` finds kernel-state reads by matching an attribute
+    whose receiver is the NAME `store`. An alias defeats it:
+
+        s = store
+        owner = s.run_owner(cmd.run_id)   # not extracted
+
+    Executed against the real extractor, that read is invisible while a new
+    payload key is caught. So the guarantee -- "authorization reads these and
+    the table does not classify them" -- holds only for reads written one way.
+
+    Widening the walk properly needs dataflow analysis. Forbidding the alias
+    is cheaper and exact, and it fails loudly if anyone introduces one.
+    """
+    tree = ast.parse(AUTHZ.read_text())
+    aliases = [
+        t.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "store"
+        for t in node.targets
+        if isinstance(t, ast.Name)
+    ]
+    assert not aliases, (
+        f"authz.py aliases `store` as {aliases}; reads through the alias are "
+        "invisible to the provenance walk, so the table's completeness "
+        "guarantee would silently stop holding"
+    )

@@ -10,8 +10,10 @@ passed `approved_by="model"` and expected a refusal -- but a model calling
 this would pass `"human"`, so the test asserts Python's `==` and the boundary
 it claims to prove is a string the caller chooses. What makes "the front end
 holds no authority" enforceable is that `enqueue` is reachable only from the
-operator's own path, on the far side of the M1-1 boundary, exactly as
-`reconcile()` already is. A model session reaches `propose_enqueue`, which
+operator's own path. That is enforced by the FILESYSTEM boundary, not the
+M1-1 network boundary this used to cite: a model session cannot write the
+kernel database. See kernel/dispatch.py and
+tests/kernel/test_identity_precondition.py. A model session reaches `propose_enqueue`, which
 records that it asked and enqueues nothing.
 """
 
