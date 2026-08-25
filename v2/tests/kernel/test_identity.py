@@ -47,9 +47,17 @@ def _to_implementing(s, implementer="claude"):
 
 # --- the payload cannot name an actor ----------------------------------------
 
-@pytest.mark.parametrize("field", sorted(ACTOR_FIELDS))
+@pytest.mark.parametrize(
+    "field", ["actor", "implementer_identity", "reviewer_identity"]
+)
 def test_a_command_carrying_an_actor_field_is_refused(field):
-    """If a caller can populate it, it is not identity."""
+    """If a caller can populate it, it is not identity.
+
+    Parametrized over a LITERAL list, not over ACTOR_FIELDS. Driving the cases
+    from the constant under test means removing a field deletes its case
+    instead of failing it -- the test would adapt to the very mutation it
+    exists to catch.
+    """
     s = _store()
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
     with pytest.raises(ValueError, match="assigned"):
