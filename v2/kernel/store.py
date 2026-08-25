@@ -93,6 +93,23 @@ class Store:
             ).fetchone()[0]
         )
 
+    def command_result(self, idempotency_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT accepted, result_json FROM commands WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row is None else {"accepted": row[0], "result": json.loads(row[1])}
+
+    def record_command(
+        self, key: str, run_id: str, name: str, accepted: bool, result: dict
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO commands (idempotency_key, run_id, name, accepted,"
+            " result_json, at_us) VALUES (?,?,?,?,?,?)",
+            (key, run_id, name, int(accepted), json.dumps(result, sort_keys=True),
+             self._clock.now_us()),
+        )
+
     def put_blob(self, content_hash: str, data: bytes) -> None:
         """Insert an immutable blob. Idempotent: identical bytes hash the same,
         so a repeated write is a no-op rather than a conflict."""
