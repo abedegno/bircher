@@ -51,15 +51,26 @@ def test_facts_cannot_be_deleted(store):
 
 
 def test_ordering_is_by_sequence_not_timestamp():
-    """Two facts can share a microsecond. Ordering must not depend on the
-    clock, or replay order becomes nondeterministic."""
-    s = Store.open(":memory:", clock=Clock(start_us=5_000, step_us=0))
+    """Ordering must not depend on the clock, or replay order becomes
+    nondeterministic when instants tie or move.
+
+    A clock that RUNS BACKWARDS is what makes this bind. An earlier version
+    used a frozen clock and two facts at the same microsecond -- but ties are
+    resolved by insertion order anyway, so ordering by timestamp produced an
+    identical result and the mutation survived. Sequence and timestamp order
+    must actively disagree for the assertion to mean anything.
+    """
+    s = Store.open(":memory:", clock=Clock(start_us=9_000, step_us=-1_000))
     a = _append(s, run="r")
     b = _append(s, run="r")
+    c = _append(s, run="r")
     facts = s.facts_for("r")
-    assert [f.observed_at_us for f in facts] == [5_000, 5_000]  # same instant
-    assert [f.seq for f in facts] == sorted(f.seq for f in facts)
-    assert [f.id for f in facts] == [a, b]
+    assert [f.observed_at_us for f in facts] == [9_000, 8_000, 7_000], (
+        "clock must be descending for this test to distinguish the two orderings"
+    )
+    assert [f.id for f in facts] == [a, b, c], (
+        "facts came back in timestamp order, not insertion order"
+    )
 
 
 def test_unknown_event_kind_is_refused(store):
