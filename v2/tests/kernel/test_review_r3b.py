@@ -118,6 +118,22 @@ def test_authorization_failures_record_a_rejection_fact(name, payload):
     assert rejects[0].payload["command_name"] == name
 
 
+def test_a_review_validation_failure_also_records_a_rejection():
+    """The parametrized cases above all fail inside authorize(); removing the
+    rejection recording from the validate_review path left them green."""
+    s, spec = _to_implementing(_store())
+    with pytest.raises(NotAuthorized):
+        # An artifact the store does not hold: fails in validate_review, not
+        # in authorize.
+        _sub(s, "record_review", "rv", owner="codex", verdict="accept",
+             artifact_hash="f" * 64, base_sha=BASE, context_bundle_hash=BUNDLE,
+             reviewer_identity="codex", policy_version=1)
+    rejects = [f for f in s.facts_for("r") if f.kind == "command_rejected"]
+    assert any(f.payload["command_name"] == "record_review" for f in rejects), (
+        "a review validation failure left no rejection fact"
+    )
+
+
 # --- verdict domain ----------------------------------------------------------
 
 def test_an_unknown_verdict_is_refused():

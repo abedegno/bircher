@@ -130,12 +130,23 @@ def test_an_uncertain_effect_halts_the_run(store):
 
 
 def test_the_halt_records_the_evidence_an_operator_needs(store):
+    """Checks CONTENT, not key presence. Emptying affected_resources and
+    recommended_actions left the earlier version green -- an operator would
+    have received a well-formed packet telling them nothing."""
     gen = _fail(store)
     ev = store.reconciliation_evidence("r")
     for key in ("run_id", "generation", "affected_resources",
                 "last_confirmed_observations", "recommended_actions"):
         assert key in ev, f"evidence is missing {key}"
     assert ev["generation"] == gen
+    assert ev["run_id"] == "r"
+    assert ev["affected_resources"] == [EffectClass.PULL_REQUEST], (
+        f"evidence does not name what is affected: {ev['affected_resources']}"
+    )
+    assert ev["recommended_actions"], "evidence recommends nothing"
+    assert any("k1" in a for a in ev["recommended_actions"]), (
+        "the recommended actions do not name the effect needing reconciliation"
+    )
 
 
 def test_unrelated_runs_continue(store):
@@ -157,7 +168,16 @@ def test_resolution_is_an_audited_cas_command(store):
         reconcile(store, "r", "k1", resolution="no_pr", expected_version=v + 5)
     reconcile(store, "r", "k1", resolution="no_pr", expected_version=v)
     assert not is_halted(store, "r")
-    assert "effect_reconciled" in [f.kind for f in store.facts_for("r")]
+    # Provenance, not just presence: an audited command records WHO resolved
+    # it. Changing the actor from "human" to "kernel" left the earlier version
+    # green, in the test whose name is 'audited command'.
+    rec = [f for f in store.facts_for("r") if f.kind == "effect_reconciled"]
+    assert len(rec) == 1
+    assert rec[0].actor == "human", (
+        f"reconciliation recorded actor {rec[0].actor!r}: a human resolution "
+        "attributed to the kernel is not an audit trail"
+    )
+    assert rec[0].payload["resolution"] == "no_pr"
 
 
 def test_a_halted_run_refuses_further_commands(store):

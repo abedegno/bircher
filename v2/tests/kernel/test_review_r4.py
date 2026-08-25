@@ -144,3 +144,21 @@ def test_record_merge_outcome_requires_a_confirmed_merge_effect():
          policy_version=1, head_git_sha=HEAD)
     with pytest.raises(NotAuthorized, match="confirmed"):
         _sub(s, "record_merge_outcome", "mo", outcome="merged")
+
+
+def test_a_confirmed_NON_merge_effect_does_not_authorize_a_merge_outcome():
+    """The earlier test compared 'no effect' against 'a merge effect', so
+    making has_confirmed_effect ignore effect_class left it green: any
+    confirmed effect at all would have satisfied the gate."""
+    s = _store()
+    spec = _to_reviewing(s)
+    _sub(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _review(s, "rv", "accept", spec)
+    _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, reviewer_identity="codex",
+         policy_version=1, head_git_sha=HEAD)
+    # A confirmed COMMENT, not a merge.
+    perform(s, "r", acquire(s, "r", "impl"), EffectClass.COMMENT, "c", {},
+            lambda *a: "comment-1")
+    with pytest.raises(NotAuthorized, match="confirmed merge"):
+        _sub(s, "record_merge_outcome", "mo", outcome="merged")

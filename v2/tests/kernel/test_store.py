@@ -29,10 +29,15 @@ def test_append_returns_a_stable_id_and_reads_back(store):
     assert facts[0].payload == {"base_sha": "a" * 40}
 
 
-def test_every_fact_carries_schema_and_mechanism_version(store):
-    _append(store)
-    f = store.facts_for("run_1")[0]
-    assert f.schema_version == SCHEMA_VERSIONS[EventKind.RUN_STARTED]
+@pytest.mark.parametrize("kind", sorted(SCHEMA_VERSIONS))
+def test_every_fact_carries_schema_and_mechanism_version(store, kind):
+    """Parametrized over EVERY declared kind. Exercising only RUN_STARTED left
+    a mutation that set TRANSITION's schema version to 0 undetected -- the
+    test named 'every fact' and checked one."""
+    _append(store, kind=kind)
+    f = [x for x in store.facts_for("run_1") if x.kind == kind][0]
+    assert f.schema_version == SCHEMA_VERSIONS[kind]
+    assert f.schema_version >= 1, f"{kind} declares schema version {f.schema_version}"
     assert f.mechanism_version >= 1
 
 
