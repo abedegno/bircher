@@ -86,7 +86,7 @@ Decision 1 (which fields) and decision 2 (canonicalization) — fixed here rathe
 **Interfaces:**
 - Produces: `FROZEN_FIELDS`, `snapshot(issue: dict) -> dict`, `bundle_hash(snapshot: dict) -> str`, `BUNDLE_CANON_VERSION`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # v2/tests/kernel/test_bundle.py
@@ -156,12 +156,12 @@ def test_canon_version_is_recorded_in_the_snapshot():
     assert snapshot(_issue())["canon_version"] == BUNDLE_CANON_VERSION
 ```
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_bundle.py -v`
 Expected: FAIL, `No module named 'kernel.bundle'`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # v2/kernel/bundle.py
@@ -201,13 +201,13 @@ def bundle_hash(snap: dict) -> str:
     return content_hash(canonical_bytes(snap))
 ```
 
-- [ ] **Step 4: Run, then record the decisions**
+- [x] **Step 4: Run, then record the decisions**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_bundle.py -v` — expect PASS.
 
 Write `docs/design/frozen-bundle.md` recording decisions 1 and 2 with the reasoning above, so a later reader finds them in the design rather than only in code.
 
-- [ ] **Step 5: Commit with mutation evidence**
+- [x] **Step 5: Commit with mutation evidence**
 
 ```bash
 git add v2/kernel/bundle.py v2/tests/kernel/test_bundle.py docs/design/frozen-bundle.md
@@ -237,7 +237,7 @@ Decisions 3, 4 and 5. These are judgement calls the spec requires Milestone 1 to
 **Interfaces:**
 - Produces: `is_relevant_change(old, new) -> bool`, `REVISION_AUTHORITY`, `invalidates(verdict_kind, changed) -> bool`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # append to v2/tests/kernel/test_bundle.py
@@ -276,12 +276,12 @@ def test_decision_5_a_bundle_change_invalidates_spec_and_plan():
         assert invalidates(kind, {"context_bundle_hash"}), kind
 ```
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_bundle.py -v`
 Expected: FAIL, `cannot import name 'is_relevant_change'`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # append to v2/kernel/bundle.py
@@ -315,7 +315,7 @@ def invalidates(verdict_kind: str, changed: set[str]) -> bool:
     return bool(_BINDS[verdict_kind] & set(changed))
 ```
 
-- [ ] **Step 4: Run, record, and mutation-test**
+- [x] **Step 4: Run, record, and mutation-test**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_bundle.py -v` — expect PASS.
 
@@ -352,7 +352,7 @@ Open question 3, decided: a conversation held only in model or UI state makes `g
 **Interfaces:**
 - Produces: `record_answer(store, run_id, question, answer, asked_by, answered_by) -> str`, `decision_packet(store, run_id) -> dict`, `packet_hash(store, run_id) -> str`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # v2/tests/kernel/test_grill.py
@@ -406,12 +406,12 @@ def test_answers_cannot_be_revised_in_place(store):
     assert [a["answer"] for a in answers] == ["renderer only", "renderer and main"]
 ```
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_grill.py -v`
 Expected: FAIL, `No module named 'kernel.grill'`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # v2/kernel/grill.py
@@ -446,7 +446,7 @@ def packet_hash(store, run_id: str) -> str:
     return content_hash(canonical_bytes(decision_packet(store, run_id)))
 ```
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run and commit**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_grill.py -v` — expect PASS.
 
@@ -473,7 +473,7 @@ Decision 6. A crash between persisting artifacts and enqueueing must leave neith
 - Consumes: `put_artifact`, `bundle_hash`, `packet_hash`, `Store`.
 - Produces: `enqueue(store, *, run_id, base_repo, base_sha, spec_bytes, plan_bytes, bundle_snapshot, approved_by) -> dict`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # v2/tests/kernel/test_enqueue.py
@@ -532,12 +532,12 @@ def test_enqueue_is_idempotent_on_the_same_run_id(store):
     assert store._conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 ```
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_enqueue.py -v`
 Expected: FAIL, `No module named 'kernel.enqueue'`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 # v2/kernel/enqueue.py
@@ -622,12 +622,12 @@ from contextlib import contextmanager
                 "plan_hash": by_kind.get("plan"), "bundle_hash": by_kind.get("bundle")}
 ```
 
-- [ ] **Step 4: Run the whole suite**
+- [x] **Step 4: Run the whole suite**
 
 Run: `cd v2 && python -m pytest tests/ -v`
 Expected: every kernel and execution test passes.
 
-- [ ] **Step 5: Mutation-test the transaction**
+- [x] **Step 5: Mutation-test the transaction**
 
 ```bash
 git add v2/kernel/enqueue.py v2/kernel/store.py v2/tests/kernel/test_enqueue.py
@@ -648,7 +648,7 @@ cd v2 && python -m pytest tests/kernel/test_enqueue.py::test_a_failure_midway_le
 git checkout v2/kernel/enqueue.py && git status --short
 ```
 
-- [ ] **Step 6: Commit the evidence and the decision record**
+- [x] **Step 6: Commit the evidence and the decision record**
 
 Append decision 6 to `docs/design/frozen-bundle.md`, then:
 
@@ -666,3 +666,58 @@ alongside the other five."
 ## Done means
 
 All six frozen-bundle decisions are fixed, each encoded as an executable predicate and recorded in `docs/design/frozen-bundle.md`: the five frozen fields, the canonicalization, relevant change derived from the frozen set, human-only revision authority, an invalidation table where implementation output deliberately does not invalidate spec or plan review, and one transaction joining persistence, enqueue and the first durable transition. Grill answers are append-only facts that record who answered as well as what. A model cannot enqueue. Every decision carries a mutation proving its test binds it.
+
+
+---
+
+## Executed 2026-08-25 — what this plan got wrong
+
+All four tasks implemented and committed. 320 tests pass. Every decision
+carries a mutation that reds its named test, run one at a time against a
+committed tree with a dirty-tree abort in the harness.
+
+**Three of the plan's tests asserted `==` where they claimed to prove a
+boundary**, all the same shape and all traceable to the same cause — the plan
+predates M1-3b:
+
+1. `test_a_model_cannot_enqueue` passed `approved_by="model"` and expected a
+   refusal. A model calling `enqueue` passes `"human"`. `approved_by` is gone;
+   what enforces the handoff is that `enqueue` is reachable only from the
+   operator's path, and a model reaches `propose_enqueue`, which enqueues
+   nothing.
+2. `test_the_packet_records_who_answered_not_just_what` asserted that a
+   model-authored answer must not be indistinguishable from a human one, via
+   an `answered_by` parameter the model supplies. `record_answer` split into
+   `record_model_question` and `record_human_answer`; the function reached is
+   what decides.
+3. `assert REVISION_AUTHORITY == "human"` compares a constant to a constant.
+   It states decision 4 without enforcing it. Now `propose_revision` and
+   `revise_bundle`, with a test asserting the model path has no parameter that
+   could reach the other one.
+
+Four smaller corrections:
+
+4. **`is_relevant_change` had to take raw issues, not snapshots.** Given two
+   snapshots the answer is `old != new` and the function proves nothing — the
+   whole content of decision 3 is that volatile metadata does not count, which
+   only shows when something volatile is present to be ignored.
+5. **`invalidates` had no behaviour for an unknown kind.** A default of
+   `False` makes a typo silently mean "nothing invalidates this" — fail-open.
+   It raises.
+6. **The packet needed to represent an unanswered question.** The plan's
+   paired `record_answer` could not express one at all, so an enqueue over an
+   unfinished grill would look complete. Questions and rulings are separate
+   facts, `unanswered()` reports the gap, and the kernel refuses the enqueue
+   rather than trusting the front end to have checked.
+7. **`sorted`, not `set`.** Deduplicating labels during canonicalization would
+   make a genuine change invisible. Caught by writing the mutation before
+   believing the code.
+
+## Scope note
+
+The four tasks are the kernel-side substrate: snapshot, decisions, grill facts,
+enqueue transaction. The conversational front end itself — grilling, the
+adversarial review rounds, bundle export to a human-readable form — is
+orchestration above this line and is not built here. Nothing in "Done means"
+required it, but a reader should not infer from "supervised front end" that a
+UI exists.
