@@ -51,7 +51,7 @@ Demonstrated, not theorised: a caller recorded as implementer submitted its own 
 **Interfaces:**
 - Produces: `dispatch(store, run_id, *, actor, role) -> str`, `actor_for(store, run_id, generation) -> str | None`, `Role`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # v2/tests/kernel/test_dispatch.py
@@ -103,12 +103,12 @@ def test_dispatch_requires_a_known_role(store):
         dispatch(store, "r", actor="claude", role="boss")
 ```
 
-- [ ] **Step 2: Run and watch them fail**
+- [x] **Step 2: Run and watch them fail**
 
 Run: `cd v2 && python -m pytest tests/kernel/test_dispatch.py -q -p no:randomly -p no:rerunfailures`
 Expected: FAIL, `No module named 'kernel.dispatch'`.
 
-- [ ] **Step 3: Extend the schema and event kinds**
+- [x] **Step 3: Extend the schema and event kinds**
 
 ```sql
 CREATE TABLE IF NOT EXISTS dispatches (
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
 
 Add `ATTEMPT_DISPATCHED = "attempt_dispatched"` to `EventKind` and `SCHEMA_VERSIONS`.
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 ```python
 # v2/kernel/dispatch.py
@@ -176,7 +176,7 @@ def actor_for(store, run_id: str, generation: int) -> str | None:
     return store.dispatch_actor(run_id, generation)
 ```
 
-- [ ] **Step 5: Commit, then mutation-test**
+- [x] **Step 5: Commit, then mutation-test**
 
 ```bash
 git add v2 && git commit -m "feat(v2): the dispatch record as the identity substrate"
@@ -195,7 +195,7 @@ Mutation: make `dispatch_actor` fall back to the most recent dispatch when the g
 - Consumes: `actor_for` (Task 1).
 - Produces: `ACTOR_FIELDS` — the refused payload keys.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 @pytest.mark.parametrize("field", ["actor", "implementer_identity", "reviewer_identity"])
@@ -230,11 +230,11 @@ def test_an_undispatched_generation_cannot_submit():
         _submit_spec(s, generation=g)
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 In `submit()`, before anything else: refuse any payload containing a key in `ACTOR_FIELDS`; resolve `actor = actor_for(store, cmd.run_id, cmd.generation)` and refuse when `None`; pass it to every `append_fact(actor=actor)` for accepted and rejected commands alike.
 
-- [ ] **Step 3: Mutation-test**
+- [x] **Step 3: Mutation-test**
 
 Remove `reviewer_identity` from `ACTOR_FIELDS`; its parametrized case must go red and no other.
 
@@ -245,7 +245,7 @@ Remove `reviewer_identity` from `ACTOR_FIELDS`; its parametrized case must go re
 **Files:**
 - Modify: `v2/kernel/authz.py`, `v2/kernel/store.py`, `v2/kernel/schema.sql`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_independence_compares_dispatched_identities():
@@ -274,11 +274,11 @@ def test_a_revision_invalidates_an_acceptance_of_the_previous_artifact():
     it must not authorize a merge."""
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `runs.current_artifact_hash`, set by `start_implementation` from the artifact it names; `validate_review` compares the binding's `artifact_hash` against it; independence reads the dispatched actors for the implementer and reviewer generations rather than payload strings.
 
-- [ ] **Step 3: Mutation-test** each guard separately, confirming one red test each.
+- [x] **Step 3: Mutation-test** each guard separately, confirming one red test each.
 
 ---
 
@@ -287,7 +287,7 @@ def test_a_revision_invalidates_an_acceptance_of_the_previous_artifact():
 **Files:**
 - Modify: `v2/kernel/effects.py`, `v2/kernel/authz.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 def test_a_merge_effect_revalidates_its_binding_at_execution():
@@ -301,11 +301,11 @@ def test_a_merge_effect_revalidates_its_binding_at_execution():
                 {"binding": binding.as_dict()}, _executor)
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `perform()` requires an authorized binding in the intent for `MERGE`, and re-runs the full merge authorization against it immediately before invoking the executor — verdict, lineage, independence, CI head, state.
 
-- [ ] **Step 3: Mutation-test** — remove the revalidation; the test must go red.
+- [x] **Step 3: Mutation-test** — remove the revalidation; the test must go red.
 
 ---
 
@@ -314,11 +314,11 @@ def test_a_merge_effect_revalidates_its_binding_at_execution():
 **Files:**
 - Create: `docs/design/provenance-table.md`, `v2/tests/kernel/test_provenance.py`
 
-- [ ] **Step 1: Write the table**
+- [x] **Step 1: Write the table**
 
 One row per authorization input: the input, where it enters the system, whether the kernel **observed** it or an actor **asserted** it, and for every `asserted` row either a defect reference or a stated residual with its reason.
 
-- [ ] **Step 2: Make it checkable**
+- [x] **Step 2: Make it checkable**
 
 ```python
 def test_no_authorization_input_is_asserted_without_a_reason():
@@ -334,10 +334,67 @@ def test_every_authorization_input_appears_in_the_table():
     links stayed asserted through three rounds of repair."""
 ```
 
-- [ ] **Step 3: Commit** — the table is a required Milestone 1 artifact, not documentation.
+- [x] **Step 3: Commit** — the table is a required Milestone 1 artifact, not documentation.
 
 ---
 
 ## Done means
 
 No `Command` payload can name an actor; every accepted and rejected fact records the dispatched actor rather than `"kernel"`; independence compares two dispatched identities; a review binds this run's current artifact; a merge effect revalidates its binding immediately before executing; and the provenance table has no `asserted` row without a stated reason. Each guard carries a mutation that reds its named test and nothing else.
+
+
+---
+
+## Executed 2026-08-25 — what this plan got wrong
+
+All five tasks are implemented and committed (`6080e6b` … `fe6330e`). 187 tests
+pass. Every guard carries a mutation that reds its named test; the mutations and
+their results are recorded in the commit messages.
+
+Four things the plan specified incorrectly, each found by executing it:
+
+1. **`dispatch()` had to become the acquisition.** The plan had dispatch bind an
+   actor to the generation a worker had already acquired. But `acquire()` takes
+   its owner from the caller, and it *always increments* — so a worker would
+   fence itself into a generation with no dispatch, orphaning the record. Fence
+   and identity have to be written in one operation.
+
+2. **The plan's Task 1 mutation was wrong.** It claimed a "fall back to the most
+   recent dispatch" mutation would red `test_each_generation_gets_its_own_actor`.
+   It did not: both generations in that test have exact dispatches, so the
+   fallback never fires. Worse, the test that *should* have caught it —
+   `..._with_no_dispatch_has_no_actor` — had no dispatch anywhere in the run, so
+   the fallback returned `None` for want of any row rather than the right one.
+   **The mutation survived.** The test now requires a dispatch on another
+   generation, so a fallback has something wrong to return.
+
+3. **Lineage needed a new command, which the plan did not anticipate.** Task 3
+   assumed `start_implementation` could set the current artifact "from the
+   artifact it names" — but it names none, and an implementation has produced
+   nothing when it starts. Nothing anywhere recorded an implementation's
+   *output*, which is why "existence" was standing in for "identity" in the
+   first place. `record_implementation_output` closes it, and the closed command
+   set grows by one with the argument recorded in the spec.
+
+4. **`reviewer_identity` had to leave the verdict binding**, which the plan
+   treated as untouched. Once the payload cannot name a reviewer, a merge
+   requester cannot present the fifth member of the tuple — and should not be
+   able to choose it. The binding is now four immutable inputs; who approved is
+   a kernel-observed fact recorded beside the verdict.
+
+Two process notes worth keeping:
+
+- **A parametrize driven by the constant under test adapts to its own
+  mutation.** `@parametrize("field", sorted(ACTOR_FIELDS))` deleted its case
+  instead of failing it when a field was removed. Driven from a literal now.
+- **The Task 5 mutations ran against uncommitted files and accumulated**, so
+  three of five results were contaminated by earlier unrestored mutations. The
+  harness now aborts unless exactly one file is dirty before it runs the suite.
+
+## Residuals, carried to M1-4
+
+Named in `docs/design/provenance-table.md` and enforced by
+`test_the_residuals_are_the_ones_we_know_about`: CI status and CI head are
+reported by an actor rather than observed; the context bundle hash is never seen
+by the kernel; the policy version is type-checked but compared to nothing. The
+verdict is asserted permanently and by intent.
