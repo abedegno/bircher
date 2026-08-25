@@ -146,7 +146,11 @@ Demonstrated, not theorised: the caller recorded as implementer submitted its ow
 
 So the kernel requires:
 
-- **An authenticated actor on every command**, supplied by the mechanism that admitted the caller — the runner-issued attempt identity — and never by the command payload. A command that carries its own claim of who is sending it carries nothing.
+- **An assigned actor on every command, bound at dispatch and never accepted as input.** This was investigated before being specified, and the investigation changed the requirement. A session receives no identity token: omnigent's agent-env allowlist admits only `HTTP_*`, `HTTPS_*`, proxy and `SSL_*` vars, `XDG_*`, `LANG`, `LC_`, `HOME`, `PATH`, `TERM`, `TMPDIR`, `NODE_EXTRA_CA_CERTS` and a bare `OMNIGENT=1` marker, and the runner's own auth secrets are stripped at every spawn boundary precisely so a child cannot impersonate it. Under M1-1's egress rules the session cannot reach the server either.
+
+  So there is nothing for a session to authenticate *with*, and it needs nothing: **the kernel dispatches the attempt, so it already knows whose work it is.** Identity is read from the kernel's own dispatch record and written into the command by the kernel, never carried in from outside. "Authenticated" here means *assigned by the mechanism*, not *verified on arrival* — and that is the stronger property, because an assigned identity cannot be forged by anyone, whereas a presented one is only as good as its verification.
+
+  The corollary is a hard rule: **`Command` must have no actor field a caller can populate.** `implementer_identity` and `reviewer_identity` were payload fields, which is how a caller came to name both sides of its own independence check.
 - **Identity-bearing facts.** An accepted command records the authenticated actor, not `"kernel"`. `actor="kernel"` is correct only for facts the kernel originates itself.
 - **Reviewer independence computed from authenticated identities**, comparing the actor who submitted the implementation against the actor who submitted the review. Both sides must be observations.
 - **A current implementation artifact with lineage**, tracked by the kernel, so an approval names *this run's present output* rather than any blob the store happens to hold. Existence is not identity.
