@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from kernel.canon import canonical_hash
 from kernel.events import EventKind
 from kernel.ownership import OwnershipLost, current_generation
 
@@ -60,13 +61,18 @@ def submit(store, cmd: Command) -> Result:
     # while the run is halted. Only genuinely new work is blocked.
     prior = store.command_result(cmd.idempotency_key, run_id=cmd.run_id)
     if prior is not None:
-        if prior["name"] != cmd.name:
+        request_hash = canonical_hash(
+            {"name": cmd.name, "run_id": cmd.run_id, "payload": cmd.payload}
+        )
+        if prior["name"] != cmd.name or prior["request_hash"] != request_hash:
             # Same key, same run, different command. Not a retry -- a key
             # reused for different work. Answering it with the earlier result
             # would attribute that command's authority to this one.
             raise ValueError(
                 f"idempotency key {cmd.idempotency_key!r} was already used in run "
-                f"{cmd.run_id!r} for {prior['name']!r}, not {cmd.name!r}"
+                f"{cmd.run_id!r} for a different request "
+                f"(stored {prior['name']!r}, now {cmd.name!r}); a key identifies "
+                "one request, not one name"
             )
         return Result(accepted=bool(prior["accepted"]), result=prior["result"], replayed=True)
 
@@ -103,7 +109,10 @@ def submit(store, cmd: Command) -> Result:
                          "payload": cmd.payload},
             )
             store.record_command(
-                cmd.idempotency_key, cmd.run_id, cmd.name, True, result
+                cmd.idempotency_key, cmd.run_id, cmd.name, True, result,
+                request_hash=canonical_hash(
+                    {"name": cmd.name, "run_id": cmd.run_id, "payload": cmd.payload}
+                ),
             )
     except StaleVersion:
         # Outside the transaction: the rejection must survive the rollback.

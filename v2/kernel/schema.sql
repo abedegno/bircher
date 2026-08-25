@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS commands (
   name            TEXT NOT NULL,
   accepted        INTEGER NOT NULL,
   result_json     TEXT NOT NULL,
+  request_hash    TEXT NOT NULL,
   at_us           INTEGER NOT NULL,
   PRIMARY KEY (run_id, idempotency_key)
 );

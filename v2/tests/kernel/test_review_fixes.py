@@ -6,7 +6,7 @@ from kernel import canon
 from kernel.canon import CANON_VERSION, canonical_bytes, canonical_hash
 from kernel.commands import Command, submit
 from kernel.effects import (
-    EffectClass, UncertainEffect, is_halted, perform, reconcile,
+    EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform, reconcile,
 )
 from kernel.ids import Clock
 from kernel.ownership import acquire
@@ -62,7 +62,7 @@ def test_reconcile_does_not_unhalt_while_another_effect_is_uncertain():
 
     # A second uncertain effect on the same run.
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.COMMENT, "k2", {}, boom, _bypass_halt=True)
+        _perform_unhalted(s, "r", gen, EffectClass.COMMENT, "k2", {}, boom)
     reconcile(s, "r", "k1", resolution="x", expected_version=s.run_version("r"))
     assert is_halted(s, "r"), "run unhalted while k2 is still uncertain"
 

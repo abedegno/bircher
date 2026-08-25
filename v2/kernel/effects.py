@@ -45,30 +45,42 @@ def is_halted(store, run_id: str) -> bool:
     return store.reconciliation_evidence(run_id) is not None
 
 
-def perform(
-    store, run_id, generation, effect_class, idempotency_key, intent, executor,
-    *, _bypass_halt: bool = False,
-):
-    if effect_class not in EffectClass.ALL:
-        raise ValueError(f"unknown effect class: {effect_class}")
+def perform(store, run_id, generation, effect_class, idempotency_key, intent, executor):
+    """Perform one externally visible effect, journalling intent first.
 
-    # The halt gates EFFECTS, not just commands. Gating only submit() left the
-    # mutating path open: a halted run could retry the very effect whose
-    # outcome is unknown, under a fresh key, which is the duplicate external
-    # mutation the halt exists to prevent.
-    #
-    # _bypass_halt exists only so a test can drive a SECOND effect to uncertain
-    # on an already-halted run; production callers never pass it.
-    if not _bypass_halt and is_halted(store, run_id):
+    There is deliberately no halt-bypass parameter: a comment saying
+    production never passes one is not an enforcement, and any caller could
+    have continued mutating a halted run. Tests that need the inner checks
+    call :func:`_perform_unhalted` directly.
+    """
+    if is_halted(store, run_id):
         raise RuntimeError(
             f"run {run_id} is halted pending reconciliation; resolve it before "
             "performing further effects"
         )
+    return _perform_unhalted(
+        store, run_id, generation, effect_class, idempotency_key, intent, executor
+    )
+
+
+def _perform_unhalted(
+    store, run_id, generation, effect_class, idempotency_key, intent, executor
+):
+    """The effect path with the run-level halt already checked by the caller."""
+    if effect_class not in EffectClass.ALL:
+        raise ValueError(f"unknown effect class: {effect_class}")
 
     existing = store.effect_by_key(idempotency_key, run_id=run_id)
     if existing is not None:
-        if existing["state"] == "uncertain":
-            raise UncertainEffect(f"{idempotency_key} needs reconciliation before retry")
+        if existing["state"] in ("uncertain", "intended"):
+            # `intended` means journalled but never confirmed -- a crash,
+            # KeyboardInterrupt or SystemExit between the two. Treating it as a
+            # completed replay returned a null external id, neither executing
+            # nor demanding reconciliation, and silently wedged the run.
+            raise UncertainEffect(
+                f"{idempotency_key} is {existing['state']!r} in run {run_id}: "
+                "its outcome is unknown and it must be reconciled before retry"
+            )
         return existing["external_object_id"]
 
     # Fence BEFORE journalling, so a superseded generation leaves no trace and
@@ -87,8 +99,11 @@ def perform(
     )
     try:
         external_id = executor(effect_class, intent, idempotency_key)
-    except Exception as exc:
-        store.mark_effect(idempotency_key, "uncertain", None)
+    except BaseException as exc:
+        # BaseException, not Exception: KeyboardInterrupt and SystemExit are
+        # exactly the crash-shaped interruptions that leave an effect's outcome
+        # unknown, and catching only Exception left them as bare `intended`.
+        store.mark_effect(idempotency_key, "uncertain", None, run_id=run_id)
         store.append_fact(
             run_id=run_id, kind=EventKind.EFFECT_UNCERTAIN, actor="kernel",
             causal_command_id=idempotency_key,
@@ -105,11 +120,17 @@ def perform(
                 f"Then reconcile(store, {run_id!r}, {idempotency_key!r}, resolution, version)",
             ],
         })
+        if not isinstance(exc, Exception):
+            # KeyboardInterrupt / SystemExit: the uncertainty is now recorded
+            # and the run halted, but the interrupt itself must propagate
+            # unchanged. Converting it to UncertainEffect would swallow a
+            # Ctrl-C and let the process carry on.
+            raise
         raise UncertainEffect(
             f"{effect_class} outcome unknown ({type(exc).__name__}); reconcile before retry"
         ) from exc
 
-    store.mark_effect(idempotency_key, "confirmed", external_id)
+    store.mark_effect(idempotency_key, "confirmed", external_id, run_id=run_id)
     store.append_fact(
         run_id=run_id, kind=EventKind.EFFECT_CONFIRMED, actor="kernel",
         causal_command_id=idempotency_key,
@@ -137,17 +158,22 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
             f"{state!r}, expected 'uncertain'"
         )
 
-    if not store.bump_version_cas(run_id, expected_version):
-        raise StaleVersion(
-            f"reconciliation derived from version {expected_version}, which has moved"
+    # One transaction: CAS, effect update, halt clear and audit fact were four
+    # autocommitted operations, so a crash could clear the safety halt and
+    # consume the version with no immutable audit event -- the opposite of "an
+    # audited command with expected-version CAS".
+    with store.transaction():
+        if not store.bump_version_cas(run_id, expected_version):
+            raise StaleVersion(
+                f"reconciliation derived from version {expected_version}, "
+                "which has moved"
+            )
+        store.mark_effect(idempotency_key, "reconciled", None, run_id=run_id)
+        # Only unhalt when nothing else is still uncertain. Clearing
+        # unconditionally unhalted a run with a second outstanding effect.
+        if not pending_reconciliation(store, run_id):
+            store.clear_reconciliation(run_id)
+        store.append_fact(
+            run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
+            causal_command_id=idempotency_key, payload={"resolution": resolution},
         )
-    store.mark_effect(idempotency_key, "reconciled", None)
-    # Only unhalt when nothing else is still uncertain. Clearing
-    # unconditionally unhalted the run while a second uncertain effect was
-    # outstanding -- and, with the gate above, that run could then act again.
-    if not pending_reconciliation(store, run_id):
-        store.clear_reconciliation(run_id)
-    store.append_fact(
-        run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
-        causal_command_id=idempotency_key, payload={"resolution": resolution},
-    )

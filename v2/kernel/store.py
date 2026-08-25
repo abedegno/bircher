@@ -159,22 +159,34 @@ class Store:
         collided and the second was answered with the first's result.
         """
         row = self._conn.execute(
-            "SELECT accepted, result_json, name FROM commands"
+            "SELECT accepted, result_json, name, request_hash FROM commands"
             " WHERE idempotency_key = ? AND run_id = ?",
             (idempotency_key, run_id),
         ).fetchone()
         if row is None:
             return None
-        return {"accepted": row[0], "result": json.loads(row[1]), "name": row[2]}
+        return {
+            "accepted": row[0],
+            "result": json.loads(row[1]),
+            "name": row[2],
+            "request_hash": row[3],
+        }
 
     def record_command(
-        self, key: str, run_id: str, name: str, accepted: bool, result: dict
+        self, key: str, run_id: str, name: str, accepted: bool, result: dict,
+        *, request_hash: str,
     ) -> None:
+        """Record a command outcome with a fingerprint of the REQUEST.
+
+        Storing only the name meant a replay check could not tell the same
+        command with a different payload from a genuine retry, and answered
+        the former with the earlier result.
+        """
         self._conn.execute(
             "INSERT INTO commands (idempotency_key, run_id, name, accepted,"
-            " result_json, at_us) VALUES (?,?,?,?,?,?)",
+            " result_json, request_hash, at_us) VALUES (?,?,?,?,?,?,?)",
             (key, run_id, name, int(accepted), json.dumps(result, sort_keys=True),
-             self._clock.now_us()),
+             request_hash, self._clock.now_us()),
         )
 
     def journal_intent(
@@ -188,11 +200,19 @@ class Store:
              json.dumps(intent, sort_keys=True), self._clock.now_us()),
         )
 
-    def mark_effect(self, idempotency_key: str, state: str, external_object_id) -> None:
+    def mark_effect(
+        self, idempotency_key: str, state: str, external_object_id, *, run_id: str
+    ) -> None:
+        """Update an effect's state WITHIN a run.
+
+        Reads and uniqueness were scoped per run while this UPDATE was not, so
+        confirming one run's effect also confirmed another run's effect that
+        happened to share the key.
+        """
         self._conn.execute(
             "UPDATE effects SET state = ?, external_object_id = ?"
-            " WHERE idempotency_key = ?",
-            (state, external_object_id, idempotency_key),
+            " WHERE idempotency_key = ? AND run_id = ?",
+            (state, external_object_id, idempotency_key, run_id),
         )
 
     def effect_by_key(self, idempotency_key: str, *, run_id: str) -> dict | None:

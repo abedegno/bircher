@@ -2,7 +2,8 @@ import pytest
 
 from kernel.commands import Command, StaleVersion, submit
 from kernel.effects import (
-    EffectClass, UncertainEffect, is_halted, pending_reconciliation, perform, reconcile,
+    EffectClass, UncertainEffect, _perform_unhalted, is_halted,
+    pending_reconciliation, perform, reconcile,
 )
 from kernel.ids import Clock
 from kernel.ownership import OwnershipLost, acquire
@@ -99,8 +100,7 @@ def test_an_uncertain_effect_blocks_retry_until_reconciled(store):
 
     # Layer 2: the per-key uncertain check, with the halt stood down.
     with pytest.raises(UncertainEffect, match="reconcil"):
-        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store),
-                _bypass_halt=True)
+        _perform_unhalted(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store))
 
 
 def test_replaying_a_confirmed_key_does_not_re_execute(store):
