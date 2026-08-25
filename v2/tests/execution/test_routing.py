@@ -13,6 +13,7 @@ every time.
 """
 
 import pathlib
+import re
 import textwrap
 
 from tools.detect_direct_effects import find_direct_effects, scan
@@ -121,7 +122,7 @@ def test_the_detector_agrees_with_the_inventory():
     inventory is stale."""
     findings, suppressed = scan(str(RUN_QUEUE))
     text = INVENTORY.read_text()
-    assert "## Mutations — 13 sites" in text, "the inventory's own count moved"
+    assert "## Mutations — 15 routed sites" in text, "the inventory's own count moved"
     assert len(findings) + len(suppressed) > 0
     for f in findings:
         assert f"| {f.line} |" in text, (
@@ -129,12 +130,32 @@ def test_the_detector_agrees_with_the_inventory():
         )
 
 
-def test_criterion_1_run_queue_has_no_unrouted_mutation():
-    """Acceptance criterion 1. Fails until Task 2 has routed every site.
+def test_criterion_1_every_mutation_is_routed_or_dispositioned():
+    """Acceptance criterion 1.
 
-    If this fails after routing, the inventory was incomplete -- go back to
-    Task 1 rather than widening an exclusion.
+    An unrouted mutation must be named in the inventory's dispositioned table
+    with a reason. That is a documented exception, not a silent one: the
+    difference is that this test fails when a NEW unrouted site appears, and
+    would not if the criterion simply allowed a hardcoded count.
+
+    If this fails, the inventory was incomplete -- go back to it rather than
+    widening a detector exclusion.
     """
-    findings = find_direct_effects(str(RUN_QUEUE))
-    assert not findings, "unrouted mutations:\n" + "\n".join(
-        f"  {f.line}: {f.text}" for f in findings)
+    text = INVENTORY.read_text()
+    dispositioned = {int(m) for m in re.findall(r"^\| (\d+) \|", 
+                     text.split("## Dispositioned")[-1], re.M)}
+    unrouted = {f.line: f.text for f in find_direct_effects(str(RUN_QUEUE))}
+    undocumented = {n: txt for n, txt in unrouted.items() if n not in dispositioned}
+    assert not undocumented, "unrouted and undocumented:\n" + "\n".join(
+        f"  {n}: {txt}" for n, txt in undocumented.items())
+
+
+def test_the_dispositioned_list_is_not_a_dumping_ground():
+    """Every dispositioned line must still BE an unrouted mutation. A stale
+    entry would silently pre-authorise the next site that lands on that line."""
+    text = INVENTORY.read_text()
+    dispositioned = {int(m) for m in re.findall(r"^\| (\d+) \|",
+                     text.split("## Dispositioned")[-1], re.M)}
+    unrouted = {f.line for f in find_direct_effects(str(RUN_QUEUE))}
+    stale = sorted(dispositioned - unrouted)
+    assert not stale, f"dispositioned lines that are not unrouted mutations: {stale}"

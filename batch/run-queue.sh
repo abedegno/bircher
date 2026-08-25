@@ -1185,7 +1185,8 @@ _create_session() {
 _send_prompt() {
   local body
   body=$(python3 -c 'import json,sys; print(json.dumps({"type":"message","data":{"role":"user","content":[{"type":"input_text","text":sys.argv[1]}]}}))' "$2" 2>/dev/null) || return 1
-  curl -sf --max-time 120 -X POST "$SERVER/v1/sessions/$1/events" \
+  _effect session_control "sess-prompt:$1" 120 \
+    curl -sf --max-time 120 -X POST "$SERVER/v1/sessions/$1/events" \
     -H 'content-type: application/json' -d "$body" >/dev/null 2>&1
 }
 
@@ -1203,7 +1204,8 @@ _stop_session() {
 # this on a holder whose run's history you still want; run-queue itself only
 # prunes a DUD holder (failed agent_id lookup, no run ever started).
 _prune_session() {
-  curl -sf --max-time 15 -X DELETE "$SERVER/v1/sessions/$1" >/dev/null 2>&1 \
+  _effect session_control "sess-stop:$1" 15 \
+    curl -sf --max-time 15 -X DELETE "$SERVER/v1/sessions/$1" >/dev/null 2>&1 \
     || echo "[batch] WARN: prune of session $1 failed" >&2
 }
 

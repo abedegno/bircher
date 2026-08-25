@@ -42,9 +42,46 @@ def test_the_two_sets_partition_every_class():
 
 def test_session_control_is_permitted_but_still_journalled():
     """Permitted does not mean unjournalled. A stop whose outcome is unknown
-    leaves ownership ambiguous, and that ambiguity is a durable fact."""
+    leaves ownership ambiguous, and that ambiguity is a durable fact.
+
+    The previous version of this test asserted membership in two Python sets.
+    It journalled nothing, and passed for the whole period during which
+    session control was performed by unrouted `curl` calls. This one performs
+    the effect and reads the journal.
+    """
+    from kernel.dispatch import Role, dispatch
+    from kernel.effects import perform
+    from kernel.ids import Clock
+    from kernel.store import Store
+
     assert EffectClass.SESSION_CONTROL in PERMITTED
-    assert EffectClass.SESSION_CONTROL in EffectClass.ALL
+    s = Store.open(":memory:", clock=Clock(start_us=1))
+    s.create_run(run_id="r", base_repo="o/r", base_sha="a" * 40)
+    gen = dispatch(s, "r", actor="coordinator", role=Role.OPERATOR).generation
+    perform(s, "r", gen, EffectClass.SESSION_CONTROL, "stop:1",
+            {"argv": ["curl", "-X", "DELETE", "http://srv/v1/sessions/1"]},
+            lambda *a: "stopped")
+    kinds = [f.kind for f in s.facts_for("r") if f.kind.startswith("effect_")]
+    assert "effect_intended" in kinds and "effect_confirmed" in kinds
+
+
+def test_an_uncertain_session_stop_halts_the_run():
+    """The hazard the spec names: a stop that may or may not have happened."""
+    import pytest as _pt
+
+    from kernel.dispatch import Role, dispatch
+    from kernel.effects import UncertainEffect, is_halted, perform
+    from kernel.ids import Clock
+    from kernel.store import Store
+
+    s = Store.open(":memory:", clock=Clock(start_us=1))
+    s.create_run(run_id="r", base_repo="o/r", base_sha="a" * 40)
+    gen = dispatch(s, "r", actor="coordinator", role=Role.OPERATOR).generation
+    with _pt.raises(UncertainEffect):
+        perform(s, "r", gen, EffectClass.SESSION_CONTROL, "stop:1",
+                {"argv": ["curl", "-X", "DELETE", "http://srv/v1/sessions/1"]},
+                lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
+    assert is_halted(s, "r")
 
 
 def test_merge_is_its_own_class_and_is_forbidden_to_models():
@@ -61,15 +98,26 @@ def test_every_class_the_coordinator_routes_is_classified():
     classes = set(re.findall(r"\| `(\w+)` \|", INVENTORY.read_text()))
     routed = {c for c in classes if c in EffectClass.ALL}
     assert routed, "no effect classes parsed out of the inventory"
-    assert routed <= FORBIDDEN_TO_MODELS, (
-        f"the coordinator routes classes that are not forbidden to models: "
-        f"{sorted(routed - FORBIDDEN_TO_MODELS)}"
-    )
+    unclassified = routed - PERMITTED - FORBIDDEN_TO_MODELS
+    assert not unclassified, f"routed but unclassified: {sorted(unclassified)}"
 
 
-def test_the_coordinator_never_routes_a_permitted_class():
-    """Session control is the kernel's own business. If it ever appears in the
-    coordinator's inventory, the boundary has moved and this test should be
-    the thing that says so."""
+def test_the_coordinator_routes_session_control():
+    """This test used to assert the OPPOSITE -- that no permitted class
+    appears in the inventory -- with a comment reading "session control is the
+    kernel's own business". It did not appear because it was never routed:
+    three live `curl` calls to $SERVER/v1/sessions were performing session
+    create, prompt and stop with no journal at all. The test compared two
+    hand-written sets and passed, reflecting the omission rather than
+    detecting it.
+
+    Permitted means the kernel MAY perform it, not that it happens outside the
+    journal. Spec section 5 names "session dispatch, stop, and reconciliation
+    wherever ambiguity affects ownership" as a journalled class, and section
+    on uncertainty names the exact hazard: a session stop may be unconfirmed.
+    """
     classes = set(re.findall(r"\| `(\w+)` \|", INVENTORY.read_text()))
-    assert not (classes & PERMITTED)
+    assert EffectClass.SESSION_CONTROL in classes, (
+        "session control is not routed, so a stop whose outcome is unknown "
+        "leaves ownership ambiguous with nothing recording it"
+    )

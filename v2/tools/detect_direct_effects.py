@@ -30,7 +30,13 @@ MUTATION = re.compile(r"""
   | gh\s+["']?api["']?\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
   | gh\s+["']?api["']?\b[^|\n]*\bstatuses/
   | git\s+(-C\s+\S+\s+)?["']?push
+  | curl\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
 """, re.VERBOSE)
+#: `curl` with a mutating method. Added in round 6: the pattern knew only `gh`
+#: and `git push`, and the inventory claimed to union "five independent grep
+#: patterns" -- all five of which looked for those same two commands, so the
+#: union of five patterns was one pattern. Three live session_control
+#: mutations were invisible to every one of them.
 #: `statuses/` with the slash: the bare word also occurs in the jq filter
 #: `.statuses[] | select(...)` used to VERIFY a status, which is a GET. That
 #: match was being suppressed only because it happened to fall inside quotes --
