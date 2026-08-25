@@ -27,6 +27,12 @@ def _store(*runs):
 
 
 def _sub(s, name, key, actor, role, run="r", **payload):
+    if name == "request_merge":
+        # A merge authorization must name its target (round 6, C2). Defaulted
+        # here because these tests are about other properties; the binding
+        # itself is asserted in test_effect_contract.py.
+        payload.setdefault("pr", 42)
+        payload.setdefault("repo", "abedegno/muesli")
     return submit(s, Command(
         name=name, run_id=run, expected_version=s.run_version(run),
         idempotency_key=key,

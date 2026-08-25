@@ -63,6 +63,20 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
     # merge through perform() without an accepted verdict, green CI, or ever
     # reaching merge_requested. Rechecked HERE, immediately before execution,
     # because authorization granted at transition time can go stale.
+    from kernel.authz import NotAuthorized
+    from kernel.contract import ContractViolation, check, merge_target
+
+    # The class must describe what the argv actually does. Without this the
+    # class is a label the caller picks, and picking a non-merge label skipped
+    # the merge gate entirely. Checked for EVERY class, before anything else:
+    # an effect whose shape the kernel cannot account for does not run.
+    argv = list(intent.get("argv") or [])
+    if argv:
+        try:
+            check(effect_class, argv)
+        except ContractViolation as exc:
+            raise NotAuthorized(str(exc)) from exc
+
     if effect_class == EffectClass.MERGE:
         from kernel.authz import revalidate_merge
 
@@ -70,7 +84,19 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
         # before execution. Checking only `state == "merge_requested"` treated
         # a record THAT authorization happened as the authorization itself --
         # and a merge executed with the reviewed artifact deleted in between.
-        revalidate_merge(store, run_id)
+        authorized = revalidate_merge(store, run_id)
+
+        # ...and the effect must act on what was authorized. Revalidation
+        # proves that A merge is authorized for this run; without this, an
+        # authorized run merged PR 9999 in someone else's repository.
+        if argv:
+            pr, repo = merge_target(argv)
+            if str(pr) != str(authorized.get("pr")) or repo != authorized.get("repo"):
+                raise NotAuthorized(
+                    f"merge targets pr={pr!r} repo={repo!r}, but the kernel "
+                    f"authorized pr={authorized.get('pr')!r} "
+                    f"repo={authorized.get('repo')!r}"
+                )
 
     if is_halted(store, run_id):
         raise RuntimeError(

@@ -349,6 +349,15 @@ def authorize(store, cmd, actor: str) -> str | None:
         return _MERGE_OUTCOMES[outcome]
 
     if cmd.name == "request_merge":
+        # The authorization has to record a TARGET, or the effect has nothing
+        # to be bound to and any PR satisfies it.
+        pr, repo = cmd.payload.get("pr"), cmd.payload.get("repo")
+        if pr in (None, "") or not isinstance(repo, str) or not repo:
+            raise NotAuthorized(
+                "request_merge must name the pr and repo it authorizes: an "
+                "authorization with no target authorizes every target"
+            )
+
         current = store.current_artifact(cmd.run_id)
         if cmd.payload.get("artifact_hash") != current:
             raise NotAuthorized(

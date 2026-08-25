@@ -228,6 +228,10 @@ def submit(store, cmd: Command) -> Result:
                         "context_bundle_hash": cmd.payload.get("context_bundle_hash"),
                         "policy_version": cmd.payload.get("policy_version"),
                         "head_git_sha": cmd.payload.get("head_git_sha"),
+                        # The target. Without it, revalidation proves a merge
+                        # is authorized without proving WHICH merge.
+                        "pr": cmd.payload.get("pr"),
+                        "repo": cmd.payload.get("repo"),
                     },
                 )
             if cmd.name == "record_implementation_output":

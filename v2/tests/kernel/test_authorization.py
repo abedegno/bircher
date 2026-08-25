@@ -40,6 +40,12 @@ def _submit(s, name, key, actor=None, **payload):
     outright -- so the actor is chosen HERE, where the supervisor chooses it,
     and the command inherits it.
     """
+    if name == "request_merge":
+        # A merge authorization must name its target (round 6, C2). Defaulted
+        # here because these tests are about other properties; the binding
+        # itself is asserted in test_effect_contract.py.
+        payload.setdefault("pr", 42)
+        payload.setdefault("repo", "abedegno/muesli")
     role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
     if actor is None:
         actor = "codex" if role == Role.REVIEWER else "claude"

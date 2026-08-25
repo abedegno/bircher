@@ -21,6 +21,12 @@ BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
 
 def _sub(s, name, key, actor, role, **payload):
+    if name == "request_merge":
+        # A merge authorization must name its target (round 6, C2). Defaulted
+        # here because these tests are about other properties; the binding
+        # itself is asserted in test_effect_contract.py.
+        payload.setdefault("pr", 42)
+        payload.setdefault("repo", "abedegno/muesli")
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
         idempotency_key=key,

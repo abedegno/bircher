@@ -132,4 +132,9 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['head_git_sha']",
         "cmd.payload['context_bundle_hash']",
         "payload['policy_version']",
+        # Round 6, C2: binding the merge effect to the authorization made the
+        # authorization's own target an authorization input. It is asserted,
+        # and closing it is blocked on the kernel creating the PR (C8).
+        "cmd.payload['pr']",
+        "cmd.payload['repo']",
     }

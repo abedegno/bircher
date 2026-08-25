@@ -126,6 +126,36 @@ def logical_lines(path: str):
         yield start, buf
 
 
+def code_lines(path: str):
+    """Yield (line_no, logical_line, quote_mask, is_comment) for real code.
+
+    Heredoc bodies not fed to an interpreter are dropped; comments are yielded
+    flagged but do NOT feed the quote state, because an apostrophe in prose
+    ("don't") opens a string that never closes and every later line then reads
+    as quoted.
+
+    Extracted so the detector and anything else that has to answer "is this
+    line code?" share one implementation. A second, subtly different copy in a
+    test silently cut its own extraction from 13 call sites to 6.
+    """
+    quote: str | None = None
+    heredoc: str | None = None
+    for n, line in logical_lines(path):
+        stripped = line.lstrip()
+        if heredoc is not None:
+            if stripped == heredoc:
+                heredoc = None
+            continue
+        if quote is None and (m := _HEREDOC.search(line)):
+            if not _INTERPRETER.search(line[:m.start()]):
+                heredoc = m.group(2)
+        if quote is None and stripped.startswith("#"):
+            yield n, line, None, True
+            continue
+        mask, quote = quote_mask(line, quote)
+        yield n, line, mask, False
+
+
 def scan(path: str) -> tuple[list[Finding], list[Suppressed]]:
     """Return (unrouted mutations, matches suppressed with the reason)."""
     findings: list[Finding] = []
