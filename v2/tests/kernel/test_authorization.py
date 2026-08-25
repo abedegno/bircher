@@ -11,7 +11,9 @@ import pytest
 
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized, legal_states_for, next_state_for
+from kernel.effects import EffectClass, perform
 from kernel.commands import Command, submit
+from kernel.effects import EffectClass, perform
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.projection import project
@@ -61,9 +63,12 @@ def test_the_full_lifecycle_advances_to_a_terminal_state():
     _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
             base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
             policy_version=1)
-    _submit(s, "request_merge", "rm", artifact_hash=SPEC, base_sha=BASE,
+    _submit(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
             context_bundle_hash=BUNDLE, reviewer_identity="codex", policy_version=1)
     assert s.run_state("r") == "merge_requested"
+    # The merge effect must actually happen before its outcome is reported.
+    perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
+            lambda *a: "merged!")
     _submit(s, "record_merge_outcome", "mo", outcome="merged")
     assert s.run_state("r") == "merged"
     assert project(s.facts_for("r")).state == "merged", (
@@ -78,12 +83,15 @@ def test_a_command_out_of_order_is_refused():
 
 
 @pytest.mark.parametrize("reach", ["queued", "specified", "planned",
-                                   "implementing", "reviewing"])
+                                   "implementing", "reviewing",
+                                   "merge_requested"])
 def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
     """The old version tested only `queued`, so restricting cancellation to
     `queued` alone left it green -- it asserted the name of the property and
     exercised one case of it."""
     s = _store()
+    # request_merge needs CI evidence, so it is supplied up front rather than
+    # as a step -- record_ci_observation does not transition.
     steps = [
         ("specified", "submit_spec", {"spec_sha256": SPEC}),
         ("planned", "submit_plan", {"plan_sha256": PLAN}),
@@ -93,10 +101,20 @@ def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
                                         "context_bundle_hash": BUNDLE,
                                         "reviewer_identity": "codex",
                                         "policy_version": 1}),
+        ("merge_requested", "request_merge", {"artifact_hash": SPEC,
+                                              "base_sha": BASE,
+                                              "context_bundle_hash": BUNDLE,
+                                              "reviewer_identity": "codex",
+                                              "policy_version": 1,
+                                              "head_git_sha": HEAD}),
     ]
     for i, (state, name, payload) in enumerate(steps):
         if s.run_state("r") == reach:
             break
+        if name == "request_merge":
+            # CI evidence is a precondition of the merge gate, not a state.
+            _submit(s, "record_ci_observation", "cis", status="success",
+                    head_git_sha=HEAD)
         _submit(s, name, f"s{i}", **payload)
     assert s.run_state("r") == reach
     assert _submit(s, "cancel_run", "cancel").accepted
@@ -133,7 +151,7 @@ def test_request_merge_without_an_accepted_review_is_refused():
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
-        _submit(s, "request_merge", "k5", artifact_hash=SPEC, base_sha=BASE,
+        _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
                 context_bundle_hash=BUNDLE, reviewer_identity="codex",
                 policy_version=1)
 
@@ -144,7 +162,7 @@ def test_request_merge_with_an_accepted_review_is_authorized():
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
-    assert _submit(s, "request_merge", "k5", artifact_hash=SPEC, base_sha=BASE,
+    assert _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash=SPEC, base_sha=BASE,
                    context_bundle_hash=BUNDLE, reviewer_identity="codex",
                    policy_version=1).accepted
     assert s.run_state("r") == "merge_requested"
@@ -159,7 +177,7 @@ def test_a_verdict_bound_to_different_inputs_does_not_authorize_a_merge():
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
-        _submit(s, "request_merge", "k5", artifact_hash="f" * 64, base_sha=BASE,
+        _submit(s, "request_merge", "k5", head_git_sha=HEAD, artifact_hash="f" * 64, base_sha=BASE,
                 context_bundle_hash=BUNDLE, reviewer_identity="codex",
                 policy_version=1)
 

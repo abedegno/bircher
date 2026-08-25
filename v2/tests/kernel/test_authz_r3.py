@@ -5,6 +5,7 @@ import pytest
 
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
+from kernel.effects import EffectClass, perform
 from kernel.commands import Command, submit
 from kernel.ids import Clock
 from kernel.ownership import acquire
@@ -66,7 +67,7 @@ def test_malformed_request_merge_is_rejected_not_crashed():
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
          reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized):
-        _sub(s, "request_merge", "k5", owner="impl", artifact_hash=SPEC)
+        _sub(s, "request_merge", "k5", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC)
 
 
 def test_policy_version_is_not_coerced_across_types():
@@ -77,7 +78,7 @@ def test_policy_version_is_not_coerced_across_types():
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
          reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized):
-        _sub(s, "request_merge", "k5", owner="impl", artifact_hash=SPEC,
+        _sub(s, "request_merge", "k5", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC,
              base_sha=BASE, context_bundle_hash=BUNDLE,
              reviewer_identity="codex", policy_version=1.9)
 
@@ -94,9 +95,12 @@ def test_merge_outcomes_move_the_run_where_they_should(outcome, expected):
          reviewer_identity="codex", policy_version=1)
     _sub(s, "record_ci_observation", "ci", owner="impl", status="success",
          head_git_sha=HEAD)
-    _sub(s, "request_merge", "rm", owner="impl", artifact_hash=SPEC,
+    _sub(s, "request_merge", "rm", head_git_sha=HEAD, owner="impl", artifact_hash=SPEC,
          base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
          policy_version=1)
+    if outcome == "merged":
+        perform(s, "r", acquire(s, "r", "impl"), EffectClass.MERGE, "m", {},
+                lambda *a: "merged!")
     _sub(s, "record_merge_outcome", "mo", owner="impl", outcome=outcome)
     assert s.run_state("r") == expected
 

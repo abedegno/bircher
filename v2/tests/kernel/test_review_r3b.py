@@ -57,7 +57,7 @@ def test_merge_without_ci_evidence_is_refused():
          artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
          reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="CI"):
-        _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
+        _sub(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
              context_bundle_hash=BUNDLE, reviewer_identity="codex",
              policy_version=1)
 
@@ -69,7 +69,7 @@ def test_merge_with_a_failing_ci_observation_is_refused():
          artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
          reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="CI"):
-        _sub(s, "request_merge", "rm", artifact_hash=spec, base_sha=BASE,
+        _sub(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
              context_bundle_hash=BUNDLE, reviewer_identity="codex",
              policy_version=1)
 
@@ -103,7 +103,7 @@ def test_request_revision_allows_reimplementation():
 # --- 5. every authorization failure records a rejection ----------------------
 
 @pytest.mark.parametrize("name,payload", [
-    ("request_merge", {}),                       # illegal from queued
+    ("request_merge", {"head_git_sha": HEAD}),                       # illegal from queued
     ("submit_plan", {"plan_sha256": "b" * 64}),  # out of order
 ])
 def test_authorization_failures_record_a_rejection_fact(name, payload):

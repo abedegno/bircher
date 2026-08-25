@@ -94,6 +94,7 @@ def submit(store, cmd: Command) -> Result:
         return Result(accepted=bool(prior["accepted"]), result=prior["result"], replayed=True)
 
     if is_halted(store, cmd.run_id) and cmd.name != "cancel_run":
+        _record_rejection(store, cmd, "halted", "run halted pending reconciliation")
         raise RuntimeError(
             f"run {cmd.run_id} is halted pending reconciliation; resolve it first"
         )

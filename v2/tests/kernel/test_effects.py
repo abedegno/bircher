@@ -35,11 +35,16 @@ class Recorder:
         return "ext_123"
 
 
-def test_the_eight_effect_classes_are_all_declared():
+def test_the_effect_classes_are_all_declared():
     """If this set shrinks, effects silently stop being journalled -- which is
-    how PR creation was lost from an earlier revision of the journal."""
+    how PR creation was lost from an earlier revision of the journal.
+
+    `merge` is separate from `pull_request`: folding them together meant the
+    journal could not distinguish opening a PR from merging one, and the
+    authority-bearing operation shared a gate with the routine one.
+    """
     assert sorted(EffectClass.ALL) == sorted([
-        "ref_update", "pull_request", "status_check", "comment",
+        "ref_update", "pull_request", "merge", "status_check", "comment",
         "issue_or_label", "revert_or_recovery", "credential_lifecycle",
         "session_control",
     ])

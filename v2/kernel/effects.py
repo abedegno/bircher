@@ -15,6 +15,10 @@ from kernel.ownership import OwnershipLost, current_generation
 class EffectClass:
     REF_UPDATE = "ref_update"
     PULL_REQUEST = "pull_request"
+    # Merge is its own class. Folding it into PULL_REQUEST meant the effect
+    # journal could not distinguish opening a PR from merging one, and the
+    # authority-bearing operation shared a gate with the routine one.
+    MERGE = "merge"
     STATUS_CHECK = "status_check"
     COMMENT = "comment"
     ISSUE_OR_LABEL = "issue_or_label"
@@ -22,7 +26,7 @@ class EffectClass:
     CREDENTIAL_LIFECYCLE = "credential_lifecycle"
     SESSION_CONTROL = "session_control"
     ALL = frozenset({
-        REF_UPDATE, PULL_REQUEST, STATUS_CHECK, COMMENT,
+        REF_UPDATE, PULL_REQUEST, MERGE, STATUS_CHECK, COMMENT,
         ISSUE_OR_LABEL, REVERT_OR_RECOVERY, CREDENTIAL_LIFECYCLE, SESSION_CONTROL,
     })
 
@@ -53,6 +57,21 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
     have continued mutating a halted run. Tests that need the inner checks
     call :func:`_perform_unhalted` directly.
     """
+    # The effect path carries its own authorization. Gating only submit() left
+    # the authority-bearing operation ungated: a current owner could execute a
+    # merge through perform() without an accepted verdict, green CI, or ever
+    # reaching merge_requested. Rechecked HERE, immediately before execution,
+    # because authorization granted at transition time can go stale.
+    if effect_class == EffectClass.MERGE:
+        from kernel.authz import NotAuthorized
+
+        state = store.run_state(run_id)
+        if state != "merge_requested":
+            raise NotAuthorized(
+                f"a merge effect requires the kernel to have authorized it: run "
+                f"is {state!r}, not 'merge_requested'"
+            )
+
     if is_halted(store, run_id):
         raise RuntimeError(
             f"run {run_id} is halted pending reconciliation; resolve it before "

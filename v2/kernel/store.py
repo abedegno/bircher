@@ -187,6 +187,13 @@ class Store:
         ).fetchone()
         return None if row is None else int(row[0])
 
+    def has_confirmed_effect(self, run_id: str, effect_class: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM effects WHERE run_id = ? AND effect_class = ?"
+            " AND state = 'confirmed'",
+            (run_id, effect_class),
+        ).fetchone() is not None
+
     def has_artifact(self, content_hash: str) -> bool:
         return self._conn.execute(
             "SELECT 1 FROM artifacts WHERE hash = ?", (content_hash,)
