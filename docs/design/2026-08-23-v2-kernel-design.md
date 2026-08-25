@@ -136,6 +136,25 @@ The kernel validates the schema, confirms every referenced hash still matches, c
 
 `accept` from the judgement layer means "no unresolved blockers for the pinned review bundle". It does not mean merge.
 
+### 4b. Actor identity, and why the first implementation had none
+
+**Every authorization input must have a stated provenance: the kernel observed it, or an actor asserted it.** An earlier implementation of this design passed five review rounds while five of the six links in its merge-authorization chain were caller assertions, and it took a full-effort adversarial pass to name why.
+
+The omission was structural rather than careless. The command envelope carried a run, a version, an idempotency key and a generation — and **no authenticated actor**. `implementer_identity` and `reviewer_identity` were fields in the command payload. The kernel recorded each accepted fact as `actor="kernel"` while faithfully copying whatever the caller claimed. So reviewer independence compared two strings the same caller chose; CI status and head were whatever the caller said; and the artifact was checked for existence but never for lineage. Each individual check was correctly implemented. The chain proved nothing.
+
+Demonstrated, not theorised: the caller recorded as implementer submitted its own `accept` naming a different reviewer, asserted green CI, reached `merge_requested`, and then had the reviewed artifact deleted — and authorization still succeeded.
+
+So the kernel requires:
+
+- **An authenticated actor on every command**, supplied by the mechanism that admitted the caller — the runner-issued attempt identity — and never by the command payload. A command that carries its own claim of who is sending it carries nothing.
+- **Identity-bearing facts.** An accepted command records the authenticated actor, not `"kernel"`. `actor="kernel"` is correct only for facts the kernel originates itself.
+- **Reviewer independence computed from authenticated identities**, comparing the actor who submitted the implementation against the actor who submitted the review. Both sides must be observations.
+- **A current implementation artifact with lineage**, tracked by the kernel, so an approval names *this run's present output* rather than any blob the store happens to hold. Existence is not identity.
+- **CI as an observation, not a report.** A status and head supplied in a command payload is a claim; the kernel must either fetch it from the provider itself or bind the claim to an attestation it can verify.
+- **The authorized binding carried into the effect**, so `perform()` re-evaluates the semantic evidence immediately before acting rather than checking only that the run reached a state. Reaching `merge_requested` records that authorization *happened*; it is not the authorization.
+
+**The provenance table is a required Milestone 1 artifact.** One row per authorization input, naming its source and whether the kernel observed it. An input whose row reads "asserted" is either a defect or a declared residual with a reason; there is no third case. This document's own earlier revisions could not have produced that table, which is why the gap survived three rounds of repair.
+
 ### 5. Effect journal, defined by semantic effect class
 
 Persist intent before invoking the effect; carry an idempotency key; record the external object identifier; reconcile an uncertain result before retrying; revalidate authorization immediately before merge.
@@ -164,6 +183,7 @@ Everything else is reversible. These are not.
 | **Fact / decision / effect are distinct** | Collapsed into mutable status rows, audit and replay become guesswork |
 | **Stable identity and idempotency-key scope** | Integrations depend on identity semantics; changing them later is dangerous |
 | **An approval authorizes a tuple of immutable inputs** | Not a filename, branch name, issue number or "latest" |
+| **Actor identity is authenticated by the mechanism, never carried in a payload** | Retrofitting it means re-deriving every authorization decision ever recorded, and the facts that recorded them cannot be rewritten |
 | **The authority boundary** | If models hold ambient merge authority first, you cannot establish the historical audit was complete |
 | **Expected-version compare-and-swap on mutating commands** | Otherwise stale decisions silently apply to newer state |
 | **Persist-before-execute for irreversible effects** | Retrofitting after calls are scattered through coordinators is expensive |
