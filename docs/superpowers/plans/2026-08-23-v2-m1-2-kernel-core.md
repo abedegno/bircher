@@ -10,6 +10,19 @@
 
 **Spec:** `docs/design/2026-08-23-v2-kernel-design.md` (branch `v2`, commit `6a2be96`)
 
+## STATUS: COMPLETE (2026-08-25)
+
+All four tasks implemented in `v2/`, 35 tests passing. Every guard mutation-tested; each mutation caught by exactly one test, no collateral failures.
+
+**Two places the plan was wrong, corrected during execution:**
+
+- The canonical form's float check inspected only the top level. A payload is exactly where nested values live, so it now recurses, with its own test.
+- `test_ordering_is_by_sequence_not_timestamp` **did not bind**. It froze the clock and appended two facts at the same microsecond — but ties resolve to insertion order anyway, so `ORDER BY observed_at_us` produced identical output and the mutation survived. Rewritten with a clock running *backwards*, so sequence and timestamp order actively disagree; the mutation now reds it.
+
+**One process failure worth recording:** I mutated `projection.py` before committing it, so `git checkout` had nothing to restore and the mutation persisted silently. The corrected rule exists precisely for this — commit first, then mutate, then restore from a known state — and I broke it on an untracked file. Caught by checking rather than assuming the restore worked.
+
+---
+
 ## Global Constraints
 
 Copied from the spec's "Decisions that must be right in the first commit". These are the irreversible ones; getting them wrong cannot be retrofitted.
