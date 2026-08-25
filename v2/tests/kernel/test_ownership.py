@@ -47,44 +47,48 @@ def test_acquire_on_unknown_run_raises(store):
 
 class _InterleavingConn:
     """Delegates to the real connection, running a competing acquisition once,
-    between a SELECT of owner_generation and whatever writes it.
+    immediately BEFORE the statement that writes owner_generation.
 
-    sqlite3.Connection.execute is read-only so it cannot be patched directly;
-    Store._conn is an ordinary attribute, so the whole connection is wrapped.
+    That is the read-then-write window: a broken implementation has already
+    read the old value by this point, so the competing write is about to be
+    clobbered. Hooking the SELECT instead is useless -- the victim would then
+    read the interloper's value and lose nothing.
+
+    sqlite3.Connection.execute is read-only so it cannot be patched; Store._conn
+    is an ordinary attribute, so the whole connection is wrapped.
     """
 
-    def __init__(self, real, on_select):
-        self._real, self._on_select, self._fired = real, on_select, False
+    def __init__(self, real, on_write):
+        self._real, self._on_write, self._fired = real, on_write, False
 
     def execute(self, sql, *args):
-        if not self._fired and sql.lstrip().upper().startswith("SELECT OWNER_GENERATION"):
+        upper = sql.lstrip().upper()
+        if not self._fired and upper.startswith("UPDATE RUNS SET OWNER_GENERATION"):
             self._fired = True
-            self._on_select()
+            self._on_write()
         return self._real.execute(sql, *args)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
 
 
-def test_concurrent_acquisition_cannot_share_a_generation(store):
+def test_two_acquisitions_can_never_hold_the_same_generation(store):
     """Forces the interleaving rather than sampling for it.
 
-    A sequential test cannot tell CAS from read-then-write: both yield
+    A sequential test cannot tell CAS from read-then-write -- both yield
     distinct generations. This runs a competing acquisition in the window a
-    read-then-write implementation leaves open -- between reading
-    owner_generation and writing it back -- and asserts no update was lost.
-
-    Under the correct single-statement CAS there is no SELECT in acquire, so
-    the interloper never fires and this passes trivially. That is the point: it
-    is red only for the broken shape.
+    read-then-write leaves open, then asserts the two owners hold DIFFERENT
+    generations. Under read-then-write the victim writes old+1, clobbering the
+    interloper, and both end up believing they hold the same number.
     """
     import kernel.ownership as own
 
     real = store._conn
+    interloper_gen = {}
 
     def interlope():
-        store._conn = real  # avoid recursing through the wrapper
-        own.acquire(store, "r", owner="interloper")
+        store._conn = real  # do not recurse through the wrapper
+        interloper_gen["g"] = own.acquire(store, "r", owner="interloper")
 
     store._conn = _InterleavingConn(real, interlope)
     try:
@@ -92,7 +96,7 @@ def test_concurrent_acquisition_cannot_share_a_generation(store):
     finally:
         store._conn = real
 
-    assert victim_gen == current_generation(store, "r"), (
-        f"victim holds generation {victim_gen} but current is "
-        f"{current_generation(store, 'r')}: a competing acquisition was lost"
+    assert interloper_gen["g"] != victim_gen, (
+        f"both owners hold generation {victim_gen}: the interloper's "
+        "acquisition was clobbered by a read-then-write"
     )
