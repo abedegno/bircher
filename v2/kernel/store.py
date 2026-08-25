@@ -187,6 +187,12 @@ class Store:
         ).fetchone()
         return None if row is None else int(row[0])
 
+    def delete_blob(self, content_hash: str) -> None:
+        """Drop an artifact. Content-addressed storage is not append-only
+        forever: blobs are collected, and an approval must not outlive the
+        object it approved."""
+        self._conn.execute("DELETE FROM artifacts WHERE hash = ?", (content_hash,))
+
     def set_current_artifact(self, run_id: str, artifact_hash: str) -> None:
         self._conn.execute(
             "UPDATE runs SET current_artifact_hash = ? WHERE run_id = ?",

@@ -24,6 +24,7 @@ class EventKind:
     EFFECT_UNCERTAIN = "effect_uncertain"
     EFFECT_RECONCILED = "effect_reconciled"
     ATTEMPT_DISPATCHED = "attempt_dispatched"
+    MERGE_AUTHORIZED = "merge_authorized"
 
 
 SCHEMA_VERSIONS = {
@@ -42,6 +43,7 @@ SCHEMA_VERSIONS = {
     EventKind.EFFECT_UNCERTAIN: 1,
     EventKind.EFFECT_RECONCILED: 1,
     EventKind.ATTEMPT_DISPATCHED: 1,
+    EventKind.MERGE_AUTHORIZED: 1,
 }
 
 MECHANISM_VERSION = 1

@@ -214,6 +214,22 @@ def submit(store, cmd: Command) -> Result:
                     "payload": cmd.payload,
                 },
             )
+            if cmd.name == "request_merge":
+                # What was authorized, recorded by the kernel at the moment it
+                # authorized it. Reaching `merge_requested` says a decision was
+                # made; this says what the decision was ABOUT, so the effect
+                # path can re-derive it instead of trusting its own intent.
+                store.append_fact(
+                    run_id=cmd.run_id, kind=EventKind.MERGE_AUTHORIZED,
+                    actor=actor, causal_command_id=cmd.idempotency_key,
+                    payload={
+                        "artifact_hash": cmd.payload.get("artifact_hash"),
+                        "base_sha": cmd.payload.get("base_sha"),
+                        "context_bundle_hash": cmd.payload.get("context_bundle_hash"),
+                        "policy_version": cmd.payload.get("policy_version"),
+                        "head_git_sha": cmd.payload.get("head_git_sha"),
+                    },
+                )
             if cmd.name == "record_implementation_output":
                 store.set_current_artifact(cmd.run_id, cmd.payload["artifact_hash"])
             if review_binding is not None:

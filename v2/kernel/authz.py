@@ -338,3 +338,89 @@ def authorize(store, cmd, actor: str) -> str | None:
         )
 
     return next_state
+
+
+def latest_merge_authorization(store, run_id: str) -> dict | None:
+    """What the kernel authorized for merge, as the kernel recorded it."""
+    latest = None
+    for fact in store.facts_for(run_id):
+        if fact.kind == EventKind.MERGE_AUTHORIZED:
+            latest = fact.payload
+    return latest
+
+
+def revalidate_merge(store, run_id: str) -> dict:
+    """Re-run merge authorization immediately before the effect executes.
+
+    Reaching `merge_requested` RECORDS that authorization happened; it is not
+    the authorization. Between the transition and the effect the world moves:
+    the reviewed artifact can be deleted, a revision can land, CI can be
+    superseded, the reviewer's independence can lapse. The effect path
+    previously checked only the state name, and a merge executed with the
+    reviewed artifact deleted out from under it.
+
+    Every input here is re-derived from kernel state. Nothing is read from the
+    effect's intent, which is supplied by the caller asking for the effect.
+    """
+    state = store.run_state(run_id)
+    if state != "merge_requested":
+        raise NotAuthorized(
+            f"a merge effect requires the kernel to have authorized it: run "
+            f"is {state!r}, not 'merge_requested'"
+        )
+
+    authorized = latest_merge_authorization(store, run_id)
+    if authorized is None:
+        raise NotAuthorized(
+            "the run is in merge_requested with no recorded merge "
+            "authorization: revalidation has nothing to check"
+        )
+
+    artifact = authorized.get("artifact_hash")
+    if not store.has_artifact(artifact):
+        raise NotAuthorized(
+            f"revalidation failed: the approved artifact {str(artifact)[:12]}... "
+            "is no longer held by the kernel"
+        )
+    current = store.current_artifact(run_id)
+    if artifact != current:
+        raise NotAuthorized(
+            "revalidation failed: the run's current output moved after the "
+            "merge was authorized"
+        )
+    if not _merge_is_authorized(store, run_id, authorized):
+        raise NotAuthorized(
+            "revalidation failed: no accepted review binds the authorized "
+            "inputs any more"
+        )
+    if not _ci_is_green(store, run_id, authorized.get("head_git_sha")):
+        raise NotAuthorized(
+            "revalidation failed: CI is no longer green on the authorized head"
+        )
+
+    reviewer = _reviewer_of(store, run_id, binding_hash(_binding_from(authorized)))
+    implementer = _implementer_of(store, run_id)
+    if reviewer is None:
+        raise NotAuthorized(
+            "revalidation failed: no kernel-recorded reviewer for the "
+            "authorized binding"
+        )
+    if reviewer == implementer:
+        raise NotAuthorized(
+            f"revalidation failed: {reviewer!r} is now both reviewer and "
+            "implementer of this run"
+        )
+    return authorized
+
+
+def _reviewer_of(store, run_id: str, wanted: str) -> str | None:
+    """Who the kernel recorded as accepting *wanted*, latest first."""
+    reviewer = None
+    for fact in store.facts_for(run_id):
+        if (
+            fact.kind == EventKind.REVIEW_VERDICT
+            and fact.payload.get("binding_hash") == wanted
+            and fact.payload.get("verdict") == "accept"
+        ):
+            reviewer = fact.payload.get("reviewer_identity")
+    return reviewer

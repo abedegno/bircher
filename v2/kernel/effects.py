@@ -63,14 +63,13 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
     # reaching merge_requested. Rechecked HERE, immediately before execution,
     # because authorization granted at transition time can go stale.
     if effect_class == EffectClass.MERGE:
-        from kernel.authz import NotAuthorized
+        from kernel.authz import revalidate_merge
 
-        state = store.run_state(run_id)
-        if state != "merge_requested":
-            raise NotAuthorized(
-                f"a merge effect requires the kernel to have authorized it: run "
-                f"is {state!r}, not 'merge_requested'"
-            )
+        # The full authorization, re-derived from kernel state, immediately
+        # before execution. Checking only `state == "merge_requested"` treated
+        # a record THAT authorization happened as the authorization itself --
+        # and a merge executed with the reviewed artifact deleted in between.
+        revalidate_merge(store, run_id)
 
     if is_halted(store, run_id):
         raise RuntimeError(
