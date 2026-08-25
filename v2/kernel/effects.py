@@ -82,6 +82,22 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
     )
 
 
+def _halt_evidence(store, run_id, generation, effect_class, idempotency_key) -> dict:
+    """What an operator needs to resolve this halt. Shared by both paths that
+    raise it, so a retry-triggered halt is as actionable as an original one."""
+    return {
+        "run_id": run_id,
+        "generation": generation,
+        "affected_resources": [effect_class],
+        "last_confirmed_observations": store.last_confirmed(run_id),
+        "stop_attempts": 0,
+        "recommended_actions": [
+            f"Check whether the {effect_class} succeeded externally",
+            f"Then reconcile(store, {run_id!r}, {idempotency_key!r}, resolution, version)",
+        ],
+    }
+
+
 def _perform_unhalted(
     store, run_id, generation, effect_class, idempotency_key, intent, executor
 ):
@@ -121,6 +137,17 @@ def _perform_unhalted(
             # KeyboardInterrupt or SystemExit between the two. Treating it as a
             # completed replay returned a null external id, neither executing
             # nor demanding reconciliation, and silently wedged the run.
+            #
+            # HALT HERE TOO. Only the original failure path used to halt, so a
+            # process that died before its handler ran left the effect
+            # `intended` -- and the retry raised while the run stayed live and
+            # went on performing further external effects, which is exactly
+            # the wedge the halt exists to prevent.
+            if not is_halted(store, run_id):
+                enter_reconciliation_required(store, run_id, _halt_evidence(
+                    store, run_id, generation, existing["effect_class"],
+                    idempotency_key,
+                ))
             raise UncertainEffect(
                 f"{idempotency_key} is {existing['state']!r} in run {run_id}: "
                 "its outcome is unknown and it must be reconciled before retry"
@@ -153,17 +180,8 @@ def _perform_unhalted(
             causal_command_id=idempotency_key,
             payload={"effect_id": eid, "error": type(exc).__name__},
         )
-        enter_reconciliation_required(store, run_id, {
-            "run_id": run_id,
-            "generation": generation,
-            "affected_resources": [effect_class],
-            "last_confirmed_observations": store.last_confirmed(run_id),
-            "stop_attempts": 0,
-            "recommended_actions": [
-                f"Check whether the {effect_class} succeeded externally",
-                f"Then reconcile(store, {run_id!r}, {idempotency_key!r}, resolution, version)",
-            ],
-        })
+        enter_reconciliation_required(store, run_id, _halt_evidence(
+            store, run_id, generation, effect_class, idempotency_key))
         if not isinstance(exc, Exception):
             # KeyboardInterrupt / SystemExit: the uncertainty is now recorded
             # and the run halted, but the interrupt itself must propagate

@@ -50,15 +50,22 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
         raise ValueError(f"unknown role: {role!r}; expected one of {sorted(Role.ALL)}")
     if not actor or not isinstance(actor, str):
         raise ValueError("an attempt must be dispatched to a named actor")
-    generation = acquire(store, run_id, actor)
+    # ONE transaction across the fence and the record. Two statements left a
+    # window in which a failure between them fenced a generation with no actor
+    # behind it: every command under it is then refused for having no
+    # dispatched actor, and the resulting state is indistinguishable from a
+    # caller self-fencing. M1-2 put submit()'s three writes in one transaction
+    # for exactly this reason; dispatch was written afterwards and did not.
     did = new_id("dsp")
-    store.record_dispatch(did, run_id, generation, actor, role)
-    store.append_fact(
-        run_id=run_id, kind=EventKind.ATTEMPT_DISPATCHED, actor="kernel",
-        causal_command_id=None,
-        payload={"dispatch_id": did, "generation": generation,
-                 "actor": actor, "role": role},
-    )
+    with store.transaction():
+        generation = acquire(store, run_id, actor)
+        store.record_dispatch(did, run_id, generation, actor, role)
+        store.append_fact(
+            run_id=run_id, kind=EventKind.ATTEMPT_DISPATCHED, actor="kernel",
+            causal_command_id=None,
+            payload={"dispatch_id": did, "generation": generation,
+                     "actor": actor, "role": role},
+        )
     return Dispatch(dispatch_id=did, generation=generation, actor=actor, role=role)
 
 

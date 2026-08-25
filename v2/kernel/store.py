@@ -331,11 +331,17 @@ class Store:
         caller in any run -- no execution, no fact, no fence.
         """
         row = self._conn.execute(
-            "SELECT state, external_object_id FROM effects"
+            "SELECT state, external_object_id, effect_class FROM effects"
             " WHERE idempotency_key = ? AND run_id = ?",
             (idempotency_key, run_id),
         ).fetchone()
-        return None if row is None else {"state": row[0], "external_object_id": row[1]}
+        # effect_class is the JOURNALLED one, not the retry's. A halt raised on
+        # a retry must name the class that is actually uncertain: a retry that
+        # declared a different class would otherwise put the wrong resource in
+        # front of the operator.
+        return None if row is None else {
+            "state": row[0], "external_object_id": row[1], "effect_class": row[2],
+        }
 
     def effect_state(self, idempotency_key: str, *, run_id: str) -> str | None:
         row = self._conn.execute(

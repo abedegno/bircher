@@ -186,8 +186,20 @@ def test_the_revision_loop_tracks_the_current_implementer():
         _sub(s, "record_review", "rv2", "gpt", Role.REVIEWER, verdict="accept",
              artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
              policy_version=1)
-    # ...and the original implementer is free to review the revision.
-    assert _sub(s, "record_review", "rv3", "claude", Role.REVIEWER,
+    # ...and so is claude, who PRODUCED the artifact still under review.
+    #
+    # This assertion was inverted until round 6. It read "the original
+    # implementer is free to review the revision" and asserted claude could
+    # accept -- but gpt has not produced anything yet, so the artifact bound
+    # here is still claude's own output. The test encoded the defect codex
+    # found: independence was tracking who STARTED an implementation rather
+    # than who produced the thing being reviewed.
+    with pytest.raises(NotAuthorized, match="independence"):
+        _sub(s, "record_review", "rv3", "claude", Role.REVIEWER,
+             verdict="accept", artifact_hash=spec, base_sha=BASE,
+             context_bundle_hash=BUNDLE, policy_version=1)
+    # An actor with neither role may review it. The control.
+    assert _sub(s, "record_review", "rv4", "codex", Role.REVIEWER,
                 verdict="accept", artifact_hash=spec, base_sha=BASE,
                 context_bundle_hash=BUNDLE, policy_version=1).accepted
 

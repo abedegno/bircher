@@ -174,13 +174,50 @@ def validate_review(store, cmd, actor: str) -> VerdictBinding:
             "cannot elect itself reviewer"
         )
 
-    implementer = _implementer_of(store, cmd.run_id)
-    if implementer is not None and actor == implementer:
+    conflicted = _conflicted_actors(store, cmd.run_id)
+    if actor in conflicted:
         raise NotAuthorized(
-            f"reviewer independence violated: {actor!r} implemented this run "
-            "and cannot review its own work"
+            f"reviewer independence violated: {actor!r} is implementing this "
+            f"run or produced the artifact under review (conflicted: "
+            f"{sorted(conflicted)})"
         )
     return binding
+
+
+def _producer_of_current_artifact(store, run_id: str) -> str | None:
+    """Who produced the artifact this run is currently carrying.
+
+    THE actor independence is about. `_implementer_of` reads whoever last
+    issued `start_implementation`, which is not necessarily who produced the
+    thing under review: with alice starting and bob recording the output, bob
+    reviewed his own artifact and the merge executed. That gap arrived with
+    `record_implementation_output` in M1-3b and nothing moved the check onto
+    it.
+    """
+    current = store.current_artifact(run_id)
+    if current is None:
+        return None
+    producer = None
+    for fact in store.facts_for(run_id):
+        if (
+            fact.kind == EventKind.COMMAND_ACCEPTED
+            and fact.payload.get("command_name") == "record_implementation_output"
+            and (fact.payload.get("payload") or {}).get("artifact_hash") == current
+        ):
+            producer = fact.actor
+    return producer
+
+
+def _conflicted_actors(store, run_id: str) -> set[str]:
+    """Everyone who cannot review this run's current output.
+
+    BOTH the producer of the artifact and whoever is currently implementing:
+    an actor mid-implementation has a conflict even before it has produced
+    anything, and an actor that produced the artifact has one even if someone
+    else started the attempt.
+    """
+    return {a for a in (_producer_of_current_artifact(store, run_id),
+                        _implementer_of(store, run_id)) if a is not None}
 
 
 def _implementer_of(store, run_id: str) -> str | None:
@@ -399,13 +436,12 @@ def revalidate_merge(store, run_id: str) -> dict:
         )
 
     reviewer = _reviewer_of(store, run_id, binding_hash(_binding_from(authorized)))
-    implementer = _implementer_of(store, run_id)
     if reviewer is None:
         raise NotAuthorized(
             "revalidation failed: no kernel-recorded reviewer for the "
             "authorized binding"
         )
-    if reviewer == implementer:
+    if reviewer in _conflicted_actors(store, run_id):
         raise NotAuthorized(
             f"revalidation failed: {reviewer!r} is now both reviewer and "
             "implementer of this run"
