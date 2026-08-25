@@ -21,12 +21,18 @@ def _cmd(store, name="submit_spec", version=0, key="k1", generation=None, **payl
     )
 
 
-def test_the_interface_is_exactly_seven_commands():
+def test_the_command_interface_is_closed_and_explicit():
     """A narrow interface, not a general one. Growth here is a design change
-    to be argued, not absorbed."""
+    to be argued, not absorbed.
+
+    record_merge_outcome was added deliberately: merge_requested was a dead
+    end, so a merge that came back uncertain wedged the run and the only
+    escape recorded 'cancelled' for a run that had in fact merged.
+    """
     assert sorted(COMMAND_NAMES) == sorted([
         "submit_spec", "submit_plan", "record_review", "start_implementation",
-        "record_ci_observation", "request_merge", "cancel_run",
+        "record_ci_observation", "request_merge", "record_merge_outcome",
+        "cancel_run",
     ])
 
 

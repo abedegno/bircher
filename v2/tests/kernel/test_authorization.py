@@ -35,7 +35,7 @@ def _submit(s, name, key, **payload):
 def _advance_to_reviewing(s):
     _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
     _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
-    _submit(s, "start_implementation", "k3")
+    _submit(s, "start_implementation", "k3", implementer_identity="claude")
     return s
 
 
@@ -73,7 +73,12 @@ def test_every_command_declares_its_legal_states():
 
     for name in COMMAND_NAMES:
         assert legal_states_for(name), f"{name} declares no legal states"
-        assert next_state_for(name) is not None or name == "record_ci_observation"
+        # A None next-state is legitimate for commands that observe without
+        # transitioning, and for those whose destination depends on the
+        # outcome they report.
+        assert next_state_for(name) is not None or name in (
+            "record_ci_observation", "record_merge_outcome",
+        )
 
 
 # --- merge authorization ------------------------------------------------------

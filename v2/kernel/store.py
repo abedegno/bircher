@@ -119,6 +119,20 @@ class Store:
             "UPDATE runs SET state = ? WHERE run_id = ?", (state, run_id)
         )
 
+    def run_base_sha(self, run_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT base_sha FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no such run: {run_id}")
+        return row[0]
+
+    def run_owner(self, run_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT owner FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if row is None else row[0]
+
     def run_version(self, run_id: str) -> int:
         return int(
             self._conn.execute(

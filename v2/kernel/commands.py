@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from kernel.authz import authorize
+from kernel.artifacts import binding_hash
+from kernel.authz import authorize, validate_review
 from kernel.canon import canonical_hash
 from kernel.events import EventKind
 from kernel.ownership import OwnershipLost, current_generation
@@ -17,6 +18,9 @@ from kernel.ownership import OwnershipLost, current_generation
 COMMAND_NAMES = frozenset({
     "submit_spec", "submit_plan", "record_review", "start_implementation",
     "record_ci_observation", "request_merge", "cancel_run",
+    # Added with the merge-outcome transition: merge_requested was a dead end,
+    # and cancel_run was the only escape -- which misreports a run that merged.
+    "record_merge_outcome",
 })
 
 
@@ -98,6 +102,13 @@ def submit(store, cmd: Command) -> Result:
     # accepted.
     next_state = authorize(store, cmd)
 
+    # A review is validated BEFORE it is recorded, and recorded as a verdict in
+    # its own right. Previously the verdict existed only as a verbatim copy of
+    # the caller's payload nested inside a COMMAND_ACCEPTED fact, so merge
+    # authorization was a search for a claim rather than a binding to
+    # something the mechanism observed.
+    review_binding = validate_review(store, cmd) if cmd.name == "record_review" else None
+
     result = {"name": cmd.name}
     try:
         with store.transaction():
@@ -112,9 +123,25 @@ def submit(store, cmd: Command) -> Result:
                 # Payload is NESTED, not splatted: splatting let a payload key
                 # named like one of the command's own fields silently overwrite
                 # it in the recorded fact.
-                payload={"command_name": cmd.name, "generation": cmd.generation,
-                         "payload": cmd.payload},
+                payload={
+                    "command_name": cmd.name,
+                    "generation": cmd.generation,
+                    # Hoisted out of the payload so independence checks read a
+                    # kernel-recorded field rather than re-parsing a nested blob.
+                    "implementer_identity": cmd.payload.get("implementer_identity"),
+                    "payload": cmd.payload,
+                },
             )
+            if review_binding is not None:
+                store.append_fact(
+                    run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor="kernel",
+                    causal_command_id=cmd.idempotency_key,
+                    payload={
+                        "verdict": cmd.payload.get("verdict"),
+                        "binding_hash": binding_hash(review_binding),
+                        "reviewer_identity": review_binding.reviewer_identity,
+                    },
+                )
             if next_state is not None:
                 store.append_fact(
                     run_id=cmd.run_id, kind=EventKind.TRANSITION, actor="kernel",
