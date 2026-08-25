@@ -18,6 +18,11 @@ class EventKind:
     TRANSITION = "transition_performed"
     OBSERVATION = "external_observation"
     HUMAN_RULING = "human_ruling"
+    OWNERSHIP_ACQUIRED = "ownership_acquired"
+    EFFECT_INTENDED = "effect_intended"
+    EFFECT_CONFIRMED = "effect_confirmed"
+    EFFECT_UNCERTAIN = "effect_uncertain"
+    EFFECT_RECONCILED = "effect_reconciled"
 
 
 SCHEMA_VERSIONS = {
@@ -30,6 +35,11 @@ SCHEMA_VERSIONS = {
     EventKind.TRANSITION: 1,
     EventKind.OBSERVATION: 1,
     EventKind.HUMAN_RULING: 1,
+    EventKind.OWNERSHIP_ACQUIRED: 1,
+    EventKind.EFFECT_INTENDED: 1,
+    EventKind.EFFECT_CONFIRMED: 1,
+    EventKind.EFFECT_UNCERTAIN: 1,
+    EventKind.EFFECT_RECONCILED: 1,
 }
 
 MECHANISM_VERSION = 1

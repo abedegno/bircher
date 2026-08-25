@@ -79,6 +79,20 @@ class Store:
         )
         return fid
 
+    def create_run(self, *, run_id: str, base_repo: str, base_sha: str) -> None:
+        self._conn.execute(
+            "INSERT INTO runs (run_id, state, base_repo, base_sha, created_at_us)"
+            " VALUES (?,?,?,?,?)",
+            (run_id, "queued", base_repo, base_sha, self._clock.now_us()),
+        )
+
+    def run_version(self, run_id: str) -> int:
+        return int(
+            self._conn.execute(
+                "SELECT version FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+        )
+
     def put_blob(self, content_hash: str, data: bytes) -> None:
         """Insert an immutable blob. Idempotent: identical bytes hash the same,
         so a repeated write is a no-op rather than a conflict."""

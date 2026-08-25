@@ -22,12 +22,26 @@ CREATE TRIGGER IF NOT EXISTS facts_no_delete BEFORE DELETE ON facts
 BEGIN SELECT RAISE(ABORT, 'facts are append-only'); END;
 
 CREATE TABLE IF NOT EXISTS runs (
-  run_id        TEXT PRIMARY KEY,
-  state         TEXT NOT NULL,
-  base_repo     TEXT NOT NULL,
-  base_sha      TEXT NOT NULL,
-  created_at_us INTEGER NOT NULL
+  run_id           TEXT PRIMARY KEY,
+  state            TEXT NOT NULL,
+  base_repo        TEXT NOT NULL,
+  base_sha         TEXT NOT NULL,
+  created_at_us    INTEGER NOT NULL,
+  version          INTEGER NOT NULL DEFAULT 0,
+  owner_generation INTEGER NOT NULL DEFAULT 0,
+  owner            TEXT
 );
+
+CREATE TABLE IF NOT EXISTS commands (
+  idempotency_key TEXT PRIMARY KEY,
+  run_id          TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  accepted        INTEGER NOT NULL,
+  result_json     TEXT NOT NULL,
+  at_us           INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS commands_no_update BEFORE UPDATE ON commands
+BEGIN SELECT RAISE(ABORT, 'command results are immutable'); END;
 
 CREATE TABLE IF NOT EXISTS artifacts (
   hash  TEXT PRIMARY KEY,
