@@ -31,7 +31,11 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "submit_spec": (frozenset({"queued"}), "specified"),
     "submit_plan": (frozenset({"specified"}), "planned"),
     "start_implementation": (frozenset({"planned"}), "implementing"),
-    "record_review": (frozenset({"implementing", "reviewing"}), "reviewing"),
+    # record_review's destination depends on the verdict: a revision request
+    # must return the run to `planned` so implementation can start again.
+    # Landing every review in `reviewing` left a revision request with nowhere
+    # to do the revision.
+    "record_review": (frozenset({"implementing", "reviewing"}), None),
     # merge_requested must not be a dead end. Without an outbound transition a
     # merge that comes back uncertain can never be retried after
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
@@ -47,6 +51,15 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
         }),
         "cancelled",
     ),
+}
+
+#: Verdicts `record_review` may carry, and where each leaves the run. A closed
+#: set: arbitrary strings were accepted while only literal "accept" authorized
+#: a merge, so a typo silently became a non-approval that read as a review.
+_VERDICTS: dict[str, str] = {
+    "accept": "reviewing",
+    "request_revision": "planned",
+    "reject": "reviewing",
 }
 
 #: Outcomes `record_merge_outcome` may report, and where each leaves the run.
@@ -104,7 +117,23 @@ def validate_review(store, cmd) -> VerdictBinding:
     approval, naming any reviewer and any hashes, then present the same tuple
     for merge.
     """
+    verdict = cmd.payload.get("verdict")
+    if verdict not in _VERDICTS:
+        raise NotAuthorized(
+            f"verdict {verdict!r} is not one of {sorted(_VERDICTS)}"
+        )
+
     binding = _binding_from(cmd.payload)
+
+    # The artifact must be one the kernel actually holds. Without this an
+    # independent reviewer could approve hashes for objects that do not exist,
+    # and merge then compared one caller-supplied tuple against another.
+    if not store.has_artifact(binding.artifact_hash):
+        raise NotAuthorized(
+            f"review binds artifact {binding.artifact_hash[:12]}..., which the "
+            "kernel does not hold: an approval binds objects the mechanism has, "
+            "not hashes the actor supplies"
+        )
 
     observed_base = store.run_base_sha(cmd.run_id)
     if binding.base_sha != observed_base:
@@ -139,6 +168,22 @@ def _implementer_of(store, run_id: str) -> str | None:
         ):
             return fact.payload.get("implementer_identity")
     return None
+
+
+def _ci_is_green(store, run_id: str) -> bool:
+    """True when the most recent CI observation for the run reports success.
+
+    Merge authorization previously required only a matching verdict, so a run
+    could reach merge_requested having never reported CI at all.
+    """
+    latest = None
+    for fact in store.facts_for(run_id):
+        if (
+            fact.kind == EventKind.COMMAND_ACCEPTED
+            and fact.payload.get("command_name") == "record_ci_observation"
+        ):
+            latest = (fact.payload.get("payload") or {}).get("status")
+    return latest == "success"
 
 
 def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
@@ -182,6 +227,14 @@ def authorize(store, cmd) -> str | None:
             f"legal from {sorted(allowed)}"
         )
 
+    if cmd.name == "record_review":
+        verdict = cmd.payload.get("verdict")
+        if verdict not in _VERDICTS:
+            raise NotAuthorized(
+                f"verdict {verdict!r} is not one of {sorted(_VERDICTS)}"
+            )
+        return _VERDICTS[verdict]
+
     if cmd.name == "record_merge_outcome":
         outcome = cmd.payload.get("outcome")
         if outcome not in _MERGE_OUTCOMES:
@@ -189,6 +242,13 @@ def authorize(store, cmd) -> str | None:
                 f"outcome {outcome!r} is not one of {sorted(_MERGE_OUTCOMES)}"
             )
         return _MERGE_OUTCOMES[outcome]
+
+    if cmd.name == "request_merge":
+        if not _ci_is_green(store, cmd.run_id):
+            raise NotAuthorized(
+                "no successful CI observation for this run: a merge needs "
+                "evidence the mechanism observed, not only a review"
+            )
 
     if cmd.name == "request_merge" and not _merge_is_authorized(
         store, cmd.run_id, cmd.payload

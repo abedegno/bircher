@@ -3,18 +3,22 @@ previous 'authorized' happy-path test demonstrated rather than refuted."""
 
 import pytest
 
+from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
 
-SPEC, BASE, BUNDLE = "a" * 64, "c" * 40, "e" * 64
+BASE, BUNDLE, HEAD = "c" * 40, "e" * 64, "d" * 40
+SPEC = None  # set per-store: reviews may only bind artifacts the kernel holds
 
 
 def _store():
+    global SPEC
     s = Store.open(":memory:", clock=Clock(start_us=1))
     s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    SPEC = put_artifact(s, b"# spec")
     return s
 
 
@@ -27,7 +31,7 @@ def _sub(s, name, key, owner="implementer", **payload):
 
 def _to_implementing(s):
     _sub(s, "submit_spec", "k1", spec_sha256=SPEC)
-    _sub(s, "submit_plan", "k2", plan_sha256="b" * 64)
+    _sub(s, "submit_plan", "k2", plan_sha256=put_artifact(s, b"# plan"))
     _sub(s, "start_implementation", "k3", implementer_identity="claude")
     return s
 
@@ -78,27 +82,40 @@ def test_policy_version_is_not_coerced_across_types():
              reviewer_identity="codex", policy_version=1.9)
 
 
-def test_merge_requested_is_not_a_dead_end():
-    """No path to merged and none back to reviewing wedges every run whose
-    merge does not go cleanly -- and cancel_run then records 'cancelled' for
-    a run that actually merged."""
-    from kernel.authz import legal_states_for
+@pytest.mark.parametrize("outcome,expected", [("merged", "merged"),
+                                              ("failed", "reviewing")])
+def test_merge_outcomes_move_the_run_where_they_should(outcome, expected):
+    """The old version only checked that a command name appeared in the table,
+    so mutating 'merged' to land back in 'reviewing' left it green. It
+    asserted a table entry, not a behaviour."""
+    s = _to_implementing(_store())
+    _sub(s, "record_review", "rv", owner="codex", verdict="accept",
+         artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
+         reviewer_identity="codex", policy_version=1)
+    _sub(s, "record_ci_observation", "ci", owner="impl", status="success",
+         head_git_sha=HEAD)
+    _sub(s, "request_merge", "rm", owner="impl", artifact_hash=SPEC,
+         base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
+         policy_version=1)
+    _sub(s, "record_merge_outcome", "mo", owner="impl", outcome=outcome)
+    assert s.run_state("r") == expected
 
-    outbound = [
-        name for name in ("record_merge_outcome", "cancel_run")
-        if "merge_requested" in legal_states_for(name)
-    ]
-    assert "record_merge_outcome" in outbound, (
-        "merge_requested has no way to record what actually happened"
-    )
 
+def test_the_recorded_verdict_carries_the_binding_that_authorizes_merge():
+    """The old version asserted only that an event of the right KIND existed,
+    so replacing its binding hash with 'broken' left it green. What matters is
+    that the recorded hash is the one merge authorization compares against."""
+    from kernel.artifacts import VerdictBinding, binding_hash
 
-def test_a_verdict_is_recorded_as_a_verdict():
-    """REVIEW_VERDICT exists as an event kind and was never emitted; the
-    verdict lived only as a verbatim copy of the caller's payload nested in a
-    COMMAND_ACCEPTED fact."""
     s = _to_implementing(_store())
     _sub(s, "record_review", "k4", owner="codex", verdict="accept",
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
          reviewer_identity="codex", policy_version=1)
-    assert "review_verdict" in [f.kind for f in s.facts_for("r")]
+    verdicts = [f for f in s.facts_for("r") if f.kind == "review_verdict"]
+    assert len(verdicts) == 1
+    expected = binding_hash(VerdictBinding(
+        artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
+        reviewer_identity="codex", policy_version=1,
+    ))
+    assert verdicts[0].payload["binding_hash"] == expected
+    assert verdicts[0].payload["verdict"] == "accept"

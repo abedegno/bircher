@@ -45,6 +45,18 @@ class Result:
     replayed: bool = False
 
 
+def _record_rejection(store, cmd, reason: str, detail: str) -> None:
+    """Append the immutable record of a refusal.
+
+    Outside any transaction: a rejection must survive whatever rolled back.
+    """
+    store.append_fact(
+        run_id=cmd.run_id, kind=EventKind.COMMAND_REJECTED, actor="kernel",
+        causal_command_id=cmd.idempotency_key,
+        payload={"command_name": cmd.name, "reason": reason, "detail": detail[:300]},
+    )
+
+
 def submit(store, cmd: Command) -> Result:
     if cmd.name not in COMMAND_NAMES:
         raise ValueError(f"unknown command: {cmd.name}")
@@ -87,6 +99,7 @@ def submit(store, cmd: Command) -> Result:
         )
 
     if cmd.generation != current_generation(store, cmd.run_id):
+        _record_rejection(store, cmd, "OwnershipLost", "superseded generation")
         raise OwnershipLost(
             f"generation {cmd.generation} superseded; command carries no write capability"
         )
@@ -100,14 +113,27 @@ def submit(store, cmd: Command) -> Result:
     # authorize the effect it enables? Without this the kernel checked only the
     # envelope, and request_merge on a queued run with an empty payload was
     # accepted.
-    next_state = authorize(store, cmd)
+    # Every refusal is recorded, not only the stale-version one. Illegal
+    # transitions, malformed bindings and failed merge authorization
+    # previously left no immutable trace of the decision.
+    try:
+        next_state = authorize(store, cmd)
+    except Exception as exc:
+        _record_rejection(store, cmd, type(exc).__name__, str(exc))
+        raise
 
     # A review is validated BEFORE it is recorded, and recorded as a verdict in
     # its own right. Previously the verdict existed only as a verbatim copy of
     # the caller's payload nested inside a COMMAND_ACCEPTED fact, so merge
     # authorization was a search for a claim rather than a binding to
     # something the mechanism observed.
-    review_binding = validate_review(store, cmd) if cmd.name == "record_review" else None
+    try:
+        review_binding = (
+            validate_review(store, cmd) if cmd.name == "record_review" else None
+        )
+    except Exception as exc:
+        _record_rejection(store, cmd, type(exc).__name__, str(exc))
+        raise
 
     result = {"name": cmd.name}
     try:
@@ -157,11 +183,9 @@ def submit(store, cmd: Command) -> Result:
             )
     except StaleVersion:
         # Outside the transaction: the rejection must survive the rollback.
-        store.append_fact(
-            run_id=cmd.run_id, kind=EventKind.COMMAND_REJECTED, actor="kernel",
-            causal_command_id=cmd.idempotency_key,
-            payload={"command_name": cmd.name, "reason": "stale_version",
-                     "expected_version": cmd.expected_version},
+        _record_rejection(
+            store, cmd, "stale_version",
+            f"expected version {cmd.expected_version}",
         )
         raise
 

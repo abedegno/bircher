@@ -152,10 +152,10 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
     # is a bare UPDATE by key, so an unknown or already-confirmed key would
     # otherwise succeed silently, bump the version and clear the halt.
     state = store.effect_state(idempotency_key, run_id=run_id)
-    if state != "uncertain":
+    if state not in ("uncertain", "intended"):
         raise ValueError(
             f"cannot reconcile {idempotency_key!r} in run {run_id!r}: state is "
-            f"{state!r}, expected 'uncertain'"
+            f"{state!r}, expected 'uncertain' or 'intended'"
         )
 
     # One transaction: CAS, effect update, halt clear and audit fact were four

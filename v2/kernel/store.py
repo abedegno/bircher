@@ -187,10 +187,19 @@ class Store:
         ).fetchone()
         return None if row is None else int(row[0])
 
+    def has_artifact(self, content_hash: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM artifacts WHERE hash = ?", (content_hash,)
+        ).fetchone() is not None
+
     def uncertain_effects(self, run_id: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT idempotency_key, effect_class, generation FROM effects"
-            " WHERE run_id = ? AND state = 'uncertain' ORDER BY at_us",
+            # `intended` counts as unresolved: a real process death after
+            # journalling never runs the handler that marks it uncertain, so
+            # excluding it made such effects impossible to reconcile at all.
+            " WHERE run_id = ? AND state IN ('uncertain','intended')"
+            " ORDER BY at_us",
             (run_id,),
         ).fetchall()
         return [

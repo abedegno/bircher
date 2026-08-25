@@ -9,6 +9,7 @@ authorized a merge.
 
 import pytest
 
+from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized, legal_states_for, next_state_for
 from kernel.commands import Command, submit
 from kernel.ids import Clock
@@ -16,12 +17,16 @@ from kernel.ownership import acquire
 from kernel.projection import project
 from kernel.store import Store
 
-SPEC, PLAN, BASE, HEAD, BUNDLE = "a" * 64, "b" * 64, "c" * 40, "d" * 40, "e" * 64
+BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
+SPEC = PLAN = None  # set per-store: a review may only bind artifacts the kernel holds
 
 
 def _store():
+    global SPEC, PLAN
     s = Store.open(":memory:", clock=Clock(start_us=1))
     s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    SPEC = put_artifact(s, b"# spec")
+    PLAN = put_artifact(s, b"# plan")
     return s
 
 
@@ -48,10 +53,22 @@ def test_request_merge_on_a_queued_run_is_refused():
         _submit(s, "request_merge", "k")
 
 
-def test_the_happy_path_advances_state_and_is_projectable():
+def test_the_full_lifecycle_advances_to_a_terminal_state():
+    """The old version stopped at `implementing` and never exercised review,
+    CI, merge request, merge outcome or terminal projection."""
     s = _advance_to_reviewing(_store())
-    assert project(s.facts_for("r")).state == "implementing"
-    assert s.run_state("r") == "implementing", "runs.state was left stale"
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
+            base_sha=BASE, context_bundle_hash=BUNDLE, reviewer_identity="codex",
+            policy_version=1)
+    _submit(s, "request_merge", "rm", artifact_hash=SPEC, base_sha=BASE,
+            context_bundle_hash=BUNDLE, reviewer_identity="codex", policy_version=1)
+    assert s.run_state("r") == "merge_requested"
+    _submit(s, "record_merge_outcome", "mo", outcome="merged")
+    assert s.run_state("r") == "merged"
+    assert project(s.facts_for("r")).state == "merged", (
+        "the projection disagrees with the aggregate at the terminal state"
+    )
 
 
 def test_a_command_out_of_order_is_refused():
@@ -60,9 +77,29 @@ def test_a_command_out_of_order_is_refused():
         _submit(s, "submit_plan", "k", plan_sha256=PLAN)
 
 
-def test_cancel_run_is_legal_from_any_state():
+@pytest.mark.parametrize("reach", ["queued", "specified", "planned",
+                                   "implementing", "reviewing"])
+def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
+    """The old version tested only `queued`, so restricting cancellation to
+    `queued` alone left it green -- it asserted the name of the property and
+    exercised one case of it."""
     s = _store()
-    assert _submit(s, "cancel_run", "k").accepted
+    steps = [
+        ("specified", "submit_spec", {"spec_sha256": SPEC}),
+        ("planned", "submit_plan", {"plan_sha256": PLAN}),
+        ("implementing", "start_implementation", {"implementer_identity": "claude"}),
+        ("reviewing", "record_review", {"verdict": "accept",
+                                        "artifact_hash": SPEC, "base_sha": BASE,
+                                        "context_bundle_hash": BUNDLE,
+                                        "reviewer_identity": "codex",
+                                        "policy_version": 1}),
+    ]
+    for i, (state, name, payload) in enumerate(steps):
+        if s.run_state("r") == reach:
+            break
+        _submit(s, name, f"s{i}", **payload)
+    assert s.run_state("r") == reach
+    assert _submit(s, "cancel_run", "cancel").accepted
     assert s.run_state("r") == "cancelled"
 
 
@@ -76,8 +113,11 @@ def test_every_command_declares_its_legal_states():
         # A None next-state is legitimate for commands that observe without
         # transitioning, and for those whose destination depends on the
         # outcome they report.
+        # A None next-state is legitimate where the destination depends on
+        # what is being reported (a verdict, a merge outcome) or where the
+        # command observes without transitioning.
         assert next_state_for(name) is not None or name in (
-            "record_ci_observation", "record_merge_outcome",
+            "record_ci_observation", "record_merge_outcome", "record_review",
         )
 
 
@@ -85,7 +125,11 @@ def test_every_command_declares_its_legal_states():
 
 def test_request_merge_without_an_accepted_review_is_refused():
     s = _advance_to_reviewing(_store())
-    _submit(s, "record_review", "k4", verdict="request_revision",
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    # `reject`, not `request_revision`: a revision request now returns the run
+    # to `planned`, so request_merge would be refused for being illegal in that
+    # state and the test would pass without ever reaching the approval check.
+    _submit(s, "record_review", "k4", verdict="reject",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
     with pytest.raises(NotAuthorized, match="no accepted review"):
@@ -96,6 +140,7 @@ def test_request_merge_without_an_accepted_review_is_refused():
 
 def test_request_merge_with_an_accepted_review_is_authorized():
     s = _advance_to_reviewing(_store())
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
@@ -109,6 +154,7 @@ def test_a_verdict_bound_to_different_inputs_does_not_authorize_a_merge():
     """The whole point of the binding: yesterday's approval must not
     authorize today's object."""
     s = _advance_to_reviewing(_store())
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
     _submit(s, "record_review", "k4", verdict="accept",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             reviewer_identity="codex", policy_version=1)
