@@ -45,11 +45,27 @@ def is_halted(store, run_id: str) -> bool:
     return store.reconciliation_evidence(run_id) is not None
 
 
-def perform(store, run_id, generation, effect_class, idempotency_key, intent, executor):
+def perform(
+    store, run_id, generation, effect_class, idempotency_key, intent, executor,
+    *, _bypass_halt: bool = False,
+):
     if effect_class not in EffectClass.ALL:
         raise ValueError(f"unknown effect class: {effect_class}")
 
-    existing = store.effect_by_key(idempotency_key)
+    # The halt gates EFFECTS, not just commands. Gating only submit() left the
+    # mutating path open: a halted run could retry the very effect whose
+    # outcome is unknown, under a fresh key, which is the duplicate external
+    # mutation the halt exists to prevent.
+    #
+    # _bypass_halt exists only so a test can drive a SECOND effect to uncertain
+    # on an already-halted run; production callers never pass it.
+    if not _bypass_halt and is_halted(store, run_id):
+        raise RuntimeError(
+            f"run {run_id} is halted pending reconciliation; resolve it before "
+            "performing further effects"
+        )
+
+    existing = store.effect_by_key(idempotency_key, run_id=run_id)
     if existing is not None:
         if existing["state"] == "uncertain":
             raise UncertainEffect(f"{idempotency_key} needs reconciliation before retry")
@@ -118,6 +134,16 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
     manual state edit."""
     from kernel.commands import StaleVersion
 
+    # Reconciliation must name an effect that is actually uncertain. mark_effect
+    # is a bare UPDATE by key, so an unknown or already-confirmed key would
+    # otherwise succeed silently, bump the version and clear the halt.
+    state = store.effect_state(idempotency_key, run_id=run_id)
+    if state != "uncertain":
+        raise ValueError(
+            f"cannot reconcile {idempotency_key!r} in run {run_id!r}: state is "
+            f"{state!r}, expected 'uncertain'"
+        )
+
     cur = store._conn.execute(
         "UPDATE runs SET version = version + 1 WHERE run_id = ? AND version = ?",
         (run_id, expected_version),
@@ -127,7 +153,11 @@ def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> N
             f"reconciliation derived from version {expected_version}, which has moved"
         )
     store.mark_effect(idempotency_key, "reconciled", None)
-    store.clear_reconciliation(run_id)
+    # Only unhalt when nothing else is still uncertain. Clearing
+    # unconditionally unhalted the run while a second uncertain effect was
+    # outstanding -- and, with the gate above, that run could then act again.
+    if not pending_reconciliation(store, run_id):
+        store.clear_reconciliation(run_id)
     store.append_fact(
         run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
         causal_command_id=idempotency_key, payload={"resolution": resolution},

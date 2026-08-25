@@ -93,12 +93,20 @@ class Store:
             ).fetchone()[0]
         )
 
-    def command_result(self, idempotency_key: str) -> dict | None:
+    def command_result(self, idempotency_key: str, *, run_id: str) -> dict | None:
+        """Look up a prior command result by key WITHIN a run.
+
+        Keyed globally, two genuinely different commands sharing a key
+        collided and the second was answered with the first's result.
+        """
         row = self._conn.execute(
-            "SELECT accepted, result_json FROM commands WHERE idempotency_key = ?",
-            (idempotency_key,),
+            "SELECT accepted, result_json, name FROM commands"
+            " WHERE idempotency_key = ? AND run_id = ?",
+            (idempotency_key, run_id),
         ).fetchone()
-        return None if row is None else {"accepted": row[0], "result": json.loads(row[1])}
+        if row is None:
+            return None
+        return {"accepted": row[0], "result": json.loads(row[1]), "name": row[2]}
 
     def record_command(
         self, key: str, run_id: str, name: str, accepted: bool, result: dict
@@ -128,12 +136,25 @@ class Store:
             (state, external_object_id, idempotency_key),
         )
 
-    def effect_by_key(self, idempotency_key: str) -> dict | None:
+    def effect_by_key(self, idempotency_key: str, *, run_id: str) -> dict | None:
+        """Look up an effect by key WITHIN a run.
+
+        Keyed globally, a confirmed key returned its external object id to any
+        caller in any run -- no execution, no fact, no fence.
+        """
         row = self._conn.execute(
-            "SELECT state, external_object_id FROM effects WHERE idempotency_key = ?",
-            (idempotency_key,),
+            "SELECT state, external_object_id FROM effects"
+            " WHERE idempotency_key = ? AND run_id = ?",
+            (idempotency_key, run_id),
         ).fetchone()
         return None if row is None else {"state": row[0], "external_object_id": row[1]}
+
+    def effect_state(self, idempotency_key: str, *, run_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT state FROM effects WHERE idempotency_key = ? AND run_id = ?",
+            (idempotency_key, run_id),
+        ).fetchone()
+        return None if row is None else row[0]
 
     def set_reconciliation(self, run_id: str, evidence: dict) -> None:
         self._conn.execute(

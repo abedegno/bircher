@@ -50,8 +50,17 @@ def submit(store, cmd: Command) -> Result:
             f"run {cmd.run_id} is halted pending reconciliation; resolve it first"
         )
 
-    prior = store.command_result(cmd.idempotency_key)
+    prior = store.command_result(cmd.idempotency_key, run_id=cmd.run_id)
     if prior is not None:
+        if prior["name"] != cmd.name:
+            # Same key, same run, different command. This is not a retry --
+            # it is a key reused for different work, and answering it with the
+            # earlier result would attribute that command's authority to this
+            # one. Fail loudly rather than silently.
+            raise ValueError(
+                f"idempotency key {cmd.idempotency_key!r} was already used in run "
+                f"{cmd.run_id!r} for {prior['name']!r}, not {cmd.name!r}"
+            )
         # Replay: return the original outcome and mutate nothing. The version
         # must not advance, or a retry would consume a version.
         return Result(accepted=bool(prior["accepted"]), result=prior["result"], replayed=True)

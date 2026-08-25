@@ -80,13 +80,27 @@ def test_a_superseded_generation_leaves_no_journal_row(store):
 
 
 def test_an_uncertain_effect_blocks_retry_until_reconciled(store):
+    """Two independent layers stop the retry, and both are asserted.
+
+    The run-level halt catches it first (it gates every effect on a halted
+    run). Underneath, the per-key uncertain check still refuses this specific
+    key -- exercised by bypassing the halt, so removing either guard is
+    visible here rather than masked by the other.
+    """
     gen = acquire(store, "r", "a")
     with pytest.raises(UncertainEffect):
         perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {},
                 Recorder(store, fail=TimeoutError("no response")))
     assert [e["idempotency_key"] for e in pending_reconciliation(store, "r")] == ["k4"]
-    with pytest.raises(UncertainEffect, match="reconcil"):
+
+    # Layer 1: the run-level halt.
+    with pytest.raises(RuntimeError, match="reconcil"):
         perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store))
+
+    # Layer 2: the per-key uncertain check, with the halt stood down.
+    with pytest.raises(UncertainEffect, match="reconcil"):
+        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store),
+                _bypass_halt=True)
 
 
 def test_replaying_a_confirmed_key_does_not_re_execute(store):

@@ -33,12 +33,16 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS commands (
-  idempotency_key TEXT PRIMARY KEY,
+  -- Idempotency is scoped PER RUN. A global key let one run's result be
+  -- returned for another run's command -- a misattribution of authority
+  -- reported as accepted+replayed.
+  idempotency_key TEXT NOT NULL,
   run_id          TEXT NOT NULL,
   name            TEXT NOT NULL,
   accepted        INTEGER NOT NULL,
   result_json     TEXT NOT NULL,
-  at_us           INTEGER NOT NULL
+  at_us           INTEGER NOT NULL,
+  PRIMARY KEY (run_id, idempotency_key)
 );
 CREATE TRIGGER IF NOT EXISTS commands_no_update BEFORE UPDATE ON commands
 BEGIN SELECT RAISE(ABORT, 'command results are immutable'); END;
@@ -55,11 +59,12 @@ CREATE TABLE IF NOT EXISTS effects (
   run_id             TEXT NOT NULL,
   generation         INTEGER NOT NULL,
   effect_class       TEXT NOT NULL,
-  idempotency_key    TEXT NOT NULL UNIQUE,
+  idempotency_key    TEXT NOT NULL,
   state              TEXT NOT NULL,          -- intended | confirmed | uncertain | reconciled
   external_object_id TEXT,
   intent_json        TEXT NOT NULL,
-  at_us              INTEGER NOT NULL
+  at_us              INTEGER NOT NULL,
+  UNIQUE (run_id, idempotency_key)
 );
 CREATE TRIGGER IF NOT EXISTS effects_no_delete BEFORE DELETE ON effects
 BEGIN SELECT RAISE(ABORT, 'the effect journal is append-only'); END;

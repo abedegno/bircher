@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass
 
-from kernel.canon import canonical_bytes, content_hash
+from kernel.canon import canonical_hash, content_hash
 
 _HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -37,7 +37,7 @@ class VerdictBinding:
 
 
 def binding_hash(b: VerdictBinding) -> str:
-    return content_hash(canonical_bytes(asdict(b)))
+    return canonical_hash(asdict(b))
 
 
 def is_valid(stored: VerdictBinding, current: VerdictBinding) -> bool:
