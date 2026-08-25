@@ -25,6 +25,8 @@ class EventKind:
     EFFECT_RECONCILED = "effect_reconciled"
     ATTEMPT_DISPATCHED = "attempt_dispatched"
     MERGE_AUTHORIZED = "merge_authorized"
+    REVISION_PROPOSED = "revision_proposed"
+    BUNDLE_REVISED = "bundle_revised"
 
 
 SCHEMA_VERSIONS = {
@@ -44,6 +46,8 @@ SCHEMA_VERSIONS = {
     EventKind.EFFECT_RECONCILED: 1,
     EventKind.ATTEMPT_DISPATCHED: 1,
     EventKind.MERGE_AUTHORIZED: 1,
+    EventKind.REVISION_PROPOSED: 1,
+    EventKind.BUNDLE_REVISED: 1,
 }
 
 MECHANISM_VERSION = 1
