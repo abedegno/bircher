@@ -247,3 +247,52 @@ def test_a_shadow_rejection_mid_sequence_does_not_derail_later_legal_commands(mo
     assert kinds.count("command_rejected") == 1
     assert kinds.count("shadow_rejected") == 1
     assert not [f for f in s.facts_for("r") if f.kind == EventKind.MERGE_AUTHORIZED]
+
+
+def test_shadow_does_not_apply_a_conflicted_review(monkeypatch):
+    """The sibling of the merge-authorization defect fix round 1 closed:
+    authorize() checks only state-legality and verdict well-formedness for
+    record_review. Every substantive check -- artifact-hash binding,
+    base-sha match, role, reviewer independence -- lives entirely in
+    validate_review(). A record_review that PASSES authorize() and FAILS
+    validate_review() (a conflicted reviewer, here: the actor who
+    implemented and produced the artifact under review) must not advance the
+    run under shadow, or the except-block sibling to the one round 1 fixed
+    would have zero coverage -- exactly what the round-2 re-review found.
+    """
+    monkeypatch.setenv("BIRCHER_KERNEL_MODE", SHADOW)
+    s = Store.open(":memory:", clock=Clock(start_us=1))
+    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    spec = put_artifact(s, b"# spec")
+    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=spec)
+    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=spec)
+    _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
+    out = put_artifact(s, b"diff v1")
+    _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,
+         artifact_hash=out)
+    assert s.run_state("r") == "implementing"
+    state_before = s.run_state("r")
+    version_before = s.run_version("r")
+    # The prior legitimate commands already wrote their own
+    # transition_performed/command_accepted facts -- what matters is whether
+    # THIS refused review adds any more, not whether the run has ever seen
+    # one.
+    kinds_before = [f.kind for f in s.facts_for("r")]
+
+    # claude implemented this run and produced the artifact under review;
+    # dispatched as reviewer here so it clears authorize()'s role/state
+    # checks and reaches validate_review()'s independence check, which must
+    # refuse it.
+    r = _sub(s, "record_review", "k5", "claude", Role.REVIEWER,
+             verdict="accept", artifact_hash=out, base_sha=BASE,
+             context_bundle_hash=BUNDLE, policy_version=1)
+    assert not r.accepted
+    assert s.run_state("r") == state_before, "a refused review must not transition the run"
+    assert s.run_version("r") == version_before
+
+    new_kinds = [f.kind for f in s.facts_for("r")][len(kinds_before):]
+    assert EventKind.TRANSITION not in new_kinds
+    assert EventKind.REVIEW_VERDICT not in new_kinds
+    assert EventKind.COMMAND_ACCEPTED not in new_kinds
+    assert "command_rejected" in new_kinds
+    assert "shadow_rejected" in new_kinds

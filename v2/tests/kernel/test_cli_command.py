@@ -6,7 +6,7 @@ import pytest
 
 from conftest import valid_argv
 from kernel.artifacts import put_artifact
-from kernel.cli import main
+from kernel.cli import RC_REFUSED, main
 from kernel.dispatch import Role, dispatch
 from kernel.effects import EffectClass, UncertainEffect, perform
 from kernel.ids import Clock
@@ -42,6 +42,27 @@ def test_an_illegal_command_is_refused(db):
     rc = main(["command", "--db", db, "--run-id", "r", "--generation", str(g),
                "--name", "request_merge", "--payload-json", "{}"])
     assert rc == 87
+
+
+def test_an_illegal_command_under_the_real_shadow_default_does_not_claim_success(
+    db, monkeypatch, capsys
+):
+    """The test above passes only because tests/kernel/conftest.py forces
+    BIRCHER_KERNEL_MODE=enforce for this whole suite -- it says nothing about
+    the mode the CLI actually runs under by default. Clear that override to
+    reach the real default (unset -> shadow) and prove the CLI does not print
+    "accepted" or exit 0 for a command shadow mode refused: submit() returns
+    Result(accepted=False, ...) instead of raising, and _do_command must read
+    that field rather than treat "did not raise" as "succeeded".
+    """
+    monkeypatch.delenv("BIRCHER_KERNEL_MODE", raising=False)
+    g = _gen(db, "claude", Role.IMPLEMENTER)
+    rc = main(["command", "--db", db, "--run-id", "r", "--generation", str(g),
+               "--name", "request_merge", "--payload-json", "{}"])
+    assert rc == RC_REFUSED
+    out = capsys.readouterr()
+    assert "accepted" not in out.out
+    assert "accepted" not in out.err
 
 
 def test_a_payload_that_is_not_json_is_a_usage_error(db):

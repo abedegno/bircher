@@ -163,12 +163,20 @@ def _do_command(a) -> int:
     """Submit one typed command and translate its outcome to an exit code.
 
     Exit codes: 0 accepted or replayed, 2 usage (unknown command name,
-    unparseable or non-object payload), 87 refused (NotAuthorized, a stale
-    aggregate version, or any other command-level rejection), 88 fenced
-    (superseded generation), 90 failed (a run halted pending reconciliation --
-    the same RC _do_effect returns for its own RuntimeError, so the two
-    subcommands agree). 89 (uncertain) does not apply here: only an effect
-    executor can leave an outcome unconfirmed.
+    unparseable or non-object payload), 87 refused -- either ENFORCE raising
+    (NotAuthorized, a stale aggregate version, or any other command-level
+    rejection) OR SHADOW recording a refusal and returning normally instead
+    of raising (`submit()` gives back `Result(accepted=False, ...)`). Under
+    BIRCHER_KERNEL_MODE's real default (`shadow`, unset), most refusals take
+    this second path -- `r.accepted` must be checked, not just whether
+    `submit()` raised, or a shadow-refused command prints "accepted" and
+    exits 0. The bash wrapper is advisory and never branches on 87 vs. any
+    other nonzero code, but an operator reading the output must not be told
+    a refusal succeeded just because shadow mode did not raise for it.
+    88 fenced (superseded generation), 90 failed (a run halted pending
+    reconciliation -- the same RC _do_effect returns for its own
+    RuntimeError, so the two subcommands agree). 89 (uncertain) does not
+    apply here: only an effect executor can leave an outcome unconfirmed.
     """
     from kernel.commands import COMMAND_NAMES, Command, StaleVersion, submit
 
@@ -193,8 +201,20 @@ def _do_command(a) -> int:
                                   expected_version=store.run_version(a.run_id),
                                   idempotency_key=key, generation=a.generation,
                                   payload=payload))
-        print("replayed" if r.replayed else "accepted")
-        return RC_OK
+        if r.replayed:
+            print("replayed")
+            return RC_OK
+        if r.accepted:
+            print("accepted")
+            return RC_OK
+        # SHADOW evaluated this and refused it, but submit() returned instead
+        # of raising: the refusal is recorded (command_rejected,
+        # shadow_rejected) and nothing was applied. Must not print "accepted"
+        # or return RC_OK for the same reason ENFORCE's raise below does not.
+        print(f"shadow-refused: {a.name} would have been refused by "
+              "enforcement; the kernel recorded it and applied nothing",
+              file=sys.stderr)
+        return RC_REFUSED
     except NotAuthorized as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return RC_REFUSED
