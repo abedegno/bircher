@@ -79,11 +79,30 @@ Inside `run_item`, at the points the run already has the information:
 |---|---|
 | item accepted, prompt non-empty | `enqueue(...)` → `RUN_ID` |
 | after `_create_session` succeeds | `dispatch(actor=$vendor, role=implementer)` → `GEN` |
-| marker parsed, PR known | `record_implementation_output` |
+| marker parsed | `put_artifact(marker body)`, then `record_implementation_output` |
 | marker carries CI result | `record_ci_observation` |
-| marker carries review verdict | `record_review` (actor = the reviewer vendor) |
-| before `merge_ready_pr` | `request_merge` |
+| **before recording the review** | `dispatch(actor=$RECOVERY_REVIEWER, role=reviewer)` → `GEN` |
+| marker carries review verdict | `record_review` |
+| before `merge_ready_pr` | `dispatch(actor=$vendor, role=implementer)`, `request_merge` |
 | after the merge effect returns | `record_merge_outcome` |
+
+**Two corrections the self-review caught, both of which would have produced a
+shadow rejection on every single run:**
+
+*The reviewer needs its own dispatch.* `validate_review` refuses a review whose
+attempt was not dispatched in the reviewer role (`v2/kernel/authz.py:170`). One
+dispatch at session creation gives the implementer role only. Each role change
+is a new dispatch, which also re-fences the generation — so `GEN` is re-read
+after each one, and the merge request needs an implementer dispatch again.
+
+*The output needs an artifact that exists.* `record_implementation_output`
+refuses a hash the store does not hold (`v2/kernel/authz.py:321`), and in
+record mode there is no patch — v1's implementer pushed a PR and reported a
+marker. **The artifact is the marker body**: the bytes the coordinator actually
+observed the implementer report. That is honest about what is being recorded
+and it makes the review bind something real, but it is a stand-in — the
+artifact is a *report about* the work, not the work. C8 is what replaces it
+with the commit.
 
 `RUN_ID` and `GEN` are exported so the effect adapter picks them up unchanged —
 it already reads `BIRCHER_RUN_ID` and `BIRCHER_GENERATION`.
