@@ -116,3 +116,42 @@ def test_a_dash_cap_bypasses_net_run(tmp_path):
              f'_effect ref_update k - true', mode="legacy")
     assert r.returncode == 0, r.stderr
     assert not log.exists()
+
+
+# --- what legacy mode costs, pinned ------------------------------------------
+
+def test_legacy_mode_bypasses_the_entire_kernel_path(tmp_path):
+    """Legacy runs the command directly: no contract check, no executable
+    resolution, no journal, no authorization.
+
+    That is its PURPOSE -- it exists to bisect against v1 behaviour -- but the
+    cost was written down nowhere and asserted nowhere, so a reader could not
+    tell a deliberate escape hatch from an oversight. This test pins it, so
+    the day someone narrows or removes legacy, the change is visible.
+
+    The witness is a command NO contract admits: `sh -c`, which is not even in
+    the launcher's tool allowlist.
+    """
+    witness = tmp_path / "ran"
+    r = _run(f'_effect comment k - sh -c "touch {witness}"', mode="legacy")
+    assert r.returncode == 0, r.stderr
+    assert witness.exists(), "legacy did not execute -- this test has stopped pinning anything"
+
+
+def test_kernel_mode_would_refuse_that_same_command():
+    """The other half. Without this, the test above documents a bypass without
+    showing there is anything to bypass."""
+    from kernel.contract import ContractViolation, check
+    from kernel.effects import EffectClass
+
+    with pytest.raises(ContractViolation):
+        check(EffectClass.COMMENT, ["sh", "-c", "touch /tmp/x"])
+
+
+def test_the_self_test_runs_in_legacy_mode_deliberately():
+    """`run-queue.sh --self-test` sets BIRCHER_EFFECT_MODE=legacy, so a green
+    self-test says nothing about the kernel boundary. Pinned because the two
+    are easily confused: one exercises v1 orchestration, the other the v2
+    authority path."""
+    text = (REPO_ROOT / "batch" / "run-queue.sh").read_text()
+    assert 'BIRCHER_EFFECT_MODE="${BIRCHER_EFFECT_MODE:-legacy}"' in text

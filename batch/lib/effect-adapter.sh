@@ -11,6 +11,18 @@
 #   deny    - refuse every effect (fault injection; the constrained mode)
 #   legacy  - v1 behaviour, direct execution. Retained only for bisection.
 #
+# WHAT LEGACY COSTS. It runs the command directly, so it bypasses ALL of the
+# kernel path: no argv contract, no executable resolution, no effect journal,
+# no authorization recheck. A run in legacy mode has none of the guarantees
+# rounds 6 and 7 built. That is deliberate -- the mode exists to compare
+# against v1 -- but it is an escape hatch, and
+# test_fault_injection.py::test_legacy_mode_bypasses_the_entire_kernel_path
+# pins the fact so narrowing or removing it is a visible change rather than a
+# silent one.
+#
+# `run-queue.sh --self-test` sets this to legacy, so a green self-test says
+# nothing about the v2 boundary. The two are easily confused.
+#
 # Default is deny. An unset variable must not silently restore v1 authority:
 # fail closed, in the direction that stops work rather than the one that
 # performs an unmediated mutation.
