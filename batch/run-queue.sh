@@ -18,6 +18,12 @@ BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  #
 # (`_net_run`) resolve at call time, so the order of definition does not bind.
 # shellcheck source=lib/effect-adapter.sh
 . "$BUNDLE_DIR/batch/lib/effect-adapter.sh"
+# The kernel client: the coordinator's advisory interface to the v2 kernel.
+# Sourced after the effect adapter and before anything can call `_kernel` /
+# `_kernel_dispatch`. Every call it makes is advisory -- see the file's own
+# header -- so sourcing it here changes nothing about what a run does.
+# shellcheck source=lib/kernel-client.sh
+. "$BUNDLE_DIR/batch/lib/kernel-client.sh"
 
 QUEUE="${QUEUE:-$BUNDLE_DIR/queue}"
 PROCESSED="$QUEUE/processed"

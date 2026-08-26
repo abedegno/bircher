@@ -15,7 +15,7 @@ plain `curl` — were invisible to all of them, and to the detector built from
 them. The adversarial attention went entirely to the exclusions; the
 *inclusion* set was never questioned. The `curl` pattern is the sixth.
 
-Confirmed against `batch/run-queue.sh` at 6851 lines on 2026-08-25. Line
+Confirmed against `batch/run-queue.sh` at 6883 lines on 2026-08-26. Line
 numbers move: re-run the patterns and reconcile before relying on them.
 
 ```bash
@@ -31,23 +31,23 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 
 | Line | Call | Effect class |
 |---|---|---|
-| 366 | `gh issue reopen` | `issue_or_label` |
-| 1276 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
-| 1503 | `gh pr merge --squash --delete-branch` | `merge` |
-| 1707 | `git push origin HEAD:main` | `ref_update` |
-| 1800 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
-| 1883 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
-| 1963 | `gh pr close` | `pull_request` |
-| 2122 | `gh pr comment` | `comment` |
-| 2964 | `gh issue comment` | `comment` |
-| 2965 | `gh issue edit --remove-label` | `issue_or_label` |
-| 2966 | `gh issue edit --add-label` | `issue_or_label` |
-| 2982 | `gh issue close` | `issue_or_label` |
-| 3143 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
-| 1188 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
-| 1206 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
+| 378 | `gh issue reopen` | `issue_or_label` |
+| 1291 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
+| 1519 | `gh pr merge --squash --delete-branch` | `merge` |
+| 1723 | `git push origin HEAD:main` | `ref_update` |
+| 1816 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
+| 1899 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
+| 1979 | `gh pr close` | `pull_request` |
+| 2138 | `gh pr comment` | `comment` |
+| 2980 | `gh issue comment` | `comment` |
+| 2981 | `gh issue edit --remove-label` | `issue_or_label` |
+| 2982 | `gh issue edit --add-label` | `issue_or_label` |
+| 2998 | `gh issue close` | `issue_or_label` |
+| 3159 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 1195 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
+| 1214 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
 
-**1503 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
+**1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
 classified it as `pull_request`. M1-3 split `merge` into its own class
 precisely so the authority-bearing operation would not share a gate with the
 routine one, and it is now the only class `perform()` revalidates. Routing it
@@ -64,12 +64,12 @@ suppression nobody wrote down is a suppression nobody re-reads.
 
 | Line | Text | Why it is not a call |
 |---|---|---|
-| 1530 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 5093 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 5163 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 5888 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
-| 5889 | `echo "FAIL #62: the recovery git push must be bounded"` | failure message |
-| 5906 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 1546 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
+| 5115 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 5185 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 5914 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
+| 5915 | `echo "FAIL #62: the recovery git push must be bounded"` | failure message |
+| 5938 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
@@ -89,4 +89,4 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 1149 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed.** `resp=$(curl -s -w '\n%{http_code}' ...)` captures the status and body together, and the caller reads both to report why an upload failed. Routing it changes what the caller receives on failure — the kernel returns the effect's external id and reports errors on stderr — and this sits on the coordinator's hot path, where every run begins. Routing it needs the intent contract to carry a response, which is the same work as C1/C2's full form. Recorded rather than done blind. |
+| 1155 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed.** `resp=$(curl -s -w '\n%{http_code}' ...)` captures the status and body together, and the caller reads both to report why an upload failed. Routing it changes what the caller receives on failure — the kernel returns the effect's external id and reports errors on stderr — and this sits on the coordinator's hot path, where every run begins. Routing it needs the intent contract to carry a response, which is the same work as C1/C2's full form. Recorded rather than done blind. |
