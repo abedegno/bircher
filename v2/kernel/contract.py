@@ -26,7 +26,8 @@ reviewable act rather than a consequence of nobody having thought of a flag.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 
 from kernel.effects import EffectClass
 
@@ -38,10 +39,16 @@ class Rule:
     """One permitted command shape for a class."""
 
     sig: str
-    #: For `gh api`: a fragment that must appear in the URL OPERAND itself --
-    #: not anywhere in the argv. Searching the joined argv let the marker be
-    #: smuggled into an unrelated field.
-    url: str | None = None
+    #: For `gh api` / `curl`: a regex the URL's PATH must match, after the
+    #: query and fragment are stripped.
+    #:
+    #: This was a substring test against the URL operand, and round 7 showed a
+    #: substring is not an endpoint: `repos/o/r/issues/1/comments?marker=/statuses/`
+    #: satisfied the status rule and posted an issue comment, and
+    #: `repos/o/r/contents/x.txt?marker=update-branch` satisfied the ref rule
+    #: and wrote a repository file. The marker lived in the QUERY. The path is
+    #: the endpoint; everything after `?` is data.
+    url_path: str | None = None
     flags: frozenset = frozenset()
     #: Flags whose NEXT token is a value, not an operand. Without this,
     #: `--max-time 120` made `120` the URL operand and every session_control
@@ -49,9 +56,19 @@ class Rule:
     #: behind a flag that takes one.
     valued: frozenset = frozenset()
     methods: frozenset = frozenset()
-    #: Operand prefixes that are refused outright. `:` on a git refspec is a
-    #: DELETION -- `git push origin :main` removes the branch.
+    #: Operand prefixes refused outright. On a git refspec `:` is a DELETION
+    #: and `+` is a FORCED update -- git's second spelling for --force, which
+    #: is an operand, so no flag allowlist can see it. Demonstrated in round 7
+    #: against a real repository: `git push origin +HEAD:main` rewrote main
+    #: while the plain push was rejected as non-fast-forward.
     forbid_operand_prefix: tuple = ()
+    #: Exact number of operands permitted, when the shape is fixed. `git push`
+    #: takes a remote and ONE refspec: `origin HEAD:main HEAD:other` updated
+    #: two branches under a single journalled effect.
+    operand_count: int | None = None
+    #: URL schemes permitted when the operand carries one. `file://` is not a
+    #: session-control transfer.
+    schemes: frozenset = frozenset({"http", "https"})
 
 
 _GH_COMMON = frozenset({"--repo"})
@@ -76,12 +93,12 @@ CONTRACTS: dict[str, list[Rule]] = {
         # No --force, no --delete, no deletion refspec. A ref update advances a
         # branch; it does not remove or rewrite one.
         Rule("git push", flags=frozenset({"-q", "--quiet"}),
-             forbid_operand_prefix=(":",)),
-        Rule("gh api", url="update-branch", flags=frozenset({"-X", "-f", "-q"}),
+             forbid_operand_prefix=(":", "+"), operand_count=2),
+        Rule("gh api", url_path=r"/update-branch$", flags=frozenset({"-X", "-f", "-q"}),
              valued=frozenset({"-X", "-f", "-q"}), methods=frozenset({"PUT"})),
     ],
     EffectClass.STATUS_CHECK: [
-        Rule("gh api", url="/statuses/", flags=frozenset({"-X", "-f"}),
+        Rule("gh api", url_path=r"/statuses/", flags=frozenset({"-X", "-f"}),
              valued=frozenset({"-X", "-f"}), methods=frozenset({"POST"})),
     ],
     EffectClass.COMMENT: [
@@ -103,18 +120,29 @@ CONTRACTS: dict[str, list[Rule]] = {
         Rule("git revert", flags=frozenset({"-n", "--no-edit", "-m"}),
              valued=frozenset({"-m"})),
         Rule("git push", flags=frozenset({"-q", "--quiet"}),
-             forbid_operand_prefix=(":",)),
+             forbid_operand_prefix=(":", "+"), operand_count=2),
     ],
     EffectClass.SESSION_CONTROL: [
-        Rule("curl", url="/v1/sessions",
-             flags=frozenset({"-s", "-sf", "-f", "-X", "-H", "-d", "-F", "-w",
+        # `-w` is GONE. Its value supports `%output{path}`, which redirects
+        # write-out to a local file -- an arbitrary filesystem write from a
+        # class that exists to control a session. No routed site uses it.
+        Rule("curl", url_path=r"/v1/sessions", operand_count=1,
+             flags=frozenset({"-s", "-sf", "-f", "-X", "-H", "-d", "-F",
                               "--max-time"}),
-             valued=frozenset({"-X", "-H", "-d", "-F", "-w", "--max-time"}),
+             valued=frozenset({"-X", "-H", "-d", "-F", "--max-time"}),
              methods=frozenset({"POST", "DELETE"})),
     ],
-    EffectClass.CREDENTIAL_LIFECYCLE: [
-        Rule("gh auth", flags=frozenset({"--hostname"})),
-    ],
+    # DELIBERATELY EMPTY. `Rule("gh auth", ...)` admitted every unflagged
+    # `gh auth` subcommand, including `gh auth token` -- which PRINTS the
+    # token. `cli.py`'s executor captures stdout as the external object id and
+    # main() prints it back to the caller, so an authorized
+    # credential_lifecycle request could extract the kernel's GitHub
+    # credential through the very adapter built to keep it away from models.
+    #
+    # No routed call site performs a credential effect. The class keeps its
+    # entry so `check` can say this was decided rather than forgotten, and so
+    # adding a shape here is a deliberate act.
+    EffectClass.CREDENTIAL_LIFECYCLE: [],
 }
 
 
@@ -161,41 +189,71 @@ def _flags_and_operands(argv: list[str], valued: frozenset = frozenset()):
     return flags, methods, operands
 
 
-def _url_operand(argv: list[str], after: str, valued: frozenset) -> str | None:
-    """The first operand following *after* -- `gh api <URL>`, `curl <URL>`."""
-    _f, _m, operands = _flags_and_operands(argv, valued)
-    if after in operands:
-        i = operands.index(after)
-        return operands[i + 1] if i + 1 < len(operands) else None
-    return operands[0] if operands else None
+def _rule_parts(argv: list[str], rule) -> tuple[list[str], list[str], list[str]]:
+    """Flags, method values, and operands, with the rule's own command words
+    removed.
+
+    The command words are not operands: leaving `curl` and `git push` in the
+    list made every `operand_count` off by the length of the signature.
+    """
+    lead = len(rule.sig.split())
+    return _flags_and_operands(argv[lead:], rule.valued)
 
 
 def check(effect_class: str, argv: list[str]) -> None:
     """Refuse an argv inconsistent with its declared class."""
     allowed = CONTRACTS.get(effect_class)
-    if not allowed:
+    if allowed is None:
         raise ContractViolation(
             f"effect class {effect_class!r} declares no argv contract, so "
             "nothing constrains what it may run"
+        )
+    if not allowed:
+        raise ContractViolation(
+            f"effect class {effect_class!r} has an empty contract: no command "
+            "shape is permitted for it"
         )
     sig = signature(argv)
     reasons = []
     for rule in allowed:
         if not (sig == rule.sig or sig.startswith(rule.sig + " ")):
             continue
-        flags, methods, operands = _flags_and_operands(argv, rule.valued)
-        if rule.url is not None:
-            target = _url_operand(argv, rule.sig.split()[-1], rule.valued)
-            if not target or rule.url not in target:
-                reasons.append(f"{rule.sig}: url operand {target!r} lacks {rule.url!r}")
+        flags, methods, operands = _rule_parts(argv, rule)
+        if rule.url_path is not None:
+            target = operands[0] if operands else None
+            if not target:
+                reasons.append(f"{rule.sig}: no url operand")
+                continue
+            scheme = target.split("://", 1)[0].lower() if "://" in target else None
+            if scheme is not None and scheme not in rule.schemes:
+                reasons.append(f"{rule.sig}: scheme {scheme!r} not permitted")
+                continue
+            # Query and fragment are DATA. The path is the endpoint.
+            path = target.split("#", 1)[0].split("?", 1)[0]
+            if not re.search(rule.url_path, path):
+                reasons.append(
+                    f"{rule.sig}: url path {path!r} does not match {rule.url_path!r}")
                 continue
         bad = [f for f in flags if f not in rule.flags]
         if bad:
             reasons.append(f"{rule.sig}: flags not permitted: {bad}")
             continue
-        bad_m = [m for m in methods if m.upper() not in rule.methods]
-        if bad_m:
-            reasons.append(f"{rule.sig}: method not permitted: {bad_m}")
+        # A rule that names methods REQUIRES one. Checking only the values it
+        # happened to collect made the constraint vacuous when no method flag
+        # was given at all -- and `gh api` switches from GET to POST on its own
+        # when a field is present, so an omitted `-X` reached a PUT-only rule
+        # as a POST.
+        if rule.methods:
+            if len(methods) != 1:
+                reasons.append(
+                    f"{rule.sig}: exactly one explicit method required, got {methods}")
+                continue
+            if methods[0].upper() not in rule.methods:
+                reasons.append(f"{rule.sig}: method not permitted: {methods}")
+                continue
+        if rule.operand_count is not None and len(operands) != rule.operand_count:
+            reasons.append(
+                f"{rule.sig}: expected {rule.operand_count} operand(s), got {operands}")
             continue
         bad_o = [o for o in operands
                  if o.startswith(rule.forbid_operand_prefix)] \
@@ -210,12 +268,22 @@ def check(effect_class: str, argv: list[str]) -> None:
     )
 
 
+_MERGE_VALUED = frozenset({"--repo", "--match-head-commit"})
+
+
 def merge_target(argv: list[str]) -> tuple[str | None, str | None]:
-    """The (pr, repo) a merge command would act on."""
-    pr = repo = None
+    """The (pr, repo) a merge command would act on.
+
+    Uses the operand parser rather than "the token after `merge`", because
+    `gh` accepts flags before the positional: `gh pr merge --repo o/r 42` is
+    valid and the old reading returned pr=None, refusing a legitimate merge.
+    That failed closed, but the docstring claimed to model what the command
+    would act on, and it did not.
+    """
+    _f, _m, operands = _flags_and_operands(argv[3:], _MERGE_VALUED)
+    pr = operands[0] if operands else None
+    repo = None
     for i, tok in enumerate(argv):
-        if tok == "merge" and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-            pr = argv[i + 1]
         if tok == "--repo" and i + 1 < len(argv):
             repo = argv[i + 1]
         elif tok.startswith("--repo="):

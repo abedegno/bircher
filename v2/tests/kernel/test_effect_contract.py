@@ -208,12 +208,14 @@ def test_the_contract_constrains_more_than_the_verb(name, cls, argv):
 
 
 def test_the_url_marker_must_be_in_the_url_not_anywhere_in_the_argv():
-    """The `gh api` rules require a fragment in the URL. Searching the joined
-    argv let it be smuggled into an unrelated field -- `-f note=update-branch`
-    satisfied a check meant to identify the endpoint."""
+    """The `gh api` rules identify an endpoint. Searching the joined argv let
+    the marker be smuggled into an unrelated field -- `-f note=update-branch`
+    satisfied a check meant to identify the endpoint. Round 7 then showed the
+    URL-operand version was still a substring test, so the marker could sit in
+    the QUERY; it is now a regex over the PATH."""
     from kernel.contract import ContractViolation, check
 
-    with pytest.raises(ContractViolation, match="url operand"):
+    with pytest.raises(ContractViolation, match="url path"):
         check(EffectClass.REF_UPDATE,
               ["gh", "api", "repos/o/r/git/refs/heads/main", "-X", "PUT",
                "-f", "note=update-branch"])
@@ -245,3 +247,77 @@ def test_a_repo_given_as_an_equals_form_is_still_read():
     from kernel.contract import merge_target
 
     assert merge_target(["gh", "pr", "merge", "42", "--repo=o/r"]) == ("42", "o/r")
+
+
+# --- round 7, codex: twelve shapes the verb/flag contract still admitted ------
+
+CODEX_R7 = [
+    ("R7-1 gh auth token prints the kernel credential",
+     EffectClass.CREDENTIAL_LIFECYCLE, ["gh", "auth", "token", "--hostname", "github.com"]),
+    ("R7-2 status marker in a query, on a comments endpoint",
+     EffectClass.STATUS_CHECK,
+     ["gh", "api", "repos/o/r/issues/1/comments?marker=/statuses/", "-X", "POST",
+      "-f", "body=x"]),
+    ("R7-3 no method flag; gh defaults to POST when -f is present",
+     EffectClass.REF_UPDATE,
+     ["gh", "api", "repos/o/r/pulls/1/update-branch", "-f", "expected_head_sha=0"]),
+    ("R7-4 file:// scheme", EffectClass.SESSION_CONTROL,
+     ["curl", "-s", "-X", "POST", "file:///etc/hosts/v1/sessions"]),
+    ("R7-5 a second URL operand", EffectClass.SESSION_CONTROL,
+     ["curl", "-s", "-X", "POST", "http://srv/v1/sessions", "file:///etc/hosts"]),
+    ("R7-6 +refspec forces a push with no force flag", EffectClass.REF_UPDATE,
+     ["git", "push", "origin", "+HEAD:main"]),
+    ("R7-7 two refspecs under one journalled effect", EffectClass.REF_UPDATE,
+     ["git", "push", "origin", "HEAD:main", "HEAD:other"]),
+    ("R7-9 -w %output{} writes an arbitrary local file",
+     EffectClass.SESSION_CONTROL,
+     ["curl", "-s", "-X", "POST", "http://srv/v1/sessions", "-w", "%output{/tmp/x}HI"]),
+    ("R7-12 ref marker in a query, on the contents endpoint",
+     EffectClass.REF_UPDATE,
+     ["gh", "api", "repos/o/r/contents/x.txt?marker=update-branch", "-X", "PUT",
+      "-f", "content=eA=="]),
+]
+
+
+@pytest.mark.parametrize("name,cls,argv", CODEX_R7, ids=[c[0][:5] for c in CODEX_R7])
+def test_codex_round7_shapes_are_refused(name, cls, argv):
+    """Every one of these was ADMITTED by the verb-and-flag contract, and each
+    was demonstrated against the real tool by the reviewer -- `+HEAD:main`
+    rewrote a branch in a scratch repository, `-w %output{}` created a file,
+    `gh auth token` printed a token that the executor would have returned to
+    the caller as an external object id."""
+    from kernel.contract import ContractViolation, check
+
+    with pytest.raises(ContractViolation):
+        check(cls, argv)
+
+
+def test_the_credential_class_permits_nothing_and_says_so():
+    """Distinguished from a class with no entry at all: this one was decided."""
+    from kernel.contract import CONTRACTS, ContractViolation, check
+
+    assert CONTRACTS[EffectClass.CREDENTIAL_LIFECYCLE] == []
+    with pytest.raises(ContractViolation, match="empty contract"):
+        check(EffectClass.CREDENTIAL_LIFECYCLE, ["gh", "auth", "status"])
+
+
+def test_merge_target_reads_flags_before_the_positional():
+    """R7-11. `gh pr merge --repo o/r 42` is valid and the old reading gave
+    pr=None, refusing a legitimate merge. It failed closed, but the helper
+    claimed to model what the command would act on."""
+    from kernel.contract import merge_target
+
+    assert merge_target(
+        ["gh", "pr", "merge", "--repo", "o/r", "42", "--squash"]) == ("42", "o/r")
+
+
+def test_the_real_calls_still_pass_after_all_of_it():
+    """The control for the whole round: hardening that broke the coordinator
+    would be a different failure, not a fix."""
+    from kernel.contract import check
+
+    check(EffectClass.REF_UPDATE, ["git", "push", "origin", "HEAD:main", "-q"])
+    check(EffectClass.STATUS_CHECK,
+          ["gh", "api", "repos/o/r/statuses/abc", "-X", "POST", "-f", "state=success"])
+    check(EffectClass.SESSION_CONTROL,
+          ["curl", "-sf", "--max-time", "15", "-X", "DELETE", "http://srv/v1/sessions/1"])

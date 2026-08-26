@@ -41,7 +41,10 @@ def routed_calls():
         if not m or mask[m.start()]:
             continue
         cls, rest = m.groups()
-        rest = re.split(r"\s+(?:>|2>|\|\||&&|;)", rest)[0]
+        # `)` and `}` end a command too: the recovery push sits inside a
+        # subshell and ends `-q ); then`, so `);` and `then` were being read
+        # as operands and failed the operand-count rule.
+        rest = re.split(r"\s+(?:>|2>|\|\||&&|;|\)|\})", rest)[0]
         try:
             toks = shlex.split(rest)
         except ValueError:
