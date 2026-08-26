@@ -23,6 +23,7 @@ import re
 
 import pytest
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 AUTHZ = pathlib.Path(__file__).resolve().parents[2] / "kernel" / "authz.py"
 TABLE = (pathlib.Path(__file__).resolve().parents[3]
          / "docs" / "design" / "provenance-table.md")
@@ -177,4 +178,26 @@ def test_the_store_is_never_aliased_in_authz():
         f"authz.py aliases `store` as {aliases}; reads through the alias are "
         "invisible to the provenance walk, so the table's completeness "
         "guarantee would silently stop holding"
+    )
+
+
+def test_the_spec_and_the_table_agree_on_the_count():
+    """The spec said FOUR, the table had EIGHT, and the test fixed EIGHT.
+
+    An edit meant for the spec landed in the table instead, so the number in
+    the design document drifted from the artifact it describes and nothing
+    noticed -- found by a reviewer counting the rows. A count asserted in
+    prose and checked nowhere is the defect this whole table exists to catch,
+    committed in the document that defines it.
+    """
+    spec = (REPO_ROOT / "docs" / "design"
+            / "2026-08-23-v2-kernel-design.md").read_text()
+    m = re.search(r"\*\*(\w+) rows are asserted after Milestone 1\*\*", spec)
+    assert m, "the spec no longer states the asserted-row count"
+    words = {"four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+    claimed = words.get(m.group(1).lower())
+    assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
+    actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")
+    assert claimed == actual, (
+        f"the spec says {claimed} asserted rows; the table has {actual}"
     )
