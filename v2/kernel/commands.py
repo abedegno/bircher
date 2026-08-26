@@ -174,12 +174,22 @@ def submit(store, cmd: Command) -> Result:
     # Every refusal is recorded, not only the stale-version one. Illegal
     # transitions, malformed bindings and failed merge authorization
     # previously left no immutable trace of the decision.
+    # Shadow evaluates and records; it does not act. `shadow_or_raise` below
+    # can return normally instead of raising, and if execution simply fell
+    # through from there, MERGE_AUTHORIZED and set_current_artifact -- gated
+    # only on `cmd.name`, never on authorization having actually succeeded --
+    # would run for a command `authorize()` just refused. A run already at
+    # `merge_requested` receiving a second, illegal `request_merge` naming an
+    # attacker's pr/repo demonstrated exactly that: the poisoned
+    # MERGE_AUTHORIZED fact became the one `revalidate_merge` trusted. So a
+    # refusal here returns immediately -- recorded, not acted on -- and
+    # control never reaches the transaction below at all.
     try:
         next_state = authorize(store, cmd, actor)
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
-        shadow_or_raise(store, cmd.run_id, exc, command_name=cmd.name)
-        next_state = None
+        shadow_or_raise(store, cmd.run_id, exc, cmd.idempotency_key, command_name=cmd.name)
+        return Result(accepted=False, result={"name": cmd.name})
 
     # A review is validated BEFORE it is recorded, and recorded as a verdict in
     # its own right. Previously the verdict existed only as a verbatim copy of
@@ -194,8 +204,8 @@ def submit(store, cmd: Command) -> Result:
         )
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
-        shadow_or_raise(store, cmd.run_id, exc, command_name=cmd.name)
-        review_binding = None
+        shadow_or_raise(store, cmd.run_id, exc, cmd.idempotency_key, command_name=cmd.name)
+        return Result(accepted=False, result={"name": cmd.name})
 
     result = {"name": cmd.name}
     try:

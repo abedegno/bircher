@@ -90,7 +90,7 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
         try:
             check(effect_class, argv)
         except ContractViolation as exc:
-            shadow_or_raise(store, run_id, NotAuthorized(str(exc)),
+            shadow_or_raise(store, run_id, NotAuthorized(str(exc)), idempotency_key,
                             effect_class=effect_class, argv=argv[:6])
 
     if effect_class == EffectClass.MERGE:

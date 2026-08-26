@@ -34,17 +34,22 @@ def kernel_mode() -> str:
     return mode
 
 
-def shadow_or_raise(store, run_id: str, exc: Exception, **context) -> None:
+def shadow_or_raise(
+    store, run_id: str, exc: Exception, causal_command_id: str | None, **context
+) -> None:
     """In enforce, re-raise. In shadow, record and return.
 
     The fact is appended BEFORE the caller proceeds, so a crash mid-command
     still leaves the refusal recorded -- the runs worth studying are exactly
-    the ones that go wrong.
+    the ones that go wrong. `causal_command_id` is the idempotency key of the
+    command or effect being refused: both call sites already have it, and a
+    shadow_rejected fact with no causal link back to its request is harder to
+    match against the command_rejected fact recorded beside it.
     """
     if kernel_mode() == ENFORCE:
         raise exc
     store.append_fact(
         run_id=run_id, kind=EventKind.SHADOW_REJECTED, actor="kernel",
-        causal_command_id=None,
+        causal_command_id=causal_command_id,
         payload={"error": type(exc).__name__, "reason": str(exc)[:400], **context},
     )
