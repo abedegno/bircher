@@ -102,11 +102,16 @@ def test_the_effect_subcommand_still_works(db):
     This only proves `main()` still dispatches "effect" to `_do_effect`
     without an argparse usage error -- it calls `kernel.cli.main()` directly
     and never touches `batch/lib/effect-adapter.sh`, so it says nothing about
-    the adapter's own invocation. That was checked separately, outside this
-    suite: sourcing the adapter with `BIRCHER_EFFECT_MODE=kernel` and a stub
-    `python3` confirms the argv it builds still reads `-m kernel.cli effect
-    --db ... -- <argv>`, with `effect` landing right after `kernel.cli` and
-    every other argument unchanged.
+    the adapter's own invocation.
+
+    That invocation is covered by
+    test_fault_injection.py::test_kernel_mode_reaches_the_kernel_and_performs_the_effect.
+    It previously was not. This docstring used to claim the adapter had been
+    "checked separately, outside this suite" with a stub `python3` that
+    confirmed the argv shape -- and a stub imports nothing, so that check was
+    incapable of noticing the adapter set no PYTHONPATH and that every real
+    effect died with `No module named kernel`. An out-of-suite check, recorded
+    only in prose, also cannot fail when the code drifts away from it.
     """
     g = _gen(db, "claude", Role.IMPLEMENTER)
     rc = main(["effect", "--db", db, "--run-id", "r", "--generation", str(g),

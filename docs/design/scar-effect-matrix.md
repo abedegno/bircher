@@ -35,7 +35,7 @@ v1's own `--self-test` catches the mutation: where it does not, the v2 test is
 | Recovery push is bounded | `run-queue.sh:1723` `merge_ready_pr` `_effect ref_update` | cap → `-`; or `_net_run` drops `-k` — **v1 binds both** | effect adapter cap → `_net_run` | v1 `--self-test` #62 | the bound removed | `effect_uncertain` on timeout | `ref_update` |
 | Reopening reverted issues is bounded | `run-queue.sh:378` `_reopen_reverted_issues` `_effect issue_or_label` | cap → `-` — **v1 binds** | effect adapter cap → `_net_run` | v1 `--self-test` #62 | the bound removed | `effect_intended` | `issue_or_label` |
 | The adapter is actually wired in | `run-queue.sh:20` `«top-level»` `effect-adapter.sh` | remove the `source` line — **v1 binds, via #50** | `batch/lib/effect-adapter.sh` | v1 `--self-test` | adapter not sourced | none — the run cannot start | none |
-| Effect denial fails closed | `effect-adapter.sh:50` `_effect` `BIRCHER_EFFECT_MODE:-deny` | default mode `deny` → `legacy` — **v2 binds** | `batch/lib/effect-adapter.sh` | `test_fault_injection.py` | `BIRCHER_EFFECT_MODE` unset | none — refused before execution | none |
+| Effect denial fails closed | `effect-adapter.sh:76` `_effect` `BIRCHER_EFFECT_MODE:-deny` | default mode `deny` → `legacy` — **v2 binds** | `batch/lib/effect-adapter.sh` | `test_fault_injection.py` | `BIRCHER_EFFECT_MODE` unset | none — refused before execution | none |
 
 ## Excluded, with dispositions
 
