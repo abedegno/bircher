@@ -48,7 +48,27 @@ authorization and the argv contract.
 
 - `shadow` — evaluate; on `NotAuthorized` or `ContractViolation`, append a
   `shadow_rejected` fact carrying the command or effect, the exception type
-  and its message, then proceed as if it had passed.
+  and its message. What happens next differs by kind, and the difference is
+  the whole safety property:
+
+  - **A refused COMMAND is not applied.** No `command_accepted`, no version
+    bump, no state transition, no side effect, `Result.accepted` false. The
+    coordinator decides what the run does, so the kernel never needs to
+    pretend a refusal succeeded.
+  - **A refused EFFECT still executes.** The contract violation is recorded
+    and the command runs, because the coordinator is mid-run and stopping its
+    external effects is exactly the interference record mode exists to avoid.
+    The merge-target and empty-argv checks stay enforcing even here.
+
+  **An earlier revision of this document said shadow should "proceed as if it
+  had passed", without distinguishing the two.** That sentence produced a real
+  defect: `submit()` wrote the `merge_authorized` fact and set the current
+  artifact gated only on the command's NAME, so a shadowed `request_merge`
+  naming someone else's pull request poisoned the record that the enforcing
+  merge-target check reads — and a reviewer demonstrated shadow mode merging
+  an attacker-named PR. Recorded here because the wording, not the code, was
+  the cause, and a future implementer reading the old sentence would rebuild
+  the same hole.
 - `enforce` — present behaviour: the refusal is the outcome.
 
 Defaulting to `shadow` is the opposite of `BIRCHER_EFFECT_MODE`, which defaults
