@@ -17,6 +17,7 @@ uncertain rather than as a completed replay.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -100,17 +101,34 @@ def _executor(effect_class, intent, idempotency_key):
     return r.stdout.strip() or "ok"
 
 
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="bircher-effect")
+def _add_common(p):
     p.add_argument("--db", required=True)
     p.add_argument("--run-id", required=True)
     p.add_argument("--generation", type=int, required=True)
-    p.add_argument("--class", dest="effect_class", required=True,
-                   choices=sorted(EffectClass.ALL))
-    p.add_argument("--idempotency-key", required=True)
-    p.add_argument("cmd", nargs=argparse.REMAINDER)
-    a = p.parse_args(argv)
 
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="bircher-kernel")
+    subs = p.add_subparsers(dest="mode", required=True)
+
+    e = subs.add_parser("effect")
+    _add_common(e)
+    e.add_argument("--class", dest="effect_class", required=True,
+                   choices=sorted(EffectClass.ALL))
+    e.add_argument("--idempotency-key", required=True)
+    e.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    c = subs.add_parser("command")
+    _add_common(c)
+    c.add_argument("--name", required=True)
+    c.add_argument("--payload-json", default="{}")
+    c.add_argument("--idempotency-key", default=None)
+
+    a = p.parse_args(argv)
+    return _do_effect(a) if a.mode == "effect" else _do_command(a)
+
+
+def _do_effect(a) -> int:
     cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
     if not cmd:
         print("no command given", file=sys.stderr)
@@ -139,6 +157,43 @@ def main(argv=None) -> int:
     except RuntimeError as e:
         print(f"failed: {e}", file=sys.stderr)
         return RC_FAILED
+
+
+def _do_command(a) -> int:
+    from kernel.commands import COMMAND_NAMES, Command, StaleVersion, submit
+
+    if a.name not in COMMAND_NAMES:
+        print(f"unknown command: {a.name}", file=sys.stderr)
+        return RC_USAGE
+    try:
+        payload = json.loads(a.payload_json)
+    except ValueError as exc:
+        print(f"payload is not JSON: {exc}", file=sys.stderr)
+        return RC_USAGE
+    if not isinstance(payload, dict):
+        print("payload must be a JSON object", file=sys.stderr)
+        return RC_USAGE
+
+    store = Store.open(a.db)
+    # A stable default so a retry of the same stage REPLAYS. Without it every
+    # retry is a new command and the same stage records twice.
+    key = a.idempotency_key or f"{a.run_id}:{a.name}:{a.generation}"
+    try:
+        r = submit(store, Command(name=a.name, run_id=a.run_id,
+                                  expected_version=store.run_version(a.run_id),
+                                  idempotency_key=key, generation=a.generation,
+                                  payload=payload))
+        print("replayed" if r.replayed else "accepted")
+        return RC_OK
+    except NotAuthorized as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return RC_REFUSED
+    except OwnershipLost as exc:
+        print(f"fenced: {exc}", file=sys.stderr)
+        return RC_FENCED
+    except (StaleVersion, ValueError) as exc:
+        print(f"rejected: {exc}", file=sys.stderr)
+        return RC_REFUSED
 
 
 if __name__ == "__main__":

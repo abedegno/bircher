@@ -50,7 +50,7 @@ _effect() {
   case "${BIRCHER_EFFECT_MODE:-deny}" in
     kernel)
       local -a kcmd=(
-        "${BIRCHER_PY:-python3}" -m kernel.cli
+        "${BIRCHER_PY:-python3}" -m kernel.cli effect
         --db "${BIRCHER_KERNEL_DB:?BIRCHER_KERNEL_DB must be set in kernel mode}"
         --run-id "${BIRCHER_RUN_ID:?BIRCHER_RUN_ID must be set in kernel mode}"
         --generation "${BIRCHER_GENERATION:?BIRCHER_GENERATION must be set in kernel mode}"
