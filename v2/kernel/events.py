@@ -30,6 +30,7 @@ class EventKind:
     RUN_ENQUEUED = "run_enqueued"
     REVISION_PROPOSED = "revision_proposed"
     BUNDLE_REVISED = "bundle_revised"
+    SHADOW_REJECTED = "shadow_rejected"
 
 
 SCHEMA_VERSIONS = {
@@ -54,6 +55,7 @@ SCHEMA_VERSIONS = {
     EventKind.RUN_ENQUEUED: 1,
     EventKind.REVISION_PROPOSED: 1,
     EventKind.BUNDLE_REVISED: 1,
+    EventKind.SHADOW_REJECTED: 1,
 }
 
 MECHANISM_VERSION = 1

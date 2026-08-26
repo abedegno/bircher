@@ -10,6 +10,7 @@ from __future__ import annotations
 from kernel.dispatch import actor_for
 from kernel.events import EventKind
 from kernel.ids import new_id
+from kernel.mode import shadow_or_raise
 from kernel.ownership import OwnershipLost, current_generation
 
 
@@ -89,7 +90,8 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
         try:
             check(effect_class, argv)
         except ContractViolation as exc:
-            raise NotAuthorized(str(exc)) from exc
+            shadow_or_raise(store, run_id, NotAuthorized(str(exc)),
+                            effect_class=effect_class, argv=argv[:6])
 
     if effect_class == EffectClass.MERGE:
         from kernel.authz import revalidate_merge

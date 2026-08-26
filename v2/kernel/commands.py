@@ -14,6 +14,7 @@ from kernel.authz import NotAuthorized, authorize, validate_review
 from kernel.canon import canonical_hash
 from kernel.dispatch import actor_for
 from kernel.events import EventKind
+from kernel.mode import shadow_or_raise
 from kernel.ownership import OwnershipLost, current_generation
 
 #: The label recorded for an attempt the kernel cannot name. It is a LABEL,
@@ -177,7 +178,8 @@ def submit(store, cmd: Command) -> Result:
         next_state = authorize(store, cmd, actor)
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
-        raise
+        shadow_or_raise(store, cmd.run_id, exc, command_name=cmd.name)
+        next_state = None
 
     # A review is validated BEFORE it is recorded, and recorded as a verdict in
     # its own right. Previously the verdict existed only as a verbatim copy of
@@ -192,7 +194,8 @@ def submit(store, cmd: Command) -> Result:
         )
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
-        raise
+        shadow_or_raise(store, cmd.run_id, exc, command_name=cmd.name)
+        review_binding = None
 
     result = {"name": cmd.name}
     try:

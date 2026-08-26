@@ -11,7 +11,22 @@ Tests that are about the journal, fencing or idempotency rather than about the
 command still need a command, so they use this.
 """
 
+import pytest
+
 from kernel.effects import EffectClass
+
+
+@pytest.fixture(autouse=True)
+def _kernel_mode_defaults_to_enforce_in_tests(monkeypatch):
+    """This suite predates `kernel.mode` and tests whether a guard fires at
+    all -- "the exploit is reproduced below as a test; it must not be
+    expressible." Production defaults `BIRCHER_KERNEL_MODE` to `shadow`
+    (`kernel.mode.kernel_mode`, exercised directly by
+    `tests/kernel/test_mode.py`, which sets or clears the variable itself and
+    so overrides this default); every other kernel test runs under `enforce`
+    unless it opts out, so a refusal it asserts on still refuses.
+    """
+    monkeypatch.setenv("BIRCHER_KERNEL_MODE", "enforce")
 
 _ARGV = {
     EffectClass.MERGE: ["gh", "pr", "merge", "42", "--repo", "abedegno/muesli"],
