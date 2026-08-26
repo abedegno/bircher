@@ -45,6 +45,32 @@
 _EFFECT_RC_DENIED=87      # refused by the adapter
 _EFFECT_RC_BADMODE=2      # unknown mode
 
+# Where `-m kernel.cli` is imported from.
+#
+# THE SCAR. Without this, kernel mode invokes `python3 -m kernel.cli` with
+# whatever PYTHONPATH the coordinator happened to have -- which is none --
+# and every effect dies with `No module named kernel` before it reaches the
+# kernel at all. In kernel mode `_effect` is NOT advisory: it is the
+# execution path, so that failure does not merely lose the recording, it
+# loses the effect. It took down prompt delivery in the first live
+# acceptance run.
+#
+# The identical defect was found and fixed in `_kernel`
+# (batch/lib/kernel-client.sh) before it ever ran; the fix was applied to
+# that instance and the class was assumed closed. It was not: this file had
+# the same shape and no test that could see it.
+#
+# Precedence matches `_kernel_pythonpath` so the two agree, with a
+# self-locating fallback because this file is sourced by callers (and
+# tests) that set neither variable: the adapter sits at
+# <bundle>/batch/lib/, so <bundle>/v2 is two directories up.
+_effect_pythonpath() {
+  if [ -n "${BIRCHER_V2_DIR:-}" ]; then printf '%s' "$BIRCHER_V2_DIR"
+  elif [ -n "${BUNDLE_DIR:-}" ]; then printf '%s' "$BUNDLE_DIR/v2"
+  else printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/v2"
+  fi
+}
+
 _effect() {
   local class="$1" key="$2" cap="$3"; shift 3
   case "${BIRCHER_EFFECT_MODE:-deny}" in
@@ -56,8 +82,8 @@ _effect() {
         --generation "${BIRCHER_GENERATION:?BIRCHER_GENERATION must be set in kernel mode}"
         --class "$class" --idempotency-key "$key" --
       )
-      if [ "$cap" = "-" ]; then "${kcmd[@]}" "$@"
-      else _net_run "$cap" "${kcmd[@]}" "$@"; fi
+      if [ "$cap" = "-" ]; then PYTHONPATH="$(_effect_pythonpath)" "${kcmd[@]}" "$@"
+      else PYTHONPATH="$(_effect_pythonpath)" _net_run "$cap" "${kcmd[@]}" "$@"; fi
       ;;
     deny)
       echo "effect refused: $class $key ($*)" >&2

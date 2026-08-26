@@ -10,11 +10,19 @@ language runtime.
 
 import pathlib
 import subprocess
+import sys
 
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 ADAPTER = REPO_ROOT / "batch" / "lib" / "effect-adapter.sh"
+V2_DIR = REPO_ROOT / "v2"
+
+sys.path.insert(0, str(V2_DIR))
+
+from kernel.dispatch import dispatch  # noqa: E402
+from kernel.events import EventKind  # noqa: E402
+from kernel.store import Store  # noqa: E402
 
 #: The six classes the coordinator can request. `credential_lifecycle` and
 #: `session_control` are not routed from bash and are covered in
@@ -25,8 +33,8 @@ CLASSES = ["ref_update", "pull_request", "merge", "status_check", "comment",
 RC_DENIED, RC_BADMODE = 87, 2
 
 
-def _run(script: str, mode: str | None = None):
-    env = {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+def _run(script: str, mode: str | None = None, env: dict | None = None):
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", **(env or {})}
     if mode is not None:
         env["BIRCHER_EFFECT_MODE"] = mode
     return subprocess.run(
@@ -155,3 +163,79 @@ def test_the_self_test_runs_in_legacy_mode_deliberately():
     authority path."""
     text = (REPO_ROOT / "batch" / "run-queue.sh").read_text()
     assert 'BIRCHER_EFFECT_MODE="${BIRCHER_EFFECT_MODE:-legacy}"' in text
+
+
+# --------------------------------------------------------------------------
+# The positive half. Everything above this line asserts that kernel mode
+# FAILS -- and both existing kernel-mode tests supply no run id, so
+# `${VAR:?}` aborts the function before `python3 -m kernel.cli` is ever
+# reached. They bind the `:?` guards, not the invocation, and stayed green
+# with the module name corrupted to `kernel.NOPE` (494 passed).
+#
+# That gap shipped a real defect: the kernel branch set no PYTHONPATH, so
+# every effect died with `No module named kernel`. In kernel mode `_effect`
+# is not advisory -- it IS the execution path -- so the first live run lost
+# prompt delivery and stalled with two idle sessions.
+#
+# test_kernel_client.py makes exactly this argument for `_kernel` and closes
+# it with a live-database test. These are that test's missing counterpart.
+# --------------------------------------------------------------------------
+
+def _live_run(tmp_path):
+    """A real database with a real dispatched generation."""
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    store.create_run(run_id="r-live", base_repo="abedegno/muesli",
+                     base_sha="deadbeef")
+    assert dispatch(store, "r-live", actor="claude",
+                    role="implementer").generation == 1
+    return db
+
+
+def _kernel_env(db):
+    return {"BIRCHER_KERNEL_DB": str(db), "BIRCHER_RUN_ID": "r-live",
+            "BIRCHER_GENERATION": "1", "BIRCHER_V2_DIR": str(V2_DIR)}
+
+
+def test_kernel_mode_reaches_the_kernel_and_performs_the_effect(tmp_path):
+    """Against a REAL database: the effect must execute AND be journalled.
+
+    `credential_lifecycle` is the one class carrying no argv contract, so a
+    harmless `git init` is contract-legal and this exercises the happy path
+    rather than a shadow-refusal path. It must be `git`, not `touch`: the
+    kernel resolves argv[0] against an allowlist of THREE tools
+    (`kernel.cli.TOOLS`), so anything else is refused before it runs.
+
+    The witness and the facts assert different halves and both are needed:
+    the witness alone would pass in legacy mode, and the facts alone would
+    pass for an effect the kernel journalled but never ran.
+    """
+    db = _live_run(tmp_path)
+    witness = tmp_path / "performed"
+    r = _run(f'_effect credential_lifecycle k - git init -q "{witness}"',
+             mode="kernel", env=_kernel_env(db))
+
+    assert "No module named" not in r.stderr, r.stderr
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (witness / ".git").exists(), f"the effect never executed: {r.stderr}"
+
+    kinds = [f.kind for f in Store.open(db).facts_for("r-live")]
+    assert EventKind.EFFECT_INTENDED in kinds, kinds
+    assert EventKind.EFFECT_CONFIRMED in kinds, kinds
+
+
+def test_a_capped_kernel_mode_effect_also_reaches_the_kernel(tmp_path):
+    """The bounded branch is a SECOND invocation site, and the unbounded
+    test above does not cover it -- the PYTHONPATH defect had to be repaired
+    on both lines. A passthrough `_net_run` stands in for run-queue.sh's,
+    which needs a real `timeout(1)` (absent on this box)."""
+    db = _live_run(tmp_path)
+    witness = tmp_path / "performed-capped"
+    r = _run('_net_run() { shift; "$@"; }\n'
+             f'_effect credential_lifecycle k2 42 git init -q "{witness}"',
+             mode="kernel", env=_kernel_env(db))
+
+    assert "No module named" not in r.stderr, r.stderr
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert (witness / ".git").exists(), \
+        f"the capped effect never executed: {r.stderr}"
