@@ -127,7 +127,10 @@ CONTRACTS: dict[str, list[Rule]] = {
         # write-out to a local file -- an arbitrary filesystem write from a
         # class that exists to control a session. No routed site uses it.
         Rule("curl", url_path=r"/v1/sessions", operand_count=1,
-             flags=frozenset({"-s", "-sf", "-f", "-X", "-H", "-d", "-F",
+             # -q is permitted but not required here: the LAUNCHER injects it as
+             # curl's first argument, which is the only position that suppresses
+             # .curlrc. Allowed so an explicit one is not refused.
+             flags=frozenset({"-s", "-sf", "-f", "-q", "-X", "-H", "-d", "-F",
                               "--max-time"}),
              valued=frozenset({"-X", "-H", "-d", "-F", "--max-time"}),
              methods=frozenset({"POST", "DELETE"})),
