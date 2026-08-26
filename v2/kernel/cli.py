@@ -160,6 +160,16 @@ def _do_effect(a) -> int:
 
 
 def _do_command(a) -> int:
+    """Submit one typed command and translate its outcome to an exit code.
+
+    Exit codes: 0 accepted or replayed, 2 usage (unknown command name,
+    unparseable or non-object payload), 87 refused (NotAuthorized, a stale
+    aggregate version, or any other command-level rejection), 88 fenced
+    (superseded generation), 90 failed (a run halted pending reconciliation --
+    the same RC _do_effect returns for its own RuntimeError, so the two
+    subcommands agree). 89 (uncertain) does not apply here: only an effect
+    executor can leave an outcome unconfirmed.
+    """
     from kernel.commands import COMMAND_NAMES, Command, StaleVersion, submit
 
     if a.name not in COMMAND_NAMES:
@@ -194,6 +204,15 @@ def _do_command(a) -> int:
     except (StaleVersion, ValueError) as exc:
         print(f"rejected: {exc}", file=sys.stderr)
         return RC_REFUSED
+    except RuntimeError as exc:
+        # A halted run is an ordinary reachable state -- any failed effect
+        # halts its run unconditionally (kernel.effects, on the first
+        # execution failure). submit() raises a bare RuntimeError for it
+        # (kernel.commands), same as _do_effect's halt-on-retry path, so both
+        # subcommands map it to the same exit code rather than one of them
+        # leaking an uncaught traceback.
+        print(f"failed: {exc}", file=sys.stderr)
+        return RC_FAILED
 
 
 if __name__ == "__main__":

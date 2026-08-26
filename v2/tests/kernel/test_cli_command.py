@@ -4,9 +4,11 @@ import pathlib
 
 import pytest
 
+from conftest import valid_argv
 from kernel.artifacts import put_artifact
 from kernel.cli import main
 from kernel.dispatch import Role, dispatch
+from kernel.effects import EffectClass, UncertainEffect, perform
 from kernel.ids import Clock
 from kernel.store import Store
 
@@ -73,13 +75,50 @@ def test_the_idempotency_key_defaults_to_run_name_generation(db):
     assert len(accepted) == 1
 
 
-def test_the_effect_subcommand_still_works(db, tmp_path):
+def test_the_effect_subcommand_still_works(db):
+    """The subcommand split must not have cost the effect path its route.
+
+    This only proves `main()` still dispatches "effect" to `_do_effect`
+    without an argparse usage error -- it calls `kernel.cli.main()` directly
+    and never touches `batch/lib/effect-adapter.sh`, so it says nothing about
+    the adapter's own invocation. That was checked separately, outside this
+    suite: sourcing the adapter with `BIRCHER_EFFECT_MODE=kernel` and a stub
+    `python3` confirms the argv it builds still reads `-m kernel.cli effect
+    --db ... -- <argv>`, with `effect` landing right after `kernel.cli` and
+    every other argument unchanged.
+    """
     g = _gen(db, "claude", Role.IMPLEMENTER)
-    witness = tmp_path / "ran"
     rc = main(["effect", "--db", db, "--run-id", "r", "--generation", str(g),
                "--class", "comment", "--idempotency-key", "k",
                "--", "gh", "pr", "comment", "1", "--repo", "o/r",
                "--body", "hi"])
     # Refused or failed at execution is fine here; what must not happen is a
-    # usage error, which would mean the subcommand split broke the adapter.
+    # usage error, which would mean "effect" no longer routes to _do_effect.
     assert rc != 2
+
+
+def test_a_command_against_a_halted_run_returns_the_failed_exit_code(db):
+    """A halted run is an ordinary reachable state -- any failed effect halts
+    its run unconditionally, on the first execution failure (kernel.effects).
+    `submit()` raises a bare RuntimeError for it (kernel.commands), and that
+    used to escape `_do_command` as an uncaught traceback: a fifth,
+    undocumented exit code alongside 0/2/87/88.
+
+    The halt is driven the way production reaches it -- a real failing
+    effect through `perform()` -- not by writing the reconciliation row
+    directly, so this proves the exit code for the state the kernel actually
+    produces rather than one this test fabricated.
+    """
+    g = _gen(db, "claude", Role.IMPLEMENTER)
+    s = Store.open(db, clock=Clock(start_us=1))
+
+    def _boom(effect_class, intent, idempotency_key):
+        raise RuntimeError("no response")
+
+    with pytest.raises(UncertainEffect):
+        perform(s, "r", g, EffectClass.COMMENT, "k-halt",
+                valid_argv(EffectClass.COMMENT), _boom)
+
+    rc = main(["command", "--db", db, "--run-id", "r", "--generation", str(g),
+               "--name", "submit_spec", "--payload-json", "{}"])
+    assert rc == 90
