@@ -173,3 +173,75 @@ def test_every_effect_class_has_a_contract():
 
     missing = sorted(EffectClass.ALL - set(CONTRACTS))
     assert not missing, f"effect classes with no argv contract: {missing}"
+
+
+# --- round 7: the contract must constrain more than the verb ------------------
+
+DANGEROUS = [
+    ("delete the branch",        EffectClass.REF_UPDATE,
+     ["git", "push", "origin", ":main"]),
+    ("force-push over main",     EffectClass.REF_UPDATE,
+     ["git", "push", "--force", "origin", "HEAD:main"]),
+    ("delete a ref via gh api",  EffectClass.REF_UPDATE,
+     ["gh", "api", "repos/o/r/git/refs/heads/main", "-X", "DELETE",
+      "-f", "note=update-branch"]),
+    ("wrong method on statuses", EffectClass.STATUS_CHECK,
+     ["gh", "api", "repos/o/r/statuses/abc", "-X", "DELETE"]),
+    ("body from a file",         EffectClass.COMMENT,
+     ["gh", "pr", "comment", "7", "--body-file", "/etc/passwd"]),
+    ("assign a collaborator",    EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "7", "--add-assignee", "attacker"]),
+    ("mirror-push",              EffectClass.REF_UPDATE,
+     ["git", "push", "--mirror", "origin"]),
+]
+
+
+@pytest.mark.parametrize("name,cls,argv", DANGEROUS, ids=[d[0] for d in DANGEROUS])
+def test_the_contract_constrains_more_than_the_verb(name, cls, argv):
+    """ROUND 7. The first repair matched only the command's leading words, and
+    `signature()` stops at the first flag -- so everything after it went
+    unexamined. Every one of these passed."""
+    from kernel.contract import ContractViolation, check
+
+    with pytest.raises(ContractViolation):
+        check(cls, argv)
+
+
+def test_the_url_marker_must_be_in_the_url_not_anywhere_in_the_argv():
+    """The `gh api` rules require a fragment in the URL. Searching the joined
+    argv let it be smuggled into an unrelated field -- `-f note=update-branch`
+    satisfied a check meant to identify the endpoint."""
+    from kernel.contract import ContractViolation, check
+
+    with pytest.raises(ContractViolation, match="url operand"):
+        check(EffectClass.REF_UPDATE,
+              ["gh", "api", "repos/o/r/git/refs/heads/main", "-X", "PUT",
+               "-f", "note=update-branch"])
+
+
+def test_the_real_update_branch_call_still_passes():
+    """The control for the rule above."""
+    from kernel.contract import check
+
+    check(EffectClass.REF_UPDATE,
+          ["gh", "api", "repos/o/r/pulls/7/update-branch", "-X", "PUT"])
+
+
+def test_a_flag_value_is_not_mistaken_for_an_operand():
+    """`--max-time 120` made `120` the URL operand. Beyond breaking the real
+    calls, it means an operand could hide behind any value-taking flag."""
+    from kernel.contract import check
+
+    check(EffectClass.SESSION_CONTROL,
+          ["curl", "-sf", "--max-time", "120", "-X", "POST",
+           "http://srv/v1/sessions/1/events", "-H", "content-type: application/json",
+           "-d", "{}"])
+
+
+def test_a_repo_given_as_an_equals_form_is_still_read():
+    """`merge_target` looked for the exact token `--repo`, so `--repo=x` read
+    as None. That happened to fail closed; it is now read properly rather than
+    relying on the accident."""
+    from kernel.contract import merge_target
+
+    assert merge_target(["gh", "pr", "merge", "42", "--repo=o/r"]) == ("42", "o/r")
