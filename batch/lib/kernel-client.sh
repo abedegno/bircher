@@ -121,3 +121,159 @@ print(dispatch(s, os.environ["BIRCHER_RUN_ID"],
   printf '%s' "$gen"
   return 0
 }
+
+# --- Lifecycle wiring -------------------------------------------------------
+#
+# The functions below are what `run_item` actually calls at each stage
+# transition. They exist so the wiring can be tested by EXECUTION against a
+# real database, not only by grepping run_item's source for a command name --
+# see v2/tests/execution/test_lifecycle_functions.py. Splitting them out of
+# run_item also means a payload shape only has to be gotten right in one
+# place per stage.
+#
+# Every one of them is exactly as advisory as `_kernel` itself: each ends in
+# a call to `_kernel` (or, for `_kernel_run_start`/`_kernel_put_artifact`,
+# the same bounded-python-via-_net_run shape `_kernel_dispatch` already
+# uses), never branches on its result, and always returns 0.
+
+# _kernel_run_start <run_id> <base_repo> <base_sha> -- creates this run's row.
+#
+# The plan's Step 3 called this `_kernel command --name enqueue ...`, routed
+# through submit()'s COMMAND_NAMES set. That does not work: "enqueue" is not
+# one of those names (kernel/commands.py's COMMAND_NAMES omits it on
+# purpose -- see kernel/enqueue.py's docstring, which reserves `enqueue()`
+# for a human-approved spec+plan+grill workflow this batch queue does not
+# have). Verified directly against the CLI: `--name enqueue` exits 2,
+# "unknown command: enqueue" -- not a shadow-refusal, a usage error, and the
+# run's row is never created. Every later command for the run then fails too:
+# `store.run_version()` reads `.fetchone()[0]` on a run that was never
+# inserted and raises an uncaught TypeError. `_kernel` treats that exactly
+# like a healthy shadow-refusal -- warn (or not, if it happened to look like
+# one) and move on -- so the whole lifecycle would record NOTHING, silently,
+# behind the same "advisory, so nothing breaks" cover every other failure
+# here legitimately uses. That is the exact near-miss this file's own header
+# warns about, one call earlier than Task 3's.
+#
+# The fix mirrors `_kernel_dispatch` rather than `_kernel`: `dispatch()` is
+# ALSO not a submit() command (a worker cannot CAS a version against a run
+# that has no version yet), and it is called directly, by name, against the
+# store. Creating the run's row is the same shape of foundational operation,
+# so it is called the same way. `kernel.enqueue.enqueue()` itself is not
+# reused here -- it persists a spec/plan/bundle this call site does not have
+# and does not need; `store.create_run()` is the whole of what a fresh run
+# requires to become a legal target for every other command below.
+#
+# Idempotent: a duplicate run_id (there should never be one -- BIRCHER_RUN_ID
+# carries the attempt epoch) hits the `runs` table's primary key and is
+# swallowed rather than warned about, the same way `kernel.enqueue.enqueue`
+# treats a repeat as a safe retry rather than a failure.
+_kernel_run_start() {  # <run_id> <base_repo> <base_sha>
+  local run_id="$1" base_repo="$2" base_sha="$3"
+  local src='
+import os, sqlite3, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+try:
+    s.create_run(run_id=os.environ["K_RUN_ID"],
+                 base_repo=os.environ["K_BASE_REPO"],
+                 base_sha=os.environ["K_BASE_SHA"])
+except sqlite3.IntegrityError:
+    pass  # already created -- idempotent, same run_id retried
+'
+  K_RUN_ID="$run_id" K_BASE_REPO="$base_repo" K_BASE_SHA="$base_sha" \
+    BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+    _net_run "$(_kernel_net_cap)" \
+    "${BIRCHER_PY:-python3}" -c "$src" >/dev/null 2>&1 \
+    || _kernel_warn "run start failed (advisory): $run_id"
+  return 0
+}
+
+# _kernel_put_artifact <data> -- PUTs *data* into the store and echoes its
+# content hash, or nothing on failure.
+#
+# `record_implementation_output`'s authorization (kernel/authz.py) refuses
+# any artifact_hash the store does not already hold via `store.has_artifact`
+# -- so the hash a command names has to be the result of an actual PUT, not
+# merely a value computed and asserted alongside it. Hashing happens on the
+# PYTHON side (`kernel.artifacts.put_artifact`, plain sha256 over the exact
+# bytes stored) rather than shelling out to `shasum` on a separately
+# `printf`'d copy of the same text: one computation, so the hash returned
+# here is BY CONSTRUCTION the hash of what got stored, not two independent
+# renderings of the same string that happen to agree.
+#
+# *data* travels as an env var, the same choice `_kernel_dispatch` made for
+# actor/role: env vars never touch the `-c` program text, so nothing in a
+# marker body pulled from an untrusted PR can inject into the script that
+# reads it.
+_kernel_put_artifact() {  # <data>
+  local data="$1" hash=""
+  local src='
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.artifacts import put_artifact
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+print(put_artifact(s, os.environ["K_ARTIFACT_DATA"].encode("utf-8")))
+'
+  hash=$( K_ARTIFACT_DATA="$data" \
+          BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+          _net_run "$(_kernel_net_cap)" \
+          "${BIRCHER_PY:-python3}" -c "$src" 2>/dev/null
+  ) || hash=""
+  [ -n "$hash" ] || _kernel_warn "artifact put failed (advisory)"
+  printf '%s' "$hash"
+  return 0
+}
+
+# _kernel_record_output <run_id> <generation> <body> -- records
+# record_implementation_output for *body*, PUTting it first so the hash the
+# command names is one the kernel actually holds. If the PUT fails, there is
+# no hash to name and no run_implementation_output call is made at all (a
+# missing artifact is warned about once, by `_kernel_put_artifact`, not
+# twice by also sending a command that names an empty hash).
+_kernel_record_output() {  # <run_id> <generation> <body>
+  local run_id="$1" generation="$2" body="$3" hash
+  hash=$(_kernel_put_artifact "$body")
+  [ -n "$hash" ] || return 0
+  # record_implementation_output
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name record_implementation_output \
+    --payload-json "{\"artifact_hash\":\"$hash\"}"
+}
+
+# _kernel_record_ci <run_id> <generation> <status> <head_git_sha> -- records
+# record_ci_observation.
+_kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
+  local run_id="$1" generation="$2" status="$3" head="$4"
+  # record_ci_observation
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name record_ci_observation \
+    --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"}"
+}
+
+# _kernel_record_review <run_id> <generation> <verdict> -- records
+# record_review.
+_kernel_record_review() {  # <run_id> <generation> <verdict>
+  local run_id="$1" generation="$2" verdict="$3"
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name record_review --payload-json "{\"verdict\":\"$verdict\"}"
+}
+
+# _kernel_request_merge <run_id> <generation> <pr> <repo> <head_git_sha> --
+# records request_merge.
+_kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head_git_sha>
+  local run_id="$1" generation="$2" pr="$3" repo="$4" head="$5"
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name request_merge \
+    --payload-json "{\"pr\":\"$pr\",\"repo\":\"$repo\",\"head_git_sha\":\"$head\"}"
+}
+
+# _kernel_record_outcome <run_id> <generation> <outcome> -- records
+# record_merge_outcome. *outcome* is "merged" or "failed".
+_kernel_record_outcome() {  # <run_id> <generation> <outcome>
+  local run_id="$1" generation="$2" outcome="$3"
+  # record_merge_outcome
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name record_merge_outcome --payload-json "{\"outcome\":\"$outcome\"}"
+}

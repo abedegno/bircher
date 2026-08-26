@@ -3155,6 +3155,18 @@ run_item() {
     return 0
   fi
   echo "[batch] === $item ==="
+  # The kernel's record of this run. Item codes recur across attempts, so the
+  # epoch makes each attempt its own aggregate.
+  BIRCHER_RUN_ID="${item}-$(date +%s)"; export BIRCHER_RUN_ID
+  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"
+  export BIRCHER_KERNEL_DB
+  mkdir -p "$(dirname "$BIRCHER_KERNEL_DB")" 2>/dev/null || true
+  # enqueue: creates this run's row in the kernel. See
+  # batch/lib/kernel-client.sh's _kernel_run_start for why this is not
+  # `_kernel command --name enqueue` (that command name does not exist).
+  local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
+  _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" \
+    "${_base_sha:-0000000000000000000000000000000000000000}"
   local _iss; _iss=$(_item_issue "$prompt")
   [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
   # B-3 vendor dispatch: resolve THIS item's implementer and flip the reviewer to
@@ -3190,6 +3202,8 @@ ${prompt}"
     return 0
   fi
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
+  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+  export BIRCHER_GENERATION
   # Binding check: we set host_id in create; confirm the session bound to THIS runner.
   local sess_host; sess_host=$(_http_json GET "/v1/sessions/$conv_id" | _json_get host_id)
   if [ -n "$host_id" ] && [ "$(_host_ids_match "$sess_host" "$host_id")" != "yes" ]; then
@@ -3393,7 +3407,12 @@ ${prompt}"
     # earlier run is not this run's verdict, and adopting it here would record a
     # stale outcome as if the session had produced it.
     local _fb; _fb=$(_marker_bodies_since "$pr" "$start")
-    _contains "$_fb" 'bircher-status:' && marker=$(parse_marker "$_fb")
+    # $body, not just $marker, must track whichever text actually produced
+    # the marker in use -- the kernel's implementation-output artifact is
+    # hashed from $body below, and leaving it holding a stale (or never
+    # assigned) value from the poll loop would record the wrong bytes, or
+    # none, under a hash that looks like it came from this marker.
+    if _contains "$_fb" 'bircher-status:'; then marker=$(parse_marker "$_fb"); body="$_fb"; fi
   fi
 
   local outcome ci_first review rounds note
@@ -3404,6 +3423,19 @@ ${prompt}"
 $marker
 EOF
     : "${outcome:=timeout}" "${ci_first:=false}"
+
+    # record_implementation_output, record_ci_observation: what this attempt
+    # produced, and what CI said about the head it produced.
+    _kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body"
+    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_ci" "$marker_head"
+
+    # A role change is a NEW dispatch and re-fences the generation.
+    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+    export BIRCHER_GENERATION
+    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review"
+
+    BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+    export BIRCHER_GENERATION
   else
     # No marker. Two cases, and they must not be conflated:
     #
@@ -3459,7 +3491,11 @@ EOF
         ;;
     esac
     if [ "$_gate" != "skip" ]; then
+      # request_merge, record_merge_outcome
+      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$marker_head"
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
+      local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
+      _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
       [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
       # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
       # scorecard row is written from $outcome -- captured from the item's MARKER, not
