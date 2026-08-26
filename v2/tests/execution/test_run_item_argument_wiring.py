@@ -98,6 +98,22 @@ RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
 sys.path.insert(0, str(REPO_ROOT / "v2"))
 
 HEAD_SHA = "b" * 40
+#: The head this fixture's marker claims (`marker_head`, into
+#: `_kernel_request_merge`'s 5th argument) and what `_merge_gate` derives as
+#: the pinned/reviewed head (`reviewed_sha`, into `merge_ready_pr`'s 3rd
+#: argument) are the SAME value on every path that reaches either call in
+#: production -- `_merge_gate` (run-queue.sh) does nothing but echo back
+#: whatever head it was given, prefixed `pin|`, and `reviewed_sha` is that
+#: prefix stripped straight back off. A fixture that reuses HEAD_SHA for
+#: both cannot tell a call site that threads the wrong one from one that
+#: threads the right one -- confirmed empirically: swapping `"$marker_head"`
+#: for `"$reviewed_sha"` at the request_merge call site left every test
+#: green. `_merge_gate` is therefore STUBBED here (not extracted as real
+#: code, see `_NEEDED_REAL_FUNCTIONS` below) to return this deliberately
+#: DIFFERENT value, so `test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3`
+#: and `test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha` can actually
+#: discriminate which variable landed where.
+REVIEWED_SHA = "c" * 40
 VENDOR = "claude_code"
 REVIEWER = "codex"
 PR = "777"
@@ -107,10 +123,11 @@ PR = "777"
 #: `_kernel_*` function is stubbed (see module docstring). In dependency
 #: order for readability only -- bash does not require functions to be
 #: defined before use, only before CALL, and sourcing happens before any
-#: call here.
+#: call here. `_merge_gate` is deliberately NOT in this list -- see
+#: REVIEWED_SHA above -- it is stubbed instead, in `_STUB_TEMPLATE`.
 _NEEDED_REAL_FUNCTIONS = [
     "_contains", "_is_blank", "_is_limit_message", "parse_marker",
-    "_merge_gate", "_pr_signal", "_session_died", "_item_issue",
+    "_pr_signal", "_session_died", "_item_issue",
     "_local_host_id", "_json_get", "_host_ids_match", "_writeback_plan",
     "_issue_writeback", "_ensure_issue_closed", "_record_deferred_ready",
 ]
@@ -264,6 +281,10 @@ _last_assistant_text() {{ printf ''; return 0; }}
 json_row()         {{ :; }}
 merge_ready_pr()   {{ _log_call merge_ready_pr "$@"; return 0; }}
 _marker_bodies_since() {{ printf '%s' {marker_body!r}; }}
+# Deliberately NOT the real _merge_gate: see REVIEWED_SHA's module-level
+# comment for why this fixture needs its own, distinct answer rather than
+# echoing back the marker head it was given.
+_merge_gate() {{ [ -n "${{2:-}}" ] && {{ printf 'pin|%s' {reviewed_sha!r}; return 0; }}; printf 'skip'; }}
 '''
 
 
@@ -320,7 +341,7 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
 
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
-        marker_body=marker_body,
+        marker_body=marker_body, reviewed_sha=REVIEWED_SHA,
     )
     if not merge_ok:
         stub = stub.replace(
@@ -494,18 +515,28 @@ def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):
 
 
 def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3(happy_drive):
+    """Fix round 2, ITEM 1: the 5th argument is `$marker_head` -- HEAD_SHA,
+    what the crafted marker claims -- never `$reviewed_sha` (REVIEWED_SHA,
+    `_merge_gate`'s stubbed, deliberately DIFFERENT answer). Distinguishable
+    only because REVIEWED_SHA != HEAD_SHA in this fixture; see REVIEWED_SHA's
+    module-level comment for why the swap that motivated this test was
+    invisible before that separation."""
     calls, _ = happy_drive
     name, args = calls[11]
     assert name == "_kernel_request_merge"
     run_id = calls[0][1][0]
     assert args == [run_id, "3", PR, "acme/widgets", HEAD_SHA], args
+    assert HEAD_SHA != REVIEWED_SHA  # the whole point -- see REVIEWED_SHA above
 
 
 def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):
+    """The other half of the same distinction: `merge_ready_pr`'s 3rd
+    argument is `$reviewed_sha` -- REVIEWED_SHA, `_merge_gate`'s answer --
+    never the marker's own `$marker_head`."""
     calls, _ = happy_drive
     name, args = calls[12]
     assert name == "merge_ready_pr"
-    assert args == ["t01-test-item", PR, HEAD_SHA], args
+    assert args == ["t01-test-item", PR, REVIEWED_SHA], args
 
 
 def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):

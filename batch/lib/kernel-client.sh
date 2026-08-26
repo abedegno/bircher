@@ -34,12 +34,24 @@ _kernel_warn() { echo "[batch:kernel] $*" >&2; }
 _kernel_pythonpath() { printf '%s' "${BIRCHER_V2_DIR:-$BUNDLE_DIR/v2}"; }
 
 # The wall-clock bound on every kernel call, in seconds. This is a local
-# sqlite write with no network I/O, so 20s is generous rather than tight --
-# a cold interpreter start on a loaded box should still finish in well under
-# a second -- but it is still a BOUND: a hung python now returns control to
-# the coordinator in 20s instead of never. Overridable so a caller (or a
-# test) can shrink it rather than wait out the default.
-_kernel_net_cap() { printf '%s' "${BIRCHER_KERNEL_TIMEOUT:-20}"; }
+# sqlite write with no network I/O -- a cold interpreter start on a loaded
+# box should still finish in well under a second -- but it is still a
+# BOUND: a hung python now returns control to the coordinator in this many
+# seconds instead of never.
+#
+# 5, not 20 (fix round 2): this task's wiring added four more kernel calls
+# (_kernel_put_artifact, _kernel_submit_spec, _kernel_submit_plan,
+# _kernel_start_implementation) into the window between session creation
+# and _send_prompt, each bounded by this same cap -- so the 20s default,
+# never itself reasoned about, had widened the worst-case delay to prompt
+# delivery from ~20s to ~100s when the kernel database is unresponsive. 5s
+# still leaves three orders of magnitude of headroom over the millisecond
+# typical case and bounds the new worst case at ~25s. Raise it only with a
+# reason that outweighs that delay -- the sqlite operations behind this cap
+# do not need it.
+# Overridable so a caller (or a test) can shrink it rather than wait out
+# the default.
+_kernel_net_cap() { printf '%s' "${BIRCHER_KERNEL_TIMEOUT:-5}"; }
 
 # _kernel <subcommand> <args...>  -- always returns 0
 #
