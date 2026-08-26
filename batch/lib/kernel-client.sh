@@ -226,6 +226,43 @@ print(put_artifact(s, os.environ["K_ARTIFACT_DATA"].encode("utf-8")))
   return 0
 }
 
+# _kernel_submit_spec <run_id> <generation> <spec_hash> -- records
+# submit_spec (queued -> specified). *spec_hash* must already be PUT (see
+# _kernel_put_artifact) -- the same PUT-before-reference discipline as
+# record_implementation_output, even though authorize() does not currently
+# check it for this command: this is the run's recorded INPUT, and an
+# unverifiable hash here would be as wrong as one on the output.
+_kernel_submit_spec() {  # <run_id> <generation> <spec_hash>
+  local run_id="$1" generation="$2" hash="$3"
+  # submit_spec
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name submit_spec --payload-json "{\"artifact_hash\":\"$hash\"}"
+}
+
+# _kernel_submit_plan <run_id> <generation> <plan_hash> -- records submit_plan
+# (specified -> planned). v1 has no separate plan document, so the caller
+# passes the SAME hash `_kernel_submit_spec` was given -- the queue item's
+# prompt stands in for a plan artifact until a real one exists, exactly as
+# the marker body stands in for a real implementation-output artifact in
+# `_kernel_record_output`.
+_kernel_submit_plan() {  # <run_id> <generation> <plan_hash>
+  local run_id="$1" generation="$2" hash="$3"
+  # submit_plan
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name submit_plan --payload-json "{\"artifact_hash\":\"$hash\"}"
+}
+
+# _kernel_start_implementation <run_id> <generation> -- records
+# start_implementation (planned -> implementing). Requires *generation* to be
+# dispatched in the implementer role (kernel/authz.py); called right after
+# the implementer dispatch in run_item, so it always is.
+_kernel_start_implementation() {  # <run_id> <generation>
+  local run_id="$1" generation="$2"
+  # start_implementation
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name start_implementation --payload-json "{}"
+}
+
 # _kernel_record_output <run_id> <generation> <body> -- records
 # record_implementation_output for *body*, PUTting it first so the hash the
 # command names is one the kernel actually holds. If the PUT fails, there is

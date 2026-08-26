@@ -81,11 +81,28 @@ def test_no_kernel_call_is_tested_for_success():
 # the functions work.")
 
 @pytest.mark.parametrize("fn", [
-    "_kernel_run_start", "_kernel_record_output", "_kernel_record_ci",
+    "_kernel_run_start", "_kernel_submit_spec", "_kernel_submit_plan",
+    "_kernel_start_implementation", "_kernel_record_output", "_kernel_record_ci",
     "_kernel_record_review", "_kernel_request_merge", "_kernel_record_outcome",
 ])
 def test_run_item_calls_the_named_lifecycle_function(fn):
     assert fn in _run_item(), f"run_item never calls {fn}"
+
+
+def test_the_three_missing_transitions_precede_the_implementation_output():
+    """Fix round 1, IMPORTANT (b): without submit_spec / submit_plan /
+    start_implementation, the run never leaves `queued`, and every later
+    command is refused for the same reason regardless of what it is --
+    reviewed empirically against a live database, not merely reasoned about
+    (see test_lifecycle_functions.py). All three must run, in state-machine
+    order, before record_implementation_output (which requires state
+    'implementing')."""
+    body = _run_item()
+    spec = body.index("_kernel_submit_spec")
+    plan = body.index("_kernel_submit_plan")
+    start = body.index("_kernel_start_implementation")
+    output = body.index("_kernel_record_output")
+    assert spec < plan < start < output, (spec, plan, start, output)
 
 
 def test_run_item_never_inlines_a_kernel_command_call():

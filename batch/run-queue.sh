@@ -3204,6 +3204,14 @@ ${prompt}"
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
   BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
   export BIRCHER_GENERATION
+  # The queue item's prompt, PUT once as the spec artifact and reused as a
+  # stand-in plan artifact (v1 has no separate plan document -- see
+  # kernel-client.sh's submit_plan wrapper for why that reuse is deliberate).
+  local _spec_hash; _spec_hash=$(_kernel_put_artifact "$prompt")
+  _kernel_submit_spec "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
+  _kernel_submit_plan "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
+  # start_implementation
+  _kernel_start_implementation "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION"
   # Binding check: we set host_id in create; confirm the session bound to THIS runner.
   local sess_host; sess_host=$(_http_json GET "/v1/sessions/$conv_id" | _json_get host_id)
   if [ -n "$host_id" ] && [ "$(_host_ids_match "$sess_host" "$host_id")" != "yes" ]; then

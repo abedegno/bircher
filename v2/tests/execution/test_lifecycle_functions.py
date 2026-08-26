@@ -12,13 +12,14 @@ call was survivable).
 
 This file is the other half: every function in `batch/lib/kernel-client.sh`
 added for Task 4 (`_kernel_run_start`, `_kernel_put_artifact`,
+`_kernel_submit_spec`, `_kernel_submit_plan`, `_kernel_start_implementation`,
 `_kernel_record_output`, `_kernel_record_ci`, `_kernel_record_review`,
 `_kernel_request_merge`, `_kernel_record_outcome`) is exercised against a
 real temporary SQLite database, and the facts it leaves behind are read back
 and asserted on.
 
-Two real defects surfaced writing these tests, neither visible to a
-source-text assertion:
+Real defects surfaced writing these tests, none visible to a source-text
+assertion:
 
 1. The plan's `_kernel_run_start` step (`_kernel command --name enqueue
    ...`) does not work: "enqueue" is not in `kernel.commands.COMMAND_NAMES`,
@@ -42,15 +43,47 @@ source-text assertion:
    `test_record_output_puts_before_it_names_the_hash` is the test that would
    have caught the original approach.
 
-Every stage past artifact PUT and dispatch (`record_review`, `request_merge`,
-`record_merge_outcome`) is expected to be permanently shadow-refused given
-the payload shapes the plan specifies -- `record_review`'s payload carries
-only a verdict, never the full binding (`artifact_hash`/`base_sha`/
-`context_bundle_hash`/`policy_version`) `record_review` requires to be
-authorized at all, and `request_merge`'s payload never carries an
-`artifact_hash` either. That is not a defect this task's brief asks it to
-fix (CONTEXT: "Expect most commands in a first real run to be
-shadow-refused; that is the point, not a bug") -- but "always refused" and
+3. (Fix round 1, IMPORTANT (b)) The original wiring never called
+   `submit_spec`/`submit_plan`/`start_implementation`, so a run never left
+   `queued` and every downstream command was refused for the identical
+   reason ("not legal from state 'queued'") regardless of what it was --
+   proven here by actually replaying the sequence against a live database
+   (`test_every_stage_actually_reaches_the_kernel`, before this fix: five
+   NotAuthorized rejections, all state-illegal, none of them informative).
+   `_kernel_submit_spec`/`_kernel_submit_plan` PUT the queue item's prompt
+   as the spec artifact and reuse it as a stand-in plan artifact (v1 has no
+   separate plan document); `_kernel_start_implementation` follows, under
+   the same implementer generation. All three, in order, now precede
+   `_kernel_record_output`.
+
+With the run correctly advanced to `implementing`, empirical replay
+(verified directly against a live database, not reasoned about) shows:
+`submit_spec`, `submit_plan`, `start_implementation`,
+`record_implementation_output` and `record_ci_observation` are all
+ACCEPTED. `record_review`, `request_merge` and `record_merge_outcome` remain
+refused, but for three DIFFERENT and now-informative reasons rather than one
+repeated one:
+
+  - `record_review`: NotAuthorized, "verdict 'codex:pass' is not one of
+    ['accept', 'reject', 'request_revision']" -- the marker's `review=`
+    field is `<vendor>:<verdict>` (e.g. `codex:pass`), a vocabulary
+    `kernel.authz._VERDICTS` does not share. The state gate is satisfied
+    (`implementing` is legal for record_review); this is a genuine
+    vocabulary mismatch between run-queue.sh's marker format and the
+    kernel's verdict set, not a missing transition. NOT fixed here --
+    CONTEXT scopes this task to the three missing transitions, and mapping
+    marker verdicts to kernel verdicts is a separate, larger decision
+    (what does `revision requested` map to? is a "fail" ever legal to
+    merge on?) than this fix round asked for.
+  - `request_merge` / `record_merge_outcome`: NotAuthorized, state-illegal
+    (`reviewing` / `merge_requested` required) -- because `record_review`
+    never accepts, the run never leaves `implementing`, so these two never
+    become reachable. A direct consequence of the point above, not a
+    separate defect.
+
+That is not a defect this task's brief asks it to fix (CONTEXT: "Expect
+most commands in a first real run to be shadow-refused; that is the point,
+not a bug") -- but "refused for an informative, state-correct reason" and
 "never even reaches the kernel" are different failure shapes, and this file
 tells them apart: every stage's COMMAND_REQUESTED fact must land even when
 its COMMAND_ACCEPTED does not.
@@ -61,6 +94,7 @@ import hashlib
 import pathlib
 import subprocess
 import sys
+import time
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 CLIENT = REPO_ROOT / "batch" / "lib" / "kernel-client.sh"
@@ -68,7 +102,6 @@ V2_DIR = REPO_ROOT / "v2"
 
 sys.path.insert(0, str(V2_DIR))
 
-from kernel.commands import Command, submit  # noqa: E402
 from kernel.events import EventKind  # noqa: E402
 from kernel.store import Store  # noqa: E402
 
@@ -113,6 +146,15 @@ def _run(script, env=None, net_run=_NET_RUN_STUB):
 
 def _db_env(db):
     return {"BIRCHER_KERNEL_DB": str(db)}
+
+
+def _sleepy_python(tmp_path):
+    """A stand-in for a hung kernel process. See test_kernel_client.py's copy
+    of this helper for why it's `exec`'d rather than run as a child."""
+    p = tmp_path / "sleepy-python"
+    p.write_text("#!/bin/sh\nexec sleep 30\n")
+    p.chmod(0o755)
+    return p
 
 
 # --- _kernel_run_start -------------------------------------------------------
@@ -191,35 +233,134 @@ def test_put_artifact_against_a_missing_database_echoes_nothing(tmp_path):
     assert "[]" in r.stdout, r.stdout
 
 
-# --- every stage's request lands, even when its acceptance does not --------
+def test_a_hung_python_does_not_block_run_start(tmp_path):
+    """Task 3 built this hardness for `_kernel`/`_kernel_dispatch`;
+    `_kernel_run_start` and `_kernel_put_artifact` bypass `_kernel` and call
+    `_net_run` directly (fix round 1, IMPORTANT (c)), so they need the same
+    proof: a hung interpreter must not block the caller."""
+    sleepy = _sleepy_python(tmp_path)
+    started = time.monotonic()
+    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + '\necho SURVIVED',
+             env={"BIRCHER_PY": str(sleepy), "BIRCHER_KERNEL_TIMEOUT": "2"})
+    elapsed = time.monotonic() - started
+    assert "SURVIVED" in r.stdout, r.stdout
+    assert elapsed < 15, f"took {elapsed:.1f}s -- the bound did not fire"
+    assert "[batch:kernel]" in r.stderr, r.stderr
 
-def test_every_stage_actually_reaches_the_kernel(tmp_path):
-    """Drives the exact sequence `run_item` drives -- run start, implementer
-    dispatch, output, CI, reviewer dispatch, review, implementer redispatch,
-    merge request, outcome -- against one real database, then reopens it and
-    asserts a COMMAND_REQUESTED fact landed for every command-shaped stage.
 
-    Most of these are expected to end up COMMAND_REJECTED: the run never
-    leaves `queued` (nothing in this task's wiring calls submit_spec /
-    submit_plan / start_implementation -- see
-    test_authorized_stages_are_actually_accepted below for the stages that
-    it CAN reach), and record_review / request_merge's payload shapes never
-    carry a full verdict binding. That is the documented, correct behaviour
-    of shadow mode evaluating a real authorization decision -- CONTEXT: "most
-    commands in a first real run will be shadow-refused; that is the point,
-    not a bug." What this test is actually checking is the thing a refusal
-    and a silent no-op both LOOK like from run_item's side (an advisory call
-    that returns 0): that a REQUEST was actually recorded for every stage,
-    not that every stage succeeded.
-    """
+def test_a_missing_interpreter_does_not_fail_run_start():
+    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + '; echo "rc=$?"',
+             env={"BIRCHER_PY": "/nonexistent/python"})
+    assert "rc=0" in r.stdout, r.stderr
+
+
+def test_a_hung_python_does_not_block_put_artifact(tmp_path):
+    sleepy = _sleepy_python(tmp_path)
+    started = time.monotonic()
+    r = _run("h=$(_kernel_put_artifact 'hello'); echo \"[$h]\"\necho SURVIVED",
+             env={"BIRCHER_PY": str(sleepy), "BIRCHER_KERNEL_TIMEOUT": "2"})
+    elapsed = time.monotonic() - started
+    assert "SURVIVED" in r.stdout, r.stdout
+    assert "[]" in r.stdout, r.stdout
+    assert elapsed < 15, f"took {elapsed:.1f}s -- the bound did not fire"
+
+
+def test_a_missing_interpreter_does_not_fail_put_artifact():
+    r = _run("h=$(_kernel_put_artifact 'hello'); echo \"[$h]\"; echo \"rc=$?\"",
+             env={"BIRCHER_PY": "/nonexistent/python"})
+    assert "[]" in r.stdout, r.stdout
+    assert "rc=0" in r.stdout, r.stdout
+
+
+# --- _kernel_submit_spec / _kernel_submit_plan / _kernel_start_implementation
+
+def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
+    """Fix round 1, IMPORTANT (b): submit_spec and submit_plan both take an
+    already-PUT hash as an argument (the same PUT-before-reference contract
+    record_implementation_output has), and run_item PUTs the prompt ONCE and
+    passes that one hash to both -- proven here by putting it once and
+    feeding the same hash to both functions, then checking the artifact
+    really is held and both commands were requested."""
     db = tmp_path / "kernel.db"
-    run_id = "run-full"
+    run_id = "run-spec"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
+              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    assert gen == "1", (r.stdout, r.stderr)
+
+    prompt = "do the thing"
+    r = _run(
+        f"h=$(_kernel_put_artifact {prompt!r}); "
+        f'_kernel_submit_spec {run_id} {gen} "$h"; '
+        f'_kernel_submit_plan {run_id} {gen} "$h"',
+        env=_db_env(db),
+    )
+    assert r.returncode == 0, r.stderr
+
+    store = Store.open(db)
+    expected_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    assert store.has_artifact(expected_hash)
+    facts = store.facts_for(run_id)
+    accepted = {
+        f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
+    }
+    assert {"submit_spec", "submit_plan"} <= accepted, accepted
+    assert store.run_state(run_id) == "planned"
+
+
+def test_start_implementation_needs_the_implementer_role(tmp_path):
+    """authorize() refuses start_implementation from any generation not
+    dispatched as implementer (kernel/authz.py). Dispatching as REVIEWER and
+    driving submit_spec/submit_plan/start_implementation on that generation
+    must be refused, not silently accepted."""
+    db = tmp_path / "kernel.db"
+    run_id = "run-wrong-role"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch codex reviewer); echo "[$g]"',
+              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    assert gen == "1", (r.stdout, r.stderr)
+
+    _run(f'h=$(_kernel_put_artifact "x"); '
+         f'_kernel_submit_spec {run_id} {gen} "$h"; '
+         f'_kernel_submit_plan {run_id} {gen} "$h"; '
+         f'_kernel_start_implementation {run_id} {gen}',
+         env=_db_env(db))
+
+    store = Store.open(db)
+    assert store.run_state(run_id) == "planned", (
+        "start_implementation from a reviewer-dispatched generation must be "
+        "refused, leaving the run in 'planned'"
+    )
+    facts = store.facts_for(run_id)
+    rejected = {
+        (f.payload["command_name"], f.payload["reason"])
+        for f in facts if f.kind == EventKind.COMMAND_REJECTED
+    }
+    assert ("start_implementation", "NotAuthorized") in rejected, rejected
+
+
+# --- the full lifecycle, driven for real ------------------------------------
+
+def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
+    """Drives the exact sequence `run_item` drives, end to end, entirely
+    through the named shell functions: run start, implementer dispatch,
+    submit_spec, submit_plan, start_implementation, output, CI, reviewer
+    dispatch, review, implementer redispatch, merge request, outcome.
+    Returns the three generations observed on stdout."""
     _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
 
-    r = _run(f'g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
+    r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen1 = r.stdout.strip().strip("[]")
     assert gen1 == "1", (r.stdout, r.stderr)
+
+    _run(f'h=$(_kernel_put_artifact {prompt!r}); '
+         f'_kernel_submit_spec {run_id} {gen1} "$h"; '
+         f'_kernel_submit_plan {run_id} {gen1} "$h"',
+         env=_db_env(db))
+    _run(f"_kernel_start_implementation {run_id} {gen1}", env=_db_env(db))
 
     body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
     _run(f"_kernel_record_output {run_id} {gen1} {body!r}", env=_db_env(db))
@@ -230,7 +371,7 @@ def test_every_stage_actually_reaches_the_kernel(tmp_path):
     gen2 = r.stdout.strip().strip("[]")
     assert gen2 == "2", (r.stdout, r.stderr)
 
-    _run(f"_kernel_record_review {run_id} {gen2} accept", env=_db_env(db))
+    _run(f"_kernel_record_review {run_id} {gen2} codex:pass", env=_db_env(db))
 
     r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
@@ -240,6 +381,19 @@ def test_every_stage_actually_reaches_the_kernel(tmp_path):
     _run(f"_kernel_request_merge {run_id} {gen3} 42 abedegno/muesli {HEAD_SHA}",
          env=_db_env(db))
     _run(f"_kernel_record_outcome {run_id} {gen3} merged", env=_db_env(db))
+    return gen1, gen2, gen3
+
+
+def test_every_stage_actually_reaches_the_kernel(tmp_path):
+    """Drives the full lifecycle against one real database, then reopens it
+    and asserts a COMMAND_REQUESTED fact landed for every command-shaped
+    stage -- what a refusal and a silent no-op both LOOK like from
+    run_item's side (an advisory call that returns 0) is a REQUEST that
+    landed either way, so this is the assertion a wiring failure could not
+    fake."""
+    db = tmp_path / "kernel.db"
+    run_id = "run-full"
+    _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
     facts = store.facts_for(run_id)
@@ -247,6 +401,7 @@ def test_every_stage_actually_reaches_the_kernel(tmp_path):
         f.payload.get("name") for f in facts if f.kind == EventKind.COMMAND_REQUESTED
     }
     assert requested_names == {
+        "submit_spec", "submit_plan", "start_implementation",
         "record_implementation_output", "record_ci_observation",
         "record_review", "request_merge", "record_merge_outcome",
     }, requested_names
@@ -257,73 +412,64 @@ def test_every_stage_actually_reaches_the_kernel(tmp_path):
         ("claude_code", "implementer"),
     ], dispatched
 
-    # The one stage this wiring CAN authorize (state=queued, role=implementer,
-    # a real artifact already PUT) is accepted, not refused.
+
+def test_the_three_missing_transitions_are_now_accepted(tmp_path):
+    """Fix round 1, IMPORTANT (b): before this fix, the run never left
+    `queued` and every one of the five commands below was refused for the
+    SAME reason ("not legal from state 'queued'") -- verified empirically
+    against a live database before writing this fix, not merely reasoned
+    about. With submit_spec/submit_plan/start_implementation wired in ahead
+    of it, the run reaches `implementing`, and record_implementation_output
+    / record_ci_observation -- refused before purely because of the missing
+    state, not because of anything wrong with THEM -- are now accepted too."""
+    db = tmp_path / "kernel.db"
+    run_id = "run-advances"
+    _drive_full_lifecycle(db, run_id)
+
+    store = Store.open(db)
+    assert store.run_state(run_id) == "implementing", (
+        "record_review's payload never carries a kernel-vocabulary verdict "
+        "(see module docstring), so the run advances to 'implementing' and "
+        "stops there -- it must not still be 'queued'"
+    )
+    facts = store.facts_for(run_id)
     accepted_names = {
         f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
     }
-    assert accepted_names == set(), (
-        "nothing here calls submit_spec/submit_plan/start_implementation, so "
-        f"the run never leaves 'queued' and record_implementation_output "
-        f"(legal only from 'implementing') is refused too: {accepted_names}"
-    )
-    rejected_reasons = {
-        (f.payload["command_name"], f.payload["reason"])
-        for f in facts if f.kind == EventKind.COMMAND_REJECTED
-    }
-    for name in ("record_implementation_output", "record_ci_observation"):
-        assert (name, "NotAuthorized") in rejected_reasons, rejected_reasons
+    assert accepted_names == {
+        "submit_spec", "submit_plan", "start_implementation",
+        "record_implementation_output", "record_ci_observation",
+    }, accepted_names
+
+    expected_hash = hashlib.sha256(b"do the thing").hexdigest()
+    assert store.has_artifact(expected_hash)
+    assert store.current_artifact(run_id) == hashlib.sha256(
+        ("bircher-status: outcome=ready ci=success head=" + HEAD_SHA).encode()
+    ).hexdigest()
 
 
-# --- the stages this wiring CAN authorize really do get accepted -----------
-
-def test_authorized_stages_are_actually_accepted(tmp_path):
-    """`test_every_stage_actually_reaches_the_kernel` proves every call
-    reaches the kernel even when the state gate refuses it. This proves the
-    other half: when a stage IS legally reachable, `_kernel_record_output`
-    and `_kernel_record_ci` do not merely reach the kernel, they get
-    ACCEPTED -- the payload shape, the PUT-before-reference ordering and the
-    generation threading are all actually correct, not just present.
-
-    submit_spec / submit_plan / start_implementation are driven directly
-    against the store rather than through the shell: this task's wiring does
-    not call them (CONTEXT confirms the plan never wires them), so there is
-    no shell function to exercise for them, and driving them through
-    kernel.commands.submit() -- the exact function `_kernel command` itself
-    calls -- advances the run through its REAL transition, not a shortcut
-    around it (no direct store.set_run_state mutation this test would have
-    to trust separately).
+def test_the_remaining_refusals_are_informative_not_repeated(tmp_path):
+    """The three stages that stay refused must be refused for THREE
+    different, state-correct reasons -- not the one repeated "queued is
+    illegal" message that made the pre-fix shadow report uninformative
+    (CONTROLLER: "the shadow report Task 5 builds would be one message
+    repeated five times, teaching nothing"). record_review is refused for a
+    vocabulary mismatch (the marker's `vendor:verdict` shape vs. the
+    kernel's accept/reject/request_revision set) with the state gate
+    already satisfied; request_merge and record_merge_outcome are refused
+    because the run consequently never reaches `reviewing` / merge_requested.
     """
     db = tmp_path / "kernel.db"
-    run_id = "run-happy"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
-
-    r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
-              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
-    gen = r.stdout.strip().strip("[]")
-    assert gen == "1", (r.stdout, r.stderr)
+    run_id = "run-refusals"
+    _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
-    for name in ("submit_spec", "submit_plan", "start_implementation"):
-        res = submit(store, Command(
-            name=name, run_id=run_id, expected_version=store.run_version(run_id),
-            idempotency_key=f"{run_id}:{name}:{gen}", generation=int(gen), payload={},
-        ))
-        assert res.accepted, (name, res)
-    assert store.run_state(run_id) == "implementing"
-
-    body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
-    r = _run(f"_kernel_record_output {run_id} {gen} {body!r}", env=_db_env(db))
-    assert r.returncode == 0, r.stderr
-    r = _run(f"_kernel_record_ci {run_id} {gen} success {HEAD_SHA}", env=_db_env(db))
-    assert r.returncode == 0, r.stderr
-
-    reopened = Store.open(db)
-    expected_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    assert reopened.current_artifact(run_id) == expected_hash
-    facts = reopened.facts_for(run_id)
-    accepted = {
-        f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
+    rejected = {
+        f.payload["command_name"]: f.payload["detail"]
+        for f in store.facts_for(run_id) if f.kind == EventKind.COMMAND_REJECTED
     }
-    assert "record_implementation_output" in accepted, accepted
-    assert "record_ci_observation" in accepted, accepted
+    assert set(rejected) == {"record_review", "request_merge", "record_merge_outcome"}, rejected
+    assert "not one of" in rejected["record_review"], rejected["record_review"]
+    assert "codex:pass" in rejected["record_review"], rejected["record_review"]
+    assert "not legal from state 'implementing'" in rejected["request_merge"], rejected
+    assert "not legal from state 'implementing'" in rejected["record_merge_outcome"], rejected
