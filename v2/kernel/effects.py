@@ -64,13 +64,27 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
     # reaching merge_requested. Rechecked HERE, immediately before execution,
     # because authorization granted at transition time can go stale.
     from kernel.authz import NotAuthorized
-    from kernel.contract import ContractViolation, check, merge_target
+    from kernel.contract import (
+        CONTRACTS, ContractViolation, check, merge_target,
+    )
 
     # The class must describe what the argv actually does. Without this the
     # class is a label the caller picks, and picking a non-merge label skipped
     # the merge gate entirely. Checked for EVERY class, before anything else:
     # an effect whose shape the kernel cannot account for does not run.
+    # An effect that runs no command is not an effect. This used to be
+    # `if argv:` -- so an EMPTY intent skipped the contract check AND, below,
+    # the merge-target check: `perform(MERGE, intent={})` executed and neither
+    # ran. A guard that applies only when the caller supplies something to
+    # guard is not a guard, and "no production caller does that" is the same
+    # reasoning that nearly dismissed the PATH-resolution finding.
     argv = list(intent.get("argv") or [])
+    if CONTRACTS.get(effect_class) is not None and not argv:
+        raise NotAuthorized(
+            f"{effect_class} declares an argv contract, so an effect of that "
+            "class must carry a command; an empty intent would skip every "
+            "check the contract exists to make"
+        )
     if argv:
         try:
             check(effect_class, argv)
@@ -89,8 +103,8 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
         # ...and the effect must act on what was authorized. Revalidation
         # proves that A merge is authorized for this run; without this, an
         # authorized run merged PR 9999 in someone else's repository.
-        if argv:
-            pr, repo = merge_target(argv)
+        pr, repo = merge_target(argv)
+        if True:
             if str(pr) != str(authorized.get("pr")) or repo != authorized.get("repo"):
                 raise NotAuthorized(
                     f"merge targets pr={pr!r} repo={repo!r}, but the kernel "

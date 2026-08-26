@@ -13,6 +13,7 @@ from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized, latest_merge_authorization
 from kernel.commands import Command, submit
 from kernel.dispatch import Role, dispatch
+from conftest import valid_argv
 from kernel.effects import EffectClass, perform
 from kernel.ids import Clock
 from kernel.store import Store
@@ -60,7 +61,7 @@ def _authorized_merge():
 
 def _merge(s, key="m"):
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
-    return perform(s, "r", gen, EffectClass.MERGE, key, {}, lambda *a: "merged!")
+    return perform(s, "r", gen, EffectClass.MERGE, key, valid_argv(EffectClass.MERGE), lambda *a: "merged!")
 
 
 # --- the control --------------------------------------------------------------

@@ -5,6 +5,7 @@ import pytest
 
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
+from conftest import valid_argv
 from kernel.effects import EffectClass, perform
 from kernel.commands import Command, submit
 from kernel.dispatch import Role, dispatch
@@ -113,7 +114,7 @@ def test_merge_outcomes_move_the_run_where_they_should(outcome, expected):
          base_sha=BASE, context_bundle_hash=BUNDLE,
          policy_version=1)
     if outcome == "merged":
-        perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.MERGE, "m", {},
+        perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.MERGE, "m", valid_argv(EffectClass.MERGE),
                 lambda *a: "merged!")
     _sub(s, "record_merge_outcome", "mo", outcome=outcome)
     assert s.run_state("r") == expected

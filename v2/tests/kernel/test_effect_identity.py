@@ -10,6 +10,7 @@ import pytest
 
 from kernel.authz import NotAuthorized
 from kernel.dispatch import Role, dispatch
+from conftest import valid_argv
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, perform,
 )
@@ -31,7 +32,7 @@ def _never_runs(*a):
 def test_an_effect_fact_names_the_dispatched_actor():
     s = _store()
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
-    perform(s, "r", gen, EffectClass.COMMENT, "k", {}, lambda *a: "ok")
+    perform(s, "r", gen, EffectClass.COMMENT, "k", valid_argv(EffectClass.COMMENT), lambda *a: "ok")
     facts = [f for f in s.facts_for("r") if f.kind.startswith("effect_")]
     assert facts, "no effect facts recorded at all"
     assert {f.actor for f in facts} == {"claude"}, (
@@ -45,7 +46,7 @@ def test_an_uncertain_effect_also_names_who_asked():
     s = _store()
     gen = dispatch(s, "r", actor="codex", role=Role.REVIEWER).generation
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     uncertain = [f for f in s.facts_for("r") if f.kind == "effect_uncertain"]
     assert [f.actor for f in uncertain] == ["codex"]
@@ -61,7 +62,7 @@ def test_an_undispatched_generation_cannot_perform_an_effect():
     dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER)
     self_fenced = acquire(s, "r", "claude")
     with pytest.raises(NotAuthorized, match="no dispatched actor"):
-        perform(s, "r", self_fenced, EffectClass.COMMENT, "k", {}, _never_runs)
+        perform(s, "r", self_fenced, EffectClass.COMMENT, "k", valid_argv(EffectClass.COMMENT), _never_runs)
 
 
 def test_a_refused_effect_does_not_execute():
@@ -72,7 +73,7 @@ def test_a_refused_effect_does_not_execute():
     self_fenced = acquire(s, "r", "claude")
     ran = []
     with pytest.raises(NotAuthorized):
-        perform(s, "r", self_fenced, EffectClass.COMMENT, "k", {},
+        perform(s, "r", self_fenced, EffectClass.COMMENT, "k", valid_argv(EffectClass.COMMENT),
                 lambda *a: ran.append(1))
     assert not ran
 
@@ -89,9 +90,9 @@ def test_a_refused_effect_consumes_no_idempotency_key():
     dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER)
     self_fenced = acquire(s, "r", "claude")
     with pytest.raises(NotAuthorized):
-        perform(s, "r", self_fenced, EffectClass.COMMENT, "shared", {}, _never_runs)
+        perform(s, "r", self_fenced, EffectClass.COMMENT, "shared", valid_argv(EffectClass.COMMENT), _never_runs)
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
-    assert perform(s, "r", gen, EffectClass.COMMENT, "shared", {},
+    assert perform(s, "r", gen, EffectClass.COMMENT, "shared", valid_argv(EffectClass.COMMENT),
                    lambda *a: "ok") == "ok"
 
 
@@ -102,11 +103,11 @@ def test_an_undispatched_caller_is_not_told_a_confirmed_effect_s_external_id():
     PR or comment another attempt created."""
     s = _store()
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
-    perform(s, "r", gen, EffectClass.PULL_REQUEST, "shared", {},
+    perform(s, "r", gen, EffectClass.PULL_REQUEST, "shared", valid_argv(EffectClass.PULL_REQUEST),
             lambda *a: "https://github.com/o/r/pull/42")
     self_fenced = acquire(s, "r", "claude")
     with pytest.raises(NotAuthorized, match="no dispatched actor"):
-        perform(s, "r", self_fenced, EffectClass.PULL_REQUEST, "shared", {},
+        perform(s, "r", self_fenced, EffectClass.PULL_REQUEST, "shared", valid_argv(EffectClass.PULL_REQUEST),
                 _never_runs)
 
 
@@ -115,12 +116,12 @@ def test_an_undispatched_caller_is_not_told_an_effect_is_uncertain():
     s = _store()
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     self_fenced = acquire(s, "r", "claude")
     with pytest.raises(NotAuthorized, match="no dispatched actor"):
         _perform_unhalted(s, "r", self_fenced, EffectClass.PULL_REQUEST, "k",
-                          {}, _never_runs)
+                          valid_argv(EffectClass.PULL_REQUEST), _never_runs)
 
 
 def test_reconciliation_stays_a_human_fact():
@@ -131,7 +132,7 @@ def test_reconciliation_stays_a_human_fact():
     s = _store()
     gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     reconcile(s, "r", "k", "closed by hand", s.run_version("r"))
     fact = [f for f in s.facts_for("r") if f.kind == "effect_reconciled"][0]

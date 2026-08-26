@@ -1,6 +1,7 @@
 import pytest
 
 from kernel.commands import Command, StaleVersion, submit
+from conftest import valid_argv
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted,
     pending_reconciliation, perform, reconcile,
@@ -54,13 +55,14 @@ def test_the_effect_classes_are_all_declared():
 def test_intent_is_persisted_before_the_effect_is_attempted(store):
     gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     rec = Recorder(store)
-    perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1", {"title": "x"}, rec)
+    perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1",
+            valid_argv(EffectClass.PULL_REQUEST), rec)
     assert rec.calls == [("executed", ["intended"])]
 
 
 def test_confirmed_effect_records_the_external_object_id(store):
     gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
-    perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1", {}, Recorder(store))
+    perform(store, "r", gen, EffectClass.PULL_REQUEST, "k1", valid_argv(EffectClass.PULL_REQUEST), Recorder(store))
     row = store._conn.execute(
         "SELECT state, external_object_id FROM effects WHERE idempotency_key='k1'"
     ).fetchone()
@@ -74,7 +76,7 @@ def test_a_superseded_generation_cannot_perform_an_effect(store):
     stale = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     dispatch(store, "r", actor="b", role=Role.IMPLEMENTER).generation
     with pytest.raises(OwnershipLost):
-        perform(store, "r", stale, EffectClass.REF_UPDATE, "k2", {}, Recorder(store))
+        perform(store, "r", stale, EffectClass.REF_UPDATE, "k2", valid_argv(EffectClass.REF_UPDATE), Recorder(store))
 
 
 def test_a_superseded_generation_leaves_no_journal_row(store):
@@ -83,7 +85,7 @@ def test_a_superseded_generation_leaves_no_journal_row(store):
     stale = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     dispatch(store, "r", actor="b", role=Role.IMPLEMENTER).generation
     with pytest.raises(OwnershipLost):
-        perform(store, "r", stale, EffectClass.REF_UPDATE, "k3", {}, Recorder(store))
+        perform(store, "r", stale, EffectClass.REF_UPDATE, "k3", valid_argv(EffectClass.REF_UPDATE), Recorder(store))
     assert store._conn.execute(
         "SELECT COUNT(*) FROM effects WHERE idempotency_key='k3'"
     ).fetchone()[0] == 0
@@ -99,31 +101,31 @@ def test_an_uncertain_effect_blocks_retry_until_reconciled(store):
     """
     gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {},
+        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", valid_argv(EffectClass.PULL_REQUEST),
                 Recorder(store, fail=TimeoutError("no response")))
     assert [e["idempotency_key"] for e in pending_reconciliation(store, "r")] == ["k4"]
 
     # Layer 1: the run-level halt.
     with pytest.raises(RuntimeError, match="reconcil"):
-        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store))
+        perform(store, "r", gen, EffectClass.PULL_REQUEST, "k4", valid_argv(EffectClass.PULL_REQUEST), Recorder(store))
 
     # Layer 2: the per-key uncertain check, with the halt stood down.
     with pytest.raises(UncertainEffect, match="reconcil"):
-        _perform_unhalted(store, "r", gen, EffectClass.PULL_REQUEST, "k4", {}, Recorder(store))
+        _perform_unhalted(store, "r", gen, EffectClass.PULL_REQUEST, "k4", valid_argv(EffectClass.PULL_REQUEST), Recorder(store))
 
 
 def test_replaying_a_confirmed_key_does_not_re_execute(store):
     gen = dispatch(store, "r", actor="a", role=Role.IMPLEMENTER).generation
     rec = Recorder(store)
-    perform(store, "r", gen, EffectClass.COMMENT, "k5", {}, rec)
-    perform(store, "r", gen, EffectClass.COMMENT, "k5", {}, rec)
+    perform(store, "r", gen, EffectClass.COMMENT, "k5", valid_argv(EffectClass.COMMENT), rec)
+    perform(store, "r", gen, EffectClass.COMMENT, "k5", valid_argv(EffectClass.COMMENT), rec)
     assert len(rec.calls) == 1, "a confirmed effect was executed twice"
 
 
 def _fail(store, run="r"):
     gen = dispatch(store, run, actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(store, run, gen, EffectClass.PULL_REQUEST, "k1", {},
+        perform(store, run, gen, EffectClass.PULL_REQUEST, "k1", valid_argv(EffectClass.PULL_REQUEST),
                 Recorder(store, fail=TimeoutError("no response")))
     return gen
 

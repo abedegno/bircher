@@ -3,6 +3,7 @@
 import pytest
 
 from kernel.commands import Command, submit
+from conftest import valid_argv
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform, reconcile,
 )
@@ -27,8 +28,8 @@ def test_confirming_one_runs_effect_does_not_touch_another_runs():
     s = _store("A", "B")
     gA, gB = dispatch(s, "A", actor="a", role=Role.IMPLEMENTER).generation, dispatch(s, "B", actor="b", role=Role.IMPLEMENTER).generation
     # A journals an intent that never completes.
-    s.journal_intent("eff_a", "A", gA, EffectClass.COMMENT, "shared", {})
-    perform(s, "B", gB, EffectClass.COMMENT, "shared", {}, lambda *a: "external-b")
+    s.journal_intent("eff_a", "A", gA, EffectClass.COMMENT, "shared", valid_argv(EffectClass.COMMENT))
+    perform(s, "B", gB, EffectClass.COMMENT, "shared", valid_argv(EffectClass.COMMENT), lambda *a: "external-b")
     assert s.effect_state("shared", run_id="A") == "intended", (
         "run B's confirmation leaked into run A's effect"
     )
@@ -50,7 +51,7 @@ def test_an_interrupted_effect_demands_reconciliation_rather_than_replaying():
     # The interrupt propagates unchanged -- swallowing a Ctrl-C would be worse
     # than the bug -- but the uncertainty is recorded before it does.
     with pytest.raises(KeyboardInterrupt):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {}, interrupt)
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST), interrupt)
     assert s.effect_state("k", run_id="r") == "uncertain", (
         "an interrupted effect was left unrecorded"
     )
@@ -58,7 +59,7 @@ def test_an_interrupted_effect_demands_reconciliation_rather_than_replaying():
 
     calls = []
     with pytest.raises((UncertainEffect, RuntimeError)):
-        _perform_unhalted(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+        _perform_unhalted(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST),
                           lambda *a: calls.append(1) or "x")
     assert not calls, "the retry executed against an unresolved effect"
 
@@ -72,7 +73,7 @@ def test_reconcile_is_atomic(monkeypatch):
     s = _store()
     gen = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", {},
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     v = s.run_version("r")
 

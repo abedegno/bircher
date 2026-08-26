@@ -5,6 +5,7 @@ import pytest
 from kernel import canon
 from kernel.canon import CANON_VERSION, canonical_bytes, canonical_hash
 from kernel.commands import Command, submit
+from conftest import valid_argv
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform, reconcile,
 )
@@ -28,7 +29,7 @@ def _halt(s, run="r", key="k1"):
         raise TimeoutError("no response")
 
     with pytest.raises(UncertainEffect):
-        perform(s, run, gen, EffectClass.PULL_REQUEST, key, {}, boom)
+        perform(s, run, gen, EffectClass.PULL_REQUEST, key, valid_argv(EffectClass.PULL_REQUEST), boom)
     return gen
 
 
@@ -41,7 +42,7 @@ def test_a_halted_run_refuses_further_effects():
     gen = _halt(s)
     assert is_halted(s, "r")
     with pytest.raises(RuntimeError, match="reconcil"):
-        perform(s, "r", gen, EffectClass.COMMENT, "k2", {}, lambda *a: "ext_9")
+        perform(s, "r", gen, EffectClass.COMMENT, "k2", valid_argv(EffectClass.COMMENT), lambda *a: "ext_9")
 
 
 def test_reconcile_refuses_an_effect_that_is_not_uncertain():
@@ -63,7 +64,7 @@ def test_reconcile_does_not_unhalt_while_another_effect_is_uncertain():
 
     # A second uncertain effect on the same run.
     with pytest.raises(UncertainEffect):
-        _perform_unhalted(s, "r", gen, EffectClass.COMMENT, "k2", {}, boom)
+        _perform_unhalted(s, "r", gen, EffectClass.COMMENT, "k2", valid_argv(EffectClass.COMMENT), boom)
     reconcile(s, "r", "k1", resolution="x", expected_version=s.run_version("r"))
     assert is_halted(s, "r"), "run unhalted while k2 is still uncertain"
 

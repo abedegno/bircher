@@ -5,6 +5,7 @@ import pytest
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit
+from conftest import valid_argv
 from kernel.effects import EffectClass, UncertainEffect, perform
 from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
@@ -107,7 +108,7 @@ def test_a_halt_refusal_records_a_rejection_fact():
     s = _store()
     gen = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
-        perform(s, "r", gen, EffectClass.PULL_REQUEST, "eff", {},
+        perform(s, "r", gen, EffectClass.PULL_REQUEST, "eff", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     with pytest.raises(RuntimeError, match="reconcil"):
         _sub(s, "submit_spec", "k", spec_sha256=put_artifact(s, b"x"))
@@ -129,7 +130,7 @@ def test_a_merge_effect_cannot_execute_without_kernel_authorization():
     _to_reviewing(s)
     gen = dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation
     with pytest.raises(NotAuthorized, match="merge"):
-        perform(s, "r", gen, EffectClass.MERGE, "m", {}, lambda *a: "merged!")
+        perform(s, "r", gen, EffectClass.MERGE, "m", valid_argv(EffectClass.MERGE), lambda *a: "merged!")
 
 
 def test_a_merge_effect_executes_once_the_kernel_has_authorized_it():
@@ -141,7 +142,7 @@ def test_a_merge_effect_executes_once_the_kernel_has_authorized_it():
          context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     gen = dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation
-    assert perform(s, "r", gen, EffectClass.MERGE, "m", {},
+    assert perform(s, "r", gen, EffectClass.MERGE, "m", valid_argv(EffectClass.MERGE),
                    lambda *a: "merged!") == "merged!"
 
 
@@ -173,7 +174,7 @@ def test_a_confirmed_NON_merge_effect_does_not_authorize_a_merge_outcome():
          context_bundle_hash=BUNDLE,
          policy_version=1, head_git_sha=HEAD)
     # A confirmed COMMENT, not a merge.
-    perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.COMMENT, "c", {},
+    perform(s, "r", dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation, EffectClass.COMMENT, "c", valid_argv(EffectClass.COMMENT),
             lambda *a: "comment-1")
     with pytest.raises(NotAuthorized, match="confirmed merge"):
         _sub(s, "record_merge_outcome", "mo", outcome="merged")

@@ -321,3 +321,32 @@ def test_the_real_calls_still_pass_after_all_of_it():
           ["gh", "api", "repos/o/r/statuses/abc", "-X", "POST", "-f", "state=success"])
     check(EffectClass.SESSION_CONTROL,
           ["curl", "-sf", "--max-time", "15", "-X", "DELETE", "http://srv/v1/sessions/1"])
+
+
+def test_an_effect_with_no_command_is_refused():
+    """`perform(MERGE, intent={})` returned "MERGED" and the executor ran: the
+    contract check and the merge-target check were both guarded by `if argv:`,
+    so an empty intent skipped both. A guard that applies only when the caller
+    supplies something to guard is not a guard."""
+    from kernel.dispatch import Role, dispatch
+    from kernel.effects import perform
+
+    s = _authorized()
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    ran = []
+    with pytest.raises(NotAuthorized, match="must carry a command"):
+        perform(s, "r", gen, EffectClass.MERGE, "empty", {},
+                lambda c, i, k: ran.append(i) or "MERGED")
+    assert not ran, "the executor ran for an effect with no command"
+
+
+def test_an_effect_with_a_command_still_works():
+    """The control."""
+    from kernel.dispatch import Role, dispatch
+    from kernel.effects import perform
+
+    s = _authorized()
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    assert perform(s, "r", gen, EffectClass.MERGE, "ok",
+                   {"argv": ["gh", "pr", "merge", str(PR), "--repo", REPO]},
+                   lambda *a: "done") == "done"

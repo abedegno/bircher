@@ -11,6 +11,7 @@ from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit
 from kernel.dispatch import Role, actor_for, dispatch
+from conftest import valid_argv
 from kernel.effects import (
     EffectClass, UncertainEffect, _perform_unhalted, is_halted, perform,
 )
@@ -90,7 +91,7 @@ def test_retrying_an_interrupted_effect_halts_the_run():
     s.journal_intent("eff_crash", "r", g, EffectClass.PULL_REQUEST, "crashed",
                      {"argv": ["gh", "pr", "create"]})
     with pytest.raises(UncertainEffect):
-        perform(s, "r", g, EffectClass.PULL_REQUEST, "crashed", {},
+        perform(s, "r", g, EffectClass.PULL_REQUEST, "crashed", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: "must-not-run")
     assert is_halted(s, "r"), "the run stayed live holding an unconfirmed effect"
 
@@ -100,11 +101,11 @@ def test_a_later_effect_cannot_execute_after_that_retry():
     stops the next effect."""
     s = _store()
     g = dispatch(s, "r", actor="worker", role=Role.IMPLEMENTER).generation
-    s.journal_intent("eff_crash", "r", g, EffectClass.PULL_REQUEST, "crashed", {})
+    s.journal_intent("eff_crash", "r", g, EffectClass.PULL_REQUEST, "crashed", valid_argv(EffectClass.PULL_REQUEST))
     with pytest.raises(UncertainEffect):
-        perform(s, "r", g, EffectClass.PULL_REQUEST, "crashed", {}, lambda *a: "x")
+        perform(s, "r", g, EffectClass.PULL_REQUEST, "crashed", valid_argv(EffectClass.PULL_REQUEST), lambda *a: "x")
     with pytest.raises(RuntimeError, match="reconcil"):
-        perform(s, "r", g, EffectClass.COMMENT, "later", {},
+        perform(s, "r", g, EffectClass.COMMENT, "later", valid_argv(EffectClass.COMMENT),
                 lambda *a: "comment-executed")
 
 
@@ -112,9 +113,9 @@ def test_the_halt_records_evidence_for_the_retried_effect():
     """A halt an operator cannot act on is a stall."""
     s = _store()
     g = dispatch(s, "r", actor="worker", role=Role.IMPLEMENTER).generation
-    s.journal_intent("eff_crash", "r", g, EffectClass.REF_UPDATE, "crashed", {})
+    s.journal_intent("eff_crash", "r", g, EffectClass.REF_UPDATE, "crashed", valid_argv(EffectClass.REF_UPDATE))
     with pytest.raises(UncertainEffect):
-        perform(s, "r", g, EffectClass.REF_UPDATE, "crashed", {}, lambda *a: "x")
+        perform(s, "r", g, EffectClass.REF_UPDATE, "crashed", valid_argv(EffectClass.REF_UPDATE), lambda *a: "x")
     ev = s.reconciliation_evidence("r")
     assert ev and ev.get("run_id") == "r"
     assert "ref_update" in str(ev.get("affected_resources"))

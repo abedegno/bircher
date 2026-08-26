@@ -5,6 +5,7 @@ import pytest
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit
+from conftest import valid_argv
 from kernel.effects import EffectClass, pending_reconciliation, reconcile
 from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
@@ -57,7 +58,7 @@ def test_a_persisted_intended_effect_can_be_reconciled():
     reconcilable -- otherwise the effect can never be retried at all."""
     s = _store()
     gen = acquire(s, "r", "a")
-    s.journal_intent("eff", "r", gen, EffectClass.PULL_REQUEST, "k", {})
+    s.journal_intent("eff", "r", gen, EffectClass.PULL_REQUEST, "k", valid_argv(EffectClass.PULL_REQUEST))
     assert [e["idempotency_key"] for e in pending_reconciliation(s, "r")] == ["k"]
     reconcile(s, "r", "k", resolution="no_pr_created",
               expected_version=s.run_version("r"))
