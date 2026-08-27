@@ -3266,6 +3266,14 @@ ${prompt}"
   # stand-in plan artifact (v1 has no separate plan document -- see
   # kernel-client.sh's submit_plan wrapper for why that reuse is deliberate).
   local _spec_hash; _spec_hash=$(_kernel_put_artifact "$prompt")
+  # Declared at RUN scope, not inside the marker branch that assigns it.
+  # It was a `local` in that branch and is read at the merge gate below, which
+  # every path reaches -- so the no-marker recovery path died on `set -u` with
+  # "_out_hash: unbound variable", after the implementer session had already
+  # opened its PR. Empty is the correct value there: nothing recorded an
+  # implementation output, so there is no artifact to bind, and the client
+  # refuses an incomplete binding rather than sending one.
+  local _out_hash=""
   _kernel_submit_spec "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
   _kernel_submit_plan "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
   # start_implementation
@@ -3508,7 +3516,6 @@ EOF
     # produced, and what CI said about the head it produced.
     # The hash is the object under review. Captured rather than discarded so
     # the verdict below can bind to it.
-    local _out_hash
     _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body")
     _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_ci" "$marker_head"
 

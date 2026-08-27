@@ -488,3 +488,40 @@ def test_every_adopting_function_adopts_before_its_first_effect():
             f"{name} performs an effect at body line {effect_at} before adopting "
             f"a run at {adopt_at}: that effect runs under a stale generation or "
             f"none at all, and fails silently either way")
+
+
+# --- binding variables must outlive the branch that fills them ----------------
+
+def test_binding_variables_are_declared_at_run_item_scope():
+    """`local` inside a branch, read outside it, is a crash under `set -u`.
+
+    run-queue.sh runs with `set -uo pipefail`. `_out_hash` was declared
+    `local` inside `if [ -n "$marker" ]` and read at the merge gate, which
+    EVERY path reaches. The marker path was fine; the no-marker recovery path
+    -- which fires automatically whenever an implementer session dies -- died
+    with `_out_hash: unbound variable`, on a real run, after the PR had already
+    been opened.
+
+    The suite could not have caught it: the argument-wiring harness drives the
+    MARKER path only, so the branch that declares the variable always ran. This
+    is structural because the behavioural version would have to drive
+    `recover_from_ground_truth` for real.
+    """
+    body = _run_item().splitlines()
+    base = "  "                      # run_item's own body indent
+
+    used_in_bindings = set()
+    for _, logical in _logical_lines():
+        if "_kernel_record_review" in logical or "_kernel_request_merge" in logical:
+            used_in_bindings.update(re.findall(r'"\$(_[a-z_]+)"', logical))
+    assert used_in_bindings, "found no binding variables; the parser is wrong"
+
+    for var in sorted(used_in_bindings):
+        decls = [l for l in body if re.match(rf"\s*local\s+{var}\b", l)]
+        assert decls, f"${var} is used in a binding but never declared local in run_item"
+        for d in decls:
+            indent = d[:len(d) - len(d.lstrip())]
+            assert indent == base, (
+                f"${var} is declared at indent {len(indent)} (inside a branch) but read "
+                f"at the merge gate, which every path reaches: under `set -u` the "
+                f"path that skips that branch dies with 'unbound variable'.\n  {d.strip()}")

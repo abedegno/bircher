@@ -458,6 +458,14 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
 _kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head> <artifact> <base> <context>
   local run_id="$1" generation="$2" pr="$3" repo="$4" head="$5"
   local artifact="$6" base="$7" context="$8"
+  # Same guard record_review carries. The no-marker recovery path reaches this
+  # with an EMPTY artifact -- nothing recorded an implementation output, so
+  # there is nothing to bind -- and sending a binding with a hole in it asks
+  # the kernel to refuse something the caller already knew was incomplete.
+  if [ -z "$artifact" ] || [ -z "$base" ] || [ -z "$context" ]; then
+    _kernel_warn "incomplete merge binding (artifact='$artifact' base='$base' context='$context') -- not requesting a merge"
+    return 0
+  fi
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name request_merge \
     --payload-json "{\"pr\":\"$pr\",\"repo\":\"$repo\",\"head_git_sha\":\"$head\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
