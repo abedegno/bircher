@@ -569,3 +569,23 @@ def test_recover_pr_cmd_resolves_a_halt_before_it_acts():
     assert recon < effect, (
         f"the halt check is at body line {recon} but an effect runs at {effect}: "
         "on a halted run that effect is refused and the halt is never resolved")
+
+
+def test_the_merge_key_distinguishes_attempts():
+    """`merge:<pr>:<head>` was stable across reconciliations, so a retry after
+    one replayed a spent key: the kernel returned the resolved attempt's null
+    external id without executing, and merge_ready_pr read that as "merged,
+    sha unknown" for a PR that was still open.
+
+    The generation is the kernel's own notion of a distinct attempt, so retries
+    within one attempt still collapse to a single effect while a new attempt
+    gets a new key.
+    """
+    src = RUN_QUEUE.read_text()
+    key = next(l for l in src.splitlines()
+               if "_effect merge " in l and not l.strip().startswith("#"))
+    assert "BIRCHER_GENERATION" in key, (
+        f"the merge key does not distinguish attempts, so a retry after a "
+        f"reconciliation replays a spent key:\n  {key.strip()}")
+    assert "$expected_sha" in key, (
+        "the merge key must still pin the head it was reviewed against")

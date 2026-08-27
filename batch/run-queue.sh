@@ -1514,7 +1514,19 @@ merge_ready_pr() {
   # review, so a race can never land unreviewed code.
   local merged=0 mt=0
   while [ "$mt" -lt 30 ] && ! _deadline_passed "$PREMERGE_DEADLINE_AT"; do
-    _effect merge "merge:$pr:$expected_sha" \
+    # The key carries the GENERATION, so a retry after a reconciliation is a
+    # new attempt rather than a replay of a spent one. `merge:<pr>:<head>`
+    # alone was stable across reconciliations: the kernel had resolved that
+    # attempt, its key was consumed, and the retry came back with the resolved
+    # attempt's null external id instead of executing -- which this function
+    # then read as "merged, sha unknown" for a PR that was still open.
+    #
+    # The generation is the kernel's own notion of a distinct attempt: it is
+    # re-fenced at every dispatch, so retries WITHIN one attempt still collapse
+    # to a single effect (which is what idempotency is for) while a genuinely
+    # new attempt gets a genuinely new key. Empty outside a kernel run, which
+    # leaves the legacy shape untouched.
+    _effect merge "merge:$pr:$expected_sha${BIRCHER_GENERATION:+:g$BIRCHER_GENERATION}" \
       "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
       gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
       --match-head-commit "$expected_sha" >/dev/null 2>&1 && { merged=1; break; }
