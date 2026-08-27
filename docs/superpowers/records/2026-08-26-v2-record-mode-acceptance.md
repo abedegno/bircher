@@ -319,6 +319,45 @@ under enforcement those abort exactly as they did under shadow. C8 is unchanged:
 the implementer's PR creation and marker comment never reach the kernel in
 either mode.
 
+## Run 8 — the generation gap, closed for recovery and the sweep
+
+Ruling taken rather than deferred further: **(b), adopt the item's original
+run**, with minting as the fallback. Recovery and the end-of-run sweep are
+continuations of an item's lifecycle — the run already holds the spec, the plan
+and the implementation output the recovery is deciding about — so a ledger that
+splits them tells you less. Run ids are `<item>-<epoch>`, so the item's run is
+discoverable by prefix. Minting is the fallback for a PR that never came from
+the queue, deliberately not the default: a fresh run presents an empty history
+to a merge gate whose whole job is checking history.
+
+**Cost if wrong:** recovery attempts appear as extra generations on an existing
+run rather than as separate runs. The facts stay readable and it is a rename to
+undo.
+
+Live verification against the previous enforce run:
+
+```
+[batch:recover-pr] s05: kernel run=s05-enforce-1787837900 generation=4
+```
+
+and the adopted run grew from 40 to 42 facts, the new pair being
+`ownership_acquired` + `attempt_dispatched(reviewer)`. Before this change the
+same command produced an **empty** kernel database.
+
+**What this verification does NOT cover.** The probe script failed to capture
+the PR number, so the recovery ran against a nonexistent PR and was killed at
+the CI wait rather than completing a review and merge. What is proven is the
+part that was broken: adoption finds the run, fences a generation, and gives
+the path's effects a valid context. A complete recovery through merge under
+kernel mode is still unrun.
+
+**Still open:** `_reopen_reverted_issues` and `_pr` remain STALE GENERATION —
+they run after `run_item` returns and nothing unsets the exported run id.
+`test_every_effect_site_is_classified` keeps them enumerated, and
+`test_every_adopting_function_adopts_before_its_first_effect` asserts the order
+for the two that now adopt, because an effect above the adopt call fails
+silently either way.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
