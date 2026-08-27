@@ -330,8 +330,31 @@ _kernel_verdict() {
 
 # _kernel_record_ci <run_id> <generation> <status> <head_git_sha> -- records
 # record_ci_observation.
+# _kernel_ci_status <coordinator_status> -- echoes the KERNEL's word.
+#
+# The SECOND untranslated vocabulary, found the same way as the first: by
+# running the thing. The marker says `ci=green` / `ci=red`; the kernel's merge
+# gate asks `status == "success"` and nothing else. So CI was recorded
+# faithfully and counted for nothing -- request_merge refused with "no
+# successful CI observation for the head being merged" even on a green run,
+# one link further along the same chain the verdict mismatch used to break.
+#
+# Unknown values PASS THROUGH unchanged rather than being coerced or dropped.
+# The kernel does not police this vocabulary, so an unrecognised status is
+# recorded honestly and simply never counts as green -- which is the
+# fail-closed direction. Coercing it to "success" would be the one unsafe
+# choice available here.
+_kernel_ci_status() {
+  case "$1" in
+    green|success) printf 'success' ;;
+    red|failure|failed) printf 'failure' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
   local run_id="$1" generation="$2" status="$3" head="$4"
+  status=$(_kernel_ci_status "$status")
   # record_ci_observation
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_ci_observation \

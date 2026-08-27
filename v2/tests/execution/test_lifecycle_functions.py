@@ -395,7 +395,12 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
     r = _run(f"_kernel_record_output {run_id} {gen1} {body!r}", env=_db_env(db))
     out_hash = r.stdout.strip()
-    _run(f"_kernel_record_ci {run_id} {gen1} success {HEAD_SHA}", env=_db_env(db))
+    # `green`, not `success`: the PRODUCTION vocabulary. run-queue.sh reads
+    # `ci=green` out of the marker and passes it straight here, so a driver
+    # that said `success` was testing a value production never sends -- and
+    # the mapping it depends on could not have been wrong in a way this
+    # noticed.
+    _run(f"_kernel_record_ci {run_id} {gen1} green {HEAD_SHA}", env=_db_env(db))
 
     r = _run('g=$(_kernel_dispatch codex reviewer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
