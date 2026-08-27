@@ -101,6 +101,13 @@ class Store:
             payload={"base_sha": base_sha, "base_repo": base_repo, "state": "queued"},
         )
 
+    def all_run_ids(self) -> list[str]:
+        """Every run, oldest first. The shadow report needs to sweep them all;
+        without this the only way to enumerate runs was to already know their
+        ids, which a report cannot."""
+        return [r[0] for r in self._conn.execute(
+            "SELECT run_id FROM runs ORDER BY created_at_us").fetchall()]
+
     def run_state(self, run_id: str) -> str:
         row = self._conn.execute(
             "SELECT state FROM runs WHERE run_id = ?", (run_id,)
