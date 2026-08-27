@@ -703,3 +703,117 @@ def test_a_MINTED_run_is_usable_for_what_it_was_minted_for(tmp_path):
     assert Store.open(db).run_state(run_id) == "implementing", (
         "a minted run is not at `implementing`, so the first thing the caller "
         "does with it is refused")
+
+
+# --- the reconciliation WIRING, not just the kernel function -------------------
+#
+# The kernel's reconcile() has tests. The bash that reaches it had none:
+# deleting the `_kernel_reconcile` call from run-queue.sh left every test
+# passing. That is the same shape as the verdict mapping -- a mechanism built
+# and nothing binding the wiring to it.
+
+def _halted_run(db, run_id="r-halt"):
+    """A real halted run: an effect whose executor never answers."""
+    import sys as _sys
+    _sys.path.insert(0, str(V2_DIR))
+    # conftest.py lives in tests/kernel/, which is not on the path from here.
+    # Import it by location rather than duplicating the contract-legal argv it
+    # holds -- a second copy would drift from the contract it is meant to
+    # satisfy, silently, the first time the contract changed.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "kernel_conftest", REPO_ROOT / "v2" / "tests" / "kernel" / "conftest.py")
+    _cf = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_cf)
+    valid_argv = _cf.valid_argv
+    from kernel.dispatch import dispatch as _dispatch
+    from kernel.effects import EffectClass, UncertainEffect, perform
+    s = Store.open(db)
+    s.create_run(run_id=run_id, base_repo="o/r", base_sha=BASE_SHA)
+    g = _dispatch(s, run_id, actor="claude", role="implementer").generation
+    try:
+        perform(s, run_id, g, EffectClass.MERGE, f"merge:9:{HEAD_SHA}",
+                valid_argv(EffectClass.MERGE),
+                lambda *a: (_ for _ in ()).throw(TimeoutError("no answer")))
+    except UncertainEffect:
+        pass
+    except Exception:
+        # MERGE needs prior authorization; fall back to a class that does not.
+        try:
+            perform(s, run_id, g, EffectClass.STATUS_CHECK, "sc-1",
+                    valid_argv(EffectClass.STATUS_CHECK),
+                    lambda *a: (_ for _ in ()).throw(TimeoutError("no answer")))
+        except UncertainEffect:
+            pass
+    return s
+
+
+def test_kernel_pending_reports_a_real_halt_through_bash(tmp_path):
+    db = tmp_path / "k.db"
+    _halted_run(db)
+    r = _run('_kernel_pending r-halt', env=_db_env(db))
+    assert '"halted": true' in r.stdout, r.stdout
+    assert '"pending"' in r.stdout and '"state"' in r.stdout, r.stdout
+
+
+def test_kernel_reconcile_actually_clears_a_halt_through_bash(tmp_path):
+    """Deleting the _kernel_reconcile call from run-queue.sh left all tests
+    passing. This is the test that would have noticed."""
+    import json
+    db = tmp_path / "k.db"
+    s = _halted_run(db)
+    from kernel.effects import is_halted
+    assert is_halted(s, "r-halt"), "precondition: the run must be halted"
+
+    out = json.loads(_run('_kernel_pending r-halt', env=_db_env(db)).stdout)
+    key = out["pending"][0]["idempotency_key"]
+    _run(f'_kernel_reconcile r-halt {key!r} "observed: it did not land" {out["version"]}',
+         env=_db_env(db))
+
+    assert not is_halted(Store.open(db), "r-halt"), (
+        "the halt survived a reconciliation driven through the shell wrapper")
+
+
+def test_a_reconciliation_at_a_stale_version_does_not_clear_the_halt(tmp_path):
+    """The CAS is the point, and the wrapper is advisory -- so a stale
+    reconciliation must fail QUIETLY and leave the halt standing, not fail
+    quietly and clear it."""
+    import json
+    db = tmp_path / "k.db"
+    _halted_run(db)
+    out = json.loads(_run('_kernel_pending r-halt', env=_db_env(db)).stdout)
+    key = out["pending"][0]["idempotency_key"]
+    _run(f'_kernel_reconcile r-halt {key!r} "stale" {out["version"] - 1}',
+         env=_db_env(db))
+    from kernel.effects import is_halted
+    assert is_halted(Store.open(db), "r-halt"), "a stale CAS cleared the halt"
+
+
+# --- adoption: the choices it makes, bound ------------------------------------
+
+def test_adoption_picks_the_NEWEST_run_for_a_code(tmp_path):
+    """`runs[-1]` -> `runs[0]` survived every test. A re-queued item has several
+    runs and the live one is the last; adopting the first attaches this
+    recovery's effects to an attempt that finished long ago."""
+    db = tmp_path / "k.db"
+    s = Store.open(db)
+    for rid in ("dup-first-100", "dup-second-200"):
+        s.create_run(run_id=rid, base_repo="o/r", base_sha=BASE_SHA)
+    r = _run(f'_kernel_adopt_run dup o/r {BASE_SHA} codex implementer >/dev/null; '
+             f'printf "%s" "$BIRCHER_RUN_ID"', env=_db_env(db))
+    assert r.stdout.strip() == "dup-second-200", r.stdout
+
+
+def test_adoption_dispatches_the_ROLE_it_was_asked_for(tmp_path):
+    """Hardcoding the role survived every test. The first command
+    --recover-pr issues is record_implementation_output, which refuses any role
+    but implementer -- so a hardcoded reviewer silently loses the whole
+    lifecycle drive to a refusal."""
+    db = tmp_path / "k.db"
+    s = Store.open(db)
+    s.create_run(run_id="role-1", base_repo="o/r", base_sha=BASE_SHA)
+    _run(f'_kernel_adopt_run role o/r {BASE_SHA} codex implementer >/dev/null',
+         env=_db_env(db))
+    roles = [(f.payload or {}).get("role") for f in Store.open(db).facts_for("role-1")
+             if f.kind == "attempt_dispatched"]
+    assert roles and roles[-1] == "implementer", (
+        f"adoption dispatched {roles!r}, not the role it was given")

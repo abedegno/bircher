@@ -565,6 +565,11 @@ def test_recover_pr_cmd_resolves_a_halt_before_it_acts():
     effect = next((i for i, l in enumerate(body)
                    if re.search(r"(?<!_)\b_effect\s+\w", l)), None)
     assert recon is not None, "recover_pr_cmd never checks for a halt"
+    # Checking for a halt and never resolving it is a check with no consequence.
+    # Deleting the _kernel_reconcile call left every test passing.
+    assert any("_kernel_reconcile" in l for l in body), (
+        "recover_pr_cmd detects a halt and never calls _kernel_reconcile, so "
+        "the halt it found is never resolved")
     assert effect is not None, "recover_pr_cmd has no _effect call; update this test"
     assert recon < effect, (
         f"the halt check is at body line {recon} but an effect runs at {effect}: "
