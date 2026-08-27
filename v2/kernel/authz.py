@@ -88,11 +88,20 @@ _MERGE_OUTCOMES: dict[str, str] = {
 }
 
 
-#: Outcomes `record_run_outcome` may report. Deliberately the SCORECARD's
-#: vocabulary rather than a tidier one of the kernel's own invention: the
-#: criterion these facts have to satisfy is that the kernel's aggregate
-#: matches the scorecard, and a translation layer between the two is exactly
-#: where a mismatch would hide.
+#: Outcomes `record_run_outcome` may report.
+#:
+#: The scorecard's own terminal vocabulary is SIX values -- skipped, failed,
+#: noop, escalated, ready, timeout. `merged` is NOT among them: run-queue.sh
+#: uses "merged" only as the argument to record_merge_outcome, never as a
+#: scorecard outcome. An earlier version of this comment claimed the scorecard
+#: had seven and that the kernel could express one of them; both halves were
+#: wrong, and the correct statement is starker -- the kernel could express
+#: NONE of the six, because `cancelled` is not a scorecard outcome either.
+#:
+#: `merged` is accepted here anyway, as the one value a mechanism can check
+#: (below), so a caller on the merge path can close its ledger with it. The
+#: other six are the scorecard's, verbatim: a translation layer between the two
+#: is exactly where a mismatch would hide.
 #:
 #: WHAT THIS RECORDS IS AN ASSERTION, NOT AN OBSERVATION -- with one
 #: exception. In record mode the kernel is watching a coordinator it does not

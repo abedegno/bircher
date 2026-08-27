@@ -94,12 +94,45 @@ def test_two_runs_sharing_an_idempotency_key_are_two_commands(store):
 
 
 def test_the_order_is_stable_when_counts_tie(store):
-    """An unstable order makes two runs of the same report look like a
-    change."""
-    _bad_merge(store, "r1")
-    g = dispatch(store, "r2", actor="claude", role=Role.IMPLEMENTER).generation
-    submit(store, Command(name="submit_plan", run_id="r2",
-                          expected_version=store.run_version("r2"),
+    """An unstable order makes two runs of the same report look like a change.
+
+    The refusals are created in REVERSE alphabetical order on purpose. An
+    earlier version of this test made them in alphabetical order, so insertion
+    order and sorted order coincided and it passed with the tiebreak removed --
+    it asserted the property it was named for only by accident of the fixture.
+    """
+    g = dispatch(store, "r1", actor="claude", role=Role.IMPLEMENTER).generation
+    submit(store, Command(name="submit_plan", run_id="r1",
+                          expected_version=store.run_version("r1"),
                           idempotency_key="p", generation=g, payload={}))
+    _bad_merge(store, "r2")
+
     names = [r["command_name"] for r in shadow_summary(store)]
+    assert names == ["request_merge", "submit_plan"], names
     assert names == sorted(names), "tied counts must break ties by name"
+
+
+def test_facts_without_a_causal_id_stay_distinct(store):
+    """The `or f"#{fact.id}"` fallback, made reachable and asserted.
+
+    No production call site passes a None causal id, so the fallback was dead
+    code that no test could reach -- and dead code in a dedupe key is the kind
+    that collapses two real refusals into one the day something does. Appending
+    the facts directly is the only way to reach it.
+    """
+    from kernel.events import EventKind
+    for i in range(2):
+        store.append_fact(run_id="r1", kind=EventKind.SHADOW_REJECTED,
+                          actor="kernel", causal_command_id=None,
+                          payload={"command_name": "submit_plan",
+                                   "reason": "no causal id"})
+    row = shadow_summary(store)[0]
+    assert row["count"] == 2, "two causal-id-less refusals collapsed into one"
+    assert row["occurrences"] == 2
+
+
+def test_runs_are_swept_oldest_first(store):
+    """`all_run_ids` documents an ordering; nothing asserted it, so reversing
+    the SQL ORDER BY changed nothing observable."""
+    store.create_run(run_id="r3", base_repo="o/r", base_sha="a" * 40)
+    assert store.all_run_ids() == ["r1", "r2", "r3"]

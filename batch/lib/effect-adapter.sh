@@ -60,10 +60,18 @@ _EFFECT_RC_BADMODE=2      # unknown mode
 # that instance and the class was assumed closed. It was not: this file had
 # the same shape and no test that could see it.
 #
-# Precedence matches `_kernel_pythonpath` so the two agree, with a
-# self-locating fallback because this file is sourced by callers (and
-# tests) that set neither variable: the adapter sits at
-# <bundle>/batch/lib/, so <bundle>/v2 is two directories up.
+# Precedence matches `_kernel_pythonpath` for the two cases that helper
+# handles -- BIRCHER_V2_DIR, then BUNDLE_DIR/v2 -- and then DIVERGES: this one
+# adds a self-locating fallback for callers (and tests) that set neither
+# variable, resolving <bundle>/v2 from this file's own location two
+# directories up.
+#
+# So "the two agree" is false precisely where it would matter, and saying they
+# agree would be the same shape of unearned claim this file exists to fix. With
+# neither variable set, `_kernel_pythonpath` yields a bare "/v2" and this
+# yields a real path. That divergence is deliberate -- `_effect` is the
+# EXECUTION path in kernel mode and must not depend on a caller remembering to
+# export something -- but it is a difference, not an agreement.
 _effect_pythonpath() {
   if [ -n "${BIRCHER_V2_DIR:-}" ]; then printf '%s' "$BIRCHER_V2_DIR"
   elif [ -n "${BUNDLE_DIR:-}" ]; then printf '%s' "$BUNDLE_DIR/v2"

@@ -4,16 +4,21 @@ The input to switching commands from shadow to enforce one at a time. A count
 tells you enforcement would break something; the reason tells you what, and
 whether the fix is the guard or the wiring.
 
-WHAT `count` COUNTS, and why it is not the number of facts. The coordinator
-retries: an advisory `_kernel` call that gets shadow-refused is retried by
-run-queue.sh, and each attempt appends its own `shadow_rejected` fact carrying
-the SAME `causal_command_id`. Counting facts would answer "how many times did
-we notice", when the question this report exists to answer is "how many
-distinct commands would enforcement have broken" -- the number that decides
-whether a command is safe to enforce. So `count` is distinct
-(run_id, causal_command_id) pairs, and the raw fact total is reported
-separately as `occurrences`. A large gap between them is itself a signal: the
-same refusal is being retried rather than handled.
+WHAT `count` COUNTS, and why it is not the number of facts. `count` is
+distinct (run_id, causal_command_id) pairs; the raw fact total is reported
+separately as `occurrences`.
+
+An earlier version of this docstring justified that by saying run-queue.sh
+retries a shadow-refused `_kernel` call. It does not -- `_kernel` returns 0
+and the coordinator never branches on it, so today the two numbers are equal
+for every command. The real justification is weaker and worth stating as such:
+the question this report answers is "how many DISTINCT commands would
+enforcement have broken", which is a property of commands, not of how many
+facts happen to describe them. Counting identities rather than records is
+right whether or not anything currently retries, and `occurrences` diverging
+from `count` later is then a signal -- a refusal being re-submitted rather
+than handled -- instead of a silent inflation of the number that decides
+whether a command is safe to enforce.
 
 The pair, not the id alone: idempotency keys are unique within a run, not
 across runs -- two runs both using "k3" are two different commands, and

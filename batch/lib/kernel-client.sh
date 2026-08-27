@@ -318,8 +318,6 @@ _kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head_git_sha>
     --payload-json "{\"pr\":\"$pr\",\"repo\":\"$repo\",\"head_git_sha\":\"$head\"}"
 }
 
-# _kernel_record_outcome <run_id> <generation> <outcome> -- records
-# record_merge_outcome. *outcome* is "merged" or "failed".
 # _kernel_record_run_outcome <run_id> <generation> <outcome>
 #
 # The TERMINAL record: "this run is over, and here is what the coordinator
@@ -329,16 +327,40 @@ _kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head_git_sha>
 # emitting facts and sat in `implementing` forever, indistinguishable from one
 # still running.
 #
-# The payload is built by python rather than interpolated, because a `"` in
-# $outcome would otherwise produce malformed JSON that the CLI rejects -- a
-# silent advisory failure at the one point in the run where the ledger records
-# how it ended.
+# The payload is built by a CASE over the closed vocabulary, not by shelling
+# out to python and not by interpolating $outcome into JSON.
+#
+# Interpolating is unsafe: a `"` in $outcome produces malformed JSON the CLI
+# rejects -- a silent advisory failure at the one point in the run that records
+# how it ended. But the first fix for that was worse than the problem. It ran a
+# BARE `python3`, which (a) sat OUTSIDE `_net_run`, so the one call this file
+# exists to keep bounded was unbounded -- a hung interpreter blocks the
+# coordinator, measured at 8s against a 2s cap -- and (b) hardcoded `python3`
+# while every other call here honours `BIRCHER_PY`, so a deployment pointing at
+# a different interpreter would use two.
+#
+# A case statement needs neither. The vocabulary is closed and known here, so
+# the JSON is a literal and cannot be malformed. An unrecognised outcome maps to
+# a value the kernel REFUSES rather than one it silently accepts: drift between
+# this list and kernel/authz.py's shows up as a recorded refusal instead of a
+# run whose ledger quietly disagrees with its scorecard.
 _kernel_record_run_outcome() {  # <run_id> <generation> <outcome>
   local run_id="$1" generation="$2" outcome="$3" payload
-  payload=$(python3 -c 'import json,sys; print(json.dumps({"outcome": sys.argv[1]}))' "$outcome" 2>/dev/null)     || payload='{"outcome":"unparseable"}'
+  case "$outcome" in
+    merged|ready|escalated|noop|skipped|failed|timeout)
+      payload="{\"outcome\":\"$outcome\"}" ;;
+    *)
+      payload='{"outcome":"unrecognised"}' ;;
+  esac
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_run_outcome --payload-json "$payload"
 }
+
+# _kernel_record_outcome <run_id> <generation> <outcome> -- records
+# record_merge_outcome. *outcome* is "merged" or "failed". NOT the terminal
+# record; that is _kernel_record_run_outcome above. This comment previously sat
+# above THAT function by accident, mislabelling both at the one place the two
+# must not be confused.
 
 _kernel_record_outcome() {  # <run_id> <generation> <outcome>
   local run_id="$1" generation="$2" outcome="$3"

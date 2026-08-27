@@ -283,3 +283,28 @@ def test_a_second_terminal_record_is_refused():
     assert s.run_state("r") == "ended"
     with pytest.raises(NotAuthorized):
         _submit(s, "record_run_outcome", "k2", actor="claude", outcome="failed")
+
+
+def test_a_merged_outcome_WITH_a_confirmed_merge_effect_is_accepted():
+    """The ACCEPTING direction of the evidence check.
+
+    Its refusing direction is covered above, and that alone is not enough:
+    a guard wired to a nonexistent effect class refuses everything and passes
+    every refusal test in the suite. Only this test distinguishes "checks for
+    a confirmed merge" from "never accepts merged at all", and without it the
+    check could be pointed anywhere and stay green.
+    """
+    s = _advance_to_reviewing(_store())
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
+            base_sha=BASE, context_bundle_hash=BUNDLE, actor="codex",
+            policy_version=1)
+    _submit(s, "request_merge", "rm", head_git_sha=HEAD, artifact_hash=SPEC,
+            base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1)
+    perform(s, "r",
+            dispatch(s, "r", actor="impl", role=Role.IMPLEMENTER).generation,
+            EffectClass.MERGE, "m", valid_argv(EffectClass.MERGE),
+            lambda *a: "merged!")
+
+    _submit(s, "record_run_outcome", "ro", actor="claude", outcome="merged")
+    assert s.run_state("r") == "ended"
