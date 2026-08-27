@@ -629,7 +629,15 @@ def test_the_recovery_branch_does_not_die_on_an_unbound_variable(recovery_drive)
     and read at the merge gate, which every path reaches. Under `set -u` the
     recovery path -- which fires automatically whenever an implementer session
     dies -- crashed the coordinator on a live run, after the PR had already
-    been opened. Nothing here drove that path, so nothing caught it."""
+    been opened. Nothing here drove that path, so nothing caught it.
+
+    WHAT THIS DOES AND DOES NOT PIN. It no longer reproduces the original bug:
+    the recovery branch now assigns `_out_hash` itself, so the variable is
+    bound on this path even if the run-scope declaration is moved back inside
+    the marker branch -- verified by mutation. What pins that shape is
+    test_lifecycle_wiring.test_binding_variables_are_declared_at_run_item_scope.
+    This one remains a general guard: any future unbound variable on the
+    recovery path reds it, which is worth having and is less than it looks."""
     _, result = recovery_drive
     assert "unbound variable" not in result.stderr, result.stderr[-400:]
 
