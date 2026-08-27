@@ -604,3 +604,25 @@ def test_recover_pr_cmd_writes_back_to_the_issue():
     assert "closingIssuesReferences" in body, (
         "the issue must come from the PR's own closing references: this path "
         "adopts a PR and may never have seen the queue item that created it")
+
+
+@pytest.mark.parametrize("fn", ["recover_pr_cmd", "run_item"])
+def test_an_empty_recovery_tuple_is_treated_as_a_failure(fn):
+    """recover_from_ground_truth has ONE exit and always emits five fields, so
+    no output means it died before reaching that line -- and `rec=$(...)`
+    swallows the death into an empty string. Parsed straight it reads as
+    outcome="" and the caller reports "NOT ready", which is a benign-looking
+    sentence for "the recovery crashed". Seen once on the smoke repo and not
+    reproducible since; the misreading is the part worth making impossible."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith(f"{fn}()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+
+    call = next(i for i, l in enumerate(body) if "rec=$(recover_from_ground_truth" in l)
+    parse = next(i for i, l in enumerate(body)
+                 if "read -r" in l and ("r_outcome" in l or "outcome review note" in l))
+    window = "\n".join(body[call:parse])
+    assert "${rec//[[:space:]]/}" in window, (
+        f"{fn} parses the recovery tuple without checking it is non-empty, so a "
+        "crashed recovery reads as a verdict of ''")

@@ -1971,7 +1971,19 @@ EOF
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
   local rec r_outcome r_review r_note r_sha r_ci
+  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
+  # single exit and always emits five fields, so no output means it died before
+  # reaching that line -- and `rec=$(...)` swallows the death into an empty
+  # string. Parsed straight, that reads as outcome="" and the caller reports
+  # "NOT ready", which is a benign-looking sentence for "the recovery
+  # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
+  # note= head=) and not reproducible since; the specific crash is unknown and
+  # the misreading is the part worth making impossible.
   rec=$(recover_from_ground_truth "$item" "$code" "$pr")
+  if [ -z "${rec//[[:space:]]/}" ]; then
+    echo "[batch:recover-pr] $code: recovery produced NO tuple -> it failed; PR left untouched for a human" >&2
+    return 1
+  fi
   IFS='|' read -r r_outcome r_review r_note r_sha r_ci <<EOF
 $rec
 EOF
@@ -3664,6 +3676,18 @@ EOF
       echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
       local rec
       rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
+  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
+  # single exit and always emits five fields, so no output means it died before
+  # reaching that line -- and `rec=$(...)` swallows the death into an empty
+  # string. Parsed straight, that reads as outcome="" and the caller reports
+  # "NOT ready", which is a benign-looking sentence for "the recovery
+  # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
+  # note= head=) and not reproducible since; the specific crash is unknown and
+  # the misreading is the part worth making impossible.
+      if [ -z "${rec//[[:space:]]/}" ]; then
+        echo "[batch] $item: recovery produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
+        rec="escalated|na|ground-truth recovery failed (no tuple); needs a human||na"
+      fi
       local _rec_ci=""
       IFS='|' read -r outcome review note marker_head _rec_ci <<EOF
 $rec
