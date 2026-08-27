@@ -127,10 +127,19 @@ def test_run_item_never_inlines_a_kernel_command_call():
 # one still in flight. The first live acceptance run demonstrated it: scorecard
 # `escalated`, kernel `implementing`.
 #
-# Wiring the three reachable sites fixes those three instances. This test is
-# what closes the CLASS: a new exit added later either records an outcome or
-# names itself here with a reason, and there is no third option that stays
-# green.
+# Wiring the reachable sites fixes those instances. The tests below close the
+# class WITHIN run_item: a new exit added there either records an outcome or
+# names itself in _NO_KERNEL_OUTCOME with a reason.
+#
+# SCOPE, stated because the earlier version of this comment did not and the
+# claim was therefore larger than the parser. `_run_item()` reads run_item and
+# nothing else. `reconcile_deferred_ready` appends EIGHT further terminal
+# scorecard rows for the same items after run_item has returned, and can
+# record `escalated` where run_item already recorded `ready`. None of those
+# are in scope here, none are exempted here, and because a second
+# record_run_outcome is refused by design, the kernel's terminal fact can then
+# disagree with the scorecard's last word and never be corrected. That is a
+# real gap; this test does not cover it and does not pretend to.
 
 #: Scorecard writes that deliberately record NO kernel outcome, and why. Each
 #: key is a distinguishing substring of the site's own line.

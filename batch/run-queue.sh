@@ -3403,8 +3403,12 @@ ${prompt}"
     local nnote; nnote=$(_read_note "$NOOP_DIR/$code.noop")
     rm -f "$NOOP_DIR/$code.noop"
     mkdir -p "$(dirname "$SCORECARD")"
-    # The run is over: close its ledger before the scorecard row, so the
-    # kernel's terminal fact and the scorecard agree by construction.
+    # The run is over: close its ledger before the scorecard row. The kernel's
+    # terminal fact is written first, but the two are NOT guaranteed to agree:
+    # `_kernel` is advisory and always returns 0, so a failed or refused command
+    # leaves no terminal fact while the scorecard row below is written anyway.
+    # An earlier version of this comment claimed they "agree by construction",
+    # which is the unearned-claim shape this change exists to remove.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "noop"
     json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=noop (no change needed)"
@@ -3420,8 +3424,12 @@ ${prompt}"
     local enote; enote=$(_read_note "$NOOP_DIR/$code.escalated")
     rm -f "$NOOP_DIR/$code.escalated"
     mkdir -p "$(dirname "$SCORECARD")"
-    # The run is over: close its ledger before the scorecard row, so the
-    # kernel's terminal fact and the scorecard agree by construction.
+    # The run is over: close its ledger before the scorecard row. The kernel's
+    # terminal fact is written first, but the two are NOT guaranteed to agree:
+    # `_kernel` is advisory and always returns 0, so a failed or refused command
+    # leaves no terminal fact while the scorecard row below is written anyway.
+    # An earlier version of this comment claimed they "agree by construction",
+    # which is the unearned-claim shape this change exists to remove.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "escalated"
     json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=escalated (no PR; reason: ${enote:-n/a})"
@@ -3543,8 +3551,17 @@ EOF
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
-  # The run is over: close its ledger before the scorecard row, so the
-  # kernel's terminal fact and the scorecard agree by construction.
+  # The run is over: close its ledger before the scorecard row. The kernel's
+  # terminal fact is written first, but the two are NOT guaranteed to agree:
+  # `_kernel` is advisory and always returns 0, so a failed or refused command
+  # leaves no terminal fact while the scorecard row below is written anyway.
+  # An earlier version of this comment claimed they "agree by construction",
+  # which is the unearned-claim shape this change exists to remove.
+  #
+  # This site can also diverge on VALUE: $outcome comes from a model-authored
+  # `bircher-status:` marker parsed with no schema validation, so a word
+  # outside the kernel's vocabulary is refused -- correctly and visibly --
+  # while the scorecard records it regardless.
   _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
   json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
   _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"

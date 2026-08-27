@@ -65,7 +65,7 @@ Run id `zz02-terminal-record-1787795851`, implementer `codex`,
 outcome `escalated` (the file it was asked about is absent, which was the
 expected answer), no PR, item moved to `processed/`.
 
-### Criterion 1 — the aggregate matches the scorecard: **HOLDS**
+### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
 |---|---|
@@ -77,15 +77,34 @@ The three `zz01` runs remain `implementing` with no kernel outcome. That is
 history, recorded before `record_run_outcome` existed — not a live divergence,
 and deliberately not back-filled.
 
-### Criterion 2 — every mutation is journalled: **VACUOUS, not verified**
+**The caveat this criterion needs, and did not have.** It was checked on one
+escalated run with no PR and no merge — a path where the known failure modes
+cannot arise. Two of them are real:
 
-The journal contains exactly two effects, both `session_control` (the prompt
-send), for each of the two runs that got that far.
+1. `_kernel` is advisory and always returns 0, so a failed or refused terminal
+   command leaves no fact while the scorecard row is written regardless. The
+   run then stays non-terminal and the two disagree. The source comments at
+   the three recording sites used to claim they "agree by construction"; they
+   now say this.
+2. `reconcile_deferred_ready` appends further terminal scorecard rows for the
+   same item **after** `run_item` has returned, and can record `escalated`
+   where `run_item` already recorded `ready`. Because a second
+   `record_run_outcome` is refused by design, the kernel's terminal fact then
+   disagrees with the scorecard's last word and can never be corrected. Those
+   sweep rows are outside the scope of the class-closure tests, which read
+   `run_item` only. **This is an open gap, not a solved one.**
 
-This run performed **no `gh` or `git` mutation at all** — it escalated without
-opening a PR. So "every mutation is journalled" is satisfied only because
-there were no mutations to journal. That is a pass that could not have failed,
-and it is recorded here as not-yet-verified rather than as a green criterion.
+### Criterion 2 — every mutation is journalled: **NARROW, not verified**
+
+The journal contains exactly two effects per run that got that far, both
+`session_control` (the prompt send).
+
+An earlier version of this record called this "vacuous" on the grounds that the
+run performed no mutation at all. That was wrong in the pessimistic direction:
+`session_control` **is** an externally visible mutation, it was performed, and
+it was journalled — the criterion had something to check and it passed. What is
+true is that the coverage is narrow: no `gh` or `git` effect ran, because the
+item escalated without opening a PR.
 
 **What would actually test it:** an item that opens a PR, posts a status and
 merges — exercising `pull_request`, `status_check`, `comment` and `merge`.
@@ -94,10 +113,9 @@ for explicit sign-off.
 
 Also noted: `effect_confirmed` facts carry `effect_class=None`. The intent fact
 carries the class and the confirmation does not, so the journal cannot be
-filtered by class on confirmations alone. Cosmetic for now; it would matter to
-any report that reconciles intents against confirmations.
+filtered by class on confirmations alone.
 
-### Criterion 3 — the shadow report: **zero rows**
+### Criterion 3 — the shadow report: **zero rows, genuinely, on a narrow path**
 
 ```
 []
@@ -108,19 +126,62 @@ means either the wiring is right or the kernel was never called, and Step 4's
 journal distinguishes them. Here the kernel **was** called — the runs carry
 `run_started`, `ownership_acquired`, `attempt_dispatched`, three
 `command_accepted` with their transitions, a terminal `record_run_outcome`,
-and the effect pair. So zero rows is genuine for the paths exercised.
+and the effect pair. So zero rows is genuine.
 
-But the paths exercised are narrow. No review, no CI observation, no merge
-request, no merge. **Zero rows says nothing about whether the merge path is
-safe to enforce**, because no command on that path was ever submitted. The
-shadow report becomes decision-grade input only after a run that reaches merge.
+But no review, CI observation, merge request or merge command was ever
+submitted. **Zero rows says nothing about whether the merge path is safe to
+enforce.** The report becomes decision-grade only after a run that reaches
+merge.
+
+### Criterion 4 — a deliberately broken kernel changes nothing: **DOES NOT HOLD**
+
+The spec calls this "the one that decides whether this was safe to do", and
+an earlier version of this record omitted it entirely. It does not hold in the
+configuration the acceptance run used.
+
+Probe — `BIRCHER_EFFECT_MODE=kernel`, `BIRCHER_KERNEL_DB` pointed at an
+unopenable path, one routed `ref_update` effect:
+
+```
+rc = 1
+sqlite3.OperationalError: unable to open database file
+the mutation happened: NO
+```
+
+The criterion holds for `_kernel`, which is advisory by construction: every
+command call warns and returns 0, and nothing branches on it. It does **not**
+hold for `_effect` in kernel mode, which is not advisory — it is the execution
+path. A broken kernel there does not merely lose the record, it loses the
+merge, the status post, the PR comment and prompt delivery. Run 1 of this very
+document is the live demonstration.
+
+The spec's supporting sentence, "each call site is `|| _kernel_warn` and
+nothing reads a kernel exit code", is true of the `_kernel` sites and not of
+the `_effect` sites, which carry no such guard.
+
+**This is a property of the design, not a defect to fix here:** routing effects
+through the kernel is the point, and a kernel that cannot journal must not let
+the mutation proceed unrecorded. But it means **kernel effect mode is a hard
+dependency**, and the safety argument for deploying it is not the one the
+criterion states. Recorded as failed rather than reworded.
+
+### Criterion 5 — the self-test stays green: **HOLDS**
+
+`bash batch/run-queue.sh --self-test` exits 0, ending `self-test OK`.
 
 ## Verdict
 
 Record mode works end to end for a run that starts, executes and ends without
 merging: the kernel observes the lifecycle, journals the effect that matters,
-and now records how the run finished, in agreement with the scorecard.
+and records how the run finished, in agreement with the scorecard.
 
-Criterion 1 holds. Criterion 3 is implemented and returns a true zero. 
-Criterion 2 is untested by this run and is the outstanding gate before
-enforcement can be argued for.
+- **Criterion 1** holds on this run, with two known divergence paths untested.
+- **Criterion 2** is narrow, not vacuous, and not yet verified for `gh`/`git`.
+- **Criterion 3** is implemented and returns a true zero, on a narrow path.
+- **Criterion 4** does not hold in kernel effect mode, by design.
+- **Criterion 5** holds.
+
+The outstanding gate before enforcement can be argued for is a run that
+reaches merge. Until then criteria 2 and 3 are untested where it counts, and
+criterion 4 should be read as "the kernel is a hard dependency", not as the
+safety guarantee the spec's wording implies.
