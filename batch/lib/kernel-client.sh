@@ -185,11 +185,18 @@ print(runs[-1] if runs else "")
     # rev-parse HEAD` there refused every review on an adopted run and left it
     # stuck at `implementing` with the merge unauthorized.
     #
-    # Reading it back does make the kernel's base check tautological ON THIS
-    # PATH, and that is the honest trade: a recovery is not making an
-    # independent observation of the base, it is continuing a run that already
-    # recorded one. The checks that stay load-bearing here are the artifact and
-    # the CI observation, which the recovery does observe.
+    # Reading it back makes the base TAUTOLOGICAL ON THIS PATH -- and not only
+    # the review's direct base check, which is what an earlier version of this
+    # comment admitted. The same value is repeated into request_merge, so the
+    # base's membership in the review-to-merge binding hash is tautological
+    # too: revalidation confirms the recorded tuple still has an accepted
+    # review, and never re-observes the base. Naming only the narrower
+    # consequence understated it.
+    #
+    # What stays load-bearing is real and worth stating precisely:
+    # revalidation checks the approved artifact still exists AND is still the
+    # run's current output, and that CI is still green on the authorized head.
+    # Those the recovery genuinely observes.
     BIRCHER_RUN_BASE=$( K_RUN="$BIRCHER_RUN_ID" PYTHONPATH="$(_kernel_pythonpath)" \
       _net_run "$(_kernel_net_cap)" \
       "${BIRCHER_PY:-python3}" -c 'import os,sys
@@ -459,7 +466,21 @@ _kernel_verdict() {
   case "$1" in
     *:pass) printf 'accept' ;;
     *:fail) printf 'request_revision' ;;
-    *)      printf '%s' "$1" ;;
+    # PREFIXED, and stripped to a safe charset. Passing an unmapped word
+    # through UNCHANGED -- the previous version -- was an authorization bypass:
+    # `review=` is model-authored, and `accept` is the kernel's own vocabulary,
+    # so a marker saying `review=accept` produced a real review_verdict fact and
+    # advanced the run to `reviewing` without ever satisfying the `*:pass`
+    # requirement this mapping exists to enforce. Verified against a live
+    # database before it was fixed.
+    #
+    # `unmapped:` cannot collide with any accepted verdict, so the refusal is
+    # guaranteed rather than hoped for, and the original word survives in the
+    # refusal reason. The `tr` strips quotes and braces: the value is
+    # interpolated into JSON below, and model output containing `"` turned the
+    # intended visible refusal into a payload parse failure that the advisory
+    # wrapper then swallowed -- a refusal promised and not delivered.
+    *)      printf 'unmapped:%s' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9:._-' | cut -c1-40)" ;;
   esac
 }
 

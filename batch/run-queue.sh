@@ -1973,15 +1973,25 @@ recover_pr_cmd() {
     # presented as an observation about each effect, which is the exact shape
     # this design exists to refuse. Anything else stays unresolved and the run
     # stays halted, which is the truthful state: nobody has looked at it.
-    _pkeys=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys
+    # The key must name THIS pr, not merely be a merge. Filtering by class
+    # alone closed half the defect: an adopted run can hold an uncertain merge
+    # for a DIFFERENT PR -- adoption still picks the newest run for an item
+    # code without linking it to the PR on the command line -- and this
+    # observation is about `$pr` and nothing else. Merge keys are
+    # `merge:<pr>:<head>[:g<n>]`, so the prefix is the check.
+    _pkeys=$(K_PR="$pr" printf '%s' "$_pend" | K_PR="$pr" "${BIRCHER_PY:-python3}" -c 'import json,os,sys
+want = "merge:" + os.environ.get("K_PR","") + ":"
 for e in json.load(sys.stdin)["pending"]:
-    if e.get("effect_class") == "merge":
+    if e.get("effect_class") == "merge" and e.get("idempotency_key","").startswith(want):
         print(e["idempotency_key"])' 2>/dev/null)
     local _unspoken
-    _unspoken=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys
+    _unspoken=$(printf '%s' "$_pend" | K_PR="$pr" "${BIRCHER_PY:-python3}" -c 'import json,sys
+import os
+want = "merge:" + os.environ.get("K_PR","") + ":"
 for e in json.load(sys.stdin)["pending"]:
-    if e.get("effect_class") != "merge":
-        print(e["effect_class"], e["idempotency_key"])' 2>/dev/null)
+    k = e.get("idempotency_key","")
+    if e.get("effect_class") != "merge" or not k.startswith(want):
+        print(e["effect_class"], k)' 2>/dev/null)
     echo "[batch:recover-pr] $code: run is HALTED -> $_resolution" >&2
     local _k
     while IFS= read -r _k; do
@@ -2057,12 +2067,19 @@ EOF
   # fix a different instance of exactly that. Only the first is a reason to
   # skip quietly.
   if [ -z "${_rp_raw//[[:space:]]/}" ]; then
-    echo "[batch:recover-pr] $code: WARN kernel unreachable (pending returned nothing) -- driving the lifecycle blind" >&2
+    # `pending` returns nothing for BOTH an unreachable kernel and a run the
+    # kernel does not know -- `run_state` raises on a missing run, so the CLI
+    # emits no JSON either way and the two cannot be told apart from here. An
+    # earlier version claimed to distinguish them, reported this case as
+    # "unreachable", and left the drive ENABLED so recovery proceeded blind
+    # against a run that might not exist. Both causes are now reported as one
+    # unknown, honestly, and both stop the drive: driving a lifecycle at a run
+    # whose state is unknown is how the four-refusal noise started.
+    echo "[batch:recover-pr] $code: WARN cannot read run state (kernel unreachable, or it knows no run '${BIRCHER_RUN_ID:-}') -- not driving the lifecycle" >&2
+    _rp_drive=0
   else
     case "$_rp_state" in
       queued|specified|planned|implementing|reviewing) : ;;
-      "") echo "[batch:recover-pr] $code: WARN kernel knows no run '${BIRCHER_RUN_ID:-}' -- adoption did not take; not re-driving" >&2
-          _rp_drive=0 ;;
       *)  echo "[batch:recover-pr] $code: run is at '$_rp_state' -- past the lifecycle stages; not re-driving them" >&2
           _rp_drive=0 ;;
     esac

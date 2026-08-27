@@ -722,3 +722,41 @@ def test_the_state_check_distinguishes_its_three_causes():
     assert "kernel unreachable" in body, "an unreachable kernel is not distinguished"
     assert "knows no run" in body, "a missing run is not distinguished"
     assert "past the lifecycle stages" in body, "the benign case lost its message"
+
+
+def test_reconciliation_targets_only_THIS_prs_merge_effects():
+    """Cross-vendor HIGH, second pass. Filtering by effect class closed half the
+    defect: an adopted run can hold an uncertain merge for a DIFFERENT PR --
+    adoption still picks the newest run for an item code without linking it to
+    the PR on the command line -- and the observation is about `$pr` alone.
+    Merge keys are `merge:<pr>:<head>`, so the prefix is the check."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
+
+    assert 'want = "merge:" + os.environ.get("K_PR","") + ":"' in body, (
+        "reconciliation does not restrict merge keys to this PR, so PR A's "
+        "observation can resolve PR B's uncertain merge")
+    assert 'startswith(want)' in body
+
+
+def test_an_unreadable_run_state_stops_the_drive():
+    """`pending` returns nothing for BOTH an unreachable kernel and a run the
+    kernel does not know -- run_state raises on a missing run, so no JSON is
+    emitted either way. An earlier version claimed to distinguish them, reported
+    the case as 'unreachable', and left the drive ENABLED, so recovery went on
+    blind against a run that might not exist."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+
+    guard = next(i for i, l in enumerate(body) if '_rp_raw//[[:space:]]' in l and "if " in l)
+    window = "\n".join(body[guard:guard + 4])
+    assert "_rp_drive=0" in window, (
+        "an unreadable run state leaves the lifecycle drive enabled, so "
+        "recovery proceeds against a run whose state is unknown")
+    assert "knows no run" not in "\n".join(body) or "cannot read run state" in "\n".join(body), (
+        "the unreachable-vs-missing distinction is claimed but cannot be "
+        "implemented from here; say one honest thing instead")
