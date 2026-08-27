@@ -545,3 +545,27 @@ def test_recover_pr_cmd_drives_the_lifecycle_too(stage):
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
     body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
     assert stage in body, f"recover_pr_cmd never calls {stage}"
+
+
+def test_recover_pr_cmd_resolves_a_halt_before_it_acts():
+    """Order again, and again it is the whole content.
+
+    `perform` refuses every effect on a halted run, so a halted run adopted
+    here would have each subsequent effect declined -- correctly, and with no
+    way forward. Reconciling after the first effect would be reconciling after
+    the thing it exists to unblock has already failed.
+    """
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+
+    import re
+    recon = next((i for i, l in enumerate(body) if "_kernel_pending" in l), None)
+    effect = next((i for i, l in enumerate(body)
+                   if re.search(r"(?<!_)\b_effect\s+\w", l)), None)
+    assert recon is not None, "recover_pr_cmd never checks for a halt"
+    assert effect is not None, "recover_pr_cmd has no _effect call; update this test"
+    assert recon < effect, (
+        f"the halt check is at body line {recon} but an effect runs at {effect}: "
+        "on a halted run that effect is refused and the halt is never resolved")

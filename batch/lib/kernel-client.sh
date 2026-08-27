@@ -134,6 +134,35 @@ _kernel() {
 # Minting is the FALLBACK, for a PR that never came from the queue. It is not
 # the default, because a fresh run would present an empty history to a merge
 # gate whose whole job is to check history.
+# _kernel_pending <run_id> -- echoes the halt JSON, or empty on failure.
+#
+# stdout is CAPTURED here, unlike `_kernel`, which discards it: the answer is
+# the point. An uncertain effect halts its run and nothing may be performed
+# until someone looks, so this is the "what do I look at" half of the halt.
+_kernel_pending() {  # <run_id>
+  local run_id="$1" out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m kernel.cli pending \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$run_id" 2>/dev/null
+  ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_reconcile <run_id> <key> <resolution> <expected_version>
+#
+# Advisory like every other call here: a coordinator that cannot reach the
+# kernel must not change what it does about the PR. The resolution is an
+# OBSERVATION the caller made -- the kernel has no view of GitHub -- and it is
+# recorded with the version it was derived from, so a run that moved in the
+# meantime refuses it rather than applying a conclusion drawn about a different
+# state.
+_kernel_reconcile() {  # <run_id> <key> <resolution> <expected_version>
+  local run_id="$1" key="$2" resolution="$3" version="$4"
+  _kernel reconcile --run-id "$run_id" --idempotency-key "$key" \
+    --resolution "$resolution" --expected-version "$version"
+}
+
 _kernel_adopt_run() {  # <code> <repo> <base_sha> <actor> [role=reviewer]
   local code="$1" repo="$2" base="$3" actor="$4" role="${5:-reviewer}" found=""
   local src='

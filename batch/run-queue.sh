@@ -1910,6 +1910,40 @@ recover_pr_cmd() {
   local _rec_impl; _rec_impl=$([ "$RECOVERY_REVIEWER" = codex ] && printf claude_code || printf codex)
   _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$_rec_impl" implementer >/dev/null
   echo "[batch:recover-pr] $code: kernel run=${BIRCHER_RUN_ID:-<none>} generation=${BIRCHER_GENERATION:-<none>}" >&2
+
+  # RESOLVE A HALT FIRST. An uncertain effect halts its run and `perform`
+  # refuses everything after it, so a halted run adopted here would have every
+  # subsequent effect declined -- correctly, and with no way forward. This is
+  # not hypothetical: a live merge on muesli came back uncertain because the
+  # coordinator raced its own review-gate, and the run could not be advanced by
+  # any path the coordinator had.
+  #
+  # The resolution is an OBSERVATION this code makes and the kernel cannot: it
+  # asks GitHub whether the PR actually merged. That answer is recorded with
+  # the version it was derived from, so a run that moved meanwhile refuses a
+  # conclusion drawn about a different state.
+  local _pend; _pend=$(_kernel_pending "${BIRCHER_RUN_ID:-}")
+  if printf '%s' "$_pend" | grep -q '"halted": *true'; then
+    local _merged_at _resolution _pver _pkeys
+    _merged_at=$(_net_run "$BIRCHER_NET_TIMEOUT" gh pr view "$pr" --repo "$REPO" \
+                   --json mergedAt -q '.mergedAt' 2>/dev/null)
+    if [ -n "$_merged_at" ] && [ "$_merged_at" != "null" ]; then
+      _resolution="observed: PR #$pr IS merged (mergedAt=$_merged_at)"
+    else
+      _resolution="observed: PR #$pr is NOT merged; the attempt did not land"
+    fi
+    _pver=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
+    _pkeys=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; [print(e["idempotency_key"]) for e in json.load(sys.stdin)["pending"]]' 2>/dev/null)
+    echo "[batch:recover-pr] $code: run is HALTED -> $_resolution" >&2
+    local _k
+    while IFS= read -r _k; do
+      [ -n "$_k" ] || continue
+      _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
+      echo "[batch:recover-pr] $code: reconciled $_k" >&2
+    done <<EOF
+$_pkeys
+EOF
+  fi
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must
   # be brought up to date first. update-branch re-triggers the required checks on

@@ -23,7 +23,10 @@ import subprocess
 import sys
 
 from kernel.authz import NotAuthorized
-from kernel.effects import EffectClass, UncertainEffect, perform
+from kernel.effects import (
+    EffectClass, UncertainEffect, is_halted, pending_reconciliation,
+    perform, reconcile,
+)
 from kernel.ownership import OwnershipLost
 from kernel.store import Store
 
@@ -124,8 +127,64 @@ def main(argv=None) -> int:
     c.add_argument("--payload-json", default="{}")
     c.add_argument("--idempotency-key", default=None)
 
+    # `pending` and `reconcile` are the halt's two halves. An uncertain effect
+    # halts its run and `kernel.effects.reconcile` has always been able to
+    # resolve it -- but nothing outside Python could ASK. A live merge came
+    # back uncertain and the coordinator had no route to the resolution, so the
+    # run could not be advanced by any path it had. The capability existed and
+    # the door did not.
+    n = subs.add_parser("pending")
+    n.add_argument("--db", required=True)
+    n.add_argument("--run-id", required=True)
+
+    r = subs.add_parser("reconcile")
+    r.add_argument("--db", required=True)
+    r.add_argument("--run-id", required=True)
+    r.add_argument("--idempotency-key", required=True)
+    r.add_argument("--resolution", required=True)
+    # Supplied by the caller, not read here: the CAS exists so a resolution
+    # derived from an observation at version N is refused when the run has
+    # moved since. Reading the version inside this command would compare it
+    # against itself and check nothing.
+    r.add_argument("--expected-version", type=int, required=True)
+
     a = p.parse_args(argv)
+    if a.mode == "pending":
+        return _do_pending(a)
+    if a.mode == "reconcile":
+        return _do_reconcile(a)
     return _do_effect(a) if a.mode == "effect" else _do_command(a)
+
+
+def _do_pending(a) -> int:
+    """What is unresolved, and the version any resolution must be derived from."""
+    store = Store.open(a.db)
+    print(json.dumps({
+        "version": store.run_version(a.run_id),
+        "halted": is_halted(store, a.run_id),
+        "pending": pending_reconciliation(store, a.run_id),
+    }))
+    return RC_OK
+
+
+def _do_reconcile(a) -> int:
+    from kernel.commands import StaleVersion
+    store = Store.open(a.db)
+    try:
+        reconcile(store, a.run_id, a.idempotency_key, a.resolution,
+                  a.expected_version)
+    except StaleVersion as exc:
+        print(f"stale: {exc}", file=sys.stderr)
+        return RC_FAILED
+    except ValueError as exc:
+        # Not an uncertain effect: an unknown or already-resolved key. Refused
+        # rather than applied, because mark_effect is a bare UPDATE and would
+        # otherwise clear the halt for something that was never in doubt.
+        print(f"refused: {exc}", file=sys.stderr)
+        return RC_REFUSED
+    print(json.dumps({"halted": is_halted(store, a.run_id),
+                      "pending": pending_reconciliation(store, a.run_id)}))
+    return RC_OK
 
 
 def _do_effect(a) -> int:
