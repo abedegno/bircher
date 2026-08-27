@@ -65,6 +65,18 @@ Run id `zz02-terminal-record-1787795851`, implementer `codex`,
 outcome `escalated` (the file it was asked about is absent, which was the
 expected answer), no PR, item moved to `processed/`.
 
+## Run 3 (zz03) — after the dispatch reorder
+
+The final review found that `_effect issue_or_label "running:..."` ran before
+any generation existed, so kernel mode silently dropped the `bircher:running`
+label. The fix moves the implementer dispatch above session creation, which
+also gives the session-create failure exit a generation to record under.
+
+That is a reordering of the live coordinator, so the smoke was re-run:
+`zz03-terminal-record-2-1787799397`, implementer `codex`, `outcome=escalated`,
+projected `ended`, kernel outcome `escalated`, scorecard `escalated`. No new
+shadow rejections. The reorder did not break the live path.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
