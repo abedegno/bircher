@@ -2025,9 +2025,9 @@ EOF
     BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
     export BIRCHER_GENERATION
     _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
-      "$_rp_out" "$_rec_base" "$_rp_ctx"
+      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
     _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$r_sha" \
-      "$_rp_out" "$_rec_base" "$_rp_ctx"
+      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
   fi
 
   if [ "$r_outcome" = "ready" ]; then

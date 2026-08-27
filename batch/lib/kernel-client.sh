@@ -179,12 +179,32 @@ print(runs[-1] if runs else "")
 
   if [ -n "$found" ]; then
     BIRCHER_RUN_ID="$found"
+    # THE RUN'S OWN BASE, not this checkout's HEAD. `validate_review` compares
+    # the binding's base_sha against what the kernel recorded at run start, and
+    # a recovery happens later -- main has usually moved. Passing `git
+    # rev-parse HEAD` there refused every review on an adopted run and left it
+    # stuck at `implementing` with the merge unauthorized.
+    #
+    # Reading it back does make the kernel's base check tautological ON THIS
+    # PATH, and that is the honest trade: a recovery is not making an
+    # independent observation of the base, it is continuing a run that already
+    # recorded one. The checks that stay load-bearing here are the artifact and
+    # the CI observation, which the recovery does observe.
+    BIRCHER_RUN_BASE=$( K_RUN="$BIRCHER_RUN_ID" PYTHONPATH="$(_kernel_pythonpath)" \
+      _net_run "$(_kernel_net_cap)" \
+      "${BIRCHER_PY:-python3}" -c 'import os,sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR","v2"))
+from kernel.store import Store
+print(Store.open(os.environ["BIRCHER_KERNEL_DB"]).run_base_sha(os.environ["K_RUN"]) or "")' 2>/dev/null
+    ) || BIRCHER_RUN_BASE=""
+    [ -n "$BIRCHER_RUN_BASE" ] || BIRCHER_RUN_BASE="$base"
   else
     BIRCHER_RUN_ID="${code}-adopted-$(date +%s)"
     _kernel_warn "no existing run for '$code' -- minting $BIRCHER_RUN_ID"
     _kernel_run_start "$BIRCHER_RUN_ID" "$repo" "$base"
+    BIRCHER_RUN_BASE="$base"
   fi
-  export BIRCHER_RUN_ID
+  export BIRCHER_RUN_ID BIRCHER_RUN_BASE
 
   # THE ROLE IS A PARAMETER because the caller knows which one it needs first,
   # and getting it wrong is a silent refusal rather than an error. A recovery
@@ -200,6 +220,21 @@ print(runs[-1] if runs else "")
   BIRCHER_GENERATION=$(_kernel_dispatch "$actor" "$role")
   export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || _kernel_warn "adopt: no generation for $BIRCHER_RUN_ID"
+
+  # A MINTED run is at `queued`, where record_implementation_output is illegal.
+  # Leaving it there meant the caller's lifecycle drive earned the exact four
+  # refusals the state field was added to prevent -- so minting produced a run
+  # that could not be used for the thing it was minted for. Advance it to
+  # `implementing`, which is where an adopted run normally is, so both cases
+  # hand the caller the same shape.
+  if [ "$found" = "" ] && [ -n "$BIRCHER_GENERATION" ]; then
+    local _seed; _seed=$(_kernel_put_artifact "adopted: $code in $repo")
+    if [ -n "$_seed" ]; then
+      _kernel_submit_spec "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_seed"
+      _kernel_submit_plan "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_seed"
+      _kernel_start_implementation "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION"
+    fi
+  fi
   printf '%s' "$BIRCHER_RUN_ID"
 }
 

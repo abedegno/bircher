@@ -667,3 +667,39 @@ def test_an_unknown_ci_status_cannot_authorize_a_merge(tmp_path):
     assert not _ci_is_green(Store.open(db), run_id, HEAD_SHA), (
         "a 'pending' CI observation reads as green, so a merge can be "
         "authorized on CI that never reported")
+
+
+# --- adoption hands back a USABLE run -----------------------------------------
+
+def test_adopting_a_run_reports_the_base_the_KERNEL_recorded(tmp_path):
+    """Second-review H2. `_rec_base` was `git rev-parse HEAD` at recovery time,
+    while `validate_review` compares the binding against the base recorded at
+    run start -- and a recovery happens later, when main has usually moved. Every
+    review on an adopted run was refused and the run stuck at `implementing`
+    with the merge unauthorized.
+    """
+    db = tmp_path / "k.db"
+    _run(f'_kernel_run_start r-adopt-1 abedegno/muesli {BASE_SHA}', env=_db_env(db))
+
+    moved = "f" * 40
+    r = _run(f'_kernel_adopt_run r-adopt {"abedegno/muesli"} {moved} codex implementer '
+             f'>/dev/null; printf "%s" "$BIRCHER_RUN_BASE"', env=_db_env(db))
+    assert r.stdout.strip() == BASE_SHA, (
+        f"adoption reported {r.stdout.strip()!r}, not the base the kernel "
+        f"recorded ({BASE_SHA!r}); a review bound to it would be refused")
+
+
+def test_a_MINTED_run_is_usable_for_what_it_was_minted_for(tmp_path):
+    """A minted run sat at `queued`, where record_implementation_output is
+    illegal -- so the caller's lifecycle drive earned exactly the four refusals
+    the state field exists to prevent, and minting produced a run that could not
+    be used for the thing it was minted for."""
+    db = tmp_path / "k.db"
+    r = _run('_kernel_adopt_run brand-new abedegno/muesli '
+             f'{BASE_SHA} codex implementer >/dev/null; printf "%s" "$BIRCHER_RUN_ID"',
+             env=_db_env(db))
+    run_id = r.stdout.strip()
+    assert run_id.startswith("brand-new-adopted-"), run_id
+    assert Store.open(db).run_state(run_id) == "implementing", (
+        "a minted run is not at `implementing`, so the first thing the caller "
+        "does with it is refused")
