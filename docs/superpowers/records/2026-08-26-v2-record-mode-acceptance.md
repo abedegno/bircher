@@ -319,6 +319,42 @@ under enforcement those abort exactly as they did under shadow. C8 is unchanged:
 the implementer's PR creation and marker comment never reach the kernel in
 either mode.
 
+## Run 9 — recovery through merge: adoption is necessary, not sufficient
+
+The verification Run 8 could not complete, done properly: a fresh PR on the
+throwaway repo, green CI, `--recover-pr` under `BIRCHER_EFFECT_MODE=kernel`.
+
+**The generation gap is genuinely closed.** Where the same command previously
+produced an EMPTY kernel database, it now journals two effects with intent and
+confirmation:
+
+```
+run_started → ownership_acquired → attempt_dispatched(reviewer)
+effect_intended/confirmed  comment        ← the recovery marker
+effect_intended/confirmed  status_check   ← bircher/cross-review
+```
+
+Both were silently aborting before. The adoption fallback also worked as
+designed: `s06` was never a queue item, so no run existed and one was minted
+(`no existing run for 's06' -- minting s06-adopted-…`).
+
+**And the merge still fails, correctly.** Run state is `queued`. The recovery
+path never records the lifecycle — no submit_spec, no plan, no
+record_implementation_output, no record_review, no request_merge — so the
+kernel holds no authorization and refuses `_effect merge`. The shadow report is
+empty because that refusal happens at the EFFECT layer rather than as a
+rejected command.
+
+So the ruling closed the gap it was aimed at and revealed the next one:
+**`--recover-pr` cannot merge under kernel mode until it drives the same
+lifecycle `run_item` does.** Giving its effects a valid generation was
+necessary and is not enough. That is a bounded piece of work — the wiring
+already exists in `run_item` and would be reused — and it is not done here.
+
+Worth stating plainly: this means the documented human-recovery path can
+review and comment under kernel mode, and cannot land a PR. Under v1 (legacy
+effects) it still can.
+
 ## Run 8 — the generation gap, closed for recovery and the sweep
 
 Ruling taken rather than deferred further: **(b), adopt the item's original
