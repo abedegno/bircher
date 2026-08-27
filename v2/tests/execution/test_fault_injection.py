@@ -20,6 +20,31 @@ V2_DIR = REPO_ROOT / "v2"
 
 sys.path.insert(0, str(V2_DIR))
 
+#: The cwd every bash-level subprocess runs in, and the reason these tests can
+#: see a missing PYTHONPATH at all.
+#:
+#: `python3 -m kernel.cli` puts the CHILD'S CWD on sys.path. `subprocess.run`
+#: with no `cwd=` inherits pytest's, so under the project's own documented
+#: command -- `cd v2 && python -m pytest tests`, which the plan prescribes in
+#: ten places -- `kernel` is a subdirectory of that cwd and imports with no
+#: PYTHONPATH at all. Every mutation of the PYTHONPATH guards then SURVIVES:
+#: dropping the prefix from both sites of effect-adapter.sh gave 519 passed
+#: from v2/ and 2 failed from the repo root. The guard was invisible to the
+#: tests written to bind it, and which of the two results you got depended
+#: only on where you happened to be standing.
+#:
+#: REPO_ROOT has no `kernel` package, so a child started here can import it
+#: only if something put it on the path deliberately -- which is the property
+#: under test. Asserted rather than assumed, because the day someone adds
+#: repo-root/kernel/ every one of these tests goes quietly blind again.
+_NEUTRAL_CWD = str(REPO_ROOT)
+assert not (REPO_ROOT / "kernel").exists(), (
+    "REPO_ROOT now contains a `kernel` package, so it is no longer a neutral "
+    "cwd: bash-level tests would import it from cwd and stop binding the "
+    "PYTHONPATH guards")
+
+
+
 from kernel.dispatch import dispatch  # noqa: E402
 from kernel.events import EventKind  # noqa: E402
 from kernel.store import Store  # noqa: E402
@@ -39,7 +64,7 @@ def _run(script: str, mode: str | None = None, env: dict | None = None):
         env["BIRCHER_EFFECT_MODE"] = mode
     return subprocess.run(
         ["bash", "-c", f'. "{ADAPTER}"\n{script}'],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=_NEUTRAL_CWD,
     )
 
 
@@ -197,45 +222,81 @@ def _kernel_env(db):
             "BIRCHER_GENERATION": "1", "BIRCHER_V2_DIR": str(V2_DIR)}
 
 
+def _local_push_repo(tmp_path):
+    """A source repo and a bare remote on the filesystem.
+
+    `ref_update` is a ROUTED class with a real argv contract
+    (`git push` + exactly two operands), and pushing to a local bare repo
+    satisfies it without touching the network -- so the effect is genuinely
+    ACCEPTED rather than tolerated, and the test survives the enforcement
+    switch this whole design exists to enable.
+    """
+    src, bare = tmp_path / "src", tmp_path / "bare.git"
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", str(src)], check=True, env=env)
+    (src / "f").write_text("x")
+    subprocess.run(["git", "add", "f"], cwd=src, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "c"], cwd=src, check=True, env=env)
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, env=env)
+    return src, bare
+
+
 def test_kernel_mode_reaches_the_kernel_and_performs_the_effect(tmp_path):
-    """Against a REAL database: the effect must execute AND be journalled.
+    """Against a REAL database: a routed effect must be ACCEPTED, executed and
+    journalled -- with no refusal recorded along the way.
 
-    `credential_lifecycle` is the one class carrying no argv contract, so a
-    harmless `git init` is contract-legal and this exercises the happy path
-    rather than a shadow-refusal path. It must be `git`, not `touch`: the
-    kernel resolves argv[0] against an allowlist of THREE tools
-    (`kernel.cli.TOOLS`), so anything else is refused before it runs.
+    The earlier version of this test used `credential_lifecycle` because it
+    appeared to carry no argv contract. It carries an EMPTY one
+    (`kernel/contract.py`), which `check` refuses unconditionally, so the
+    effect ran only because shadow mode lets a REFUSED effect execute. It
+    passed on the shadow-refusal path while its docstring claimed the happy
+    path, and it would have gone red the moment anyone enforced the contract
+    -- reading as "the adapter broke".
 
-    The witness and the facts assert different halves and both are needed:
-    the witness alone would pass in legacy mode, and the facts alone would
-    pass for an effect the kernel journalled but never ran.
+    The absence of a shadow_rejected fact is therefore load-bearing here, not
+    decoration: it is the difference between the two paths, and it is what the
+    previous version could not have asserted.
     """
     db = _live_run(tmp_path)
-    witness = tmp_path / "performed"
-    r = _run(f'_effect credential_lifecycle k - git init -q "{witness}"',
+    src, bare = _local_push_repo(tmp_path)
+
+    r = _run(f'cd "{src}" && _effect ref_update k - '
+             f'git push "{bare}" HEAD:refs/heads/main',
              mode="kernel", env=_kernel_env(db))
 
     assert "No module named" not in r.stderr, r.stderr
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    assert (witness / ".git").exists(), f"the effect never executed: {r.stderr}"
 
-    kinds = [f.kind for f in Store.open(db).facts_for("r-live")]
+    landed = subprocess.run(["git", "-C", str(bare), "rev-parse", "refs/heads/main"],
+                            capture_output=True, text=True)
+    assert landed.returncode == 0, f"the ref was never updated: {r.stderr}"
+
+    facts = Store.open(db).facts_for("r-live")
+    kinds = [f.kind for f in facts]
     assert EventKind.EFFECT_INTENDED in kinds, kinds
     assert EventKind.EFFECT_CONFIRMED in kinds, kinds
+    refusals = [f.payload for f in facts if f.kind == EventKind.SHADOW_REJECTED]
+    assert not refusals, f"the effect was refused, not accepted: {refusals}"
 
 
 def test_a_capped_kernel_mode_effect_also_reaches_the_kernel(tmp_path):
-    """The bounded branch is a SECOND invocation site, and the unbounded
-    test above does not cover it -- the PYTHONPATH defect had to be repaired
-    on both lines. A passthrough `_net_run` stands in for run-queue.sh's,
-    which needs a real `timeout(1)` (absent on this box)."""
+    """The bounded branch is a SECOND invocation site, and the unbounded test
+    above does not cover it -- the PYTHONPATH defect had to be repaired on both
+    lines. A passthrough `_net_run` stands in for run-queue.sh's, which needs a
+    real `timeout(1)` (absent on this box)."""
     db = _live_run(tmp_path)
-    witness = tmp_path / "performed-capped"
+    src, bare = _local_push_repo(tmp_path)
+
     r = _run('_net_run() { shift; "$@"; }\n'
-             f'_effect credential_lifecycle k2 42 git init -q "{witness}"',
+             f'cd "{src}" && _effect ref_update k2 42 '
+             f'git push "{bare}" HEAD:refs/heads/capped',
              mode="kernel", env=_kernel_env(db))
 
     assert "No module named" not in r.stderr, r.stderr
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
-    assert (witness / ".git").exists(), \
-        f"the capped effect never executed: {r.stderr}"
+    landed = subprocess.run(["git", "-C", str(bare), "rev-parse", "refs/heads/capped"],
+                            capture_output=True, text=True)
+    assert landed.returncode == 0, f"the capped effect never executed: {r.stderr}"

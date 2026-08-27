@@ -3168,7 +3168,6 @@ run_item() {
   _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" \
     "${_base_sha:-0000000000000000000000000000000000000000}"
   local _iss; _iss=$(_item_issue "$prompt")
-  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
   # B-3 vendor dispatch: resolve THIS item's implementer and flip the reviewer to
   # the opposite vendor (cross-vendor integrity is invariant). A per-item queue tag
   # `bircher-implementer: <vendor>` wins over the runner-level PICKED_VENDOR (set by
@@ -3191,19 +3190,37 @@ ${prompt}"
   # REST launch: create the run session bound to the bircher host (deterministic
   # conv_id from the create response - no discovery heuristic), then send the
   # prompt. (omnigent/server/API.md: Create From Existing Agent + Post Event.)
+  # The implementer attempt is dispatched HERE, as soon as the vendor is known
+  # and BEFORE the session exists. It used to sit after session creation, which
+  # left every effect between run start and that point with no generation --
+  # and in kernel mode `${BIRCHER_GENERATION:?}` aborts the call, so the
+  # `bircher:running` label below was SILENTLY dropped (its `|| true` swallowed
+  # the failure) while legacy mode applied it. On the second item of a run it
+  # was worse than dropped: BIRCHER_GENERATION is exported, so the stale value
+  # from the previous item would have attributed this item's label effect to
+  # another run. Dispatching here also gives the session-create failure exit a
+  # generation to record a terminal outcome under.
+  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+  export BIRCHER_GENERATION
+  # Now that a generation exists, the label is a routed effect like any other.
+  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
   local host_id conv_id bound_outcome="ok"
   host_id=$(_local_host_id 2>/dev/null) || host_id=""
   conv_id=$(_create_session "$AGENT_ID" "$host_id" "$WORKDIR")
   if [ -z "$conv_id" ]; then
     echo "[batch] $item: REST session create FAILED; recording failed" >&2
     mkdir -p "$(dirname "$SCORECARD")"
+    # The run was started at _kernel_run_start above, so without this the
+    # kernel would sit at `queued` while the scorecard says `failed` -- a
+    # criterion-1 divergence previously waved through as an exemption on the
+    # grounds that no generation existed. One now does, because the dispatch
+    # moved above session creation.
+    _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
     json_row "$item" "" "failed" "false" "" "" 0 "REST session create failed" "failed" >> "$SCORECARD"
     mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
     return 0
   fi
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
-  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-  export BIRCHER_GENERATION
   # The queue item's prompt, PUT once as the spec artifact and reused as a
   # stand-in plan artifact (v1 has no separate plan document -- see
   # kernel-client.sh's submit_plan wrapper for why that reuse is deliberate).

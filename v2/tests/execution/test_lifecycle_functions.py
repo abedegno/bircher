@@ -102,6 +102,31 @@ V2_DIR = REPO_ROOT / "v2"
 
 sys.path.insert(0, str(V2_DIR))
 
+#: The cwd every bash-level subprocess runs in, and the reason these tests can
+#: see a missing PYTHONPATH at all.
+#:
+#: `python3 -m kernel.cli` puts the CHILD'S CWD on sys.path. `subprocess.run`
+#: with no `cwd=` inherits pytest's, so under the project's own documented
+#: command -- `cd v2 && python -m pytest tests`, which the plan prescribes in
+#: ten places -- `kernel` is a subdirectory of that cwd and imports with no
+#: PYTHONPATH at all. Every mutation of the PYTHONPATH guards then SURVIVES:
+#: dropping the prefix from both sites of effect-adapter.sh gave 519 passed
+#: from v2/ and 2 failed from the repo root. The guard was invisible to the
+#: tests written to bind it, and which of the two results you got depended
+#: only on where you happened to be standing.
+#:
+#: REPO_ROOT has no `kernel` package, so a child started here can import it
+#: only if something put it on the path deliberately -- which is the property
+#: under test. Asserted rather than assumed, because the day someone adds
+#: repo-root/kernel/ every one of these tests goes quietly blind again.
+_NEUTRAL_CWD = str(REPO_ROOT)
+assert not (REPO_ROOT / "kernel").exists(), (
+    "REPO_ROOT now contains a `kernel` package, so it is no longer a neutral "
+    "cwd: bash-level tests would import it from cwd and stop binding the "
+    "PYTHONPATH guards")
+
+
+
 from kernel.events import EventKind  # noqa: E402
 from kernel.store import Store  # noqa: E402
 
@@ -141,7 +166,8 @@ def _run(script, env=None, net_run=_NET_RUN_STUB):
     e.update(env or {})
     preamble = net_run or ""
     return subprocess.run(["bash", "-c", f'{preamble}\n. "{CLIENT}"\n{script}'],
-                          capture_output=True, text=True, env=e)
+                          capture_output=True, text=True, env=e,
+                          cwd=_NEUTRAL_CWD)
 
 
 def _db_env(db):

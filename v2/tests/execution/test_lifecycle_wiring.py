@@ -140,16 +140,51 @@ _NO_KERNEL_OUTCOME = {
         "there is no run in the kernel to end",
     "empty/blank prompt":
         "same -- refused before the run id is minted",
-    "REST session create failed":
-        "the run exists but no generation has been dispatched, and every "
-        "command is submitted under a generation; recording here would need "
-        "a dispatch invented solely to report that nothing ran",
 }
 
 
+def _logical_lines():
+    """run_item as LOGICAL lines: continuations joined, comments stripped.
+
+    Both transformations are load-bearing, and each was a way past the naive
+    parser that stayed green:
+
+    - A new exit whose `>> "$SCORECARD"` sat on a CONTINUATION line was
+      invisible, because no single physical line held both `json_row` and
+      `SCORECARD`. The only difference from a caught exit was a backslash,
+      and run-queue.sh already writes `_effect` calls that way in seven
+      places.
+    - Replacing a real recorder with `# TODO: call _kernel_record_run_outcome
+      here` also stayed green, because the window check was a raw substring
+      search: a comment NAMING the call satisfied it. This file already knew
+      that shape -- test_no_kernel_call_is_tested_for_success filters
+      `startswith("#")` -- and the filter was not carried across.
+
+    Returns (first_physical_index, logical_text).
+    """
+    out, buf, start = [], "", None
+    for i, raw in enumerate(_run_item().splitlines()):
+        code = raw.split("#", 1)[0] if raw.lstrip().startswith("#") else raw
+        if start is None:
+            start = i
+        buf += code.rstrip("\\") if code.rstrip().endswith("\\") else code
+        if code.rstrip().endswith("\\"):
+            continue
+        out.append((start, buf))
+        buf, start = "", None
+    if start is not None:
+        out.append((start, buf))
+    return out
+
+
+def _strip_comment(text):
+    """Drop a trailing comment, so a comment naming a call is not the call."""
+    stripped = text.lstrip()
+    return "" if stripped.startswith("#") else text
+
+
 def _scorecard_sites():
-    lines = _run_item().splitlines()
-    return [(i, l) for i, l in enumerate(lines)
+    return [(i, l) for i, l in _logical_lines()
             if "json_row" in l and "SCORECARD" in l]
 
 
@@ -159,12 +194,12 @@ def test_the_scorecard_sites_are_found():
 
 
 def test_every_terminal_scorecard_row_records_a_kernel_outcome():
-    lines = _run_item().splitlines()
+    lines = [_strip_comment(l) for l in _run_item().splitlines()]
     missing = []
     for i, line in _scorecard_sites():
         if any(k in line for k in _NO_KERNEL_OUTCOME):
             continue
-        window = "\n".join(lines[max(0, i - 6):i])
+        window = "\n".join(lines[max(0, i - 8):i])
         if "_kernel_record_run_outcome" not in window:
             missing.append(line.strip()[:90])
     assert not missing, (
