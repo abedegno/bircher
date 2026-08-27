@@ -269,3 +269,108 @@ def test_no_effect_in_run_item_runs_before_a_generation_exists():
         "these routed effects run before any generation exists, so in kernel "
         "mode they abort on ${BIRCHER_GENERATION:?} and are silently skipped:\n"
         + "\n".join(f"  run_item line {i}: {t}" for i, t in early))
+
+
+# --- every _effect site in the file, classified ------------------------------
+#
+# The run_item-scoped test above closes its class WITHIN run_item, and a live
+# smoke run showed how much that leaves out. `--recover-pr` -- the documented
+# path for landing a human PR -- performs `_effect ref_update`, then reaches
+# `_post_cross_review_status` and the merge through `merge_ready_pr`, and NEVER
+# calls run_item. BIRCHER_RUN_ID is assigned in exactly one place in this file,
+# inside run_item, so in kernel mode every one of those effects aborts on
+# `${BIRCHER_RUN_ID:?}` and is swallowed by the redirects around it. Observed,
+# not reasoned: a real --recover-pr against a throwaway repo in
+# BIRCHER_EFFECT_MODE=kernel produced no kernel run, no PR comment and no
+# bircher/cross-review status.
+#
+# There are two distinct failure modes and they need separating:
+#
+#   NO GENERATION   -- entered without run_item ever having run. Effects abort.
+#   STALE GENERATION-- runs AFTER run_item returned, and nothing unsets
+#                      BIRCHER_RUN_ID/BIRCHER_GENERATION, so effects are
+#                      attributed to whichever item happened to run last.
+#
+# This test does not fix either. It makes them enumerable, so a new _effect
+# site cannot join them silently.
+
+#: Functions containing an `_effect` call, and the generation context they run
+#: in. REACHED = called from run_item, so the exported generation is this run's.
+_EFFECT_SITE_CONTEXT = {
+    "run_item": "REACHED",
+    "_send_prompt": "REACHED",
+    "_prune_session": "REACHED",
+    "_post_cross_review_status": "REACHED",
+    "merge_ready_pr": "REACHED",
+    "_issue_writeback": "REACHED",
+    "_ensure_issue_closed": "REACHED",
+    "recover_from_ground_truth": "REACHED",
+    "_reconcile_item_pr": "REACHED",
+    # --- known gaps, evidenced ---
+    "recover_pr_cmd": "NO GENERATION",
+    "reconcile_deferred_ready": "STALE GENERATION",
+    "_reopen_reverted_issues": "STALE GENERATION",
+    "_pr": "STALE GENERATION",
+}
+
+
+def _effect_sites_by_function():
+    import re
+    src = RUN_QUEUE.read_text().splitlines()
+    spans, fn, start = {}, None, None
+    for i, l in enumerate(src):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", l)
+        if m:
+            fn, start = m.group(1), i
+        elif l == "}" and fn is not None:
+            spans[fn] = (start, i)
+            fn = None
+
+    def owner(idx):
+        best = None
+        for name, (a, b) in spans.items():
+            if a < idx < b and (best is None or a > best[1]):
+                best = (name, a)
+        return best[0] if best else "«top-level»"
+
+    out = {}
+    for i, l in enumerate(src):
+        if l.strip().startswith("#"):
+            continue
+        if re.search(r"(?<!_)\b_effect\s+\w", l):
+            out.setdefault(owner(i), []).append(i + 1)
+    return out
+
+
+def test_the_effect_site_parser_finds_them():
+    """A parser that finds nothing reports total compliance."""
+    assert len(_effect_sites_by_function()) >= 10
+
+
+def test_every_effect_site_is_classified():
+    """A new `_effect` call must declare which generation context it runs in.
+
+    Without this the two gaps above are invisible: an effect added to a
+    function that never runs under run_item fails silently in kernel mode, and
+    the failure looks exactly like nothing happening.
+    """
+    found = set(_effect_sites_by_function())
+    known = set(_EFFECT_SITE_CONTEXT)
+    assert found <= known, (
+        "unclassified _effect sites -- say which generation context each runs "
+        f"in: {sorted(found - known)}")
+    assert known <= found, (
+        f"_EFFECT_SITE_CONTEXT names functions that no longer contain an "
+        f"_effect call: {sorted(known - found)}")
+
+
+def test_the_known_gaps_are_still_gaps_and_not_quietly_more():
+    """If one of these is fixed, this test fails and the entry is deleted --
+    which is the point: the gap list shrinks deliberately, never by drift."""
+    gaps = {k for k, v in _EFFECT_SITE_CONTEXT.items() if v != "REACHED"}
+    assert gaps == {"recover_pr_cmd", "reconcile_deferred_ready",
+                    "_reopen_reverted_issues", "_pr"}, sorted(gaps)
+    src = RUN_QUEUE.read_text()
+    assert src.count("BIRCHER_RUN_ID=") == 1, (
+        "BIRCHER_RUN_ID is assigned somewhere new; the gap analysis above "
+        "assumed run_item is the only place a run id is minted")
