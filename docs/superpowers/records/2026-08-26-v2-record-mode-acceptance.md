@@ -394,6 +394,61 @@ they run after `run_item` returns and nothing unsets the exported run id.
 for the two that now adopt, because an effect above the adopt call fails
 silently either way.
 
+## Run 10 — a real item on abedegno/muesli, merged by the pipeline
+
+The first run against the real target. Issue #728 (a p3 server-side defect
+whose subject is this programme's own class: "hardcoding it to 0 keeps the
+suite green"), `BIRCHER_EFFECT_MODE=kernel`, `BIRCHER_KERNEL_MODE=enforce`.
+
+**Outcome: PR #730 MERGED**, sha `8dff63f`, main carries the change, issue
+#728 closed. Verified against GitHub, not against the log — see below for why
+that distinction earned its place.
+
+### Verified live, on the real repo
+
+- `bircher:running` applied to #728 — the CRITICAL defect from the first
+  review, whose fix had never been exercised on an issue-backed item.
+- The work-repo directive held: codex worked in `/workspaces/muesli`.
+- `bircher/cross-review` → `review-gate` handshake fired as designed.
+- The kernel authorized and mediated the merge under enforcement.
+
+### Four defects, each exposed only by fixing the one before it
+
+1. **`_out_hash` was branch-scoped.** Declared `local` inside the marker
+   branch, read at the merge gate that every path reaches. Under `set -u` the
+   NO-MARKER recovery path — which fires whenever an implementer session dies,
+   and did, unprompted — crashed the coordinator after the PR was already open.
+   My regression, introduced in the verdict-binding work, and invisible because
+   the test harness drove only the marker path.
+2. **The recovery branch recorded no lifecycle.** It reached the merge gate
+   with no output, CI observation or verdict, so the kernel refused a merge it
+   had no evidence for. Correct behaviour on an input the coordinator failed to
+   supply. Both `run_item`'s branch and `--recover-pr` now drive it.
+3. **Reconciliation had no door.** `kernel.effects.reconcile` could always
+   resolve an uncertain effect; nothing outside Python could ask. The merge
+   came back uncertain — the coordinator races its own `review-gate`, posting
+   `bircher/cross-review` and merging before the workflow that status triggers
+   has run — and the run could not be advanced by any path the coordinator had.
+   Added `kernel.cli pending` / `reconcile` and wired both recovery paths.
+4. **A reconciled key was replayable, and answered `None`.** This one produced
+   a WRONG ANSWER rather than a failure. Reconciliation leaves the external id
+   None; the replay branch handled `uncertain` and `intended` and let
+   `reconciled` fall through to `return existing["external_object_id"]`.
+   `merge_ready_pr` retried under the same `merge:<pr>:<head>` key, got None,
+   polled five times for a sha that could never arrive, and reported
+   **"PR #730 MERGED (sha unknown)" while the PR was still open and main did
+   not have the change.** Its fail-closed halt is the only reason it stopped
+   there. Now `NotReplayable`, and the merge key carries the generation so a
+   retry after reconciliation is a new attempt rather than a spent one.
+
+### What this says about the evidence standard
+
+I repeated the coordinator's "MERGED" line in a status report before checking
+GitHub. It was false. That is the same defect class as the code being fixed — a
+claim outrunning its evidence — committed in the report about the fix, and it
+is why the merge above is stated against `gh pr view` rather than against a log
+line that said the same thing an hour earlier and was wrong.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
