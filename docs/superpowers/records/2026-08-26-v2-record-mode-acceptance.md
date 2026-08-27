@@ -259,6 +259,66 @@ never got the run there, and the kernel refused the mutation. **The merge
 failing was the boundary doing its job** — and the manual merge that "worked"
 worked by going around it.
 
+## Run 7 — the kernel ENFORCING
+
+Shadow mode's whole job is to say when enforcement is safe. For this path it
+said yes. This run tests that claim rather than trusting it:
+`BIRCHER_EFFECT_MODE=kernel`, `BIRCHER_KERNEL_MODE=enforce`, item `s05-enforce`.
+
+**Result: PR #5 merged, main CI green, every command accepted.**
+
+```
+submit_spec → submit_plan → start_implementation
+effect_intended  session_control
+record_implementation_output → record_ci_observation
+record_review → review_verdict → reviewing
+request_merge → merge_authorized → merge_requested
+effect_intended  status_check
+effect_intended  merge
+record_merge_outcome → merged
+record_run_outcome → ended
+shadow_rejected facts: 0
+```
+
+### Why the empty report is NOT the evidence here
+
+In enforce mode `shadow_or_raise` raises instead of recording, so
+`shadow_rejected` facts cannot exist by construction. An empty shadow report
+under enforcement is therefore worth nothing on its own — it is exactly what a
+run that never reached the kernel would also produce, and reading it as a pass
+would be the defect this programme keeps finding.
+
+The evidence is the positive half: **every command reached
+`command_accepted`**, every transition fired, `merge_authorized` was recorded,
+and the merge effect was performed and confirmed.
+
+### Proof the switch was actually on
+
+"No refusals" looks identical whether enforcement is active or silently
+defaulted, so the mode was proven separately against the deployed bundle — the
+same contract-violating effect, run twice, changing only
+`BIRCHER_KERNEL_MODE`:
+
+| mode | rc | effect |
+|---|---|---|
+| `shadow` | 0 | **EXECUTED** — refused and tolerated |
+| `enforce` | 87 | **BLOCKED** — refused and stopped |
+
+That is the boundary doing the one thing it exists to do, on the machine that
+ran the acceptance item.
+
+### What this settles, and what it does not
+
+v2 now runs a real item end to end with the kernel **enforcing**: it authorizes
+the merge, mediates it, and journals it. That is a demonstrated boundary, not
+an observed one.
+
+It does not settle the paths this run did not touch. `--recover-pr` and the
+end-of-run sweep still perform effects with no generation or a stale one, and
+under enforcement those abort exactly as they did under shadow. C8 is unchanged:
+the implementer's PR creation and marker comment never reach the kernel in
+either mode.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
