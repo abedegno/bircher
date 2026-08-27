@@ -242,3 +242,30 @@ def test_the_exempt_sites_really_are_before_a_generation_exists():
                 f"exempt site at run_item line {i} is BELOW the dispatch at "
                 f"{dispatch_at}; a generation exists, so it can and must "
                 f"record an outcome: {line.strip()[:80]}")
+
+
+# --- no routed effect may precede the generation it is recorded under ---------
+
+def test_no_effect_in_run_item_runs_before_a_generation_exists():
+    """The CRITICAL finding, closed as a class rather than as one line.
+
+    `_effect issue_or_label "running:..."` sat above the dispatch, so in kernel
+    mode `${BIRCHER_GENERATION:?}` aborted the call and its trailing `|| true`
+    swallowed the failure: the `bircher:running` label was SILENTLY dropped
+    where legacy mode applied it. On the second item of a run it was worse than
+    dropped -- BIRCHER_GENERATION is exported, so the stale value from the
+    previous item would have attributed this item's effect to another run.
+
+    Fixing the one line would leave the next `_effect` added above the dispatch
+    to fail exactly the same way, just as quietly. Every routed effect in
+    run_item must sit below the dispatch, and that is what this asserts.
+    """
+    logical = _logical_lines()
+    dispatch_at = next(i for i, l in logical
+                       if "_kernel_dispatch" in l and "BIRCHER_GENERATION=" in l)
+    early = [(i, l.strip()[:80]) for i, l in logical
+             if "_effect " in l and i < dispatch_at]
+    assert not early, (
+        "these routed effects run before any generation exists, so in kernel "
+        "mode they abort on ${BIRCHER_GENERATION:?} and are silently skipped:\n"
+        + "\n".join(f"  run_item line {i}: {t}" for i, t in early))
