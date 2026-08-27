@@ -33,6 +33,10 @@ class EffectClass:
     })
 
 
+class NotReplayable(Exception):
+    """A resolved effect's idempotency key cannot carry a fresh attempt."""
+
+
 class UncertainEffect(Exception):
     """The effect's outcome is unknown. It must be reconciled before retry."""
 
@@ -193,6 +197,28 @@ def _perform_unhalted(
             raise UncertainEffect(
                 f"{idempotency_key} is {existing['state']!r} in run {run_id}: "
                 "its outcome is unknown and it must be reconciled before retry"
+            )
+        if existing["state"] == "reconciled":
+            # A RECONCILED key is spent, not replayable. Reconciliation resolves
+            # the attempt that was made; it does not say a fresh one may reuse
+            # its key, and the external id it leaves behind is None. Falling
+            # through to the replay below returned that None without executing
+            # -- and the caller could not tell "already done, here is the id"
+            # from "resolved as never done, nothing happened".
+            #
+            # A live muesli run did exactly that: the merge was reconciled as
+            # NOT landed, merge_ready_pr retried under the same
+            # `merge:<pr>:<head>` key, got None back, retried five times for a
+            # sha that could never arrive, and then reported the PR MERGED when
+            # it was still open. Fail-closed halting is what stopped it going
+            # further -- the wrong answer had already been logged.
+            #
+            # A retry after reconciliation is a NEW attempt and needs a new key.
+            raise NotReplayable(
+                f"{idempotency_key} was reconciled in run {run_id}: a resolved "
+                "attempt cannot be replayed under its own key, because its "
+                "recorded outcome describes that attempt and not this one. "
+                "Retry under a new idempotency key."
             )
         return existing["external_object_id"]
 

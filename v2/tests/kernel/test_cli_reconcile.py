@@ -111,3 +111,57 @@ def test_the_halt_holds_while_a_SECOND_effect_is_still_unresolved(db, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["halted"] is True, "the halt lifted with c1 still unresolved"
     assert [e["idempotency_key"] for e in out["pending"]] == ["c1"]
+
+
+def test_a_reconciled_key_cannot_carry_a_fresh_attempt(db, capsys):
+    """The defect a live muesli run produced, and the reason it was dangerous.
+
+    Reconciliation resolves the attempt that WAS made. It leaves the effect's
+    external id None, and the replay branch returned that None without
+    executing -- so the caller could not tell "already done, here is the id"
+    from "resolved as never done, nothing happened".
+
+    merge_ready_pr could not tell either: it retried the merge under the same
+    `merge:<pr>:<head>` key, got None, polled five times for a sha that could
+    never arrive, and reported the PR MERGED while it was still open. The
+    fail-closed halt is what stopped it going further; the wrong answer had
+    already been logged.
+    """
+    from kernel.effects import NotReplayable, _perform_unhalted
+
+    _halt(db)
+    v = _pending(db, capsys)["version"]
+    assert main(["reconcile", "--db", db, "--run-id", "r",
+                 "--idempotency-key", "m1", "--resolution", "not landed",
+                 "--expected-version", str(v)]) == 0
+    capsys.readouterr()
+
+    s = Store.open(db)
+    g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    ran = []
+    with pytest.raises(NotReplayable, match="new idempotency key"):
+        _perform_unhalted(s, "r", g, EffectClass.STATUS_CHECK, "m1",
+                          valid_argv(EffectClass.STATUS_CHECK),
+                          lambda *a: ran.append(1) or "ext")
+    assert ran == [], "the retry executed under a spent key"
+
+
+def test_a_fresh_key_after_reconciliation_does_execute(db, capsys):
+    """The other direction, and the one that makes the refusal a constraint
+    rather than a wall: reconciliation must not make the run unusable."""
+    from kernel.effects import _perform_unhalted
+
+    _halt(db)
+    v = _pending(db, capsys)["version"]
+    main(["reconcile", "--db", db, "--run-id", "r", "--idempotency-key", "m1",
+          "--resolution", "not landed", "--expected-version", str(v)])
+    capsys.readouterr()
+
+    s = Store.open(db)
+    g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    ran = []
+    out = _perform_unhalted(s, "r", g, EffectClass.STATUS_CHECK, "m1-retry-2",
+                            valid_argv(EffectClass.STATUS_CHECK),
+                            lambda *a: ran.append(1) or "ext-2")
+    assert ran == [1], "a fresh attempt did not execute"
+    assert out == "ext-2"
