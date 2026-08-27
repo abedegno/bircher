@@ -525,3 +525,23 @@ def test_binding_variables_are_declared_at_run_item_scope():
                 f"${var} is declared at indent {len(indent)} (inside a branch) but read "
                 f"at the merge gate, which every path reaches: under `set -u` the "
                 f"path that skips that branch dies with 'unbound variable'.\n  {d.strip()}")
+
+
+@pytest.mark.parametrize("stage", [
+    "_kernel_record_output", "_kernel_record_ci",
+    "_kernel_record_review", "_kernel_request_merge",
+])
+def test_recover_pr_cmd_drives_the_lifecycle_too(stage):
+    """`--recover-pr` adopts a run, which gives its effects a generation and
+    gives the kernel no EVIDENCE. A live probe left the run at `queued` with
+    only a comment and a status_check journalled, and the merge refused --
+    correctly, since nothing had recorded an output, a CI observation or a
+    verdict for it to authorize against.
+
+    Adoption was necessary and not sufficient; this is the sufficient half.
+    """
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
+    assert stage in body, f"recover_pr_cmd never calls {stage}"

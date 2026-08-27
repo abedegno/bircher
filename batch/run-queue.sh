@@ -1920,12 +1920,37 @@ recover_pr_cmd() {
   fi
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
-  local rec r_outcome r_review r_note r_sha
+  local rec r_outcome r_review r_note r_sha r_ci
   rec=$(recover_from_ground_truth "$item" "$code" "$pr")
   IFS='|' read -r r_outcome r_review r_note r_sha r_ci <<EOF
 $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
+
+  # Drive the kernel lifecycle, exactly as run_item's recovery branch does.
+  # Adopting a run gave this path a valid generation; it did not give the
+  # kernel any EVIDENCE, so the merge gate had no recorded output, CI
+  # observation or verdict to authorize against and refused the merge -- a live
+  # probe left the run at `queued` with only a comment and a status_check
+  # journalled. Adoption was necessary and not sufficient.
+  #
+  # The context blob names the target rather than reusing the output hash: the
+  # binding's four fields are compared as a tuple, and two of them being the
+  # same value by accident makes a mismatch harder to read, not easier.
+  if [ -n "$r_sha" ]; then
+    local _rp_out _rp_ctx
+    _rp_out=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" \
+      "recovered: outcome=$r_outcome review=$r_review head=$r_sha note=$r_note")
+    _rp_ctx=$(_kernel_put_artifact "recover-pr context: repo=$REPO pr=$pr code=$code")
+    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${r_ci:-na}" "$r_sha"
+    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+    export BIRCHER_GENERATION
+    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
+      "$_rp_out" "$_rec_base" "$_rp_ctx"
+    _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$r_sha" \
+      "$_rp_out" "$_rec_base" "$_rp_ctx"
+  fi
+
   if [ "$r_outcome" = "ready" ]; then
     # #66: this was the one production caller that merged UNPINNED. A recovery
     # PASS with no captured head cannot be merged automatically -- the same
@@ -4229,7 +4254,11 @@ SH
             recover_from_ground_truth demo demo 7)
   # #66: 4th field is the orchestrator-captured reviewed head, so the recovery
   # merge can be pinned exactly as the marker path is.
-  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+  # 5th field is the CI value recovery OBSERVED. It is returned rather than
+  # inferred from `outcome=ready` so the caller records an observation instead
+  # of a deduction, and pinned here because both callers read five fields -- a
+  # four-field read would silently absorb it into the sha.
+  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
     || { echo "FAIL recover happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL recover: marker must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -4240,7 +4269,10 @@ SH
   local rec_nopr
   rec_nopr=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
              recover_from_ground_truth demo demo "")
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)|" ] \
+  # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
+  # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
+  # green by the merge gate.
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na" ] \
     || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "recover_from_ground_truth OK"
@@ -4270,7 +4302,7 @@ SH
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex recover_from_ground_truth i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -4335,7 +4367,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex recover_from_ground_truth iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
+  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
