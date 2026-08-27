@@ -1944,17 +1944,43 @@ recover_pr_cmd() {
     else
       _resolution="observed: PR #$pr is NOT merged; the attempt did not land"
     fi
-    _pver=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
-    _pkeys=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; [print(e["idempotency_key"]) for e in json.load(sys.stdin)["pending"]]' 2>/dev/null)
+    # ONLY the effects this observation actually speaks to. The first version
+    # applied one PR-merge observation to EVERY pending key regardless of
+    # class, so an uncertain comment, status_check or ref_update was "resolved"
+    # by evidence that said nothing about it -- an observation about one PR
+    # presented as an observation about each effect, which is the exact shape
+    # this design exists to refuse. Anything else stays unresolved and the run
+    # stays halted, which is the truthful state: nobody has looked at it.
+    _pkeys=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys
+for e in json.load(sys.stdin)["pending"]:
+    if e.get("effect_class") == "merge":
+        print(e["idempotency_key"])' 2>/dev/null)
+    local _unspoken
+    _unspoken=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys
+for e in json.load(sys.stdin)["pending"]:
+    if e.get("effect_class") != "merge":
+        print(e["effect_class"], e["idempotency_key"])' 2>/dev/null)
     echo "[batch:recover-pr] $code: run is HALTED -> $_resolution" >&2
     local _k
     while IFS= read -r _k; do
       [ -n "$_k" ] || continue
+      # The version is re-read PER KEY. Each successful reconciliation bumps it
+      # under CAS, so a version captured once and reused made every
+      # reconciliation after the first stale -- and the advisory wrapper
+      # swallowed the failure while the script printed "reconciled" anyway.
+      local _pver
+      _pver=$(_kernel_pending "$BIRCHER_RUN_ID" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
       _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
-      echo "[batch:recover-pr] $code: reconciled $_k" >&2
+      echo "[batch:recover-pr] $code: reconciled $_k (at version ${_pver:-?})" >&2
     done <<EOF
 $_pkeys
 EOF
+    if [ -n "${_unspoken//[[:space:]]/}" ]; then
+      echo "[batch:recover-pr] $code: NOT reconciled -- this observation says nothing about them, so they need a human:" >&2
+      printf '%s\n' "$_unspoken" | while IFS= read -r _u; do
+        [ -n "$_u" ] && echo "[batch:recover-pr] $code:   $_u" >&2
+      done
+    fi
   fi
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must

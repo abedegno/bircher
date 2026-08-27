@@ -626,3 +626,40 @@ def test_an_empty_recovery_tuple_is_treated_as_a_failure(fn):
     assert "${rec//[[:space:]]/}" in window, (
         f"{fn} parses the recovery tuple without checking it is non-empty, so a "
         "crashed recovery reads as a verdict of ''")
+
+
+def test_reconciliation_is_scoped_to_the_class_the_observation_speaks_to():
+    """Cross-vendor HIGH. The first version applied one PR-merge observation to
+    EVERY pending key regardless of class, so an uncertain comment,
+    status_check or ref_update was 'resolved' by evidence that said nothing
+    about it -- an observation about one PR presented as an observation about
+    each effect."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
+
+    assert 'effect_class") == "merge"' in body, (
+        "reconciliation does not filter by effect class, so a PR-merge "
+        "observation resolves effects it says nothing about")
+    assert "_unspoken" in body, (
+        "effects the observation cannot speak to must be reported, not "
+        "silently left out of the log")
+
+
+def test_the_reconciliation_version_is_re_read_per_key():
+    """Each successful reconciliation bumps the run version under CAS, so a
+    version captured once and reused made every reconciliation after the first
+    stale -- and the advisory wrapper swallowed the failure while the script
+    printed 'reconciled' anyway."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = src[start:end]
+
+    loop = next(i for i, l in enumerate(body) if "while IFS= read -r _k" in l)
+    done = next(i for i in range(loop, len(body)) if body[i].strip() == "EOF")
+    inside = "\n".join(body[loop:done])
+    assert "_pver=$(_kernel_pending" in inside, (
+        "the CAS version is read outside the reconciliation loop, so every key "
+        "after the first reconciles against a version the run has left behind")
