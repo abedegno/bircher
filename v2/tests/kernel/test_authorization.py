@@ -220,3 +220,66 @@ def test_the_projection_matches_the_stored_aggregate():
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             actor="codex", policy_version=1)
     assert project(s.facts_for("r")).state == s.run_state("r")
+
+
+# --- record_run_outcome: the terminal record every path can reach --------------
+#
+# Before this command the kernel had no way to say a run ENDED without merging.
+# The first live acceptance run proved the cost: scorecard `escalated`, kernel
+# `implementing`, the run never terminal and indistinguishable from one still
+# in flight.
+
+def test_a_run_can_end_from_implementing_without_merging():
+    s = _store()
+    _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
+    _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
+    _submit(s, "start_implementation", "k3", actor="claude")
+    assert s.run_state("r") == "implementing"
+
+    _submit(s, "record_run_outcome", "k9", actor="claude", outcome="escalated")
+    assert s.run_state("r") == "ended"
+
+
+def test_a_run_can_end_straight_from_queued():
+    """`skipped` items never launch. If the terminal record were legal only
+    from later states, the runs the coordinator abandons earliest -- the ones
+    a reader is most likely to mistake for in-flight -- would be exactly the
+    ones with no ending."""
+    s = _store()
+    assert s.run_state("r") == "queued"
+    _submit(s, "record_run_outcome", "k1", actor="claude", outcome="skipped")
+    assert s.run_state("r") == "ended"
+
+
+@pytest.mark.parametrize("bad", ["", "done", "ESCALATED", "success", None])
+def test_an_outcome_outside_the_vocabulary_is_refused(bad):
+    """The scorecard's vocabulary, exactly. An arbitrary string here would
+    make the aggregate agree with the scorecard by construction -- it could
+    record whatever the coordinator said, including a typo, and still look
+    like a match."""
+    s = _store()
+    with pytest.raises(NotAuthorized):
+        _submit(s, "record_run_outcome", "k1", actor="claude", outcome=bad)
+
+
+def test_a_merged_outcome_without_a_confirmed_merge_effect_is_refused():
+    """`merged` is the one outcome a mechanism can contradict, so it is the
+    one this command does not take on trust -- the same rule
+    record_merge_outcome enforces one command away. Every OTHER outcome is an
+    assertion the kernel cannot check, which is a limitation to state, not to
+    hide."""
+    s = _store()
+    _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
+    with pytest.raises(NotAuthorized, match="what the mechanism observed"):
+        _submit(s, "record_run_outcome", "k2", actor="claude", outcome="merged")
+    assert s.run_state("r") == "specified", "the refusal must not have moved it"
+
+
+def test_a_second_terminal_record_is_refused():
+    """Two terminal facts on one run is two contradictory answers to 'how did
+    this end'. The state check makes the duplicate a visible refusal."""
+    s = _store()
+    _submit(s, "record_run_outcome", "k1", actor="claude", outcome="noop")
+    assert s.run_state("r") == "ended"
+    with pytest.raises(NotAuthorized):
+        _submit(s, "record_run_outcome", "k2", actor="claude", outcome="failed")

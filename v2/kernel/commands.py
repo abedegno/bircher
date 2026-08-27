@@ -31,6 +31,18 @@ COMMAND_NAMES = frozenset({
     # Added with the merge-outcome transition: merge_requested was a dead end,
     # and cancel_run was the only escape -- which misreports a run that merged.
     "record_merge_outcome",
+    # Added because the kernel could not express a run that ENDED without
+    # merging. The only terminal records were `merged` (via
+    # record_merge_outcome, legal only from merge_requested) and `cancelled`
+    # -- so an escalated, timed-out, noop or skipped run was indistinguishable
+    # in the ledger from one still in flight. The spec's first acceptance
+    # criterion is that the kernel's aggregate MATCHES the scorecard, and the
+    # scorecard's terminal vocabulary is
+    # {merged, ready, escalated, noop, skipped, failed, timeout}: with no
+    # command for six of those seven, the criterion was not merely unmet, it
+    # was unsatisfiable. The first live acceptance run made this concrete --
+    # scorecard `escalated`, kernel `implementing`, run never terminal.
+    "record_run_outcome",
     # Added because nothing recorded what an implementation PRODUCED. The
     # reviewer named the artifact it was reviewing, so any blob the store
     # happened to hold satisfied the check -- including one from another run,

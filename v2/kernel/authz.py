@@ -47,6 +47,19 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_implementation_output": (frozenset({"implementing"}), None),
     "record_ci_observation": (frozenset({"implementing", "reviewing"}), None),
     "request_merge": (frozenset({"reviewing"}), "merge_requested"),
+    # The terminal record every path can reach. Legal from every state except
+    # `ended` itself, because a run can finish from anywhere: the coordinator
+    # escalates out of `implementing`, skips out of `queued`, and a merged run
+    # still needs an end. Not idempotent by design -- a second one is refused
+    # by the state check, so a duplicate is a visible refusal rather than two
+    # contradictory terminal facts.
+    "record_run_outcome": (
+        frozenset({
+            "queued", "specified", "planned", "implementing", "reviewing",
+            "merge_requested", "merged", "cancelled",
+        }),
+        "ended",
+    ),
     # Cancellation is legal from anywhere: a run must always be stoppable.
     "cancel_run": (
         frozenset({
@@ -73,6 +86,23 @@ _MERGE_OUTCOMES: dict[str, str] = {
     # reconciliation rather than wedging the run.
     "failed": "reviewing",
 }
+
+
+#: Outcomes `record_run_outcome` may report. Deliberately the SCORECARD's
+#: vocabulary rather than a tidier one of the kernel's own invention: the
+#: criterion these facts have to satisfy is that the kernel's aggregate
+#: matches the scorecard, and a translation layer between the two is exactly
+#: where a mismatch would hide.
+#:
+#: WHAT THIS RECORDS IS AN ASSERTION, NOT AN OBSERVATION -- with one
+#: exception. In record mode the kernel is watching a coordinator it does not
+#: control, and "escalated" names a judgement no mechanism can confirm; the
+#: fact means "the coordinator said this", and the report must not read it as
+#: more. `merged` IS checkable, so it is checked against a confirmed merge
+#: effect, on the same reasoning as record_merge_outcome.
+_RUN_OUTCOMES: frozenset[str] = frozenset({
+    "merged", "ready", "escalated", "noop", "skipped", "failed", "timeout",
+})
 
 
 def legal_states_for(name: str) -> frozenset[str]:
@@ -347,6 +377,25 @@ def authorize(store, cmd, actor: str) -> str | None:
                 "reports what the mechanism observed, not what an actor claims"
             )
         return _MERGE_OUTCOMES[outcome]
+
+    if cmd.name == "record_run_outcome":
+        outcome = cmd.payload.get("outcome")
+        if outcome not in _RUN_OUTCOMES:
+            raise NotAuthorized(
+                f"outcome {outcome!r} is not one of {sorted(_RUN_OUTCOMES)}"
+            )
+        # The one outcome a mechanism can contradict. Without this, a run that
+        # never merged anything could still close its ledger as `merged` --
+        # the exact claim-outruns-evidence shape record_merge_outcome already
+        # refuses one command away.
+        if outcome == "merged" and not store.has_confirmed_effect(
+            cmd.run_id, "merge"
+        ):
+            raise NotAuthorized(
+                "no confirmed merge outcome for this run: a merged outcome "
+                "reports what the mechanism observed, not what an actor claims"
+            )
+        return "ended"
 
     if cmd.name == "request_merge":
         # The authorization has to record a TARGET, or the effect has nothing

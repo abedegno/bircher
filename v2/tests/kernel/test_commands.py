@@ -45,6 +45,13 @@ def test_the_command_interface_is_closed_and_explicit():
         "submit_spec", "submit_plan", "record_review", "start_implementation",
         "record_implementation_output", "record_ci_observation",
         "request_merge", "record_merge_outcome", "cancel_run",
+        # record_run_outcome -- the kernel had no way to say a run ENDED
+        # without merging. `merged` (only from merge_requested) and
+        # `cancelled` were the sole terminal records, so an escalated or
+        # timed-out run read as one still in flight, and the spec's
+        # "aggregate matches the scorecard" criterion was unsatisfiable for
+        # six of the scorecard's seven terminal outcomes.
+        "record_run_outcome",
     ])
 
 
