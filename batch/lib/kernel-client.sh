@@ -113,6 +113,58 @@ _kernel() {
 #
 # An argv has neither problem: it survives being backgrounded through any
 # wrapper, and needs no temp file.
+# _kernel_adopt_run <code> <repo> <base_sha> <reviewer> -- exports
+# BIRCHER_RUN_ID and BIRCHER_GENERATION, echoes the run id (empty on failure).
+#
+# THE GAP THIS CLOSES. `BIRCHER_RUN_ID` was assigned in exactly one place --
+# inside `run_item` -- so every path that does not go through it performed
+# effects with no run and no generation. In kernel mode those abort on
+# `${BIRCHER_RUN_ID:?}` and are swallowed by the redirects around them: a live
+# `--recover-pr` produced an empty kernel database, no PR comment and no
+# cross-review status, while reporting success. The documented path for landing
+# a human PR was silently inert in the mode v2 is meant to run in.
+#
+# ADOPT, don't mint. Recovery and the end-of-run sweep are continuations of an
+# item's lifecycle, not new ones: a ledger that splits them tells you less, and
+# the run already holds the spec, the plan and the implementation output this
+# recovery is deciding about. Run ids are `<item>-<epoch>` and the item begins
+# with the code, so the item's own run is discoverable by prefix -- newest
+# first, because a re-queued item has several and the live one is the last.
+#
+# Minting is the FALLBACK, for a PR that never came from the queue. It is not
+# the default, because a fresh run would present an empty history to a merge
+# gate whose whole job is to check history.
+_kernel_adopt_run() {  # <code> <repo> <base_sha> <reviewer>
+  local code="$1" repo="$2" base="$3" reviewer="$4" found=""
+  local src='
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+code = os.environ["K_CODE"]
+runs = [r for r in s.all_run_ids() if r.startswith(code + "-")]
+print(runs[-1] if runs else "")
+'
+  found=$( K_CODE="$code"            BIRCHER_V2_DIR="$(_kernel_pythonpath)"            _net_run "$(_kernel_net_cap)"            "${BIRCHER_PY:-python3}" -c "$src" 2>/dev/null
+  ) || found=""
+
+  if [ -n "$found" ]; then
+    BIRCHER_RUN_ID="$found"
+  else
+    BIRCHER_RUN_ID="${code}-adopted-$(date +%s)"
+    _kernel_warn "no existing run for '$code' -- minting $BIRCHER_RUN_ID"
+    _kernel_run_start "$BIRCHER_RUN_ID" "$repo" "$base"
+  fi
+  export BIRCHER_RUN_ID
+
+  # A recovery reviews; the reviewer role is what validate_review requires, and
+  # the role is assigned with the fence so it cannot be elected later.
+  BIRCHER_GENERATION=$(_kernel_dispatch "$reviewer" reviewer)
+  export BIRCHER_GENERATION
+  [ -n "$BIRCHER_GENERATION" ] || _kernel_warn "adopt: no generation for $BIRCHER_RUN_ID"
+  printf '%s' "$BIRCHER_RUN_ID"
+}
+
 _kernel_dispatch() {  # <actor> <role>
   local actor="$1" role="$2" gen=""
   local src='

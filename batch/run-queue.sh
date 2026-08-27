@@ -1783,6 +1783,15 @@ reconcile_deferred_ready() {
     pr=${rest%%$'\t'*};   rest=${rest#*$'\t'}
     issue=${rest%%$'\t'*}; sha=${rest#*$'\t'}
     [ -n "$pr" ] || continue
+    # Adopt THIS item's run before touching it. The sweep runs after run_item
+    # has returned, and nothing unsets the exported BIRCHER_RUN_ID/GENERATION --
+    # so without this every sweep effect is recorded against whichever item
+    # happened to run last. That is worse than not recording: it attributes one
+    # item's mutations to another's ledger. Re-adopting per iteration also
+    # re-fences the generation, which is what makes each sweep attempt its own
+    # attempt rather than a continuation of a finished one.
+    _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
+      "$RECOVERY_REVIEWER" >/dev/null
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
     case "$st" in
       MERGED|CLOSED)
@@ -1887,6 +1896,16 @@ recover_pr_cmd() {
   RECOVERY_REVIEWER="${3:-claude_code}"
   local item="recover-$code"
   echo "[batch:recover-pr] $code: adopting PR #$pr (reviewer=$RECOVERY_REVIEWER)" >&2
+  # Adopt the item's kernel run BEFORE the first effect below. Without this
+  # BIRCHER_RUN_ID/BIRCHER_GENERATION are unset here -- they are assigned only
+  # inside run_item -- so in kernel mode every effect on this path aborts on
+  # `${VAR:?}` and is swallowed by its own redirect. A live run in that state
+  # left an empty kernel database, posted no cross-review status and no comment,
+  # and still reported success.
+  local _rec_base; _rec_base=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
+  : "${_rec_base:=0000000000000000000000000000000000000000}"
+  _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$RECOVERY_REVIEWER" >/dev/null
+  echo "[batch:recover-pr] $code: kernel run=${BIRCHER_RUN_ID:-<none>} generation=${BIRCHER_GENERATION:-<none>}" >&2
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must
   # be brought up to date first. update-branch re-triggers the required checks on

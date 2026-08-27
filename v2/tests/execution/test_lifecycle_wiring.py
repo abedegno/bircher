@@ -307,9 +307,11 @@ _EFFECT_SITE_CONTEXT = {
     "_ensure_issue_closed": "REACHED",
     "recover_from_ground_truth": "REACHED",
     "_reconcile_item_pr": "REACHED",
+    # ADOPTS = mints or re-adopts the item's run and re-fences a generation
+    # before its first effect, so it runs under a valid one of its own.
+    "recover_pr_cmd": "ADOPTS",
+    "reconcile_deferred_ready": "ADOPTS",
     # --- known gaps, evidenced ---
-    "recover_pr_cmd": "NO GENERATION",
-    "reconcile_deferred_ready": "STALE GENERATION",
     "_reopen_reverted_issues": "STALE GENERATION",
     "_pr": "STALE GENERATION",
 }
@@ -368,9 +370,9 @@ def test_every_effect_site_is_classified():
 def test_the_known_gaps_are_still_gaps_and_not_quietly_more():
     """If one of these is fixed, this test fails and the entry is deleted --
     which is the point: the gap list shrinks deliberately, never by drift."""
-    gaps = {k for k, v in _EFFECT_SITE_CONTEXT.items() if v != "REACHED"}
-    assert gaps == {"recover_pr_cmd", "reconcile_deferred_ready",
-                    "_reopen_reverted_issues", "_pr"}, sorted(gaps)
+    gaps = {k for k, v in _EFFECT_SITE_CONTEXT.items()
+            if v not in ("REACHED", "ADOPTS")}
+    assert gaps == {"_reopen_reverted_issues", "_pr"}, sorted(gaps)
     src = RUN_QUEUE.read_text()
     assert src.count("BIRCHER_RUN_ID=") == 1, (
         "BIRCHER_RUN_ID is assigned somewhere new; the gap analysis above "
@@ -419,3 +421,42 @@ def test_the_directive_is_present_for_the_default_target_too():
     out = _rendered_prompt("/workspaces/muesli", "abedegno/muesli")
     assert "git -C /workspaces/muesli worktree add" in out
     assert "WORK REPO DIRECTIVE" in out
+
+
+def test_every_adopting_function_adopts_before_its_first_effect():
+    """ADOPTS is a claim about ORDER, and order is the whole content of it.
+
+    `_kernel_adopt_run` sets BIRCHER_RUN_ID and re-fences a generation. An
+    effect above that call runs with whatever the previous item left exported
+    -- or with nothing, aborting on `${VAR:?}` and being swallowed. Both are
+    silent. Asserting the call merely EXISTS in the function would pass in
+    either case, which is why this asserts it comes first.
+    """
+    import re
+    src = RUN_QUEUE.read_text().splitlines()
+    spans, fn, start = {}, None, None
+    for i, l in enumerate(src):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", l)
+        if m:
+            fn, start = m.group(1), i
+        elif l == "}" and fn is not None:
+            spans[fn] = (start, i)
+            fn = None
+
+    adopting = [k for k, v in _EFFECT_SITE_CONTEXT.items() if v == "ADOPTS"]
+    assert adopting, "no function claims to adopt; this test would prove nothing"
+
+    for name in adopting:
+        a, b = spans[name]
+        body = src[a:b]
+        adopt_at = next((i for i, l in enumerate(body)
+                         if "_kernel_adopt_run" in l and not l.strip().startswith("#")), None)
+        effect_at = next((i for i, l in enumerate(body)
+                          if re.search(r"(?<!_)\b_effect\s+\w", l)
+                          and not l.strip().startswith("#")), None)
+        assert adopt_at is not None, f"{name} is marked ADOPTS but never calls _kernel_adopt_run"
+        assert effect_at is not None, f"{name} has no _effect call; drop it from the table"
+        assert adopt_at < effect_at, (
+            f"{name} performs an effect at body line {effect_at} before adopting "
+            f"a run at {adopt_at}: that effect runs under a stale generation or "
+            f"none at all, and fails silently either way")
