@@ -402,9 +402,20 @@ def test_the_run_id_is_still_minted_in_exactly_one_place():
     so every other _effect site either inherits it or adopts one.
     """
     src = RUN_QUEUE.read_text()
-    assert src.count("BIRCHER_RUN_ID=") == 1, (
+    assigns = [l.strip() for l in src.splitlines()
+               if "BIRCHER_RUN_ID=" in l and not l.strip().startswith("#")]
+    # TWO now, and the second is deliberate: the sweep restores the run id
+    # RECORDED with a deferred row rather than guessing by item code. It mints
+    # nothing -- it reuses an id the kernel already holds -- so the
+    # "run_item is the only place a run is CREATED" premise still stands.
+    assert len(assigns) == 2, (
         "BIRCHER_RUN_ID is assigned somewhere new; every REACHED/ADOPTS "
-        "classification above assumed run_item is the only place one is minted")
+        f"classification above assumed the places it is set are known: {assigns}")
+    assert any('="${item}-$(date +%s)"' in a for a in assigns), (
+        "the minting assignment in run_item is gone or changed shape")
+    assert any('="$deferred_run"' in a for a in assigns), (
+        "the sweep no longer restores the recorded run id, so it is back to "
+        "guessing by item code")
 
 
 # --- the work-repo directive, RENDERED rather than grepped --------------------
@@ -668,3 +679,31 @@ def test_the_reconciliation_version_is_re_read_per_key():
     assert "_pver=$(_kernel_pending" in inside, (
         "the CAS version is read outside the reconciliation loop, so every key "
         "after the first reconciles against a version the run has left behind")
+
+
+def test_the_sweep_prefers_the_run_that_opened_the_PR():
+    """Cross-vendor MEDIUM. Adoption chose the newest run sharing an item code,
+    which is not necessarily the run that opened the PR being swept: a re-queued
+    item creates a newer run, and the sweep would attribute the older run's PR
+    to it and ask the kernel to revalidate the merge against the wrong attempt's
+    authorization. Adopting by code was a guess that looked like a lookup.
+
+    The deferred row now carries the run id, and an OLD row without one still
+    parses -- falling back to adoption by code, exactly as before, so an
+    existing queue does not become unreadable because a field was added.
+    """
+    src = RUN_QUEUE.read_text()
+    assert '"$item" "$pr" "$issue" "$sha" "${BIRCHER_RUN_ID:-}"' in src, (
+        "_record_deferred_ready no longer records the run id, so the sweep is "
+        "back to guessing by item code")
+
+    lines = src.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith("reconcile_deferred_ready()"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+    body = "\n".join(l for l in lines[start:end] if not l.strip().startswith("#"))
+    assert 'deferred_run=' in body, "the sweep never parses the recorded run id"
+    assert 'if [ -n "$deferred_run" ]' in body, (
+        "the sweep parses the run id and does not prefer it")
+    assert "_kernel_adopt_run" in body, (
+        "the by-code fallback is gone, so a row written before the run id "
+        "existed can no longer be swept")

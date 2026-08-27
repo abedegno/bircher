@@ -1772,7 +1772,13 @@ _record_deferred_ready() {
   local item="$1" pr="$2" mrc="$3" issue="${4:-}" sha="${5:-}"
   [ "$mrc" = 0 ] && [ -n "$MERGE_NOTE" ] && [ "${MERGE_RETRY_ELIGIBLE:-0}" = 1 ] || return 0
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"
-  printf '%s\t%s\t%s\t%s\n' "$item" "$pr" "$issue" "$sha" >> "$DEFERRED_READY_FILE"
+  # The RUN ID is recorded, as a fifth field. Without it the sweep could only
+  # adopt by item code and took the newest run for that code -- which is not
+  # necessarily the run that opened this PR. A re-queued item creates a newer
+  # run, and the sweep would then attribute the older run's PR to it and ask
+  # the kernel to revalidate the merge against the wrong attempt's
+  # authorization. Adopting by code was a guess that looked like a lookup.
+  printf '%s\t%s\t%s\t%s\t%s\n' "$item" "$pr" "$issue" "$sha" "${BIRCHER_RUN_ID:-}" >> "$DEFERRED_READY_FILE"
 }
 
 # reconcile_deferred_ready -> end-of-run self-heal: re-drive every ready PR that a
@@ -1793,7 +1799,15 @@ reconcile_deferred_ready() {
     # IFS-whitespace), which would drop an EMPTY issue field and misalign sha.
     item=${line%%$'\t'*}; rest=${line#*$'\t'}
     pr=${rest%%$'\t'*};   rest=${rest#*$'\t'}
-    issue=${rest%%$'\t'*}; sha=${rest#*$'\t'}
+    issue=${rest%%$'\t'*}; rest=${rest#*$'\t'}
+    # A row written before the run id was recorded has no fifth field, so
+    # `sha` keeps the whole tail and `deferred_run` is empty -- which falls
+    # back to adopting by code, exactly as before. An old queue must not
+    # become unreadable because a field was added.
+    case "$rest" in
+      *$'\t'*) sha=${rest%%$'\t'*}; deferred_run=${rest#*$'\t'} ;;
+      *)        sha="$rest"; deferred_run="" ;;
+    esac
     [ -n "$pr" ] || continue
     # Adopt THIS item's run before touching it. The sweep runs after run_item
     # has returned, and nothing unsets the exported BIRCHER_RUN_ID/GENERATION --
@@ -1802,8 +1816,16 @@ reconcile_deferred_ready() {
     # item's mutations to another's ledger. Re-adopting per iteration also
     # re-fences the generation, which is what makes each sweep attempt its own
     # attempt rather than a continuation of a finished one.
-    _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
-      "$RECOVERY_REVIEWER" >/dev/null
+    # Prefer the run that actually opened this PR over the newest run sharing
+    # its item code.
+    if [ -n "$deferred_run" ]; then
+      BIRCHER_RUN_ID="$deferred_run"; export BIRCHER_RUN_ID
+      BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+      export BIRCHER_GENERATION
+    else
+      _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
+        "$RECOVERY_REVIEWER" >/dev/null
+    fi
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
     case "$st" in
       MERGED|CLOSED)
@@ -5553,7 +5575,11 @@ SH
     _record_deferred_ready itemB 12 0
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="merge deferred: mergeable=CONFLICTING" MERGE_RETRY_ELIGIBLE=0 \
     _record_deferred_ready itemC 13 0
-  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77\theadsha1234567')" ] \
+  # Five fields now: the fifth is BIRCHER_RUN_ID, empty here because the
+  # self-test drives this outside a kernel run. The sweep falls back to
+  # adopting by item code when it is empty, which is what a queue written
+  # before this field existed also produces.
+  [ "$(cat "$rdir/deferred.tsv")" = "$(printf 'itemA\t11\t77\theadsha1234567\t')" ] \
     || { echo "FAIL _record_deferred_ready: wrong contents"; cat "$rdir/deferred.tsv"; rm -rf "$rdir"; exit 1; }
   echo "_record_deferred_ready OK"
   cat >"$rdir/gh" <<'SH'
