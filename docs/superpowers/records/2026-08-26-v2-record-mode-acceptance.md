@@ -77,6 +77,61 @@ That is a reordering of the live coordinator, so the smoke was re-run:
 projected `ended`, kernel outcome `escalated`, scorecard `escalated`. No new
 shadow rejections. The reorder did not break the live path.
 
+## Run 4 (smoke) — the gh/git effect path, and what it found
+
+Criteria 2 and 3 were untested for `gh`/`git` effects. To close that without
+touching `abedegno/muesli`, a throwaway private repo
+(`abedegno/bircher-smoke`) was seeded, a PR opened in it, and the coordinator
+pointed at it with `BIRCHER_REPO`/`WORKDIR`.
+
+**The plan changed once, for safety.** The original intent was a full run with
+an implementer. The codex agent bundle hardcodes
+`git -C /workspaces/muesli worktree add …` in its IMPLEMENT step, so an
+implementer working a scratch-repo item could have branched off — and pushed
+to — the public repo. `--recover-pr` never launches an implementer, so that
+step never executes; it exercises the same effect classes with none of that
+exposure.
+
+**Result: the recovery path performs no kernel-journalled effects at all.**
+
+```
+runs: []                      # the kernel database is empty
+PR comments posted:           # none
+statuses on the head:  ci=success        # only the one posted by hand
+```
+
+`BIRCHER_RUN_ID` is assigned in exactly ONE place in `run-queue.sh` — inside
+`run_item`. `--recover-pr` never calls `run_item`, yet it performs
+`_effect ref_update` directly and reaches `_post_cross_review_status` and the
+merge through `merge_ready_pr`. In `BIRCHER_EFFECT_MODE=kernel` every one of
+those aborts on `${BIRCHER_RUN_ID:?}` and is swallowed by the redirects around
+it. **The documented path for landing a human PR is silently inert in the mode
+v2 is meant to run in.**
+
+Mapping every `_effect` site in the file separates two failure modes:
+
+| context | functions |
+|---|---|
+| reached from `run_item` — generation valid | `run_item`, `_send_prompt`, `_prune_session`, `_post_cross_review_status`, `merge_ready_pr`, `_issue_writeback`, `_ensure_issue_closed`, `recover_from_ground_truth`, `_reconcile_item_pr` |
+| **no generation** — effects abort | `recover_pr_cmd` |
+| **stale generation** — attributed to whichever item ran last, because nothing unsets the exported run id | `reconcile_deferred_ready`, `_reopen_reverted_issues`, `_pr` |
+
+`reconcile_deferred_ready` is the end-of-run sweep, so this is the same gap
+F12 identified from the other direction: its scorecard rows are unowned by any
+kernel run *and* would be recorded under the previous item's generation.
+
+**Not fixed here.** Giving these paths their own kernel run is a design
+decision — whether `--recover-pr` mints a run, whether the sweep re-dispatches
+per item — not a wiring tweak. `test_every_effect_site_is_classified` makes the
+set enumerable so a new site cannot join it silently, and
+`test_the_known_gaps_are_still_gaps_and_not_quietly_more` fails if the list
+changes in either direction.
+
+Two incidental findings from the same run, both minor: the OAuth token lacks
+`workflow` scope so the scratch repo could not be given a CI workflow, and a
+repo with no checks at all never settles the CI wait (it blocked until a status
+was posted by hand). Neither affects muesli.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
