@@ -1922,7 +1922,7 @@ recover_pr_cmd() {
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
   local rec r_outcome r_review r_note r_sha
   rec=$(recover_from_ground_truth "$item" "$code" "$pr")
-  IFS='|' read -r r_outcome r_review r_note r_sha <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci <<EOF
 $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
@@ -2164,7 +2164,13 @@ $marker_line"
   # means "cannot auto-merge".
   local _sha_out=""
   [ "$r_outcome" = "ready" ] && _sha_out="$reviewed_sha"
-  echo "$r_outcome|$r_review|$r_note|$_sha_out"
+  # $ci is returned as a FIFTH field so the caller can record a real CI
+  # OBSERVATION rather than inferring one from the outcome. "ready implies
+  # green" happens to be true today, and a ledger built on an inference is a
+  # claim with nothing behind it -- which is the one thing the kernel exists to
+  # refuse. Both callers parse five fields; a four-field read would silently
+  # absorb this into the sha.
+  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci"
 }
 
 # _is_blank <text> -> rc 0 if text is empty or whitespace-only.
@@ -3546,9 +3552,33 @@ EOF
       echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
       local rec
       rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-      IFS='|' read -r outcome review note marker_head <<EOF
+      local _rec_ci=""
+      IFS='|' read -r outcome review note marker_head _rec_ci <<EOF
 $rec
 EOF
+      # Drive the SAME kernel lifecycle the marker branch drives. Without this
+      # the recovery path reached the merge gate having recorded no output, no
+      # CI observation and no verdict, so request_merge was refused and the
+      # kernel could not authorize a merge it had no evidence for. That is the
+      # gate behaving correctly on an input the coordinator failed to supply --
+      # and it fires automatically whenever an implementer session dies, which
+      # makes it the common case rather than the exotic one.
+      #
+      # Guarded on a head: the blind path sets review="na" and no head, and a
+      # run nobody reviewed must not acquire a verdict. `_kernel_verdict` maps
+      # "na" to nothing, and `_kernel_ci_status` passes an unknown CI value
+      # through unchanged so it never counts as green.
+      if [ -n "${marker_head:-}" ]; then
+        local _rec_body="recovered: outcome=$outcome review=$review head=$marker_head note=$note"
+        _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_rec_body")
+        _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_rec_ci:-na}" "$marker_head"
+        BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+        export BIRCHER_GENERATION
+        _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
+          "$_out_hash" "$_base_sha" "$_spec_hash"
+        BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+        export BIRCHER_GENERATION
+      fi
     fi
     ci_first="false"; rounds="0"
   fi

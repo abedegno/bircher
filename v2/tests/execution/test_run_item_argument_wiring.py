@@ -227,8 +227,8 @@ def _heredoc_to_herestring(run_item_src):
             'IFS=\'|\' read -r outcome _ci ci_first review rounds note marker_head <<< "$marker"',
         ),
         (
-            "IFS='|' read -r outcome review note marker_head <<EOF\n$rec\nEOF",
-            'IFS=\'|\' read -r outcome review note marker_head <<< "$rec"',
+            "IFS='|' read -r outcome review note marker_head _rec_ci <<EOF\n$rec\nEOF",
+            'IFS=\'|\' read -r outcome review note marker_head _rec_ci <<< "$rec"',
         ),
     ]
     for old, new in pairs:
@@ -261,6 +261,10 @@ _kernel_submit_spec()        {{ _log_call _kernel_submit_spec "$@"; }}
 _kernel_submit_plan()        {{ _log_call _kernel_submit_plan "$@"; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
+recover_from_ground_truth() {{
+  _log_call recover_from_ground_truth "$@"
+  printf '%s' 'ready|claude_code:pass|recovered from ground truth|{reviewed_sha}|green'
+}}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
@@ -316,7 +320,7 @@ def _base_env(tmp_path, queue_dir, noop_dir):
 
 
 def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
-                   marker_review="codex:pass", merge_ok=True):
+                   marker_review="codex:pass", merge_ok=True, marker=True):
     """Drives ONE queue item through `run_item`, for real, with every
     session/network function stubbed. Returns (calls, result) where `calls`
     is an ordered list of (name, [args...]) tuples logged by `_log_call`,
@@ -340,10 +344,14 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     gencounter = tmp_path / "gencounter"
     gencounter.write_text("0")
 
+    # marker=False drives the NO-MARKER recovery branch -- the path that runs
+    # whenever an implementer session dies. It was never driven here, which is
+    # how `local _out_hash` inside the marker branch reached production and
+    # killed a live run on `set -u`.
     marker_body = (
         "bircher-status: outcome=ready ci=success ci_first=true "
         f"review={marker_review} rounds=1 note=\"wired for real\" head={HEAD_SHA}"
-    )
+    ) if marker else ""
 
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
@@ -393,6 +401,13 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
 def happy_drive(tmp_path_factory):
     d = tmp_path_factory.mktemp("run-item-happy")
     return _run_one_item(d)
+
+
+@pytest.fixture(scope="module")
+def recovery_drive(tmp_path_factory):
+    """No marker: the ground-truth recovery branch."""
+    d = tmp_path_factory.mktemp("run-item-recovery")
+    return _run_one_item(d, marker=False)
 
 
 @pytest.fixture(scope="module")
@@ -605,3 +620,47 @@ def test_record_outcome_gets_failed_when_the_merge_fails(failed_merge_drive):
     outcome_calls = [args for name, args in calls if name == "_kernel_record_outcome"]
     assert len(outcome_calls) == 1, outcome_calls
     assert outcome_calls[0][2] == "failed", outcome_calls
+
+
+# --- the no-marker recovery branch, driven ------------------------------------
+
+def test_the_recovery_branch_does_not_die_on_an_unbound_variable(recovery_drive):
+    """The regression. `local _out_hash` was declared inside the marker branch
+    and read at the merge gate, which every path reaches. Under `set -u` the
+    recovery path -- which fires automatically whenever an implementer session
+    dies -- crashed the coordinator on a live run, after the PR had already
+    been opened. Nothing here drove that path, so nothing caught it."""
+    _, result = recovery_drive
+    assert "unbound variable" not in result.stderr, result.stderr[-400:]
+
+
+def test_the_recovery_branch_records_the_lifecycle(recovery_drive):
+    """It used to record NONE of it, so the merge gate was asked to authorize a
+    merge the kernel had no evidence for -- and correctly refused. A recovery
+    that reviews a PR and finds it ready has observed exactly what the marker
+    path observes; it simply was not telling the kernel."""
+    calls, _ = recovery_drive
+    names = [n for n, _ in calls]
+    for required in ("_kernel_record_output", "_kernel_record_ci",
+                     "_kernel_record_review", "_kernel_request_merge"):
+        assert required in names, f"{required} never ran on the recovery path: {names}"
+
+
+def test_the_recovery_ci_observation_is_the_one_recovery_MADE(recovery_drive):
+    """The CI value comes back from recover_from_ground_truth as a fifth field,
+    not inferred from `outcome=ready`. "ready implies green" is true today and
+    is still an inference -- a ledger built on one is a claim with nothing
+    behind it."""
+    calls, _ = recovery_drive
+    ci = next(a for n, a in calls if n == "_kernel_record_ci")
+    assert ci[2] == "green", f"expected the recovered CI value, got {ci[2]!r}"
+    assert ci[3] == REVIEWED_SHA, "CI was not bound to the recovered head"
+
+
+def test_the_recovery_review_carries_the_recovered_verdict_and_binding(recovery_drive):
+    calls, _ = recovery_drive
+    rv = next(a for n, a in calls if n == "_kernel_record_review")
+    assert rv[2] == "claude_code:pass", rv
+    assert rv[3] == OUT_HASH, "the review does not bind the recovered output"
+    by_name = {n: a for n, a in calls}
+    assert rv[4] == by_name["_kernel_run_start"][2], "base differs from run_start's"
