@@ -132,6 +132,66 @@ Two incidental findings from the same run, both minor: the OAuth token lacks
 repo with no checks at all never settles the CI wait (it blocked until a status
 was posted by hand). Neither affects muesli.
 
+## Run 5 — a full item, end to end, on the throwaway repo
+
+The work-repo directive (`30ca909`) makes an off-muesli end-to-end run safe:
+`run_item` now tells the implementer which repo and checkout to use, overriding
+the literal `/workspaces/muesli` in the agent bundles. Confirmed in practice —
+the implementer worked entirely in `/workspaces/bircher-smoke` and muesli was
+untouched.
+
+Item `s02-changelog`, implementer `codex`, reviewer `claude_code`. The loop
+ran the whole way: worktree, commit, **PR #2 opened**, cross-vendor review
+**passed** (`claude_code:pass`, 1 round), `bircher/cross-review=success`
+posted and verified. The merge then failed closed, twice, including on the
+end-of-run sweep; a manual `gh pr merge --match-head-commit` minutes later
+succeeded, which is consistent with GitHub mergeability lag after the status
+post. Not diagnosed further, and not claimed as more than that.
+
+### Criterion 2, revisited: **holds for the coordinator's effects; structurally N/A for the implementer's**
+
+Journalled: `effect_intended`/`effect_confirmed` for **`status_check`** — the
+cross-review status post, a real `gh api` mutation.
+
+Not journalled, and this is the point: **PR #2's creation and the
+`bircher-status:` marker comment never passed through `_effect` at all.** They
+were performed by the implementer, from its own credential domain, exactly as
+v1 does. This is C8, already named in the plan's "not delivered" section — the
+kernel cannot journal what it never mediates. So criterion 2 as written cannot
+hold until the implementer's effects are routed, and no amount of testing the
+coordinator will change that.
+
+### Criterion 3, revisited: **three rows, and they are one causal chain**
+
+```json
+[ {"command_name": "record_merge_outcome", "count": 1,
+   "example_reason": "not legal from state 'implementing'; legal from ['merge_requested']"},
+  {"command_name": "record_review", "count": 1,
+   "example_reason": "verdict 'claude_code:pass' is not one of ['accept', 'reject', 'request_revision']"},
+  {"command_name": "request_merge", "count": 1,
+   "example_reason": "not legal from state 'implementing'; legal from ['reviewing']"} ]
+```
+
+Read bottom-up, this is a single root cause. The coordinator's verdict
+vocabulary is `<vendor>:pass` / `<vendor>:fail` / `na`; the kernel's is
+`{accept, reject, request_revision}`. `record_review` is refused, so the run
+never leaves `implementing`, so `request_merge` is refused, so
+`record_merge_outcome` is refused. **In enforce mode this run would have been
+stopped at review** — and the report says so before anyone tries it, which is
+what the report is for.
+
+**A naive fix would not work, and would look like one.** `_kernel_record_review`
+sends only `{"verdict": …}`, while `validate_review` also requires
+`artifact_hash`, `base_sha`, `context_bundle_hash` and `policy_version`.
+Translating the verdict word alone moves the refusal from "not one of …" to
+"malformed verdict binding: 'policy_version'" — same outcome, different
+message. The real fix must also bind the review to the artifact the kernel
+holds, which means `_kernel_record_output` surfacing the hash it PUT so
+`_kernel_record_review` can name it.
+
+This is the first run to produce decision-grade shadow output, and it says the
+merge path is **not** safe to enforce yet.
+
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
 | | |
