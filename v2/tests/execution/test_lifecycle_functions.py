@@ -93,6 +93,8 @@ its COMMAND_ACCEPTED does not.
 """
 from __future__ import annotations
 
+import pytest
+
 import hashlib
 import pathlib
 import subprocess
@@ -575,3 +577,93 @@ def test_a_bogus_outcome_is_refused_rather_than_recorded(tmp_path):
 
     assert Store.open(db).run_state(run_id) != "ended", (
         "an outcome outside the vocabulary ended the run anyway")
+
+
+# --- the verdict mapping itself, bound ----------------------------------------
+#
+# The mapping had NO test. Mutating `*) printf ''` to `*) printf 'accept'` --
+# every unmapped word, `na` included, minting an approval from the
+# model-authored `review=` field -- left all 554 tests passing. The input is
+# untrusted and the guard that decides whether it approves a merge was
+# unbound.
+
+def _reviewed_run(db, run_id, verdict):
+    """Drive a run to `implementing`, then record a review with *verdict*."""
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
+             env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    out = _run(f'h=$(_kernel_put_artifact "prompt"); '
+               f'_kernel_submit_spec {run_id} {gen} "$h"; '
+               f'_kernel_submit_plan {run_id} {gen} "$h"; printf %s "$h"',
+               env=_db_env(db))
+    spec = out.stdout.strip()
+    _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+    o = _run(f"_kernel_record_output {run_id} {gen} 'body'", env=_db_env(db))
+    out_hash = o.stdout.strip()
+    _run(f"_kernel_record_ci {run_id} {gen} green {HEAD_SHA}", env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch claude_code reviewer); echo "[$g]"',
+             env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    rgen = r.stdout.strip().strip("[]")
+    _run(f"_kernel_record_review {run_id} {rgen} {verdict!r} "
+         f"{out_hash} {BASE_SHA} {spec}", env=_db_env(db))
+    return Store.open(db)
+
+
+def test_a_pass_verdict_actually_advances_the_run(tmp_path):
+    s = _reviewed_run(tmp_path / "k.db", "r-pass", "codex:pass")
+    assert s.run_state("r-pass") == "reviewing", (
+        "a passing review did not advance the run; the mapping is not reaching "
+        "the kernel as `accept`")
+
+
+def test_a_fail_verdict_sends_the_run_back_rather_than_forward(tmp_path):
+    """`:fail` maps to request_revision, which returns the run to `planned` so
+    implementation can start again. `reject` would leave it in `reviewing`
+    with nowhere to go, and `accept` would let failed work merge."""
+    s = _reviewed_run(tmp_path / "k.db", "r-fail", "codex:fail")
+    assert s.run_state("r-fail") == "planned", s.run_state("r-fail")
+
+
+@pytest.mark.parametrize("verdict", ["na", "codex:error", "codex:PASS", "pass"])
+def test_an_unmapped_verdict_is_REFUSED_not_silently_skipped(tmp_path, verdict):
+    """The property the first version of this fix destroyed.
+
+    Returning empty for an unmapped word made the caller skip the command
+    entirely: no command, no fact, empty shadow report -- field for field the
+    state the acceptance record cites as proof a run SUCCEEDED. The refusal is
+    the product of this branch; losing it is worse than the refusal.
+    """
+    db = tmp_path / "k.db"
+    s = _reviewed_run(db, "r-odd", verdict)
+    assert s.run_state("r-odd") == "implementing", (
+        f"{verdict!r} advanced the run: an unmapped verdict was accepted")
+    rejected = [f for f in s.facts_for("r-odd")
+                if f.kind == EventKind.COMMAND_REJECTED
+                and (f.payload or {}).get("command_name") == "record_review"]
+    assert rejected, (
+        f"{verdict!r} left NO refusal in the ledger -- it was skipped silently, "
+        "so the shadow report cannot show what enforcement would have refused")
+    assert verdict in str(rejected[-1].payload), rejected[-1].payload
+
+
+def test_an_unknown_ci_status_cannot_authorize_a_merge(tmp_path):
+    """`_kernel_ci_status` passes unknown values through, and the comment calls
+    coercing them to success "the one unsafe choice available here". Nothing
+    bound that: coercing unknown -> success left all tests passing while
+    authorizing merges on `ci=pending` and `ci=na`."""
+    db = tmp_path / "k.db"
+    run_id = "r-ci"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
+             env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    _run(f'h=$(_kernel_put_artifact "p"); _kernel_submit_spec {run_id} {gen} "$h"; '
+         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
+    _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+    _run(f"_kernel_record_ci {run_id} {gen} pending {HEAD_SHA}", env=_db_env(db))
+
+    from kernel.authz import _ci_is_green
+    assert not _ci_is_green(Store.open(db), run_id, HEAD_SHA), (
+        "a 'pending' CI observation reads as green, so a merge can be "
+        "authorized on CI that never reported")

@@ -406,15 +406,25 @@ _KERNEL_POLICY_VERSION=1
 # verdict that returns the run to `planned` so implementation can start again.
 # `reject` would leave it in `reviewing` with nowhere to go.
 #
-# `na` maps to NOTHING and is not submitted. It means no review happened (the
-# blind-teardown path records it), and a run that was never reviewed must not
-# carry a verdict fact saying otherwise -- that would be a claim with no
-# observation behind it, in the one place this design exists to prevent that.
+# ANYTHING ELSE IS SENT UNTRANSLATED, ON PURPOSE. The first version of this
+# returned empty for unmapped words and the caller turned that into `return 0`
+# -- no command, so no `shadow_rejected` fact, so an empty report. That traded
+# a VISIBLE refusal for a SILENT SKIP in the one branch whose entire product is
+# the record of what enforcement would have refused, and it did so for the
+# model-authored `review=` field: the same untrusted input that produced the
+# original scar. A run whose review was never recorded then ended with an empty
+# shadow report, field for field the state the acceptance record cites as proof
+# that a run SUCCEEDED.
+#
+# So an unmapped verdict now goes to the kernel and is refused there, loudly
+# and in the ledger. `na` included: "a review was attempted and its verdict was
+# not one the kernel accepts" is a fact worth holding, and it is the truth
+# about a run nobody reviewed. Skipping is what looks like success.
 _kernel_verdict() {
   case "$1" in
     *:pass) printf 'accept' ;;
     *:fail) printf 'request_revision' ;;
-    *)      printf '' ;;
+    *)      printf '%s' "$1" ;;
   esac
 }
 
@@ -471,8 +481,11 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context>
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
   local verdict; verdict=$(_kernel_verdict "$raw")
+  # No early return for an unmapped verdict: it is submitted and refused, so
+  # the refusal lands in the shadow report instead of vanishing. Only a
+  # genuinely EMPTY verdict is skipped, because there is nothing to submit.
   if [ -z "$verdict" ]; then
-    _kernel_warn "no kernel verdict for '$raw' -- not recording a review"
+    _kernel_warn "empty verdict -- not recording a review"
     return 0
   fi
   if [ -z "$artifact" ] || [ -z "$base" ] || [ -z "$context" ]; then
