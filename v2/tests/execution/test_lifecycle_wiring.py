@@ -307,23 +307,48 @@ _EFFECT_SITE_CONTEXT = {
     "_ensure_issue_closed": "REACHED",
     "recover_from_ground_truth": "REACHED",
     "_reconcile_item_pr": "REACHED",
+    # Only caller is merge_ready_pr's revert path, which is itself REACHED.
+    "_reopen_reverted_issues": "REACHED",
     # ADOPTS = mints or re-adopts the item's run and re-fences a generation
     # before its first effect, so it runs under a valid one of its own.
     "recover_pr_cmd": "ADOPTS",
     "reconcile_deferred_ready": "ADOPTS",
-    # --- known gaps, evidenced ---
-    "_reopen_reverted_issues": "STALE GENERATION",
-    "_pr": "STALE GENERATION",
 }
+
+#: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about
+#: runtime reachability, and "REACHED" is asserted by reading the call graph,
+#: not proven here -- a static test cannot know which functions run under
+#: run_item. What is enforced is narrower and still worth having: that every
+#: _effect site is classified (so a new one cannot join silently), that the
+#: functions claiming to adopt do so BEFORE their first effect, and that
+#: BIRCHER_RUN_ID is still assigned in exactly one place, which is the
+#: assumption the whole analysis rests on.
+#:
+#: An earlier version of this table listed `_pr` as a gap. It was a parser
+#: artefact: `_pr` is a ONE-LINE function whose `}` sits on the same line, so
+#: the span never closed and it "owned" every later line -- including an
+#: `_effect` occurrence inside a quoted self-test assertion, which is not a
+#: call site at all. It also listed `_reopen_reverted_issues` as a gap when its
+#: only caller is REACHED. Both survived because the gap test compared the
+#: table against ITSELF.
+
+
+#: Quoted spans, stripped before looking for a call. `_effect` inside a string
+#: is a self-test ASSERTION about a call site, not one.
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 
 def _effect_sites_by_function():
-    import re
     src = RUN_QUEUE.read_text().splitlines()
     spans, fn, start = {}, None, None
     for i, l in enumerate(src):
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", l)
         if m:
+            # A one-liner opens and closes on the same line. Without this its
+            # span never closes and it silently owns the rest of the file.
+            if l.rstrip().endswith("}"):
+                spans[m.group(1)] = (i, i)
+                continue
             fn, start = m.group(1), i
         elif l == "}" and fn is not None:
             spans[fn] = (start, i)
@@ -340,7 +365,7 @@ def _effect_sites_by_function():
     for i, l in enumerate(src):
         if l.strip().startswith("#"):
             continue
-        if re.search(r"(?<!_)\b_effect\s+\w", l):
+        if re.search(r"(?<!_)\b_effect\s+\w", _QUOTED.sub("", l)):
             out.setdefault(owner(i), []).append(i + 1)
     return out
 
@@ -367,16 +392,19 @@ def test_every_effect_site_is_classified():
         f"_effect call: {sorted(known - found)}")
 
 
-def test_the_known_gaps_are_still_gaps_and_not_quietly_more():
-    """If one of these is fixed, this test fails and the entry is deleted --
-    which is the point: the gap list shrinks deliberately, never by drift."""
-    gaps = {k for k, v in _EFFECT_SITE_CONTEXT.items()
-            if v not in ("REACHED", "ADOPTS")}
-    assert gaps == {"_reopen_reverted_issues", "_pr"}, sorted(gaps)
+def test_the_run_id_is_still_minted_in_exactly_one_place():
+    """The assumption the whole classification rests on.
+
+    An earlier version of this test asserted the GAP LIST instead -- a set
+    compared against the table it was derived from, which is a tautology and
+    passed while two of its four entries were wrong. This asserts something the
+    table cannot fake: BIRCHER_RUN_ID is assigned by run_item and nowhere else,
+    so every other _effect site either inherits it or adopts one.
+    """
     src = RUN_QUEUE.read_text()
     assert src.count("BIRCHER_RUN_ID=") == 1, (
-        "BIRCHER_RUN_ID is assigned somewhere new; the gap analysis above "
-        "assumed run_item is the only place a run id is minted")
+        "BIRCHER_RUN_ID is assigned somewhere new; every REACHED/ADOPTS "
+        "classification above assumed run_item is the only place one is minted")
 
 
 # --- the work-repo directive, RENDERED rather than grepped --------------------
