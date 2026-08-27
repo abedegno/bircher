@@ -707,3 +707,18 @@ def test_the_sweep_prefers_the_run_that_opened_the_PR():
     assert "_kernel_adopt_run" in body, (
         "the by-code fallback is gone, so a row written before the run id "
         "existed can no longer be swept")
+
+
+def test_the_state_check_distinguishes_its_three_causes():
+    """It collapsed "past these stages", "no such run" and "kernel
+    unreachable" into one branch that printed the first -- so an unreachable
+    kernel was reported as a run that had progressed. A false claim about the
+    source, in code added to fix a different instance of exactly that."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
+
+    assert "kernel unreachable" in body, "an unreachable kernel is not distinguished"
+    assert "knows no run" in body, "a missing run is not distinguished"
+    assert "past the lifecycle stages" in body, "the benign case lost its message"

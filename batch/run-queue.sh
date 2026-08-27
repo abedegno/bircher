@@ -2042,17 +2042,31 @@ EOF
   # verdict, and re-driving them earns four refusals that are individually
   # correct and collectively noise -- they sit in the shadow report next to
   # refusals that mean something, which is how a report stops being read.
-  local _rp_state
-  _rp_state=$(_kernel_pending "${BIRCHER_RUN_ID:-}" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null)
+  local _rp_state="" _rp_raw
+  _rp_raw=$(_kernel_pending "${BIRCHER_RUN_ID:-}")
+  [ -n "${_rp_raw//[[:space:]]/}" ] && _rp_state=$(printf '%s' "$_rp_raw" \
+    | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin).get("state") or "")' 2>/dev/null)
   # A FLAG, not $r_sha. Blanking r_sha would skip the drive and also unpin the
   # merge below, which reads the same variable to pass --match-head-commit --
   # trading four harmless refusals for an unpinned merge.
   local _rp_drive=1
-  case "$_rp_state" in
-    queued|specified|planned|implementing|reviewing) : ;;
-    *) echo "[batch:recover-pr] $code: run is at '${_rp_state:-unknown}' -- past the lifecycle stages; not re-driving them" >&2
-       _rp_drive=0 ;;
-  esac
+  # THREE CAUSES, THREE MESSAGES. This used to collapse "the run is past these
+  # stages", "there is no such run" and "the kernel is unreachable" into one
+  # branch that printed the first -- so an unreachable kernel was reported as a
+  # run that had progressed: a false claim about the source, in code added to
+  # fix a different instance of exactly that. Only the first is a reason to
+  # skip quietly.
+  if [ -z "${_rp_raw//[[:space:]]/}" ]; then
+    echo "[batch:recover-pr] $code: WARN kernel unreachable (pending returned nothing) -- driving the lifecycle blind" >&2
+  else
+    case "$_rp_state" in
+      queued|specified|planned|implementing|reviewing) : ;;
+      "") echo "[batch:recover-pr] $code: WARN kernel knows no run '${BIRCHER_RUN_ID:-}' -- adoption did not take; not re-driving" >&2
+          _rp_drive=0 ;;
+      *)  echo "[batch:recover-pr] $code: run is at '$_rp_state' -- past the lifecycle stages; not re-driving them" >&2
+          _rp_drive=0 ;;
+    esac
+  fi
 
   # Drive the kernel lifecycle, exactly as run_item's recovery branch does.
   # Adopting a run gave this path a valid generation; it did not give the

@@ -387,7 +387,8 @@ part that was broken: adoption finds the run, fences a generation, and gives
 the path's effects a valid context. A complete recovery through merge under
 kernel mode is still unrun.
 
-**Still open:** `_reopen_reverted_issues` and `_pr` remain STALE GENERATION —
+**Superseded, and left here because the correction matters.** This section
+originally said `_reopen_reverted_issues` and `_pr` remain STALE GENERATION —
 they run after `run_item` returns and nothing unsets the exported run id.
 `test_every_effect_site_is_classified` keeps them enumerated, and
 `test_every_adopting_function_adopts_before_its_first_effect` asserts the order
@@ -423,7 +424,11 @@ that distinction earned its place.
 2. **The recovery branch recorded no lifecycle.** It reached the merge gate
    with no output, CI observation or verdict, so the kernel refused a merge it
    had no evidence for. Correct behaviour on an input the coordinator failed to
-   supply. Both `run_item`'s branch and `--recover-pr` now drive it.
+   supply. Both `run_item`'s branch and `--recover-pr` now CONTAIN that drive.
+   For `run_item` it is exercised; for `--recover-pr` the evidence at the time
+   was only that the calls appear in the source, and a later review showed the
+   adopted-run path was still refused for binding the wrong base. "Wired" and
+   "works" were not the same sentence and this recorded them as one.
 3. **Reconciliation had no door.** `kernel.effects.reconcile` could always
    resolve an uncertain effect; nothing outside Python could ask. The merge
    came back uncertain — the coordinator races its own `review-gate`, posting
@@ -565,7 +570,27 @@ and records how the run finished, in agreement with the scorecard.
 - **Criterion 4** does not hold in kernel effect mode, by design.
 - **Criterion 5** holds.
 
-The outstanding gate before enforcement can be argued for is a run that
-reaches merge. Until then criteria 2 and 3 are untested where it counts, and
-criterion 4 should be read as "the kernel is a hard dependency", not as the
-safety guarantee the spec's wording implies.
+**That verdict was written after Run 3 and left standing through Run 10.** It
+names "a run that reaches merge" as the outstanding gate — which Runs 6, 7 and
+10 each passed, the last of them on `abedegno/muesli` under enforcement. A
+verdict section that does not move as its own document does is worse than none:
+a reader who stops at the end gets the state of the work eight runs ago.
+
+### Verdict as of Run 10
+
+- **Criterion 1** holds; two divergence paths (advisory-call failure, the
+  sweep's later rows) remain untested.
+- **Criterion 2** holds for the coordinator's effects including a real
+  kernel-mediated merge; the implementer's own PR and marker still never reach
+  the kernel (C8), so it cannot hold fully until that changes.
+- **Criterion 3** is implemented and returned decision-grade rows that drove
+  two real fixes, then a true zero on the path that merged.
+- **Criterion 4** does not hold in kernel effect mode, by design: the kernel is
+  a HARD dependency there, not an advisory observer.
+- **Criterion 5** holds.
+
+The outstanding gates are C8, and a second review seat over the ~25 commits
+that followed Run 6 — two of the three HIGH findings in the last such review
+were introduced by fixes written to close earlier findings, so this branch's
+repair work has a demonstrated failure rate and should not be trusted on the
+author's word.
