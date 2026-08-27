@@ -143,10 +143,16 @@ untouched.
 Item `s02-changelog`, implementer `codex`, reviewer `claude_code`. The loop
 ran the whole way: worktree, commit, **PR #2 opened**, cross-vendor review
 **passed** (`claude_code:pass`, 1 round), `bircher/cross-review=success`
-posted and verified. The merge then failed closed, twice, including on the
-end-of-run sweep; a manual `gh pr merge --match-head-commit` minutes later
-succeeded, which is consistent with GitHub mergeability lag after the status
-post. Not diagnosed further, and not claimed as more than that.
+posted and verified. The merge then failed closed, twice, including on the end-of-run sweep.
+
+**That diagnosis was wrong and is corrected below.** This record first
+attributed it to GitHub mergeability lag, because a manual
+`gh pr merge --match-head-commit` minutes later succeeded. Run 6 showed the
+real cause: `merge_ready_pr` performs the merge through `_effect merge`, which
+in kernel mode is authorized against the run reaching `merge_requested`. The
+chain was broken at `record_review`, so the run never got there and the kernel
+REFUSED the merge -- correctly. The manual merge succeeded because it bypassed
+the kernel entirely, which is exactly what made it misleading evidence.
 
 ### Criterion 2, revisited: **holds for the coordinator's effects; structurally N/A for the implementer's**
 
@@ -191,6 +197,67 @@ holds, which means `_kernel_record_output` surfacing the hash it PUT so
 
 This is the first run to produce decision-grade shadow output, and it says the
 merge path is **not** safe to enforce yet.
+
+## Run 6 — the full chain, and an empty shadow report
+
+Two untranslated vocabularies, found one after the other by running the thing:
+
+1. **verdict** — the marker says `<vendor>:pass`, the kernel accepts
+   `{accept, reject, request_revision}`. Fixed in `db27ecc`, together with the
+   verdict BINDING (`artifact_hash`, `base_sha`, `context_bundle_hash`,
+   `policy_version`) that `validate_review` also requires — translating the
+   word alone would have moved the refusal to `malformed verdict binding` and
+   read like progress.
+2. **CI status** — the marker says `ci=green`, the merge gate asks
+   `status == "success"`. Fixed in `9891256`. CI had been recorded faithfully
+   and counted for nothing.
+
+Item `s04-notes`, run `s04-notes-…`, implementer codex, reviewer claude_code.
+The complete journal:
+
+```
+submit_spec → specified          submit_plan → planned
+start_implementation → implementing
+effect_intended/confirmed  session_control
+record_implementation_output     record_ci_observation
+record_review → review_verdict → reviewing
+request_merge → merge_authorized → merge_requested
+effect_intended/confirmed  status_check
+effect_intended/confirmed  merge          ← PR #4 MERGED, kernel-mediated
+record_merge_outcome → merged
+record_run_outcome → ended
+```
+
+```
+SHADOW REPORT: []
+```
+
+### What this settles
+
+**Criterion 2 — every mutation journalled: HOLDS for the coordinator's
+effects, including a real merge.** `session_control`, `status_check` and
+**`merge`** all carry intent and confirmation. The merge is the one that
+matters: it is a genuine `gh` mutation on a real repository, authorized by the
+kernel and journalled before it happened. Still outside: the implementer's own
+PR creation and marker comment, which never pass through `_effect` (C8).
+
+**Criterion 3 — the shadow report is empty, and now means something.** The
+previous zero was on a path that never submitted a review, a CI observation, a
+merge request or a merge. This one submitted all four and every one was
+accepted. That is the difference between "nothing was refused" and "nothing was
+asked".
+
+**Criterion 1 — kernel `ended`/`merged`, scorecard `ready`.** The run reached a
+terminal state in agreement with what the coordinator recorded.
+
+### The merge failures were the kernel working
+
+Runs 5 and the s03 run both had their merges refused twice. This record
+originally called that GitHub mergeability lag. It was not: `_effect merge` in
+kernel mode is authorized against `merge_requested`, the broken verdict chain
+never got the run there, and the kernel refused the mutation. **The merge
+failing was the boundary doing its job** — and the manual merge that "worked"
+worked by going around it.
 
 ### Criterion 1 — the aggregate matches the scorecard: **HOLDS, on a narrow path**
 
