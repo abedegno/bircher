@@ -12,6 +12,7 @@ assertion would not catch a call moved to the wrong place in `run_item`.
 """
 import pathlib
 import re
+import subprocess
 
 import pytest
 
@@ -374,3 +375,47 @@ def test_the_known_gaps_are_still_gaps_and_not_quietly_more():
     assert src.count("BIRCHER_RUN_ID=") == 1, (
         "BIRCHER_RUN_ID is assigned somewhere new; the gap analysis above "
         "assumed run_item is the only place a run id is minted")
+
+
+# --- the work-repo directive, RENDERED rather than grepped --------------------
+
+def _rendered_prompt(workdir, repo, vendor="codex", reviewer="claude_code"):
+    """Evaluate run_item's actual prompt assignment in bash.
+
+    A source-text assertion here would only prove the directive is present.
+    What matters is what it RENDERS to -- a directive that names the wrong
+    variable, or interpolates nothing, reads fine and instructs nothing.
+    """
+    body = _run_item()
+    start = body.index('prompt="IMPLEMENTER VENDOR DIRECTIVE')
+    end = body.index('${prompt}"', start) + len('${prompt}"')
+    script = (f'WORKDIR={workdir}\nREPO={repo}\nvendor={vendor}\n'
+              f'RECOVERY_REVIEWER={reviewer}\nprompt="ORIGINAL ITEM TEXT"\n'
+              f'{body[start:end]}\nprintf %s "$prompt"')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_the_implementer_is_told_which_repo_to_work_in():
+    """The agent bundles hardcode `git -C /workspaces/muesli worktree add`, so
+    without this an implementer on ANY other target branches from -- and pushes
+    to -- muesli whatever WORKDIR says. That is why a throwaway-repo end-to-end
+    run was unsafe until now.
+    """
+    out = _rendered_prompt("/workspaces/smoke", "abedegno/bircher-smoke")
+
+    assert "git -C /workspaces/smoke worktree add" in out, (
+        "the directive does not spell the worktree command with WORKDIR, so it "
+        "does not actually override the bundle's literal path")
+    assert "git -C /workspaces/smoke fetch origin main" in out
+    assert "abedegno/bircher-smoke" in out, "the target repo is never named"
+    assert "ORIGINAL ITEM TEXT" in out, "the item's own prompt was dropped"
+
+
+def test_the_directive_is_present_for_the_default_target_too():
+    """Stated unconditionally. A directive that appears only in the unusual
+    case is one nobody has read when the unusual case arrives."""
+    out = _rendered_prompt("/workspaces/muesli", "abedegno/muesli")
+    assert "git -C /workspaces/muesli worktree add" in out
+    assert "WORK REPO DIRECTIVE" in out

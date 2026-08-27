@@ -3183,7 +3183,24 @@ run_item() {
   esac
   [ "$vendor" = auto ] && vendor=claude_code   # never dispatch the literal 'auto'
   if [ "$vendor" = codex ]; then RECOVERY_REVIEWER=claude_code; else RECOVERY_REVIEWER=codex; fi
+  # WORK REPO DIRECTIVE. The agent bundles spell their worktree setup with a
+  # LITERAL /workspaces/muesli (agents/codex/config.yaml,
+  # agents/claude_code/config.yaml), so an implementer working any other target
+  # would branch from -- and push to -- muesli regardless of WORKDIR. That made
+  # a throwaway-repo end-to-end run unsafe: the only reason tonight's smoke
+  # dropped to --recover-pr, which launches no implementer.
+  #
+  # Sent as a directive rather than fixed in the bundles because the bundle is
+  # uploaded as static text and WORKDIR is only known here, per run. It is
+  # stated unconditionally, not only when WORKDIR differs from the default: a
+  # directive that appears only in the unusual case is one nobody has read when
+  # the unusual case arrives.
   prompt="IMPLEMENTER VENDOR DIRECTIVE: dispatch the implement sub-agent to ${vendor}; the cross-vendor reviewer MUST be the opposite vendor (${RECOVERY_REVIEWER}). Do not set any model or model_override.
+
+WORK REPO DIRECTIVE: the repository for this task is ${REPO}, checked out at ${WORKDIR}. This OVERRIDES any path written in your agent bundle. Wherever the bundle says /workspaces/muesli, read ${WORKDIR}. Set your isolated worktree up with:
+    git -C ${WORKDIR} fetch origin main
+    git -C ${WORKDIR} worktree add -b <code>-<slug> /tmp/wt-<code> origin/main
+and open the pull request against ${REPO}. Do not fetch, branch from, push to, or open a pull request against any other repository.
 
 ${prompt}"
   echo "[batch] $item: implementer=$vendor reviewer=$RECOVERY_REVIEWER" >&2
