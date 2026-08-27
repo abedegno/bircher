@@ -194,3 +194,26 @@ def test_a_halted_run_refuses_further_commands(store):
             name="submit_spec", run_id="r", expected_version=1,
             idempotency_key="nope", generation=gen, payload={},
         ))
+
+
+def test_a_confirmation_names_the_class_it_confirms(store):
+    """The class travels with the CONFIRMATION, not only the intent.
+
+    It used to appear on `effect_intended` alone, so the journal could be
+    filtered by class for what was ATTEMPTED and not for what actually LANDED
+    -- and a live run's journal showed `effect_confirmed` with no class beside
+    every intent that had one. Any reconciliation matching intents against
+    confirmations had to join through effect_id to learn what a confirmation
+    was even about.
+    """
+    from kernel.events import EventKind
+
+    g = dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    _perform_unhalted(store, "r", g, EffectClass.COMMENT, "k",
+                      valid_argv(EffectClass.COMMENT), Recorder(store))
+
+    confirmed = [f for f in store.facts_for("r")
+                 if f.kind == EventKind.EFFECT_CONFIRMED]
+    assert confirmed, "no confirmation was recorded"
+    assert confirmed[-1].payload.get("effect_class") == EffectClass.COMMENT, (
+        f"the confirmation does not name its class: {confirmed[-1].payload}")

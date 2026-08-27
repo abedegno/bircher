@@ -238,7 +238,14 @@ def _perform_unhalted(
     store.append_fact(
         run_id=run_id, kind=EventKind.EFFECT_CONFIRMED, actor=actor,
         causal_command_id=idempotency_key,
-        payload={"effect_id": eid, "external_object_id": external_id},
+        # The class travels with the CONFIRMATION as well as the intent. It
+        # used to appear only on effect_intended, so the journal could be
+        # filtered by class for what was attempted and not for what actually
+        # landed -- and any reconciliation matching intents against
+        # confirmations had to join through effect_id to learn what a
+        # confirmation was even about.
+        payload={"effect_id": eid, "external_object_id": external_id,
+                 "effect_class": effect_class},
     )
     return external_id
 
