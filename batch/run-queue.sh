@@ -1977,6 +1977,23 @@ $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
 
+  # Only drive the lifecycle from a state that can still accept it. A run
+  # adopted at `merge_requested` has already recorded its output, CI and
+  # verdict, and re-driving them earns four refusals that are individually
+  # correct and collectively noise -- they sit in the shadow report next to
+  # refusals that mean something, which is how a report stops being read.
+  local _rp_state
+  _rp_state=$(_kernel_pending "${BIRCHER_RUN_ID:-}" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null)
+  # A FLAG, not $r_sha. Blanking r_sha would skip the drive and also unpin the
+  # merge below, which reads the same variable to pass --match-head-commit --
+  # trading four harmless refusals for an unpinned merge.
+  local _rp_drive=1
+  case "$_rp_state" in
+    queued|specified|planned|implementing|reviewing) : ;;
+    *) echo "[batch:recover-pr] $code: run is at '${_rp_state:-unknown}' -- past the lifecycle stages; not re-driving them" >&2
+       _rp_drive=0 ;;
+  esac
+
   # Drive the kernel lifecycle, exactly as run_item's recovery branch does.
   # Adopting a run gave this path a valid generation; it did not give the
   # kernel any EVIDENCE, so the merge gate had no recorded output, CI
@@ -1987,7 +2004,7 @@ EOF
   # The context blob names the target rather than reusing the output hash: the
   # binding's four fields are compared as a tuple, and two of them being the
   # same value by accident makes a mismatch harder to read, not easier.
-  if [ -n "$r_sha" ]; then
+  if [ -n "$r_sha" ] && [ "$_rp_drive" = 1 ]; then
     local _rp_out _rp_ctx
     _rp_out=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" \
       "recovered: outcome=$r_outcome review=$r_review head=$r_sha note=$r_note")
@@ -2011,6 +2028,26 @@ EOF
     fi
     merge_ready_pr "$item" "$pr" "$r_sha"; local mrc=$?
     echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}${MERGE_UNREVIEWED_NOTE:+ UNREVIEWED=\"$MERGE_UNREVIEWED_NOTE\"}" >&2
+
+    # WRITE BACK TO THE ISSUE. This path had none, so a recovered item left its
+    # issue carrying `bircher:running` after the PR had merged -- the label
+    # means "being worked" and was saying so about finished work. It needed
+    # clearing by hand after tonight's muesli merge, which is the sort of
+    # residue that turns a label into noise nobody trusts.
+    #
+    # The issue comes from the PR's own closing references rather than a queue
+    # item, because this path has no item: --recover-pr adopts a PR and may
+    # never have seen the prompt that created it.
+    if [ "$mrc" = 0 ]; then
+      local _rp_iss
+      _rp_iss=$(_net_run "$BIRCHER_NET_TIMEOUT" gh pr view "$pr" --repo "$REPO" \
+                  --json closingIssuesReferences \
+                  -q '.closingIssuesReferences[]?.number' 2>/dev/null | head -1)
+      if [ -n "$_rp_iss" ]; then
+        _issue_writeback "$_rp_iss" "ready" "$pr" "$r_review" "" ""
+        echo "[batch:recover-pr] $code: wrote back to issue #$_rp_iss" >&2
+      fi
+    fi
     return $mrc
   fi
   echo "[batch:recover-pr] $code: NOT ready (outcome=$r_outcome) -> PR left open with marker for human" >&2

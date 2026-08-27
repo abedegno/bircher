@@ -589,3 +589,18 @@ def test_the_merge_key_distinguishes_attempts():
         f"reconciliation replays a spent key:\n  {key.strip()}")
     assert "$expected_sha" in key, (
         "the merge key must still pin the head it was reviewed against")
+
+
+def test_recover_pr_cmd_writes_back_to_the_issue():
+    """This path had no write-back, so a recovered item left its issue carrying
+    `bircher:running` after the PR had merged -- a label meaning "being worked"
+    saying so about finished work. It needed clearing by hand after the muesli
+    merge, and residue like that is how a label stops being trusted."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
+    assert "_issue_writeback" in body, "recover_pr_cmd never writes back to the issue"
+    assert "closingIssuesReferences" in body, (
+        "the issue must come from the PR's own closing references: this path "
+        "adopts a PR and may never have seen the queue item that created it")

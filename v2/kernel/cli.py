@@ -159,8 +159,15 @@ def main(argv=None) -> int:
 def _do_pending(a) -> int:
     """What is unresolved, and the version any resolution must be derived from."""
     store = Store.open(a.db)
+    # `state` rides along because every caller that asks "is this halted"
+    # also needs "how far has this run got". Without it a recovery re-drives
+    # the whole lifecycle blindly and the kernel refuses each stage the run
+    # has already passed -- four advisory refusals per run, all correct, all
+    # noise, and all indistinguishable in the shadow report from refusals that
+    # mean something.
     print(json.dumps({
         "version": store.run_version(a.run_id),
+        "state": store.run_state(a.run_id),
         "halted": is_halted(store, a.run_id),
         "pending": pending_reconciliation(store, a.run_id),
     }))
