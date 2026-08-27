@@ -1904,7 +1904,11 @@ recover_pr_cmd() {
   # and still reported success.
   local _rec_base; _rec_base=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
   : "${_rec_base:=0000000000000000000000000000000000000000}"
-  _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$RECOVERY_REVIEWER" >/dev/null
+  # Adopt as the IMPLEMENTER: the first kernel command this path issues is
+  # record_implementation_output, which refuses any other role. The reviewer
+  # dispatch happens below, at the role change, before the verdict.
+  local _rec_impl; _rec_impl=$([ "$RECOVERY_REVIEWER" = codex ] && printf claude_code || printf codex)
+  _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$_rec_impl" implementer >/dev/null
   echo "[batch:recover-pr] $code: kernel run=${BIRCHER_RUN_ID:-<none>} generation=${BIRCHER_GENERATION:-<none>}" >&2
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must

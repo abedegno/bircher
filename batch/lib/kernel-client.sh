@@ -134,8 +134,8 @@ _kernel() {
 # Minting is the FALLBACK, for a PR that never came from the queue. It is not
 # the default, because a fresh run would present an empty history to a merge
 # gate whose whole job is to check history.
-_kernel_adopt_run() {  # <code> <repo> <base_sha> <reviewer>
-  local code="$1" repo="$2" base="$3" reviewer="$4" found=""
+_kernel_adopt_run() {  # <code> <repo> <base_sha> <actor> [role=reviewer]
+  local code="$1" repo="$2" base="$3" actor="$4" role="${5:-reviewer}" found=""
   local src='
 import os, sys
 sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
@@ -157,9 +157,18 @@ print(runs[-1] if runs else "")
   fi
   export BIRCHER_RUN_ID
 
-  # A recovery reviews; the reviewer role is what validate_review requires, and
-  # the role is assigned with the fence so it cannot be elected later.
-  BIRCHER_GENERATION=$(_kernel_dispatch "$reviewer" reviewer)
+  # THE ROLE IS A PARAMETER because the caller knows which one it needs first,
+  # and getting it wrong is a silent refusal rather than an error. A recovery
+  # that records an implementation output needs an IMPLEMENTER generation --
+  # `record_implementation_output` refuses any other role, by design, so an
+  # attempt cannot elect itself the producer of what it reviews. It then
+  # re-dispatches as reviewer before recording the verdict, exactly as
+  # run_item does at its role change.
+  #
+  # Defaulting to reviewer keeps the sweep's call unchanged: it performs
+  # ref_update and merge effects and records no output, so the role never
+  # binds there.
+  BIRCHER_GENERATION=$(_kernel_dispatch "$actor" "$role")
   export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || _kernel_warn "adopt: no generation for $BIRCHER_RUN_ID"
   printf '%s' "$BIRCHER_RUN_ID"
