@@ -473,3 +473,60 @@ def test_the_remaining_refusals_are_informative_not_repeated(tmp_path):
     assert "codex:pass" in rejected["record_review"], rejected["record_review"]
     assert "not legal from state 'implementing'" in rejected["request_merge"], rejected
     assert "not legal from state 'implementing'" in rejected["record_merge_outcome"], rejected
+
+
+# --- the terminal record, driven for real -------------------------------------
+
+def test_an_escalated_run_actually_reaches_a_terminal_state(tmp_path):
+    """The production shape of the defect the first live acceptance run hit.
+
+    That run went queued -> specified -> planned -> implementing and then
+    stopped emitting facts: the coordinator escalated, and the kernel had no
+    command that could say so. `implementing` is indistinguishable from a run
+    still in progress, so the ledger claimed an in-flight run forever.
+
+    Driven through the shell function rather than the Python API, because the
+    wiring is what was missing -- the kernel could always be asked, if
+    something asked it.
+    """
+    db = tmp_path / "kernel.db"
+    run_id = "run-escalated"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
+             env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    assert gen == "1", (r.stdout, r.stderr)
+
+    _run(f'h=$(_kernel_put_artifact "do the thing"); '
+         f'_kernel_submit_spec {run_id} {gen} "$h"; '
+         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
+    _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+
+    store = Store.open(db)
+    assert store.run_state(run_id) == "implementing", "precondition"
+
+    r = _run(f"_kernel_record_run_outcome {run_id} {gen} escalated",
+             env=_db_env(db))
+    assert r.stderr == "", r.stderr  # a real, accepted call warns nothing
+
+    reopened = Store.open(db)
+    assert reopened.run_state(run_id) == "ended", (
+        "the run never reached a terminal state, so the ledger still reads as "
+        "in-flight -- the exact defect this command exists to close")
+    accepted = [f for f in reopened.facts_for(run_id)
+                if (f.payload or {}).get("command_name") == "record_run_outcome"]
+    assert accepted, "no record_run_outcome fact landed"
+
+
+def test_a_bogus_outcome_is_refused_rather_than_recorded(tmp_path):
+    """The vocabulary is the scorecard's. A run whose ledger accepted any
+    string would 'match' the scorecard by construction, typos included."""
+    db = tmp_path / "kernel.db"
+    run_id = "run-bogus"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _run('_kernel_dispatch codex implementer',
+         env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    _run(f"_kernel_record_run_outcome {run_id} 1 totally-made-up", env=_db_env(db))
+
+    assert Store.open(db).run_state(run_id) != "ended", (
+        "an outcome outside the vocabulary ended the run anyway")

@@ -117,3 +117,84 @@ def test_run_item_never_inlines_a_kernel_command_call():
             f"run_item inlines a raw kernel command call instead of using a "
             f"named function: {s}"
         )
+
+
+# --- the terminal record, and why some sites deliberately lack one -------------
+#
+# run_item has SIX exits that write a scorecard row, and before
+# record_run_outcome existed, five of them left the kernel with no terminal
+# fact at all -- the run sat in `implementing` forever, indistinguishable from
+# one still in flight. The first live acceptance run demonstrated it: scorecard
+# `escalated`, kernel `implementing`.
+#
+# Wiring the three reachable sites fixes those three instances. This test is
+# what closes the CLASS: a new exit added later either records an outcome or
+# names itself here with a reason, and there is no third option that stays
+# green.
+
+#: Scorecard writes that deliberately record NO kernel outcome, and why. Each
+#: key is a distinguishing substring of the site's own line.
+_NO_KERNEL_OUTCOME = {
+    "queue file missing at read time":
+        "the item never launched; BIRCHER_RUN_ID is not assigned yet, so "
+        "there is no run in the kernel to end",
+    "empty/blank prompt":
+        "same -- refused before the run id is minted",
+    "REST session create failed":
+        "the run exists but no generation has been dispatched, and every "
+        "command is submitted under a generation; recording here would need "
+        "a dispatch invented solely to report that nothing ran",
+}
+
+
+def _scorecard_sites():
+    lines = _run_item().splitlines()
+    return [(i, l) for i, l in enumerate(lines)
+            if "json_row" in l and "SCORECARD" in l]
+
+
+def test_the_scorecard_sites_are_found():
+    """A parser that finds nothing reports total compliance."""
+    assert len(_scorecard_sites()) >= 6
+
+
+def test_every_terminal_scorecard_row_records_a_kernel_outcome():
+    lines = _run_item().splitlines()
+    missing = []
+    for i, line in _scorecard_sites():
+        if any(k in line for k in _NO_KERNEL_OUTCOME):
+            continue
+        window = "\n".join(lines[max(0, i - 6):i])
+        if "_kernel_record_run_outcome" not in window:
+            missing.append(line.strip()[:90])
+    assert not missing, (
+        "these scorecard rows end a run without telling the kernel, so the "
+        "ledger keeps them in flight forever:\n  " + "\n  ".join(missing))
+
+
+def test_every_exemption_still_matches_a_real_site():
+    """A stale exemption is worse than none: it silently excuses whatever
+    site later happens to contain its text."""
+    sites = [l for _, l in _scorecard_sites()]
+    for key in _NO_KERNEL_OUTCOME:
+        assert sum(key in l for l in sites) == 1, (
+            f"exemption {key!r} matches {sum(key in l for l in sites)} sites, "
+            "expected exactly 1")
+
+
+def test_the_exempt_sites_really_are_before_a_generation_exists():
+    """The REASON the exemptions are legitimate, checked rather than asserted.
+
+    Every command is submitted under a dispatched generation. If one of these
+    sites drifted BELOW the dispatch, its exemption would no longer describe
+    anything true -- it would just be a site quietly opting out.
+    """
+    lines = _run_item().splitlines()
+    dispatch_at = next(i for i, l in enumerate(lines)
+                       if "_kernel_dispatch" in l and "BIRCHER_GENERATION=" in l)
+    for i, line in _scorecard_sites():
+        if any(k in line for k in _NO_KERNEL_OUTCOME):
+            assert i < dispatch_at, (
+                f"exempt site at run_item line {i} is BELOW the dispatch at "
+                f"{dispatch_at}; a generation exists, so it can and must "
+                f"record an outcome: {line.strip()[:80]}")

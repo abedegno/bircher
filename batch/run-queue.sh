@@ -3386,6 +3386,9 @@ ${prompt}"
     local nnote; nnote=$(_read_note "$NOOP_DIR/$code.noop")
     rm -f "$NOOP_DIR/$code.noop"
     mkdir -p "$(dirname "$SCORECARD")"
+    # The run is over: close its ledger before the scorecard row, so the
+    # kernel's terminal fact and the scorecard agree by construction.
+    _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "noop"
     json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=noop (no change needed)"
     _issue_writeback "$(_item_issue "$prompt")" "noop" "" "" "" ""
@@ -3400,6 +3403,9 @@ ${prompt}"
     local enote; enote=$(_read_note "$NOOP_DIR/$code.escalated")
     rm -f "$NOOP_DIR/$code.escalated"
     mkdir -p "$(dirname "$SCORECARD")"
+    # The run is over: close its ledger before the scorecard row, so the
+    # kernel's terminal fact and the scorecard agree by construction.
+    _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "escalated"
     json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=escalated (no PR; reason: ${enote:-n/a})"
     _issue_writeback "$(_item_issue "$prompt")" "escalated" "${pr:-}" "" "" ""
@@ -3520,6 +3526,9 @@ EOF
   fi
 
   mkdir -p "$(dirname "$SCORECARD")"
+  # The run is over: close its ledger before the scorecard row, so the
+  # kernel's terminal fact and the scorecard agree by construction.
+  _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
   json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
   _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"
   # #3: guarantee the issue closes when its PR actually merged (backstops a

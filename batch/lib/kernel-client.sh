@@ -320,6 +320,26 @@ _kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head_git_sha>
 
 # _kernel_record_outcome <run_id> <generation> <outcome> -- records
 # record_merge_outcome. *outcome* is "merged" or "failed".
+# _kernel_record_run_outcome <run_id> <generation> <outcome>
+#
+# The TERMINAL record: "this run is over, and here is what the coordinator
+# decided". Distinct from _kernel_record_outcome, which reports what a MERGE
+# did and is reachable only from merge_requested -- so before this existed,
+# every run that escalated, timed out, went noop or was skipped simply stopped
+# emitting facts and sat in `implementing` forever, indistinguishable from one
+# still running.
+#
+# The payload is built by python rather than interpolated, because a `"` in
+# $outcome would otherwise produce malformed JSON that the CLI rejects -- a
+# silent advisory failure at the one point in the run where the ledger records
+# how it ended.
+_kernel_record_run_outcome() {  # <run_id> <generation> <outcome>
+  local run_id="$1" generation="$2" outcome="$3" payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"outcome": sys.argv[1]}))' "$outcome" 2>/dev/null)     || payload='{"outcome":"unparseable"}'
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name record_run_outcome --payload-json "$payload"
+}
+
 _kernel_record_outcome() {  # <run_id> <generation> <outcome>
   local run_id="$1" generation="$2" outcome="$3"
   # record_merge_outcome
