@@ -3165,8 +3165,13 @@ run_item() {
   # batch/lib/kernel-client.sh's _kernel_run_start for why this is not
   # `_kernel command --name enqueue` (that command name does not exist).
   local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
-  _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" \
-    "${_base_sha:-0000000000000000000000000000000000000000}"
+  # Defaulted ONCE, here, rather than at the call below: the verdict binding
+  # must present the base the kernel actually recorded, and `validate_review`
+  # compares them. Defaulting at the call site left the binding free to send
+  # the empty string while the run held forty zeros -- a mismatch the reviewer
+  # could not have caused and could not have fixed.
+  : "${_base_sha:=0000000000000000000000000000000000000000}"
+  _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" "$_base_sha"
   local _iss; _iss=$(_item_issue "$prompt")
   # B-3 vendor dispatch: resolve THIS item's implementer and flip the reviewer to
   # the opposite vendor (cross-vendor integrity is invariant). A per-item queue tag
@@ -3482,13 +3487,17 @@ EOF
 
     # record_implementation_output, record_ci_observation: what this attempt
     # produced, and what CI said about the head it produced.
-    _kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body"
+    # The hash is the object under review. Captured rather than discarded so
+    # the verdict below can bind to it.
+    local _out_hash
+    _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body")
     _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_ci" "$marker_head"
 
     # A role change is a NEW dispatch and re-fences the generation.
     BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
     export BIRCHER_GENERATION
-    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review"
+    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
+      "$_out_hash" "$_base_sha" "$_spec_hash"
 
     BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
     export BIRCHER_GENERATION
@@ -3548,7 +3557,8 @@ EOF
     esac
     if [ "$_gate" != "skip" ]; then
       # request_merge, record_merge_outcome
-      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$marker_head"
+      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$marker_head" \
+        "$_out_hash" "$_base_sha" "$_spec_hash"
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
       local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
       _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"

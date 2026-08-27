@@ -114,6 +114,12 @@ HEAD_SHA = "b" * 40
 #: and `test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha` can actually
 #: discriminate which variable landed where.
 REVIEWED_SHA = "c" * 40
+
+#: What the stubbed `_kernel_record_output` echoes. Deliberately NOT a plausible
+#: sha and deliberately not equal to any other constant here: the point is to
+#: prove the value the coordinator binds is the one that call RETURNED, and a
+#: hash that merely looks right could be arriving from anywhere.
+OUT_HASH = "outputhash" + "0" * 54
 VENDOR = "claude_code"
 REVIEWER = "codex"
 PR = "777"
@@ -254,7 +260,7 @@ _kernel_run_start()          {{ _log_call _kernel_run_start "$@"; }}
 _kernel_submit_spec()        {{ _log_call _kernel_submit_spec "$@"; }}
 _kernel_submit_plan()        {{ _log_call _kernel_submit_plan "$@"; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
-_kernel_record_output()      {{ _log_call _kernel_record_output "$@"; }}
+_kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
@@ -341,7 +347,7 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
 
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
-        marker_body=marker_body, reviewed_sha=REVIEWED_SHA,
+        marker_body=marker_body, reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH,
     )
     if not merge_ok:
         stub = stub.replace(
@@ -500,11 +506,39 @@ def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
 
 
 def test_record_review_gets_the_raw_marker_verdict_at_the_reviewer_generation(happy_drive):
+    """The RAW marker verdict, still -- the coordinator passes what it read and
+    `_kernel_verdict` translates it in the client. Translating here instead
+    would put the mapping on the side that cannot be tested against the
+    kernel's vocabulary."""
     calls, _ = happy_drive
     name, args = calls[9]
     assert name == "_kernel_record_review"
     run_id = calls[0][1][0]
-    assert args == [run_id, "2", "codex:pass"], args
+    assert args[:3] == [run_id, "2", "codex:pass"], args
+
+
+def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive):
+    """A verdict alone approves nothing, and a binding of invented values
+    approves everything. Each field is asserted against the value the RUN
+    produced, not against a constant this test chose:
+
+      artifact -- exactly what _kernel_record_output echoed, so a coordinator
+                  that stopped capturing it, or invented a hash, reds here;
+      base     -- exactly what _kernel_run_start recorded, which is the
+                  comparison validate_review makes;
+      context  -- exactly the spec artifact _kernel_submit_spec named.
+    """
+    calls, _ = happy_drive
+    by_name = {n: a for n, a in calls}
+    _, args = calls[9]
+
+    assert args[3] == OUT_HASH, (
+        "the review does not bind the hash _kernel_record_output returned")
+    assert args[4] == by_name["_kernel_run_start"][2], (
+        "the review binds a different base than the run was started with -- "
+        "validate_review compares exactly these two")
+    assert args[5] == by_name["_kernel_submit_spec"][2], (
+        "the review binds a context hash that is not this run's spec artifact")
 
 
 def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):
@@ -525,8 +559,22 @@ def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3(happy_drive):
     name, args = calls[11]
     assert name == "_kernel_request_merge"
     run_id = calls[0][1][0]
-    assert args == [run_id, "3", PR, "acme/widgets", HEAD_SHA], args
+    assert args[:5] == [run_id, "3", PR, "acme/widgets", HEAD_SHA], args
     assert HEAD_SHA != REVIEWED_SHA  # the whole point -- see REVIEWED_SHA above
+
+
+def test_request_merge_presents_the_SAME_binding_the_review_did(happy_drive):
+    """`_merge_is_authorized` hashes the binding and looks for a kernel-recorded
+    `accept` against that exact hash. If the merge request presents any other
+    tuple it finds no approval -- so these two must be identical field for
+    field, and asserting them against each other is the only way to catch a
+    drift that leaves both individually plausible."""
+    calls, _ = happy_drive
+    _, review = calls[9]
+    _, merge = calls[11]
+    assert merge[5:8] == review[3:6], (
+        f"merge binds {merge[5:8]} but the review bound {review[3:6]}; the "
+        "merge gate will find no approval for this tuple")
 
 
 def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):

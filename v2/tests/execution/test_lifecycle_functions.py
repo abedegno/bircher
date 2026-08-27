@@ -61,30 +61,33 @@ With the run correctly advanced to `implementing`, empirical replay
 `submit_spec`, `submit_plan`, `start_implementation`,
 `record_implementation_output` and `record_ci_observation` are all
 ACCEPTED. `record_review`, `request_merge` and `record_merge_outcome` remain
-refused, but for three DIFFERENT and now-informative reasons rather than one
-repeated one:
+accepted all the way to the merge gate. That was not always true, and the
+history is the point:
 
-  - `record_review`: NotAuthorized, "verdict 'codex:pass' is not one of
-    ['accept', 'reject', 'request_revision']" -- the marker's `review=`
-    field is `<vendor>:<verdict>` (e.g. `codex:pass`), a vocabulary
-    `kernel.authz._VERDICTS` does not share. The state gate is satisfied
-    (`implementing` is legal for record_review); this is a genuine
-    vocabulary mismatch between run-queue.sh's marker format and the
-    kernel's verdict set, not a missing transition. NOT fixed here --
-    CONTEXT scopes this task to the three missing transitions, and mapping
-    marker verdicts to kernel verdicts is a separate, larger decision
-    (what does `revision requested` map to? is a "fail" ever legal to
-    merge on?) than this fix round asked for.
-  - `request_merge` / `record_merge_outcome`: NotAuthorized, state-illegal
-    (`reviewing` / `merge_requested` required) -- because `record_review`
-    never accepts, the run never leaves `implementing`, so these two never
-    become reachable. A direct consequence of the point above, not a
-    separate defect.
+  - `record_review` used to be refused -- "verdict 'codex:pass' is not one
+    of ['accept', 'reject', 'request_revision']". The marker's `review=`
+    field is `<vendor>:<verdict>`, a vocabulary the kernel does not share.
+    An earlier version of this docstring recorded that as deferred ("NOT
+    fixed here... a separate, larger decision"), and it stayed deferred
+    until a real end-to-end run produced it live.
+  - `request_merge` / `record_merge_outcome` were then refused as
+    state-illegal, because the run never left `implementing`. One unmapped
+    word, three refusals, and the whole merge-authorisation chain down.
 
-That is not a defect this task's brief asks it to fix (CONTEXT: "Expect
-most commands in a first real run to be shadow-refused; that is the point,
-not a bug") -- but "refused for an informative, state-correct reason" and
-"never even reaches the kernel" are different failure shapes, and this file
+Both are fixed. `_kernel_verdict` translates the marker's vocabulary
+(`:pass` -> accept, `:fail` -> request_revision, `na` -> not recorded at
+all, because a run nobody reviewed must not carry a verdict), and
+`_kernel_record_review` / `_kernel_request_merge` now carry the verdict
+BINDING the kernel requires -- artifact, base, context bundle, policy
+version. Translating the word alone would have moved the refusal to
+"malformed verdict binding: 'policy_version'" and read like progress.
+
+What remains refused is `record_merge_outcome`, and it is not a gap: this
+driver performs no merge effect, and a merged outcome demands a confirmed
+one. See test_the_one_remaining_refusal_is_the_evidence_check_not_a_gap.
+
+"refused for an informative, state-correct reason" and "never even reaches
+the kernel" are different failure shapes, and this file
 tells them apart: every stage's COMMAND_REQUESTED fact must land even when
 its COMMAND_ACCEPTED does not.
 """
@@ -382,14 +385,16 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     gen1 = r.stdout.strip().strip("[]")
     assert gen1 == "1", (r.stdout, r.stderr)
 
-    _run(f'h=$(_kernel_put_artifact {prompt!r}); '
-         f'_kernel_submit_spec {run_id} {gen1} "$h"; '
-         f'_kernel_submit_plan {run_id} {gen1} "$h"',
-         env=_db_env(db))
+    r = _run(f'h=$(_kernel_put_artifact {prompt!r}); '
+             f'_kernel_submit_spec {run_id} {gen1} "$h"; '
+             f'_kernel_submit_plan {run_id} {gen1} "$h"; printf %s "$h"',
+             env=_db_env(db))
+    spec_hash = r.stdout.strip()
     _run(f"_kernel_start_implementation {run_id} {gen1}", env=_db_env(db))
 
     body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
-    _run(f"_kernel_record_output {run_id} {gen1} {body!r}", env=_db_env(db))
+    r = _run(f"_kernel_record_output {run_id} {gen1} {body!r}", env=_db_env(db))
+    out_hash = r.stdout.strip()
     _run(f"_kernel_record_ci {run_id} {gen1} success {HEAD_SHA}", env=_db_env(db))
 
     r = _run('g=$(_kernel_dispatch codex reviewer); echo "[$g]"',
@@ -397,15 +402,16 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     gen2 = r.stdout.strip().strip("[]")
     assert gen2 == "2", (r.stdout, r.stderr)
 
-    _run(f"_kernel_record_review {run_id} {gen2} codex:pass", env=_db_env(db))
+    _run(f"_kernel_record_review {run_id} {gen2} codex:pass "
+         f"{out_hash} {BASE_SHA} {spec_hash}", env=_db_env(db))
 
     r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen3 = r.stdout.strip().strip("[]")
     assert gen3 == "3", (r.stdout, r.stderr)
 
-    _run(f"_kernel_request_merge {run_id} {gen3} 42 abedegno/muesli {HEAD_SHA}",
-         env=_db_env(db))
+    _run(f"_kernel_request_merge {run_id} {gen3} 42 abedegno/muesli {HEAD_SHA} "
+         f"{out_hash} {BASE_SHA} {spec_hash}", env=_db_env(db))
     _run(f"_kernel_record_outcome {run_id} {gen3} merged", env=_db_env(db))
     return gen1, gen2, gen3
 
@@ -453,10 +459,12 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
-    assert store.run_state(run_id) == "implementing", (
-        "record_review's payload never carries a kernel-vocabulary verdict "
-        "(see module docstring), so the run advances to 'implementing' and "
-        "stops there -- it must not still be 'queued'"
+    assert store.run_state(run_id) == "merge_requested", (
+        "the lifecycle now runs to the merge gate: record_review carries a "
+        "translated verdict AND a real binding, so the run reaches 'reviewing' "
+        "and request_merge is authorized. It previously stopped at "
+        "'implementing' because the marker's `vendor:verdict` shape was not "
+        "the kernel's vocabulary."
     )
     facts = store.facts_for(run_id)
     accepted_names = {
@@ -465,6 +473,7 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     assert accepted_names == {
         "submit_spec", "submit_plan", "start_implementation",
         "record_implementation_output", "record_ci_observation",
+        "record_review", "request_merge",
     }, accepted_names
 
     expected_hash = hashlib.sha256(b"do the thing").hexdigest()
@@ -474,16 +483,21 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     ).hexdigest()
 
 
-def test_the_remaining_refusals_are_informative_not_repeated(tmp_path):
-    """The three stages that stay refused must be refused for THREE
-    different, state-correct reasons -- not the one repeated "queued is
-    illegal" message that made the pre-fix shadow report uninformative
-    (CONTROLLER: "the shadow report Task 5 builds would be one message
-    repeated five times, teaching nothing"). record_review is refused for a
-    vocabulary mismatch (the marker's `vendor:verdict` shape vs. the
-    kernel's accept/reject/request_revision set) with the state gate
-    already satisfied; request_merge and record_merge_outcome are refused
-    because the run consequently never reaches `reviewing` / merge_requested.
+def test_the_one_remaining_refusal_is_the_evidence_check_not_a_gap(tmp_path):
+    """Three commands used to be refused; one still is, and for a different
+    KIND of reason.
+
+    The old three were a cascade from a single defect: the marker's
+    `vendor:verdict` shape was not the kernel's vocabulary, so record_review
+    was refused, so the run never reached `reviewing`, so request_merge and
+    record_merge_outcome were refused for being state-illegal. That was a
+    wiring gap wearing three faces -- and a live run produced exactly it.
+
+    What remains is not a gap. This driver never PERFORMS a merge effect, and
+    record_merge_outcome with outcome=merged demands a confirmed one, because
+    a merge outcome reports what the mechanism observed rather than what an
+    actor claims. The refusal is the gate doing its job; production reaches it
+    through merge_ready_pr, which performs the merge through `_effect`.
     """
     db = tmp_path / "kernel.db"
     run_id = "run-refusals"
@@ -494,11 +508,11 @@ def test_the_remaining_refusals_are_informative_not_repeated(tmp_path):
         f.payload["command_name"]: f.payload["detail"]
         for f in store.facts_for(run_id) if f.kind == EventKind.COMMAND_REJECTED
     }
-    assert set(rejected) == {"record_review", "request_merge", "record_merge_outcome"}, rejected
-    assert "not one of" in rejected["record_review"], rejected["record_review"]
-    assert "codex:pass" in rejected["record_review"], rejected["record_review"]
-    assert "not legal from state 'implementing'" in rejected["request_merge"], rejected
-    assert "not legal from state 'implementing'" in rejected["record_merge_outcome"], rejected
+    assert set(rejected) == {"record_merge_outcome"}, rejected
+    assert "no confirmed merge effect" in rejected["record_merge_outcome"], rejected
+    assert "not legal from state" not in rejected["record_merge_outcome"], (
+        "a state-illegal refusal here would mean the run never reached the "
+        "merge gate -- the cascade is back")
 
 
 # --- the terminal record, driven for real -------------------------------------

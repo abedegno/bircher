@@ -281,7 +281,12 @@ _kernel_start_implementation() {  # <run_id> <generation>
 # no hash to name and no run_implementation_output call is made at all (a
 # missing artifact is warned about once, by `_kernel_put_artifact`, not
 # twice by also sending a command that names an empty hash).
-_kernel_record_output() {  # <run_id> <generation> <body>
+# ECHOES the artifact hash it PUT, on stdout, so the caller can bind a review
+# to it. Without that the coordinator has no way to name the object under
+# review: `validate_review` requires the binding's artifact_hash to equal
+# `store.current_artifact(run_id)`, which is exactly what this PUT set, and a
+# hash the caller invented would be refused (rightly).
+_kernel_record_output() {  # <run_id> <generation> <body> -- echoes the hash
   local run_id="$1" generation="$2" body="$3" hash
   hash=$(_kernel_put_artifact "$body")
   [ -n "$hash" ] || return 0
@@ -289,6 +294,38 @@ _kernel_record_output() {  # <run_id> <generation> <body>
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_implementation_output \
     --payload-json "{\"artifact_hash\":\"$hash\"}"
+  printf '%s' "$hash"
+}
+
+# The policy version every binding this coordinator produces carries. An int,
+# because the kernel refuses anything else (`type(...) is int`: int(1.9) == 1
+# would silently bind a review recorded under a different policy).
+_KERNEL_POLICY_VERSION=1
+
+# _kernel_verdict <coordinator_verdict> -- echoes the KERNEL's word, or empty.
+#
+# The two vocabularies were never reconciled and the mismatch was invisible
+# until a real run produced it: the coordinator says `<vendor>:pass`, the
+# kernel accepts only {accept, reject, request_revision}, so every
+# record_review was refused -- and because the run then never left
+# `implementing`, request_merge and record_merge_outcome were refused too. One
+# unmapped word collapsed the whole merge-authorisation chain.
+#
+# `fail` maps to request_revision, not reject: in this pipeline a failed
+# review sends the work back for another round, and `request_revision` is the
+# verdict that returns the run to `planned` so implementation can start again.
+# `reject` would leave it in `reviewing` with nowhere to go.
+#
+# `na` maps to NOTHING and is not submitted. It means no review happened (the
+# blind-teardown path records it), and a run that was never reviewed must not
+# carry a verdict fact saying otherwise -- that would be a claim with no
+# observation behind it, in the one place this design exists to prevent that.
+_kernel_verdict() {
+  case "$1" in
+    *:pass) printf 'accept' ;;
+    *:fail) printf 'request_revision' ;;
+    *)      printf '' ;;
+  esac
 }
 
 # _kernel_record_ci <run_id> <generation> <status> <head_git_sha> -- records
@@ -301,21 +338,54 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
     --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"}"
 }
 
-# _kernel_record_review <run_id> <generation> <verdict> -- records
-# record_review.
-_kernel_record_review() {  # <run_id> <generation> <verdict>
-  local run_id="$1" generation="$2" verdict="$3"
+# _kernel_record_review <run_id> <generation> <verdict> <artifact_hash>
+#                       <base_sha> <context_hash>
+#
+# A verdict alone is not a review. `validate_review` requires the BINDING --
+# which artifact, which base, which context bundle, under which policy version
+# -- because an approval that names nothing approves everything, and the merge
+# gate compares this tuple against the one presented at request_merge.
+#
+# Sending only {"verdict": ...} was therefore refused twice over: first for the
+# untranslated verdict word, and behind that for `malformed verdict binding:
+# 'policy_version'`. Fixing only the word would have moved the refusal without
+# moving the outcome -- and read like progress.
+#
+# The values are the coordinator's OWN: the hash it PUT, the base it resolved,
+# the prompt it sent. Deliberately not read back from the kernel: a binding the
+# caller fetches from the mechanism and hands straight back makes the
+# mechanism's check compare a value against itself.
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context>
+  local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
+  local verdict; verdict=$(_kernel_verdict "$raw")
+  if [ -z "$verdict" ]; then
+    _kernel_warn "no kernel verdict for '$raw' -- not recording a review"
+    return 0
+  fi
+  if [ -z "$artifact" ] || [ -z "$base" ] || [ -z "$context" ]; then
+    _kernel_warn "incomplete verdict binding (artifact='$artifact' base='$base' context='$context') -- not recording a review"
+    return 0
+  fi
   _kernel command --run-id "$run_id" --generation "$generation" \
-    --name record_review --payload-json "{\"verdict\":\"$verdict\"}"
+    --name record_review \
+    --payload-json "{\"verdict\":\"$verdict\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
 }
 
-# _kernel_request_merge <run_id> <generation> <pr> <repo> <head_git_sha> --
-# records request_merge.
-_kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head_git_sha>
+# _kernel_request_merge <run_id> <generation> <pr> <repo> <head_git_sha>
+#                       <artifact_hash> <base_sha> <context_hash>
+#
+# Carries the SAME binding the review carried. `_merge_is_authorized` hashes
+# this tuple and looks for a kernel-recorded `accept` against that exact hash,
+# so a merge request whose binding differs by one field -- a superseded
+# artifact, a different base -- finds no approval and is refused. That is the
+# gate working; presenting no binding at all just fails it earlier and less
+# informatively.
+_kernel_request_merge() {  # <run_id> <generation> <pr> <repo> <head> <artifact> <base> <context>
   local run_id="$1" generation="$2" pr="$3" repo="$4" head="$5"
+  local artifact="$6" base="$7" context="$8"
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name request_merge \
-    --payload-json "{\"pr\":\"$pr\",\"repo\":\"$repo\",\"head_git_sha\":\"$head\"}"
+    --payload-json "{\"pr\":\"$pr\",\"repo\":\"$repo\",\"head_git_sha\":\"$head\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
 }
 
 # _kernel_record_run_outcome <run_id> <generation> <outcome>
