@@ -821,3 +821,69 @@ The check that settled it took four minutes and could have been run first.
 the kernel publishes correctly either way, and that is separately proved. What
 depends on it is the claim that publication through the kernel is the *only*
 route available to an implementer.
+
+---
+
+# C8 Phase 2 — retire the marker (in progress)
+
+Branch `c8/phase-2`, four of six tasks complete. Phase 1 landed on `main`
+first (fast-forward, 170 commits, verified green on the merged result).
+
+## What is done and proved
+
+**Tasks 1-4: the marker is gone from the code.** `parse_marker` (30 lines),
+`_marker_bodies_since` (20) and their self-tests (44) are deleted;
+`run_item` derives every outcome field from the repository via
+`observe_outcome`; `test_marker_is_gone.py` fails if any shipped file writes or
+reads a `bircher-status:` line again. 640 tests pass, `--self-test` green.
+
+Twelve mutations across the three tasks, each proved applied and restored
+clean; all twelve killed. The one the plan left open — "delete the empty-tuple
+guard; if no existing test reds, the guard is unbound and the task is not
+done" — reds
+`test_an_empty_recovery_tuple_is_treated_as_a_failure[run_item]`.
+
+**`observe_ci_history` verified against live GitHub**, which no unit test can
+do since they all stub `gh`:
+
+    main -> true|8
+    raw API: finished_runs=100 distinct_shas=9
+    earliest finished run: 2026-08-17T23:07:29Z success
+    a branch that never existed -> unknown|
+
+Nine distinct shas gives eight resubmissions; the earliest finished run
+succeeded, so `ci_first=true`. A branch with no history reports `unknown`, not
+`false|0` — the distinction the mutation table exists to protect.
+
+**`observe_outcome` emits seven fields with live CI history** against a real
+PR (`escalated|codex:na|...|||true|2`, the `true|2` read from the API).
+
+## What is NOT done
+
+**Task 6 (a full item end to end, no marker anywhere) has not run.** It needs a
+live coordinator session, and session dispatch on this runner failed four of
+five attempts tonight: `omnigent run` returns while the harness is still
+starting, and the session goes idle without executing its queued message. That
+is an orchestration problem, not a Phase 2 result, but it means criterion 1 of
+Phase 2 is untested and the field-mapping table (criterion 2) is written from
+the code rather than from an observed run.
+
+**Task 5 (make the denied push legible) is suspended, not skipped.** Its whole
+premise — that a denied push hangs — rests on the criterion-1 claim withdrawn
+above. If the boundary does not deny the push at all, there is no stall to
+bound and the task should be deleted rather than done. Resolving the boundary
+question comes first.
+
+## The scorecard mapping, from the code
+
+Written from the source, NOT from an observed run — see Task 6 above.
+
+| field | observation |
+|---|---|
+| `outcome` | `classify_recovery(pr, ci, verdict)` |
+| `review` | `observe_review` — a reviewer run-queue dispatched itself |
+| `ci_pass_first_try` | earliest finished workflow run's conclusion |
+| `resubmissions` | distinct head shas CI ran on, minus one |
+| `rounds` | **null** — no observation exists; renamed, not redefined |
+| `pr`, `wall_seconds`, `bound`, `implementer` | unchanged, already observed |
+| `cost` | **null** — unchanged, never populated |
