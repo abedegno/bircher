@@ -326,3 +326,19 @@ def test_find_run_matches_the_code_PREFIX_not_a_substring(tmp_path):
 
     assert _run('_kernel_find_run ITEM-9',
                 env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
+
+
+def test_a_run_recorded_with_an_EMPTY_base_reads_back_empty(tmp_path):
+    """The `or ""` path, which is NOT the unknown-run path above.
+
+    An unknown run raises inside the store and is caught; a run that EXISTS
+    with no recorded base returns falsy and falls to the `or`. Nothing reached
+    that line, so mutating it to return forty zeros survived all 614 tests --
+    a lookup that would have handed `publish_cmd` a fabricated base for a run
+    the kernel started but never based.
+    """
+    db = tmp_path / "kernel.db"
+    Store.open(db).create_run(run_id="ITEM-7-a", base_repo="o/r", base_sha="")
+
+    assert _run('_kernel_run_base ITEM-7-a',
+                env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
