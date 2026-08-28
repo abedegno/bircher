@@ -44,7 +44,7 @@ LOG={log}
 _log() {{ printf '%s\\n' "$*" >> "$LOG"; }}
 
 _kernel_pending() {{ printf '%s' {pend!r}; }}
-_kernel_reconcile() {{ _log "RECONCILE key=$2 version=$4"; }}
+_kernel_reconcile() {{ _log "RECONCILE version=$3 keys=${{*:4}}"; }}
 _kernel_adopt_run() {{ BIRCHER_RUN_ID=run-1; export BIRCHER_RUN_ID
                        BIRCHER_GENERATION=3; export BIRCHER_GENERATION; }}
 _kernel_dispatch() {{ printf '3'; }}
@@ -73,35 +73,40 @@ recover_pr_cmd probe {pr} claude_code || true
     return [l for l in (log.read_text().splitlines() if log.exists() else [])]
 
 
-def test_only_ONE_key_is_reconciled_per_invocation(tmp_path):
-    """Two uncertain merges for this PR: exactly one reconcile, at the version
-    this invocation observed. The second is left for an invocation that will
-    make its own observation."""
+def test_every_key_for_this_PR_is_reconciled_in_ONE_call(tmp_path):
+    """Two uncertain merges for this PR: ONE reconcile call carrying both, at
+    the version this invocation observed.
+
+    Resolving them in separate calls cannot be made safe from here -- a CAS
+    cannot distinguish this caller's own version bump from a foreign writer's --
+    so the kernel does them under a single CAS in one transaction.
+    """
     calls = _drive_halt(tmp_path, [
         {"effect_class": "merge", "idempotency_key": "merge:730:aaa"},
         {"effect_class": "merge", "idempotency_key": "merge:730:bbb"},
     ])
     recs = [c for c in calls if c.startswith("RECONCILE")]
-    assert len(recs) == 1, f"expected exactly one reconcile, got: {recs}"
-    assert recs[0] == "RECONCILE key=merge:730:aaa version=11", recs
+    assert len(recs) == 1, f"expected exactly ONE call carrying both keys: {recs}"
+    assert recs[0] == "RECONCILE version=11 keys=merge:730:aaa merge:730:bbb", recs
 
 
 def test_the_reconcile_uses_the_version_this_invocation_OBSERVED(tmp_path):
-    """Not an incremented guess, and not a re-read: the version reported by the
+    """Not an incremented guess and not a re-read: the version reported by the
     same `pending` call the keys came from."""
     calls = _drive_halt(tmp_path, [
         {"effect_class": "merge", "idempotency_key": "merge:730:aaa"}])
     recs = [c for c in calls if c.startswith("RECONCILE")]
-    assert recs == ["RECONCILE key=merge:730:aaa version=11"], recs
+    assert recs == ["RECONCILE version=11 keys=merge:730:aaa"], recs
 
 
 def test_another_prs_uncertain_merge_is_never_reconciled(tmp_path):
     """The observation is about this PR. A merge key for another PR held by the
-    same adopted run must not be resolved by it."""
+    same adopted run must not be resolved by it -- not even now that the call
+    carries several keys at once."""
     calls = _drive_halt(tmp_path, [
         {"effect_class": "merge", "idempotency_key": "merge:999:zzz"},
         {"effect_class": "merge", "idempotency_key": "merge:730:aaa"},
     ])
     recs = [c for c in calls if c.startswith("RECONCILE")]
-    assert recs == ["RECONCILE key=merge:730:aaa version=11"], (
+    assert recs == ["RECONCILE version=11 keys=merge:730:aaa"], (
         f"another PR's merge was reconciled from this PR's observation: {recs}")

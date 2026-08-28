@@ -165,3 +165,49 @@ def test_a_fresh_key_after_reconciliation_does_execute(db, capsys):
                             lambda *a: ran.append(1) or "ext-2")
     assert ran == [1], "a fresh attempt did not execute"
     assert out == "ext-2"
+
+
+def test_several_keys_are_resolved_under_ONE_cas(db, capsys):
+    """The reason this exists at all.
+
+    A CAS cannot distinguish the caller's own version bump from a foreign
+    writer's, so resolving N keys from outside is unsafe in both available
+    shapes: re-reading the version absorbs a foreign change, and incrementing
+    locally absorbs it one step later because an advisory wrapper cannot
+    confirm the previous call succeeded. Two review rounds were spent finding
+    that those are the same defect, and a third worked around it by resolving
+    one key per invocation -- correct, but it left a run with several uncertain
+    effects halted with nothing owning the follow-up.
+    """
+    from kernel.effects import EffectClass, UncertainEffect, _perform_unhalted
+
+    s = _halt(db, key="k1")
+    g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    with pytest.raises(UncertainEffect):
+        _perform_unhalted(s, "r", g, EffectClass.COMMENT, "k2",
+                          valid_argv(EffectClass.COMMENT),
+                          lambda *a: (_ for _ in ()).throw(TimeoutError("no answer")))
+
+    v = _pending(db, capsys)["version"]
+    assert main(["reconcile", "--db", db, "--run-id", "r",
+                 "--idempotency-key", "k1", "--idempotency-key", "k2",
+                 "--resolution", "observed: neither landed",
+                 "--expected-version", str(v)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["halted"] is False and out["pending"] == [], out
+    assert is_halted(Store.open(db), "r") is False
+
+
+def test_a_batch_naming_an_already_resolved_key_is_refused_ENTIRELY(db, capsys):
+    """A partial reconciliation is a state nobody asked for: some effects
+    resolved, the halt possibly cleared, and no record of which half applied."""
+    _halt(db, key="k1")
+    v = _pending(db, capsys)["version"]
+    rc = main(["reconcile", "--db", db, "--run-id", "r",
+               "--idempotency-key", "k1", "--idempotency-key", "never-existed",
+               "--resolution", "x", "--expected-version", str(v)])
+    assert rc != 0
+    s = Store.open(db)
+    assert is_halted(s, "r") is True, "a refused batch cleared the halt anyway"
+    assert s.effect_state("k1", run_id="r") in ("uncertain", "intended"), (
+        "the valid half of a refused batch was applied")

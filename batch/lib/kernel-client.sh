@@ -157,9 +157,20 @@ _kernel_pending() {  # <run_id>
 # recorded with the version it was derived from, so a run that moved in the
 # meantime refuses it rather than applying a conclusion drawn about a different
 # state.
-_kernel_reconcile() {  # <run_id> <key> <resolution> <expected_version>
-  local run_id="$1" key="$2" resolution="$3" version="$4"
-  _kernel reconcile --run-id "$run_id" --idempotency-key "$key" \
+# Takes ONE OR MORE keys. They are resolved together, under one CAS, in one
+# kernel transaction -- because resolving them one call at a time cannot be
+# made safe from out here: a CAS cannot distinguish this caller's own version
+# bump from a foreign writer's, so both re-reading the version and incrementing
+# it locally absorb someone else's change. Two review rounds were spent finding
+# out those are the same defect, and a third worked around it by resolving only
+# one key per invocation, which left a run with several uncertain effects
+# halted with nothing owning the follow-up.
+_kernel_reconcile() {  # <run_id> <resolution> <expected_version> <key>...
+  local run_id="$1" resolution="$2" version="$3"; shift 3
+  [ "$#" -gt 0 ] || return 0
+  local args=() k
+  for k in "$@"; do args+=(--idempotency-key "$k"); done
+  _kernel reconcile --run-id "$run_id" "${args[@]}" \
     --resolution "$resolution" --expected-version "$version"
 }
 

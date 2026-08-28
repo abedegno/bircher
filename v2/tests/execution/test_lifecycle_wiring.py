@@ -663,39 +663,32 @@ def test_reconciliation_is_scoped_to_the_class_the_observation_speaks_to():
         "silently left out of the log")
 
 
-def test_reconciliation_resolves_ONE_key_per_invocation():
-    """Two repairs died here before this one, both pinned by a test I wrote.
+def test_reconciliation_submits_every_key_in_ONE_call():
+    """Three shapes have now been tried here, and only this one is safe.
 
-    Re-reading the version per key absorbs an unrelated writer's change and
-    reconciles against a run that has moved. Incrementing it locally does the
-    SAME THING one step later: `_kernel_reconcile` is advisory and returns 0
-    whatever happened, so after key 1's CAS correctly fails at version V --
-    because a foreign writer moved the run to V+1 -- the loop still advanced
-    its expectation to V+1, and key 2 then succeeded against that foreign
-    version. An increment is only valid after a KNOWN-successful
-    reconciliation, and this interface cannot establish one.
+    Re-reading the version per key absorbs an unrelated writer's change.
+    Incrementing it locally absorbs the same change one step later, because an
+    advisory wrapper cannot confirm the previous reconciliation happened. One
+    key per invocation is correct but leaves a run with several uncertain
+    effects halted with nothing owning the follow-up.
 
-    So exactly one key is resolved per invocation, against the version that
-    invocation actually observed. The rest are named and the halt stands.
+    A CAS simply cannot distinguish this caller's own bump from a foreign one,
+    so the resolution belongs where the version is bumped exactly once and only
+    by us: inside a single kernel transaction. The caller now collects the keys
+    and hands them over together.
     """
     src = RUN_QUEUE.read_text().splitlines()
     start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
-    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
 
-    loop = next(i for i, l in enumerate(body) if "while IFS= read -r _k" in l)
-    done = next(i for i in range(loop, len(body)) if body[i].strip() == "EOF")
-    inside = "\n".join(body[loop:done])
-
-    assert "_done=1" in inside and '"$_done" = 1' in inside, (
-        "the loop reconciles every key in one invocation; after the first, its "
-        "expected version is a guess about state it has not observed")
-    assert "_pver=$(( ${_pver:-0} + 1 ))" not in inside, (
-        "the local increment is back: it advances the expectation past a "
-        "reconciliation the advisory wrapper cannot confirm happened")
-    assert "_kernel_pending" not in inside, (
-        "the version is re-read inside the loop, which absorbs an unrelated "
-        "writer's change and defeats the CAS it appears to honour")
+    assert '_kernel_reconcile "$BIRCHER_RUN_ID" "$_resolution" "${_pver:-0}" "${_karr[@]}"' in body, (
+        "the keys are not submitted together, so whatever version the second "
+        "one uses is a guess about state this code has not observed")
+    assert "_pver=$(( ${_pver:-0} + 1 ))" not in body, "the local increment is back"
+    assert "_done=1" not in body, (
+        "the one-key-per-invocation workaround is still here alongside the "
+        "atomic call; only one of them can be the contract")
 
 
 def test_the_sweep_prefers_the_run_that_opened_the_PR():
@@ -805,28 +798,22 @@ def test_the_recovery_bindings_CONSUME_the_adopted_base():
 
 
 def test_reconciliation_does_not_claim_a_success_it_cannot_know():
-    """`_kernel` is advisory and returns 0 whatever happened, so the loop
-    cannot know a reconciliation succeeded. It printed "reconciled" over the
-    top of a swallowed "stale: ... which has moved" -- and the commit that
-    introduced the loop named that exact shape as its motivation, then repaired
-    only the staleness half."""
+    """`_kernel` is advisory and returns 0 whatever happened, so nothing here
+    can know a reconciliation succeeded. It once printed "reconciled" over the
+    top of a swallowed "stale: ... which has moved"."""
     src = RUN_QUEUE.read_text().splitlines()
     start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
-    body = [l for l in src[start:end] if not l.strip().startswith("#")]
-    joined = "\n".join(body)
+    body = "\n".join(l for l in src[start:end] if not l.strip().startswith("#"))
 
-    loop = next(i for i, l in enumerate(body) if "while IFS= read -r _k" in l)
-    done = next(i for i in range(loop, len(body)) if body[i].strip() == "EOF")
-    inside = "\n".join(body[loop:done])
-    assert "reconciled $_k" not in inside, (
-        "the loop asserts a reconciliation succeeded; the advisory wrapper "
-        "cannot tell it that")
-    assert "attempting reconcile" in inside
-
-    assert "after reconciliation the kernel reports" in joined, (
-        "nothing reads the halt back, so the log's only account of the outcome "
-        "is an assumption")
+    assert "attempting reconcile" in body, "the log asserts an outcome it cannot know"
+    assert "after reconciliation the kernel reports" in body, (
+        "nothing reads the halt back, so the only account of the outcome is an "
+        "assumption")
+    assert "still halted after reconciliation" in body, (
+        "the read-back is printed and never consulted: a run still halted here "
+        "has every later effect refused, and driving on produces guaranteed "
+        "refusals and a merge that cannot happen")
 
 
 def test_the_drive_flag_is_actually_CONSUMED():

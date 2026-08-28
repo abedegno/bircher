@@ -791,7 +791,7 @@ def test_kernel_reconcile_actually_clears_a_halt_through_bash(tmp_path):
 
     out = json.loads(_run('_kernel_pending r-halt', env=_db_env(db)).stdout)
     key = out["pending"][0]["idempotency_key"]
-    _run(f'_kernel_reconcile r-halt {key!r} "observed: it did not land" {out["version"]}',
+    _run(f'_kernel_reconcile r-halt "observed: it did not land" {out["version"]} {key!r}',
          env=_db_env(db))
 
     assert not is_halted(Store.open(db), "r-halt"), (
@@ -807,7 +807,7 @@ def test_a_reconciliation_at_a_stale_version_does_not_clear_the_halt(tmp_path):
     _halted_run(db)
     out = json.loads(_run('_kernel_pending r-halt', env=_db_env(db)).stdout)
     key = out["pending"][0]["idempotency_key"]
-    _run(f'_kernel_reconcile r-halt {key!r} "stale" {out["version"] - 1}',
+    _run(f'_kernel_reconcile r-halt "stale" {out["version"] - 1} {key!r}',
          env=_db_env(db))
     from kernel.effects import is_halted
     assert is_halted(Store.open(db), "r-halt"), "a stale CAS cleared the halt"

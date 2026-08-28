@@ -280,6 +280,57 @@ def pending_reconciliation(store, run_id: str) -> list[dict]:
     return store.uncertain_effects(run_id)
 
 
+def reconcile_many(store, run_id, keys, resolution, expected_version) -> int:
+    """Resolve SEVERAL uncertain effects under ONE CAS, in one transaction.
+
+    Why this exists rather than a loop in the caller. A CAS cannot distinguish
+    the caller's own version bump from a foreign writer's, so resolving N keys
+    one at a time is unsafe in both available shapes: re-reading the version
+    absorbs a foreign change, and incrementing locally absorbs it one step
+    later, because an advisory wrapper cannot confirm that the previous
+    reconciliation actually happened. Two rounds of review were spent
+    discovering that those are the same defect.
+
+    The caller was then reduced to one key per invocation, which is correct and
+    leaves a run with several uncertain effects halted with nothing owning the
+    follow-up. The fix is not a cleverer caller: it is doing the whole thing
+    atomically HERE, where the version is only bumped once and only by us.
+
+    Returns the number resolved. Refuses the whole batch if any key is not
+    unresolved -- a partial reconciliation is a state nobody asked for.
+    """
+    from kernel.commands import StaleVersion
+
+    keys = list(keys)
+    if not keys:
+        return 0
+    for key in keys:
+        state = store.effect_state(key, run_id=run_id)
+        if state not in ("uncertain", "intended"):
+            raise ValueError(
+                f"cannot reconcile {key!r} in run {run_id!r}: state is "
+                f"{state!r}, expected 'uncertain' or 'intended'"
+            )
+
+    with store.transaction():
+        if not store.bump_version_cas(run_id, expected_version):
+            raise StaleVersion(
+                f"reconciliation derived from version {expected_version}, "
+                "which has moved"
+            )
+        for key in keys:
+            store.mark_effect(key, "reconciled", None, run_id=run_id)
+            store.append_fact(
+                run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
+                causal_command_id=key, payload={"resolution": resolution},
+            )
+        # Cleared once, at the end, and only if nothing is left -- including
+        # effects this batch did not name.
+        if not pending_reconciliation(store, run_id):
+            store.clear_reconciliation(run_id)
+    return len(keys)
+
+
 def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> None:
     """Resolve a halt. An audited command under expected-version CAS -- never a
     manual state edit."""

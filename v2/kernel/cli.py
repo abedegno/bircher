@@ -25,7 +25,7 @@ import sys
 from kernel.authz import NotAuthorized
 from kernel.effects import (
     EffectClass, UncertainEffect, is_halted, pending_reconciliation,
-    perform, reconcile,
+    perform, reconcile, reconcile_many,
 )
 from kernel.ownership import OwnershipLost
 from kernel.store import Store
@@ -140,7 +140,10 @@ def main(argv=None) -> int:
     r = subs.add_parser("reconcile")
     r.add_argument("--db", required=True)
     r.add_argument("--run-id", required=True)
-    r.add_argument("--idempotency-key", required=True)
+    # Repeatable: several uncertain effects are resolved under ONE CAS, in one
+    # transaction. Resolving them one call at a time cannot be made safe from
+    # outside -- a CAS cannot tell the caller's own bump from a foreign one.
+    r.add_argument("--idempotency-key", required=True, action="append")
     r.add_argument("--resolution", required=True)
     # Supplied by the caller, not read here: the CAS exists so a resolution
     # derived from an observation at version N is refused when the run has
@@ -178,8 +181,8 @@ def _do_reconcile(a) -> int:
     from kernel.commands import StaleVersion
     store = Store.open(a.db)
     try:
-        reconcile(store, a.run_id, a.idempotency_key, a.resolution,
-                  a.expected_version)
+        reconcile_many(store, a.run_id, a.idempotency_key, a.resolution,
+                       a.expected_version)
     except StaleVersion as exc:
         print(f"stale: {exc}", file=sys.stderr)
         return RC_FAILED

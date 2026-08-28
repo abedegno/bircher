@@ -2035,22 +2035,20 @@ for e in json.load(sys.stdin)["pending"]:
     # version it can honestly claim to have observed. Multiple uncertain merges
     # on one PR are rare; when they happen the remainder are named and the halt
     # stands, which is the fail-closed direction.
-    local _k _done=0
+    # ALL of them, in one call. The kernel resolves them under a single CAS in
+    # a single transaction, so the "one key per invocation" restriction -- which
+    # was correct but left a run with several uncertain merges halted forever,
+    # with nothing owning the follow-up -- is no longer needed.
+    local _karr=() _k
     while IFS= read -r _k; do
-      [ -n "$_k" ] || continue
-      if [ "$_done" = 1 ]; then
-        echo "[batch:recover-pr] $code: $_k also unresolved -- left for a later invocation, whose observation will be its own" >&2
-        continue
-      fi
-      _done=1
-      # "attempting", not "reconciled": `_kernel` is advisory and returns 0
-      # whatever happened, so this cannot know it succeeded. What actually
-      # happened is read back after the loop.
-      echo "[batch:recover-pr] $code: attempting reconcile of $_k (expected version ${_pver:-?})" >&2
-      _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
+      [ -n "$_k" ] && _karr+=("$_k")
     done <<EOF
 $_pkeys
 EOF
+    if [ "${#_karr[@]}" -gt 0 ]; then
+      echo "[batch:recover-pr] $code: attempting reconcile of ${#_karr[@]} key(s) at version ${_pver:-?}" >&2
+      _kernel_reconcile "$BIRCHER_RUN_ID" "$_resolution" "${_pver:-0}" "${_karr[@]}"
+    fi
     # What is ACTUALLY left, read back rather than inferred from the calls
     # above having returned 0 -- which they always do.
     local _still
@@ -2058,6 +2056,15 @@ EOF
 d = json.load(sys.stdin)
 print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>/dev/null)
     echo "[batch:recover-pr] $code: after reconciliation the kernel reports: ${_still:-<no answer>}" >&2
+    # CONSULTED, not just printed. A run still halted here will have every
+    # subsequent effect refused, so driving the lifecycle into it produces a
+    # run of guaranteed refusals and a merge that cannot happen. Stop and say
+    # so. An unreadable answer is not treated as "clear".
+    case "$_still" in
+      clear\ *) : ;;
+      *) echo "[batch:recover-pr] $code: still halted after reconciliation -> not driving further; needs a human" >&2
+         _rp_drive=0 ;;
+    esac
 
     if [ -n "${_unspoken//[[:space:]]/}" ]; then
       echo "[batch:recover-pr] $code: NOT reconciled -- this observation says nothing about them, so they need a human:" >&2
@@ -7208,7 +7215,10 @@ __HELP__
   fi
 
   # Standalone single-PR recovery (no queue run): adopt an existing orphaned PR,
-  # run the cross-vendor recovery review, and merge on PASS. See recover_pr_cmd.
+  # run the cross-vendor recovery review, and merge on PASS -- when the kernel
+  # authorizes it. Under BIRCHER_EFFECT_MODE=kernel a PR with no run behind it
+  # has no recorded spec, plan, output, CI or review, so its merge is refused;
+  # that is the gate working, not a failure of this command. See recover_pr_cmd.
   #   run-queue.sh --recover-pr <code> <pr> [reviewer_vendor]
   if [ "${1:-}" = "--recover-pr" ]; then
     recover_pr_cmd "${2:-}" "${3:-}" "${4:-}"; exit $?
