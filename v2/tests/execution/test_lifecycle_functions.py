@@ -856,3 +856,34 @@ def test_a_json_hostile_verdict_still_produces_a_refusal(tmp_path):
     assert rejected, (
         "a JSON-hostile verdict produced no refusal fact -- the payload failed "
         "to parse and the advisory wrapper swallowed it")
+
+
+@pytest.mark.parametrize("ci", ['suc"cess', 'success"', "suc/cess", "s u c c e s s"])
+def test_a_ci_status_that_STRIPS_into_success_cannot_authorize(tmp_path, ci):
+    """Fail-open normalisation, found by a cross-vendor seat at high effort.
+
+    Stripping happened AFTER the recognised values were matched, so an
+    unrecognised status that merely CONTAINED the accepted word normalised into
+    it: `suc"cess` became `success`, and `_ci_is_green` treats exactly
+    `success` on the requested head as green. A marker saying `ci=suc"cess`
+    authorised a merge -- while the comment beside the code claimed unknown
+    values never count as green.
+
+    The prior test exercised only `pending`, which cannot collide with anything
+    and so could not have caught this.
+    """
+    db = tmp_path / "k.db"
+    run_id = "r-ci-collide"
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
+             env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
+    gen = r.stdout.strip().strip("[]")
+    _run(f'h=$(_kernel_put_artifact "p"); _kernel_submit_spec {run_id} {gen} "$h"; '
+         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
+    _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+    _run(f"_kernel_record_ci {run_id} {gen} {ci!r} {HEAD_SHA}", env=_db_env(db))
+
+    from kernel.authz import _ci_is_green
+    assert not _ci_is_green(Store.open(db), run_id, HEAD_SHA), (
+        f"{ci!r} normalised into a green CI observation and would authorize a "
+        "merge on CI that never reported success")

@@ -846,5 +846,10 @@ def test_the_drive_flag_is_actually_CONSUMED():
         "_rp_drive is set and never read: the lifecycle drive runs regardless "
         "of the state check that computes it")
     guard = uses[0]
-    assert '[ -n "$r_sha" ]' in guard, (
-        f"the drive flag is no longer part of the drive's guard:\n  {guard.strip()}")
+    # The CONJUNCTION, contiguously. Asserting the two substrings separately
+    # let `&&` become `||` while both were still present -- which makes a
+    # non-empty r_sha drive the lifecycle even when _rp_drive=0, restoring
+    # exactly what the flag prevents. Third time this branch has been caught
+    # defending a predicate with a substring.
+    assert '[ -n "$r_sha" ] && [ "$_rp_drive" = 1 ]' in guard, (
+        f"the drive guard is not a conjunction of both conditions:\n  {guard.strip()}")

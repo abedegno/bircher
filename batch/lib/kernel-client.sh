@@ -506,15 +506,20 @@ _kernel_ci_status() {
   case "$1" in
     green|success) printf 'success' ;;
     red|failure|failed) printf 'failure' ;;
-    # STRIPPED, for the same reason `_kernel_verdict` strips. This value is
-    # interpolated into the JSON payload below, and `ci=a"b` from a marker made
-    # the payload unparseable -- so the command was never submitted, NO fact
-    # was recorded, and the observation vanished. Proven live.
+    # PREFIXED and stripped -- and the prefix is the part that matters.
     #
-    # That was the verdict defect exactly, one function away, left behind when
-    # the verdict was fixed. Fixing the instance and not the shape is the thing
-    # this branch keeps being caught doing.
-    *) printf '%s' "$1" | tr -cd 'A-Za-z0-9:._-' | cut -c1-40 ;;
+    # Stripping alone was FAIL-OPEN: the strip happens after the recognised
+    # values are matched, so an unrecognised status that merely CONTAINS the
+    # accepted word normalises into it. Proven live: `suc"cess`, `success"`,
+    # `suc/cess` and `s u c c e s s` all became `success`, and
+    # `_ci_is_green` treats exactly `success` on the requested head as green.
+    # A marker saying `ci=suc"cess` therefore authorised a merge -- while the
+    # comment two lines above claimed unknown values "never count as green".
+    #
+    # `unmapped:` cannot collide with any recognised status, so an unknown
+    # value is recorded honestly and can never be read as green. The strip
+    # stays, because the value still reaches a JSON payload.
+    *) printf 'unmapped:%s' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9:._-' | cut -c1-40)" ;;
   esac
 }
 
