@@ -827,3 +827,24 @@ def test_reconciliation_does_not_claim_a_success_it_cannot_know():
     assert "after reconciliation the kernel reports" in joined, (
         "nothing reads the halt back, so the log's only account of the outcome "
         "is an assumption")
+
+
+def test_the_drive_flag_is_actually_CONSUMED():
+    """Bound at the producer, not at its only use. Deleting
+    `&& [ "$_rp_drive" = 1 ]` from the guard left 582 tests passing and
+    restored exactly the behaviour the flag was added to prevent -- while
+    mutating the flag's ASSIGNMENT was caught. That is the same shape
+    `test_the_recovery_bindings_CONSUME_the_adopted_base` was written to fix,
+    in the same round, forty lines away."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+
+    uses = [l for l in body if '"$_rp_drive" = 1' in l]
+    assert uses, (
+        "_rp_drive is set and never read: the lifecycle drive runs regardless "
+        "of the state check that computes it")
+    guard = uses[0]
+    assert '[ -n "$r_sha" ]' in guard, (
+        f"the drive flag is no longer part of the drive's guard:\n  {guard.strip()}")

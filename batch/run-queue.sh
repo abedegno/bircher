@@ -2035,20 +2035,9 @@ for e in json.load(sys.stdin)["pending"]:
         continue
       fi
       _done=1
-      # LOCALLY INCREMENTED, not re-read. Each successful reconciliation bumps
-      # the version by one, so a version captured once and reused made every
-      # key after the first stale. But RE-READING it from the store defeats the
-      # CAS entirely: it absorbs an unrelated writer's change and reconciles
-      # against a run that has moved, which is the one thing the expected
-      # version exists to refuse -- and `kernel/cli.py` says so in the comment
-      # forbidding exactly this. Incrementing locally expects the version to
-      # have advanced only by MY OWN reconciliations, so anything else refuses.
-      # "attempting", not "reconciled". `_kernel` is advisory and returns 0
-      # whatever happened, so this cannot know it succeeded -- and the previous
-      # wording printed "reconciled" over the top of a swallowed
-      # "stale: ... which has moved". The commit that introduced this loop
-      # named that exact shape as its motivation and then repaired only the
-      # staleness half.
+      # "attempting", not "reconciled": `_kernel` is advisory and returns 0
+      # whatever happened, so this cannot know it succeeded. What actually
+      # happened is read back after the loop.
       echo "[batch:recover-pr] $code: attempting reconcile of $_k (expected version ${_pver:-?})" >&2
       _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
     done <<EOF

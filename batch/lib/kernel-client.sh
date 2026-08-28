@@ -506,7 +506,15 @@ _kernel_ci_status() {
   case "$1" in
     green|success) printf 'success' ;;
     red|failure|failed) printf 'failure' ;;
-    *) printf '%s' "$1" ;;
+    # STRIPPED, for the same reason `_kernel_verdict` strips. This value is
+    # interpolated into the JSON payload below, and `ci=a"b` from a marker made
+    # the payload unparseable -- so the command was never submitted, NO fact
+    # was recorded, and the observation vanished. Proven live.
+    #
+    # That was the verdict defect exactly, one function away, left behind when
+    # the verdict was fixed. Fixing the instance and not the shape is the thing
+    # this branch keeps being caught doing.
+    *) printf '%s' "$1" | tr -cd 'A-Za-z0-9:._-' | cut -c1-40 ;;
   esac
 }
 

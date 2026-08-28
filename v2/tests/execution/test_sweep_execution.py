@@ -147,3 +147,48 @@ reconcile_deferred_ready || true
         f"a phantom recorded id fell back to guessing by code:\n{joined}")
     assert not any(c.startswith("merge ") for c in calls), (
         f"the sweep merged under a run it could not confirm:\n{joined}")
+
+
+def _extract_python_snippet(marker):
+    """Pull a real embedded python program out of run-queue.sh and run it.
+
+    The merge-key filter was defended by asserting its SOURCE TEXT appears in
+    the function -- so changing `and` to `or` inside it left the whole suite
+    passing. A substring cannot see a predicate. This executes the actual
+    program the shell runs.
+    """
+    src = RUN_QUEUE.read_text()
+    at = src.index(marker)
+    # The program starts after `-c '`, not at the first quote on the line --
+    # the line also contains `printf '%s'`, and slicing from that quote yields
+    # a fragment that happens to be a SyntaxError rather than a wrong answer.
+    start = src.index("-c '", at) + len("-c '")
+    end = src.index("' 2>/dev/null", start)
+    return src[start:end]
+
+
+def _run_filter(program, pending, pr):
+    import json
+    r = subprocess.run(["python3", "-c", program], input=json.dumps({"pending": pending}),
+                       capture_output=True, text=True, env={"K_PR": pr, "PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+def test_the_merge_key_filter_selects_only_THIS_prs_merges():
+    """Executed, not grepped. `and` -> `or` in this predicate previously left
+    582 tests passing, because the test asserted the predicate's text."""
+    prog = _extract_python_snippet("_pkeys=$(K_PR=")
+    pending = [
+        {"effect_class": "merge",   "idempotency_key": "merge:730:abc"},
+        {"effect_class": "merge",   "idempotency_key": "merge:730:abc:g4"},
+        {"effect_class": "merge",   "idempotency_key": "merge:999:zzz"},
+        {"effect_class": "comment", "idempotency_key": "merge:730:not-a-merge"},
+        {"effect_class": "comment", "idempotency_key": "c-1"},
+    ]
+    got = _run_filter(prog, pending, "730")
+    assert got == ["merge:730:abc", "merge:730:abc:g4"], got
+    assert "merge:999:zzz" not in got, "another PR's merge was selected"
+    assert "merge:730:not-a-merge" not in got, (
+        "a non-merge effect was selected because its KEY looked like one -- the "
+        "predicate is an `or`, not an `and`")
