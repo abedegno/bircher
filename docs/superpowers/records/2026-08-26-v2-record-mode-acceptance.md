@@ -642,3 +642,115 @@ call, a reverted base binding, `&& false`, a deleted `_rp_drive` guard,
 guard. The shape they share is concrete and worth carrying forward: this
 author binds PRODUCERS rather than consumers, and asserts TEXT or ABSENCES
 rather than effects.
+
+---
+
+# C8 Phase 1 — the publish surface
+
+Run 2026-08-28 against `abedegno/bircher-smoke`, from `/workspaces/bircher-v2`
+at `c0fb5a9`, under `BIRCHER_EFFECT_MODE=kernel BIRCHER_KERNEL_MODE=enforce`.
+Nothing in this section touched `abedegno/muesli`; verified against its ref
+list after the misconfiguration described below.
+
+## The five criteria
+
+**1. A session produces a commit and no PR — HELD, and it is worse than a
+refusal.** A real session under the bundle (the sandbox wrapper is visible in
+the process table, and the bundle's system prompt with it) wrote and committed
+`e00d445` in `/tmp/c8impl-repo`. Asked to push, it issued exactly one tool call
+— `git push origin c8impl-branch` — and that call **never returned**. It ran
+about ten minutes before being cancelled, and `c8impl-branch` never appeared on
+the remote.
+
+That is the criterion met, but not in the way the bundle's own prompt
+describes. The prompt tells the implementer "do not treat a failure to reach
+GitHub as a problem to work around — it is the boundary working." There is no
+failure to observe. The egress policy blackholes the connection, so the push
+HANGS. An implementer that obediently does not work around it will sit there
+until its session timeout, having produced one useless tool call. **The
+boundary holds and the feedback is wrong.** Recorded for Phase 2: the denial
+should be legible, either as a fast refusal or by removing the instruction that
+implies one will arrive.
+
+**2. The kernel publishes that commit — HELD.** `--publish c8impl
+/tmp/c8impl-repo c8impl-branch e00d445…` produced
+`https://github.com/abedegno/bircher-smoke/pull/10`, with the claimed oid
+supplied and agreeing. The journal carries `effect_intended` and
+`effect_confirmed` for both `ref_update` and `pull_request`, the latter's
+`external_object_id` being the PR URL. A second, independent run without a
+claim (`c8v6`) produced PR #9 on the same path.
+
+**3. A commit on a stale base is refused — HELD.** Recorded base
+`3e4fe5fe4804`, branch built on `f7b989846786`:
+
+    refused: 4adf8109d96b does not descend from the run's base 3e4fe5fe4804
+
+Both values named, `RC_REFUSED`, and `git ls-remote` shows no `c8stale` ref.
+
+**4. A disagreeing claim is refused — HELD.**
+
+    refused: claimed 000000000000 but observed 147208e0d2b0 at 'c8v6-branch';
+    the observation decides and the claim disagrees
+
+Both values named; nothing pushed.
+
+**5. The shadow report after a clean run — UNTESTED, not passed.** It reads
+`[]` for both clean runs. The criterion says an empty report is worth nothing
+on its own and that the positive evidence is every command reaching
+`command_accepted`. **There are no commands on this path at all.** `publish_cmd`
+issues a dispatch and two effects and nothing else, so the evidence the
+criterion asks for cannot exist here, and its emptiness is not a result. The
+criterion was written for a path that runs commands; it does not bind this one.
+
+## Three defects found by running, none visible by reading
+
+Each survived a green unit suite, because every unit test stubs `_effect`.
+
+**The push ran in the coordinator's cwd.** `git push origin` resolved `origin`
+to the *bircher* repo rather than the one the work is on, and the nominated
+object was not present there at all. The kernel journalled `effect_uncertain`
+and halted the run. Fixed by running both effects in the nominated worktree;
+`git -C` is not available because the argv contract stops a signature at the
+first flag, which is correct and stays.
+
+**A halt recorded its exception's class and nothing else.** `error:
+"RuntimeError"` was the whole record. Diagnosing the above took three
+round-trips re-running the effect by hand against the live world — the work a
+journal exists to make unnecessary. The message is now recorded as `detail`.
+The fix paid for itself immediately: the next failure named itself.
+
+**The push and the PR could name different repositories.** `git push origin`
+resolves through the worktree's remote; `gh pr create --repo "$REPO"` names one
+explicitly, and nothing made them agree. `run-queue.sh` re-derives `REPO` from
+`BIRCHER_REPO`, so a harness exporting `REPO` alone pushed to the smoke repo
+and asked GitHub to open the PR on muesli. GitHub answered "Head ref must be a
+branch" — an error about the head ref, for a fault in the repository.
+
+**I misdiagnosed that one and shipped the wrong fix.** I read it as a
+propagation delay between push and PR visibility, measured a delay with an
+experiment that never reproduced the failing conditions, found the ~1s I
+expected to find, and committed a thirty-poll wait for it. The measurement
+confirmed a hypothesis it could not have refuted. Reverted in `c0fb5a9`; the
+repository agreement is now checked first, before the kernel is consulted and
+before any effect, because publishing to one repository while announcing it on
+another has no recovery path worth building.
+
+## Mutation results
+
+Twelve mutations over the guards this phase introduces, each proved applied and
+restored clean. Eleven died against the test named for them. One survived:
+`_kernel_run_base` returning forty zeros instead of empty on a falsy base left
+all 614 tests green — the existing unknown-run test exercises the `except`
+path, and nothing reached the `or ""` beside it. Killed by a test that reaches
+a run existing with no recorded base.
+
+## Unchanged, as promised
+
+`run_item` (521 lines) and `parse_marker` (29 lines) are byte-identical to
+their state at the plan commit `02299a7`, checked by extracting both functions
+at both revisions and diffing. `run-queue.sh` took 56 insertions and zero
+deletions, at two points outside both functions.
+
+**The marker is still how `run_item` learns outcomes.** `--publish` is reachable
+only as its own subcommand; nothing in the normal item path calls it yet. Phase
+2 retires the marker.
