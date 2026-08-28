@@ -132,7 +132,7 @@ export OMNIGENT_RUNNER="${OMNIGENT_RUNNER:-omnigent-runner-bircher}"
 
 # _branch_code_filter <code> -> a jq filter selecting PRs whose head branch carries
 # the item code on a token boundary. Single source of truth for a regex that was
-# copy-pasted at three call sites (poll-loop discovery, recover_from_ground_truth,
+# copy-pasted at three call sites (poll-loop discovery, observe_outcome,
 # _reconcile_item_pr) — issue #22.
 #
 # The boundary anchors matter: a bare substring test makes `i23` match branch
@@ -2165,7 +2165,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must
   # be brought up to date first. update-branch re-triggers the required checks on
-  # the new head, which recover_from_ground_truth's CI-wait then settles before
+  # the new head, which observe_outcome's CI-wait then settles before
   # the review -- so the subsequent (non-admin) merge sees a green, up-to-date PR.
   local mss
   mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
@@ -2177,7 +2177,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
   local rec r_outcome r_review r_note r_sha r_ci
-  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
+  # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
   # reaching that line -- and `rec=$(...)` swallows the death into an empty
   # string. Parsed straight, that reads as outcome="" and the caller reports
@@ -2185,12 +2185,12 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
   # note= head=) and not reproducible since; the specific crash is unknown and
   # the misreading is the part worth making impossible.
-  rec=$(recover_from_ground_truth "$item" "$code" "$pr")
+  rec=$(observe_outcome "$item" "$code" "$pr")
   if [ -z "${rec//[[:space:]]/}" ]; then
     echo "[batch:recover-pr] $code: recovery produced NO tuple -> it failed; PR left untouched for a human" >&2
     return 1
   fi
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ <<EOF
 $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
@@ -2352,14 +2352,14 @@ _reconcile_item_pr() {
   echo "$chosen"
 }
 
-# recover_from_ground_truth <item> <code> <pr> [issue]
+# observe_outcome <item> <code> <pr> [issue]
 # Called when a coordinator ended (idle-reaper ~30 min) before posting its
 # marker. Derives a truthful outcome from the PR and, for a CI-green PR, an
 # out-of-band cross-vendor review. Posts a self-describing bircher-status
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
 # `issue` (optional) enables the issue-linkage PR fallback when both signal and
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
-recover_from_ground_truth() {
+observe_outcome() {
   local item="$1" code="$2" pr="$3" issue="${4:-}"
   local ci="na" verdict="" reviewer_out="" reviewed_sha=""
   # A tracked PR that was CLOSED without merging can never satisfy this item --
@@ -2412,6 +2412,18 @@ recover_from_ground_truth() {
       pr="$_rp"
     fi
   fi
+  # THE CI HISTORY. What the repository shows about how this branch got here,
+  # replacing the marker's `ci_first` (asserted) and `rounds` (asserted, and
+  # about a quantity nothing observed -- see Decision 2 in the Phase 2 plan).
+  local ci_first="unknown" resubmissions=""
+  if [ -n "$pr" ]; then
+    local _br; _br=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.ref' 2>/dev/null) || _br=""
+    if [ -n "$_br" ]; then
+      local _hist; _hist=$(observe_ci_history "$_br")
+      ci_first="${_hist%%|*}"; resubmissions="${_hist#*|}"
+    fi
+  fi
+
   if [ -n "$pr" ]; then
     local buckets
     # Fetch NAME too, so non-CI checks are filtered before deciding.
@@ -2489,22 +2501,25 @@ EOF
 
   # Post a self-describing marker to the PR (reviewer findings above it, if any).
   if [ -n "$pr" ]; then
-    local marker_line body
+    local body
     # head= only on a ready/PASS outcome: it is the merge-authorising evidence,
-    # and a failed or escalated recovery must never carry one.
+    # and a failed or escalated derivation must never carry one.
     local _head_field=""
     [ "$r_outcome" = "ready" ] && [ -n "$reviewed_sha" ] && _head_field=" head=$reviewed_sha"
-    marker_line="bircher-status: outcome=$r_outcome ci=$r_ci ci_first=false review=$r_review rounds=0${_head_field} note=\"$r_note\""
+    # DECISION 3 OF PHASE 2. The findings stay -- they are the most useful
+    # thing on the PR for a human. The `bircher-status:` prefix goes, because
+    # it was a machine channel and nothing reads it any more. This text is
+    # documentation now; `test_marker_is_gone` keeps it that way.
     if [ -n "$reviewer_out" ]; then
-      body="Recovery cross-vendor review (coordinator session ended before posting a marker):
+      body="Cross-vendor review (outcome derived from the repository, not reported):
 
 $reviewer_out
 
-$marker_line"
+outcome=$r_outcome ci=$r_ci review=$r_review${_head_field}
+note: $r_note"
     else
-      body="Recovery (coordinator session ended before posting a marker; outcome derived from ground truth).
-
-$marker_line"
+      body="Outcome derived from the repository: outcome=$r_outcome ci=$r_ci${_head_field}
+note: $r_note"
     fi
     _effect comment "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
       || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
@@ -2522,7 +2537,9 @@ $marker_line"
   # claim with nothing behind it -- which is the one thing the kernel exists to
   # refuse. Both callers parse five fields; a four-field read would silently
   # absorb this into the sha.
-  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci"
+  # SEVEN fields since Phase 2. A caller reading five absorbs the CI-history
+  # pair into `ci`, silently. Both callers were updated with this change.
+  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci|$ci_first|$resubmissions"
 }
 
 # _is_blank <text> -> rc 0 if text is empty or whitespace-only.
@@ -3475,7 +3492,12 @@ print(json.dumps({
  "item": item, "pr": int(pr) if pr.isdigit() else None, "outcome": outcome,
  "implementer": implementer or None, "review": review or None,
  "ci_pass_first_try": ci_first=="true",
- "rounds": int(rounds) if rounds.isdigit() else None,
+ # DECISION 2 OF PHASE 2. `rounds` was the coordinator's own count of its fix
+ # loop, asserted in a marker and observed by nothing. It is emitted null from
+ # the first Phase 2 run onward rather than quietly redefined, so a reader
+ # comparing an old row to a new one is not misled about what the number means.
+ "rounds": None,
+ "resubmissions": int(rounds) if rounds.isdigit() else None,
  "wall_seconds": int(wall) if wall.isdigit() else None, "cost": None,
  "bound": bound or None, "note": note}))
 PY
@@ -3664,7 +3686,7 @@ ${prompt}"
     return 5
   fi
 
-  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0 _unknown_polls=0
+  local start; start=$(date +%s); local pr="" elapsed=0 polls=0 _unknown_polls=0
   while [ "$elapsed" -lt "$ITEM_TIMEOUT" ]; do
     sleep "$POLL"; elapsed=$(( $(date +%s) - start )); polls=$((polls + 1))
     # B-2 within-item fast limit check: only in the early window (first 2 polls).
@@ -3719,20 +3741,16 @@ ${prompt}"
         esac
       fi
     fi
-    if [ -n "$pr" ]; then
-      # Only markers posted by THIS run count (issue #47). A stale marker from an
-      # earlier run must not short-circuit the session now in flight.
-      local body; body=$(_marker_bodies_since "$pr" "$start")
-      if _contains "$body" 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
-      # Last of the status-deciding pipelines (see _contains). This one is only a
-      # stale-marker diagnostic -- a SIGPIPE false negative cannot adopt a marker,
-      # change an outcome or authorise a merge -- but leaving a known instance of the
-      # class behind after removing the rest is how it grows back.
-      if [ "$polls" = 1 ] \
-         && _contains "$(gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null)" 'bircher-status:'; then
-        echo "[batch] $item: PR #$pr carries a marker predating this run - ignoring it and waiting for a fresh verdict" >&2
-      fi
-    fi
+    # NO COMPLETION SIGNAL FROM THE COORDINATOR, BY DESIGN (Phase 2). A v2
+    # implementer holds no comment authority, so there is nothing it could post
+    # here even if something read it. The loop ends on a noop signal, an
+    # escalation signal, a dead session, or the cap -- and the outcome is then
+    # DERIVED from the repository.
+    #
+    # THE COST IS REAL AND IS NOT A BUG: an item that finishes early no longer
+    # says so, and waits for its session to die or its cap to expire. Anyone
+    # reading this loop looking for the fast path should know it was removed
+    # deliberately and not lost.
     # No-op signal: the coordinator decided the item is already satisfied (gap #3)
     # and dropped a marker here instead of forcing a (garbage) PR.
     [ -f "$NOOP_DIR/$code.noop" ] && break
@@ -3768,12 +3786,12 @@ ${prompt}"
       fi
     fi
   done
-  # If we exited the loop without a marker/noop and the server session is still
+  # If we exited the loop without a noop signal and the server session is still
   # ALIVE (cap reached, not a death), cancel it via the API so it actually
   # stops -- killing the local client alone does NOT stop the server-side
   # session, and a live coordinator would otherwise race the recovery review.
   local _blind=0
-  if [ -z "$marker" ] && [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
+  if [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
     local _ss; _ss=$(_session_state "$conv_id")
     if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = alive ]; then
       echo "[batch] $item: cap reached, session $conv_id still alive -> cancelling" >&2
@@ -3845,117 +3863,57 @@ ${prompt}"
     return 0
   fi
 
-  # Final marker re-check: a coordinator marker may have landed between the last
-  # poll and now (or as the session ended). Prefer it over recovery so a
-  # converged coordinator always wins and we never post a conflicting marker.
-  if [ -z "$marker" ] && [ -n "$pr" ]; then
-    # Same freshness rule as the poll loop (issue #47): a marker left by an
-    # earlier run is not this run's verdict, and adopting it here would record a
-    # stale outcome as if the session had produced it.
-    local _fb; _fb=$(_marker_bodies_since "$pr" "$start")
-    # $body, not just $marker, must track whichever text actually produced
-    # the marker in use -- the kernel's implementation-output artifact is
-    # hashed from $body below, and leaving it holding a stale (or never
-    # assigned) value from the poll loop would record the wrong bytes, or
-    # none, under a hash that looks like it came from this marker.
-    if _contains "$_fb" 'bircher-status:'; then marker=$(parse_marker "$_fb"); body="$_fb"; fi
-  fi
-
-  local outcome ci_first review rounds note
-  if [ -n "$marker" ]; then
-    # Coordinator posted its own marker -> trust it (existing path).
-    local _ci
-    IFS='|' read -r outcome _ci ci_first review rounds note marker_head <<EOF
-$marker
-EOF
-    : "${outcome:=timeout}" "${ci_first:=false}"
-
-    # record_implementation_output, record_ci_observation: what this attempt
-    # produced, and what CI said about the head it produced.
-    # The hash is the object under review. Captured rather than discarded so
-    # the verdict below can bind to it.
-    _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body")
-    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_ci" "$marker_head"
-
-    # A role change is a NEW dispatch and re-fences the generation.
-    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-    export BIRCHER_GENERATION
-    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-      "$_out_hash" "$_base_sha" "$_spec_hash"
-
-    BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-    export BIRCHER_GENERATION
+  local outcome ci_first review rounds note resubmissions observed_head _obs_ci
+  if [ "${_blind:-0}" = 1 ]; then
+    # Unchanged from the marker era, and still correct: the cancel was never
+    # confirmed, so the coordinator may still be running. Deriving an outcome
+    # means READING and WRITING the PR, which races a live session.
+    outcome="escalated"; review="na"; ci_first="unknown"; resubmissions=""
+    observed_head=""
+    note="server unreachable at cap; could not confirm the session stopped, so outcome derivation was skipped to avoid racing a live coordinator - needs a human"
+    echo "[batch] $item: blind at teardown -> escalating without derivation" >&2
   else
-    # No marker. Two cases, and they must not be conflated:
-    #
-    #   - the session is known to have ended (died, or a cancel we CONFIRMED):
-    #     recover from ground truth -- the implementer's PR usually exists and is
-    #     CI-green, so complete or truthfully label the item here rather than
-    #     recording a bare timeout that re-balloons it;
-    #   - we are BLIND (`_blind`): the cancel was never confirmed because the
-    #     server was unreachable, so the coordinator may still be running.
-    #     Recovery reads and WRITES the PR, so it must not run here.
-    if [ "${_blind:-0}" = 1 ]; then
-      # Blind at teardown (see above): do not touch the PR.
-      outcome="escalated"; review="na"
-      note="server unreachable at cap; could not confirm the session stopped, so ground-truth recovery was skipped to avoid racing a live coordinator - needs a human"
-      echo "[batch] $item: blind at teardown -> escalating without recovery" >&2
-    else
-      echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
-      local rec
-      rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
-  # single exit and always emits five fields, so no output means it died before
-  # reaching that line -- and `rec=$(...)` swallows the death into an empty
-  # string. Parsed straight, that reads as outcome="" and the caller reports
-  # "NOT ready", which is a benign-looking sentence for "the recovery
-  # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
-  # note= head=) and not reproducible since; the specific crash is unknown and
-  # the misreading is the part worth making impossible.
-      if [ -z "${rec//[[:space:]]/}" ]; then
-        echo "[batch] $item: recovery produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-        rec="escalated|na|ground-truth recovery failed (no tuple); needs a human||na"
-      fi
-      local _rec_ci=""
-      IFS='|' read -r outcome review note marker_head _rec_ci <<EOF
-$rec
-EOF
-      # Drive the SAME kernel lifecycle the marker branch drives. Without this
-      # the recovery path reached the merge gate having recorded no output, no
-      # CI observation and no verdict, so request_merge was refused and the
-      # kernel could not authorize a merge it had no evidence for. That is the
-      # gate behaving correctly on an input the coordinator failed to supply --
-      # and it fires automatically whenever an implementer session dies, which
-      # makes it the common case rather than the exotic one.
-      #
-      # GUARDED ON A HEAD, and that guard does all the work. The blind path
-      # sets review="na" and NO head, so a bare "na" never reaches
-      # _kernel_record_review from here at all -- which also means the
-      # "unmapped verdicts are now refused visibly" trade is not being made on
-      # this path, whatever its commit message argued.
-      #
-      # An earlier version of this comment justified the guard partly by
-      # "`_kernel_verdict` maps na to nothing". It no longer does: the fix that
-      # stopped unmapped verdicts being skipped changed exactly that, and
-      # walked past this comment. `_kernel_ci_status` no longer passes an
-      # unknown CI value through unchanged either -- it prefixes it
-      # `unmapped:`, because bare stripping normalised `suc"cess` INTO
-      # `success` and authorized a merge. This sentence has now been wrong
-      # twice, in a comment whose subject is fixes walking past comments.
-      if [ -n "${marker_head:-}" ]; then
-        local _rec_body="recovered: outcome=$outcome review=$review head=$marker_head note=$note"
-        _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_rec_body")
-        _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_rec_ci:-na}" "$marker_head"
-        BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-        export BIRCHER_GENERATION
-        _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-          "$_out_hash" "$_base_sha" "$_spec_hash"
-        BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-        export BIRCHER_GENERATION
-      fi
+    echo "[batch] $item: deriving the outcome from the repository" >&2
+    local obs
+    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss")
+    # An EMPTY tuple is a CRASH, not a verdict -- and since Phase 2 this is the
+    # ONLY path, so the guard that used to protect recovery alone now protects
+    # every item. `obs=$(...)` swallows a mid-function death into an empty
+    # string, which parses as outcome="" and reports "NOT ready": a crash
+    # wearing a verdict's clothes.
+    if [ -z "${obs//[[:space:]]/}" ]; then
+      echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
+      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown|"
     fi
-    ci_first="false"; rounds="0"
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions <<EOF
+$obs
+EOF
+    : "${outcome:=timeout}" "${ci_first:=unknown}"
+
+    # The kernel lifecycle, unchanged in order and in roles. Its INPUTS are now
+    # observations; the sequence is the one the marker branch used to drive.
+    #
+    # GUARDED ON A HEAD, and that guard does the work: the blind path above
+    # never reaches here, so a bare "na" verdict cannot arrive at
+    # _kernel_record_review from this function.
+    if [ -n "${observed_head:-}" ]; then
+      local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
+      _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
+      _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head"
+      BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+      export BIRCHER_GENERATION
+      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
+        "$_out_hash" "$_base_sha" "$_spec_hash"
+      BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+      export BIRCHER_GENERATION
+    fi
   fi
+  # DECISION 2 OF PHASE 2. `rounds` was the coordinator's count of its own fix
+  # loop and nothing observed it, so it is no longer reported at all.
+  # `resubmissions` -- distinct commits CI ran on, minus one -- replaces it
+  # under its own name, because it is a different measurement and a reader
+  # comparing old rows to new ones must not think otherwise.
+  rounds=""
 
   # B-1 in-run merge: merge a ready PR now so the NEXT item builds on it
   # (eliminates the merge-order conflict class). Deferral appends to the note;
@@ -3973,8 +3931,9 @@ EOF
     # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
     # also refuses an empty sha, so this is now belt and braces rather than the only
     # guard.
-    local _had_marker=0; [ -n "$marker" ] && _had_marker=1
-    local _gate; _gate=$(_merge_gate "$_had_marker" "${marker_head:-}")
+    # `_merge_gate` reads only its SECOND argument; the first was a
+    # had-a-marker flag it never consulted, and there is no marker now.
+    local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
     local reviewed_sha=""
     case "$_gate" in
       pin\|*)   reviewed_sha="${_gate#pin|}" ;;
@@ -3987,7 +3946,7 @@ EOF
     esac
     if [ "$_gate" != "skip" ]; then
       # request_merge, record_merge_outcome
-      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$marker_head" \
+      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
         "$_out_hash" "$_base_sha" "$_spec_hash"
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
       local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
@@ -4015,13 +3974,16 @@ EOF
   # An earlier version of this comment claimed they "agree by construction",
   # which is the unearned-claim shape this change exists to remove.
   #
-  # This site can also diverge on VALUE: $outcome comes from a model-authored
-  # `bircher-status:` marker parsed with no schema validation, so a word
-  # outside the kernel's vocabulary is refused -- correctly and visibly --
-  # while the scorecard records it regardless.
+  # This site could once diverge on VALUE: $outcome came from a model-authored
+  # marker parsed with no schema validation, so a word outside the kernel's
+  # vocabulary was refused -- correctly and visibly -- while the scorecard
+  # recorded it regardless. Since Phase 2 the value comes from
+  # `classify_recovery`, which emits only the fixed vocabulary, so that
+  # particular divergence has no route left. The two records can still
+  # disagree for other reasons, which is why this note stays.
   _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
-  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"
+  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
+  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}"
   # #3: guarantee the issue closes when its PR actually merged (backstops a
   # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
   [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
@@ -4600,31 +4562,41 @@ SH
   local rec_out
   rec_out=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
             GH_COMMENT_OUT="$shimdir/comment.txt" RECOVERY_REVIEWER=codex \
-            recover_from_ground_truth demo demo 7)
+            observe_outcome demo demo 7)
   # #66: 4th field is the orchestrator-captured reviewed head, so the recovery
   # merge can be pinned exactly as the marker path is.
-  # 5th field is the CI value recovery OBSERVED. It is returned rather than
-  # inferred from `outcome=ready` so the caller records an observation instead
-  # of a deduction, and pinned here because both callers read five fields -- a
-  # four-field read would silently absorb it into the sha.
-  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
-    || { echo "FAIL recover happy-path tuple: '$rec_out'"; exit 1; }
+  # 5th field is the CI value the derivation OBSERVED. It is returned rather
+  # than inferred from `outcome=ready` so the caller records an observation
+  # instead of a deduction, and pinned here because both callers read the full
+  # tuple -- a short read would silently absorb it into the sha.
+  #
+  # 6th and 7th are the CI history (Phase 2). This shim's `gh` answers nothing
+  # for the branch lookup, so they are `unknown` and empty -- which is the
+  # correct answer to "no history was visible", and is pinned here so a change
+  # that starts inventing `false|0` on a failed lookup is caught.
+  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+    || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
-    || { echo "FAIL recover: marker must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
-  grep -q '^bircher-status: outcome=ready ci=green ' "$shimdir/comment.txt" \
-    || { echo "FAIL recover: marker not posted to PR"; exit 1; }
+    || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
+  grep -q '^outcome=ready ci=green ' "$shimdir/comment.txt" \
+    || { echo "FAIL derive: outcome line not posted to PR"; cat "$shimdir/comment.txt"; exit 1; }
+  # PHASE 2: the machine marker is gone. Its replacement is the prose above --
+  # and this assertion is what keeps a future edit from quietly restoring the
+  # channel by restoring its prefix.
+  grep -q 'bircher-status:' "$shimdir/comment.txt" \
+    && { echo "FAIL derive: the retired marker was posted"; exit 1; }
   grep -q 'VERDICT: PASS' "$shimdir/comment.txt" \
     || { echo "FAIL recover: reviewer findings not included in comment"; exit 1; }
   local rec_nopr
   rec_nopr=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
-             recover_from_ground_truth demo demo "")
+             observe_outcome demo demo "")
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na" ] \
-    || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown|" ] \
+    || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
-  echo "recover_from_ground_truth OK"
+  echo "observe_outcome OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
   local ddir; ddir=$(mktemp -d)
   cat >"$ddir/gh" <<'SH'
@@ -4650,8 +4622,8 @@ SH
   chmod +x "$ddir/gh" "$ddir/omnigent"
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
-             RECOVERY_REVIEWER=codex recover_from_ground_truth i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
+             RECOVERY_REVIEWER=codex observe_outcome i300 i300 "")
+  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -4715,8 +4687,8 @@ SH
   chmod +x "$idir/gh"
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
-            RECOVERY_REVIEWER=codex recover_from_ground_truth iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
+            RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
+  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"

@@ -142,3 +142,72 @@ def test_the_review_is_dispatched_against_the_SHA_it_was_given(tmp_path):
         omnigent_fn=f"printf '%s\\n' \"$*\" > {seen}; echo 'VERDICT: PASS';"))
     assert seen.exists(), (r.stdout, r.stderr)
     assert "cafebabe0000" in seen.read_text(), seen.read_text()
+
+
+RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
+
+
+def _extract(name, path=None, code_only=False):
+    lines = (path or RUN_QUEUE).read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(f"{name}()"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+    body = lines[start:end + 1]
+    if code_only:
+        # Comments explaining the retired marker are legitimate history. The
+        # property under test is that nothing WRITES or READS one, which is a
+        # property of code. The repo's existing structural tests strip comments
+        # for the same reason.
+        body = [l for l in body if not l.strip().startswith("#")]
+    return "\n".join(body)
+
+
+def test_run_item_no_longer_reads_a_marker():
+    """The structural half. `run_item` must not mention the marker at all --
+    not parse_marker, not _marker_bodies_since, not the string itself."""
+    body = _extract("run_item", code_only=True)
+    for banned in ("parse_marker", "_marker_bodies_since", "bircher-status:"):
+        assert banned not in body, f"run_item still reads the marker: {banned}"
+
+
+def test_the_derived_tuple_carries_all_seven_fields(tmp_path):
+    """A caller reading five fields where seven are emitted silently absorbs
+    the last two into `ci`. Both callers must be updated together."""
+    script = f"""
+set -uo pipefail
+REPO=demo/demo
+BIRCHER_NET_TIMEOUT=5
+RECOVERY_REVIEWER=codex
+classify_recovery() {{ printf 'ready|codex:pass|green|derived'; }}
+observe_ci_history() {{ printf 'true|2'; }}
+observe_review() {{ printf 'PASS|/dev/null'; }}
+_pr_is_abandoned() {{ return 1; }}
+_reconcile_item_pr() {{ printf ''; }}
+_normalize_ci() {{ printf 'green'; }}
+_keep_blocking_checks() {{ printf ''; }}
+_required_contexts() {{ printf ''; }}
+_discover_pr_by_issue() {{ printf ''; }}
+_branch_code_filter() {{ printf ''; }}
+_effect() {{ return 0; }}
+gh() {{ case "$*" in
+          *head.sha*)  printf '%040d' 7 ;;
+          *head.ref*)  printf 'feat-x' ;;
+          *)           printf '' ;;
+        esac; }}
+
+{_extract("observe_outcome")}
+
+observe_outcome item-1 code1 42 ""
+"""
+    f = tmp_path / "outcome.sh"
+    f.write_text(script)
+    r = subprocess.run(["bash", str(f)], capture_output=True, text=True)
+    fields = r.stdout.strip().split("|")
+    assert len(fields) == 7, (fields, r.stderr[-800:])
+    assert fields[0] == "ready", fields
+    assert fields[5] == "true" and fields[6] == "2", fields
+
+
+def test_the_derived_comment_carries_no_machine_marker(tmp_path):
+    """Decision 3: the reviewer's findings stay, the parseable prefix goes."""
+    body = _extract("observe_outcome", code_only=True)
+    assert "bircher-status:" not in body, "observe_outcome still writes a marker"
