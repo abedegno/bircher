@@ -22,6 +22,8 @@ def _drive(tmp_path, tag, *, find_run="run-1", run_base="basesha",
            verify="deadbeef"):
     """Run publish_cmd for real; return the ordered list of what it called."""
     log = tmp_path / f"log-{tag}"
+    wt = tmp_path / f"wt-{tag}"
+    wt.mkdir()
     script = f"""
 set -uo pipefail
 REPO=demo/demo
@@ -34,13 +36,13 @@ _kernel_adopt_run() {{ _log "ADOPT $*"
                        BIRCHER_RUN_ID=run-1; export BIRCHER_RUN_ID
                        BIRCHER_GENERATION=1; export BIRCHER_GENERATION; }}
 _kernel_verify_nomination() {{ _log "VERIFY $*"; printf '%s' '{verify}'; }}
-_effect() {{ _log "EFFECT $1 $2 -- ${{*:4}}"; return 0; }}
+_effect() {{ _log "EFFECT $1 $2 pwd=$PWD -- ${{*:4}}"; return 0; }}
 _net_run() {{ shift; "$@"; }}
 _kernel_warn() {{ :; }}
 
 {_extract("publish_cmd")}
 
-publish_cmd probe /tmp/wt-probe probe-branch || true
+publish_cmd probe {wt} probe-branch || true
 """
     f = tmp_path / f"pub-{tag}.sh"
     f.write_text(script)
@@ -82,3 +84,17 @@ def test_work_the_kernel_never_dispatched_is_refused_WITHOUT_minting_a_run(tmp_p
     calls = _drive(tmp_path, "norun", find_run="")
     assert not [c for c in calls if c.startswith("ADOPT")], calls
     assert not [c for c in calls if c.startswith("EFFECT")], calls
+
+
+def test_both_effects_run_IN_THE_WORKTREE_not_the_coordinators_cwd(tmp_path):
+    """`origin` and the object id are properties of the nominated worktree.
+
+    Found live: run from the coordinator's checkout, `git push origin`
+    resolved a different remote and the oid was not present at all. The kernel
+    halted the run on an uncertain effect.
+    """
+    calls = _drive(tmp_path, "cwd")
+    assert calls, calls
+    for c in calls:
+        if c.startswith("EFFECT"):
+            assert f"pwd={tmp_path / 'wt-cwd'}" in c, c

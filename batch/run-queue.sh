@@ -1988,13 +1988,25 @@ publish_cmd() {
   fi
   echo "[batch:publish] $code: kernel will publish $oid on '$branch'" >&2
 
-  _effect ref_update "publish:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
-    git push origin "$oid:refs/heads/$branch" || {
+  # BOTH effects run IN THE NOMINATED WORKTREE, not the coordinator's cwd.
+  #
+  # Found live, not by reading: run from the coordinator's checkout, `git push
+  # origin` resolved `origin` to the BIRCHER repo -- a different remote from
+  # the one the work is on -- and the oid was not present there at all. The
+  # kernel journalled the failure as `effect_uncertain` and halted the run.
+  #
+  # `git -C "$wt" push` is NOT the fix: the argv contract stops a signature at
+  # the first flag, so `git -C <dir> push` reads as `git` and is refused. That
+  # refusal is correct and must stay -- `-C` is precisely the redirect the
+  # contract exists to deny, and widening it to make this call work would sell
+  # the boundary for a convenience.
+  ( cd "$wt" && _effect ref_update "publish:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
+      git push origin "$oid:refs/heads/$branch" ) || {
       echo "[batch:publish] $code: push refused or failed" >&2; return 1; }
 
-  _effect pull_request "publish-pr:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
-    gh pr create --repo "$REPO" --head "$branch" --base main \
-      --title "$code" --body "Published by the Bircher kernel from $oid." \
+  ( cd "$wt" && _effect pull_request "publish-pr:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
+      gh pr create --repo "$REPO" --head "$branch" --base main \
+        --title "$code" --body "Published by the Bircher kernel from $oid." ) \
     || { echo "[batch:publish] $code: PR creation refused or failed" >&2; return 1; }
 }
 
