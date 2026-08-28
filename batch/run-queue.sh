@@ -1835,6 +1835,14 @@ reconcile_deferred_ready() {
         # attribution defect the fifth field was added to remove. Skipping
         # leaves the PR for a human with its ledger honest.
         echo "[batch:sweep] $item: recorded run '$deferred_run' yielded no generation -> skipping (refusing to guess a different run)" >&2
+        # AND SAY SO WHERE HUMANS LOOK. Every other fail-closed sweep path
+        # writes an escalation row; this one left the handoff in transient
+        # stderr, and the next wave truncates the deferred file -- so the PR it
+        # "leaves for a human" was never mentioned to one.
+        mkdir -p "$(dirname "$SCORECARD")" 2>/dev/null
+        json_row "$item" "$pr" escalated false sweep 0 0 \
+          "sweep: recorded run '$deferred_run' is unknown to the kernel; refusing to attribute this PR to a different run - needs a human" ok \
+          >> "$SCORECARD"
         continue
       fi
     else
@@ -3832,8 +3840,11 @@ EOF
       # An earlier version of this comment justified the guard partly by
       # "`_kernel_verdict` maps na to nothing". It no longer does: the fix that
       # stopped unmapped verdicts being skipped changed exactly that, and
-      # walked past this comment. `_kernel_ci_status` still passes an unknown
-      # CI value through unchanged, so it never counts as green.
+      # walked past this comment. `_kernel_ci_status` no longer passes an
+      # unknown CI value through unchanged either -- it prefixes it
+      # `unmapped:`, because bare stripping normalised `suc"cess` INTO
+      # `success` and authorized a merge. This sentence has now been wrong
+      # twice, in a comment whose subject is fixes walking past comments.
       if [ -n "${marker_head:-}" ]; then
         local _rec_body="recovered: outcome=$outcome review=$review head=$marker_head note=$note"
         _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_rec_body")

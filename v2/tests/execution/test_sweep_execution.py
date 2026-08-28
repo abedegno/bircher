@@ -110,7 +110,13 @@ def test_a_phantom_recorded_run_is_SKIPPED_not_guessed_around(tmp_path):
     src = RUN_QUEUE.read_text().splitlines()
     body = _extract_function(src, "reconcile_deferred_ready")
     deferred = tmp_path / "deferred.tsv"
-    deferred.write_text("itemZ\t44\t9\t" + "c" * 40 + "\tphantom-run-id\n")
+    # TWO rows. The phantom is first, and a good row follows it. Asserting only
+    # ABSENCES on a single row cannot tell `continue` from `break`: both skip
+    # the phantom, and `break` additionally kills the rest of the sweep at rc 0
+    # with the remaining PRs never looked at -- which is the exact consequence
+    # the code this replaced was written to prevent.
+    deferred.write_text("itemZ\t44\t9\t" + "c" * 40 + "\tphantom-run-id\n"
+                        + "itemW\t45\t10\t" + "d" * 40 + "\treal-run-id\n")
     log = tmp_path / "log"
 
     script = f'''
@@ -130,8 +136,9 @@ _ensure_issue_closed() {{ :; }}
 merge_ready_pr() {{ _log "merge run=${{BIRCHER_RUN_ID:-<unset>}}"; return 0; }}
 _kernel_adopt_run() {{ _log "ADOPT_BY_CODE $1"; BIRCHER_RUN_ID="newest-for-code"; export BIRCHER_RUN_ID
                        BIRCHER_GENERATION=9; export BIRCHER_GENERATION; }}
-# the phantom: the kernel does not know this run, so no generation comes back
-_kernel_dispatch() {{ _log "dispatch for ${{BIRCHER_RUN_ID:-<unset>}}"; printf ''; }}
+# phantom-run-id yields nothing; real-run-id yields a generation
+_kernel_dispatch() {{ _log "dispatch for ${{BIRCHER_RUN_ID:-<unset>}}"
+  case "${{BIRCHER_RUN_ID:-}}" in real-run-id) printf '5' ;; *) printf '' ;; esac; }}
 
 {body}
 
@@ -145,8 +152,14 @@ reconcile_deferred_ready || true
 
     assert "ADOPT_BY_CODE" not in joined, (
         f"a phantom recorded id fell back to guessing by code:\n{joined}")
-    assert not any(c.startswith("merge ") for c in calls), (
+    assert not any("merge run=newest-for-code" in c for c in calls), (
         f"the sweep merged under a run it could not confirm:\n{joined}")
+
+    # THE LIVENESS HALF. The row after the phantom must still be swept.
+    # `continue` skips one row; `break` silently kills the whole loop at rc 0.
+    assert any("dispatch for real-run-id" in c for c in calls), (
+        f"the row AFTER the phantom was never processed -- the phantom did not "
+        f"skip a row, it ended the sweep:\n{joined}")
 
 
 def _extract_python_snippet(marker):

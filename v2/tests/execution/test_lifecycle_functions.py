@@ -628,7 +628,8 @@ def test_a_fail_verdict_sends_the_run_back_rather_than_forward(tmp_path):
 @pytest.mark.parametrize("verdict", [
     "na", "codex:error", "codex:PASS", "pass",
     # THE KERNEL'S OWN VOCABULARY, unprefixed. `review=` is model-authored, so
-    # passing an unmapped word through unchanged let a marker saying
+    # passing an unmapped word through unchanged (as this did before the
+    # `unmapped:` prefix) let a marker saying
     # `review=accept` mint a real review_verdict and advance the run to
     # `reviewing` without ever satisfying `*:pass`. An authorization bypass,
     # introduced by the fix that stopped unmapped verdicts being skipped
@@ -884,6 +885,21 @@ def test_a_ci_status_that_STRIPS_into_success_cannot_authorize(tmp_path, ci):
     _run(f"_kernel_record_ci {run_id} {gen} {ci!r} {HEAD_SHA}", env=_db_env(db))
 
     from kernel.authz import _ci_is_green
-    assert not _ci_is_green(Store.open(db), run_id, HEAD_SHA), (
+    st = Store.open(db)
+    assert not _ci_is_green(st, run_id, HEAD_SHA), (
         f"{ci!r} normalised into a green CI observation and would authorize a "
         "merge on CI that never reported success")
+
+    # POSITIVE half. "not green" is also true when the command never reached
+    # the kernel at all -- which is precisely what the unsanitised version did
+    # (`ci=a"b` broke the JSON, so no fact was recorded and the observation
+    # vanished). A negative-only assertion cannot tell "recorded as unmapped"
+    # from "lost", so it would pass for both the fix and the defect.
+    accepted = [f for f in st.facts_for(run_id)
+                if (f.payload or {}).get("command_name") == "record_ci_observation"]
+    assert accepted, (
+        f"{ci!r} produced NO ci observation at all -- the payload was rejected "
+        "and the observation was lost rather than recorded as unmapped")
+    status = (accepted[-1].payload or {}).get("payload", {}).get("status", "")
+    assert status.startswith("unmapped:"), (
+        f"recorded status {status!r} is not marked unmapped")
