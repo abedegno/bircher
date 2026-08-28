@@ -663,34 +663,39 @@ def test_reconciliation_is_scoped_to_the_class_the_observation_speaks_to():
         "silently left out of the log")
 
 
-def test_the_reconciliation_version_is_incremented_LOCALLY_not_re_read():
-    """Each successful reconciliation bumps the run version by one, so a version
-    captured once and reused makes every key after the first stale.
+def test_reconciliation_resolves_ONE_key_per_invocation():
+    """Two repairs died here before this one, both pinned by a test I wrote.
 
-    THE OBVIOUS REPAIR IS WRONG, AND THIS TEST PREVIOUSLY REQUIRED IT.
-    Re-reading the version from the store per key defeats the CAS entirely: it
-    absorbs an unrelated writer's change and reconciles against a run that has
-    moved, which is the one thing an expected version exists to refuse --
-    `kernel/cli.py` forbids exactly this in the comment on its own
-    --expected-version argument. Incrementing locally expects the version to
-    have advanced only by MY OWN reconciliations, so anything else refuses.
+    Re-reading the version per key absorbs an unrelated writer's change and
+    reconciles against a run that has moved. Incrementing it locally does the
+    SAME THING one step later: `_kernel_reconcile` is advisory and returns 0
+    whatever happened, so after key 1's CAS correctly fails at version V --
+    because a foreign writer moved the run to V+1 -- the loop still advanced
+    its expectation to V+1, and key 2 then succeeded against that foreign
+    version. An increment is only valid after a KNOWN-successful
+    reconciliation, and this interface cannot establish one.
+
+    So exactly one key is resolved per invocation, against the version that
+    invocation actually observed. The rest are named and the halt stands.
     """
     src = RUN_QUEUE.read_text().splitlines()
     start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
-    body = src[start:end]
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
 
     loop = next(i for i, l in enumerate(body) if "while IFS= read -r _k" in l)
     done = next(i for i in range(loop, len(body)) if body[i].strip() == "EOF")
     inside = "\n".join(body[loop:done])
 
-    assert "_pver=$(( ${_pver:-0} + 1 ))" in inside, (
-        "the CAS version is not incremented locally after each reconciliation, "
-        "so every key after the first reconciles against a version the run has "
-        "left behind")
+    assert "_done=1" in inside and '"$_done" = 1' in inside, (
+        "the loop reconciles every key in one invocation; after the first, its "
+        "expected version is a guess about state it has not observed")
+    assert "_pver=$(( ${_pver:-0} + 1 ))" not in inside, (
+        "the local increment is back: it advances the expectation past a "
+        "reconciliation the advisory wrapper cannot confirm happened")
     assert "_kernel_pending" not in inside, (
-        "the version is re-read from the store inside the loop, which absorbs "
-        "an unrelated writer's change and defeats the CAS it appears to honour")
+        "the version is re-read inside the loop, which absorbs an unrelated "
+        "writer's change and defeats the CAS it appears to honour")
 
 
 def test_the_sweep_prefers_the_run_that_opened_the_PR():

@@ -1828,9 +1828,14 @@ reconcile_deferred_ready() {
       # rc 0, with the remaining PRs never looked at. Fall back to adoption
       # rather than carrying an empty generation into an effect.
       if [ -z "$BIRCHER_GENERATION" ]; then
-        echo "[batch:sweep] $item: recorded run '$deferred_run' yielded no generation -> falling back to adoption" >&2
-        _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
-          "$RECOVERY_REVIEWER" >/dev/null
+        # DO NOT fall back to adoption here. The recorded id exists precisely so
+        # this sweep stops guessing by item code, and adoption takes the NEWEST
+        # run for that code -- so a phantom id would hand this PR's status and
+        # merge attempts to a newer run created by a requeue, which is the
+        # attribution defect the fifth field was added to remove. Skipping
+        # leaves the PR for a human with its ledger honest.
+        echo "[batch:sweep] $item: recorded run '$deferred_run' yielded no generation -> skipping (refusing to guess a different run)" >&2
+        continue
       fi
     else
       _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
@@ -2005,9 +2010,31 @@ for e in json.load(sys.stdin)["pending"]:
     local _pver
     _pver=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
     echo "[batch:recover-pr] $code: run is HALTED -> $_resolution" >&2
-    local _k
+    # ONE KEY PER INVOCATION. Not a loop with a local increment, and not a
+    # loop with a re-read: both absorb an unrelated writer's version change and
+    # apply an observation derived from state that has since moved.
+    #
+    # The local increment recreated the defect it replaced. `_kernel_reconcile`
+    # is advisory and returns 0 whatever happened, so after key 1's CAS
+    # correctly FAILS at version V -- because a foreign writer moved the run to
+    # V+1 -- the loop still advanced its expectation to V+1, and key 2 then
+    # reconciled successfully against that foreign version. The increment is
+    # only valid after a KNOWN-successful reconciliation, and this interface
+    # cannot establish one.
+    #
+    # So: resolve one, then stop and report. Each invocation derives its
+    # expected version from its own fresh observation, which is the only
+    # version it can honestly claim to have observed. Multiple uncertain merges
+    # on one PR are rare; when they happen the remainder are named and the halt
+    # stands, which is the fail-closed direction.
+    local _k _done=0
     while IFS= read -r _k; do
       [ -n "$_k" ] || continue
+      if [ "$_done" = 1 ]; then
+        echo "[batch:recover-pr] $code: $_k also unresolved -- left for a later invocation, whose observation will be its own" >&2
+        continue
+      fi
+      _done=1
       # LOCALLY INCREMENTED, not re-read. Each successful reconciliation bumps
       # the version by one, so a version captured once and reused made every
       # key after the first stale. But RE-READING it from the store defeats the
@@ -2024,7 +2051,6 @@ for e in json.load(sys.stdin)["pending"]:
       # staleness half.
       echo "[batch:recover-pr] $code: attempting reconcile of $_k (expected version ${_pver:-?})" >&2
       _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
-      _pver=$(( ${_pver:-0} + 1 ))
     done <<EOF
 $_pkeys
 EOF

@@ -98,3 +98,52 @@ def test_a_legacy_four_field_row_still_falls_back(tmp_path):
     assert "ADOPT_BY_CODE itemY" in joined, (
         f"a legacy row no longer falls back to adoption:\n{joined}\n"
         f"stderr: {r.stderr[-300:]}")
+
+
+def test_a_phantom_recorded_run_is_SKIPPED_not_guessed_around(tmp_path):
+    """The fifth field exists so the sweep stops guessing by item code. If the
+    recorded id yields no generation, falling back to adoption hands this PR's
+    status and merge attempts to the NEWEST run for that code -- which, after a
+    requeue, is a different attempt entirely. That is the attribution defect the
+    field was added to remove, reintroduced by the fallback meant to make the
+    field safe. Codex flagged that this case had no coverage; it now has."""
+    src = RUN_QUEUE.read_text().splitlines()
+    body = _extract_function(src, "reconcile_deferred_ready")
+    deferred = tmp_path / "deferred.tsv"
+    deferred.write_text("itemZ\t44\t9\t" + "c" * 40 + "\tphantom-run-id\n")
+    log = tmp_path / "log"
+
+    script = f'''
+set -uo pipefail
+REPO=demo/demo
+DEFERRED_READY_FILE={deferred}
+RECOVERY_REVIEWER=codex
+BIRCHER_NET_TIMEOUT=5
+MERGE_NOTE=""
+LOG={log}
+_log() {{ printf '%s\\n' "$*" >> "$LOG"; }}
+gh() {{ case "$*" in *"--json state"*) echo OPEN ;; *) echo "" ;; esac; }}
+_net_run() {{ shift; "$@"; }}
+_effect() {{ _log "effect $1"; return 0; }}
+_restamp_if_delta_unchanged() {{ return 0; }}
+_ensure_issue_closed() {{ :; }}
+merge_ready_pr() {{ _log "merge run=${{BIRCHER_RUN_ID:-<unset>}}"; return 0; }}
+_kernel_adopt_run() {{ _log "ADOPT_BY_CODE $1"; BIRCHER_RUN_ID="newest-for-code"; export BIRCHER_RUN_ID
+                       BIRCHER_GENERATION=9; export BIRCHER_GENERATION; }}
+# the phantom: the kernel does not know this run, so no generation comes back
+_kernel_dispatch() {{ _log "dispatch for ${{BIRCHER_RUN_ID:-<unset>}}"; printf ''; }}
+
+{body}
+
+reconcile_deferred_ready || true
+'''
+    f = tmp_path / "sweep-phantom.sh"
+    f.write_text(script)
+    subprocess.run(["bash", str(f)], capture_output=True, text=True, cwd=str(REPO_ROOT))
+    calls = log.read_text().splitlines() if log.exists() else []
+    joined = "\n".join(calls)
+
+    assert "ADOPT_BY_CODE" not in joined, (
+        f"a phantom recorded id fell back to guessing by code:\n{joined}")
+    assert not any(c.startswith("merge ") for c in calls), (
+        f"the sweep merged under a run it could not confirm:\n{joined}")
