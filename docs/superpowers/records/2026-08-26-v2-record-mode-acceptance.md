@@ -932,3 +932,21 @@ is not carelessness about evidence — it is treating a reproduction as faithful
 without checking what the real path supplies that mine does not. The question
 that would have caught all three: **what does the production path do that my
 test does not?**
+
+**The cross-vendor seat caught it first, with no tooling at all.** A codex
+reviewer was dispatched to attack the withdrawal while I kept testing. Every
+container command it tried failed (`exit 7` — its sandbox has no route to the
+NAS), so it ran nothing and read nothing. It still returned:
+
+> **Verdict: REFUTED — insufficiently demonstrated.** The direct-`git`
+> launcher proves network-level push capability, but not that a real
+> Claude-driven v2 implementer can push; it bypasses the unresolved layers.
+
+and declined to answer the two questions it had no evidence for rather than
+manufacturing a mechanism for either. Its nominated decisive experiment — have
+the real harness invoke `git push` under the session's own launcher — is
+exactly the one still outstanding.
+
+Worth recording precisely because it had NO advantage over me except distance:
+same facts, no execution, and it went straight to "is your reproduction the
+thing that runs?" while I was busy running more of it.

@@ -725,6 +725,17 @@ section: the implementer's `git push` does not fail, it **hangs** — measured a
 over ten minutes before cancellation. The bundle's prompt tells the implementer
 that a failure is the boundary working, and no failure ever arrives.
 
+> **STATUS 2026-08-29: premise confirmed, mechanism corrected.** The boundary
+> DOES enforce — a real session cannot reach a host outside its allow-list
+> (`curl https://example.com` → `000`) — but it enforces via an authenticated
+> local relay injected as `HTTP_PROXY` by the parent process, NOT via Landlock,
+> which matches TCP by port and cannot see a host or a path. So a denied push
+> is refused by the relay, and the candidate table below is wrong about where
+> to look. Before implementing, OBSERVE THE DENIAL'S ACTUAL SHAPE: a relay
+> refusal may already return an error, in which case there is no stall to bound
+> and this task should be deleted rather than done. See the record's second
+> correction.
+
 **This task begins as a spike, because the obvious fix does not exist.**
 `run_item` never creates the implementer's worktree — `run-queue.sh:3579` is
 PROMPT TEXT instructing the session to create its own. There is no
