@@ -1947,6 +1947,34 @@ reconcile_deferred_ready() {
 # branch-protection bypass. rc mirrors merge_ready_pr (0 = merged or left open
 # with a marker; 2 = merged but main-CI HALT). Reviewer defaults to claude_code
 # (the overnight implementer was codex; the reviewer must be the opposite vendor).
+# _publish_ref_visible <branch> -- rc 0 once GitHub's API sees the branch as
+# ahead of main; rc 1 if it never does within the bound.
+#
+# `git push` returning success does NOT mean `gh pr create` will find the
+# branch. Observed live and REPRODUCIBLY on two clean branches: a pull_request
+# effect issued immediately after a CONFIRMED ref_update failed with "No
+# commits between main and <branch>; Head ref must be a branch", and the
+# identical command succeeded a moment later. Measured propagation was under a
+# second -- short enough to lose back-to-back, and long enough to halt the run
+# when you do.
+#
+# Why a wait and not a retry: a failed effect is journalled UNCERTAIN and halts
+# the run, so the second attempt would be refused until a human reconciles a
+# publication that was one second from working. Checking before acting keeps
+# the effect a single attempt with a single outcome.
+#
+# A read, not an effect: it mutates nothing.
+_publish_ref_visible() {  # <branch>
+  local branch="$1" i=0 ahead=""
+  while [ "$i" -lt "${BIRCHER_PUBLISH_REF_TRIES:-30}" ]; do
+    ahead=$(gh api "repos/$REPO/compare/main...$branch" --jq .ahead_by 2>/dev/null) || ahead=""
+    if [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null; then return 0; fi
+    i=$((i + 1))
+    sleep "${BIRCHER_PUBLISH_REF_DELAY:-1}"
+  done
+  return 1
+}
+
 # publish_cmd <code> <worktree> <branch> [claimed_oid] -- publish an
 # implementer's nominated commit from the KERNEL's credential domain.
 #
@@ -2003,6 +2031,9 @@ publish_cmd() {
   ( cd "$wt" && _effect ref_update "publish:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
       git push origin "$oid:refs/heads/$branch" ) || {
       echo "[batch:publish] $code: push refused or failed" >&2; return 1; }
+
+  _publish_ref_visible "$branch" || {
+      echo "[batch:publish] $code: pushed $oid, but GitHub never showed '$branch' ahead of main -> not attempting the PR" >&2; return 1; }
 
   ( cd "$wt" && _effect pull_request "publish-pr:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
       gh pr create --repo "$REPO" --head "$branch" --base main \
