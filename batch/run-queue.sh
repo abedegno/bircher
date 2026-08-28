@@ -1947,34 +1947,6 @@ reconcile_deferred_ready() {
 # branch-protection bypass. rc mirrors merge_ready_pr (0 = merged or left open
 # with a marker; 2 = merged but main-CI HALT). Reviewer defaults to claude_code
 # (the overnight implementer was codex; the reviewer must be the opposite vendor).
-# _publish_ref_visible <branch> -- rc 0 once GitHub's API sees the branch as
-# ahead of main; rc 1 if it never does within the bound.
-#
-# `git push` returning success does NOT mean `gh pr create` will find the
-# branch. Observed live and REPRODUCIBLY on two clean branches: a pull_request
-# effect issued immediately after a CONFIRMED ref_update failed with "No
-# commits between main and <branch>; Head ref must be a branch", and the
-# identical command succeeded a moment later. Measured propagation was under a
-# second -- short enough to lose back-to-back, and long enough to halt the run
-# when you do.
-#
-# Why a wait and not a retry: a failed effect is journalled UNCERTAIN and halts
-# the run, so the second attempt would be refused until a human reconciles a
-# publication that was one second from working. Checking before acting keeps
-# the effect a single attempt with a single outcome.
-#
-# A read, not an effect: it mutates nothing.
-_publish_ref_visible() {  # <branch>
-  local branch="$1" i=0 ahead=""
-  while [ "$i" -lt "${BIRCHER_PUBLISH_REF_TRIES:-30}" ]; do
-    ahead=$(gh api "repos/$REPO/compare/main...$branch" --jq .ahead_by 2>/dev/null) || ahead=""
-    if [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null; then return 0; fi
-    i=$((i + 1))
-    sleep "${BIRCHER_PUBLISH_REF_DELAY:-1}"
-  done
-  return 1
-}
-
 # publish_cmd <code> <worktree> <branch> [claimed_oid] -- publish an
 # implementer's nominated commit from the KERNEL's credential domain.
 #
@@ -1987,6 +1959,28 @@ publish_cmd() {
   local wt="${2:?usage: --publish <code> <worktree> <branch> [oid]}"
   local branch="${3:?usage: --publish <code> <worktree> <branch> [oid]}"
   local claimed="${4:-}"
+
+  # THE PUSH AND THE PR MUST NAME THE SAME REPOSITORY.
+  #
+  # `git push origin` resolves through the WORKTREE's remote; `gh pr create
+  # --repo "$REPO"` names one explicitly. Nothing made them agree, and they
+  # silently did not: run-queue.sh re-derives REPO from BIRCHER_REPO, so a
+  # caller that exported REPO alone pushed to one repo and asked GitHub to open
+  # the PR on another. It surfaced as "Head ref must be a branch" -- an error
+  # about the head ref, for a fault in the repository -- and cost an entire
+  # misdiagnosis: a propagation delay that does not exist, complete with a
+  # bounded poll to wait for it. The only reason it was not worse is that the
+  # branch did not exist on the other repository.
+  #
+  # Checked BEFORE any effect, so a mismatch costs nothing and is refused
+  # rather than journalled.
+  local origin_url origin_slug
+  origin_url=$(git -C "$wt" remote get-url origin 2>/dev/null) || origin_url=""
+  origin_slug=$(printf '%s' "$origin_url" | sed -E 's#^(https?://[^/]+/|git@[^:]+:|ssh://[^/]+/)##; s#\.git$##')
+  if [ "$origin_slug" != "$REPO" ]; then
+    echo "[batch:publish] $code: the worktree pushes to '${origin_slug:-<no origin>}' but the PR would open on '$REPO' -- refusing to publish to one repository and announce it on another" >&2
+    return 1
+  fi
 
   # ASK BEFORE ADOPTING. `_kernel_adopt_run` mints when it finds nothing, so
   # routing this question through it would answer "was this dispatched?" by
@@ -2031,9 +2025,6 @@ publish_cmd() {
   ( cd "$wt" && _effect ref_update "publish:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
       git push origin "$oid:refs/heads/$branch" ) || {
       echo "[batch:publish] $code: push refused or failed" >&2; return 1; }
-
-  _publish_ref_visible "$branch" || {
-      echo "[batch:publish] $code: pushed $oid, but GitHub never showed '$branch' ahead of main -> not attempting the PR" >&2; return 1; }
 
   ( cd "$wt" && _effect pull_request "publish-pr:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
       gh pr create --repo "$REPO" --head "$branch" --base main \
