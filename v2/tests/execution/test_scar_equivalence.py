@@ -73,18 +73,25 @@ def _function_ranges():
 
 # --- the parser must be able to fail ------------------------------------------
 
-def test_the_matrix_parses_into_two_tables():
-    """A parser that finds nothing reports total compliance."""
+def test_the_matrix_parses_into_three_tables():
+    """A parser that finds nothing reports total compliance.
+
+    Three since C8 Phase 2: retained, excluded, and RETIRED -- scars whose code
+    no longer exists. The count is pinned so a fourth table cannot appear
+    unnoticed and escape every rule below.
+    """
     tables = _tables()
-    assert len(tables) == 2, f"expected retained + excluded, got {len(tables)}"
+    assert len(tables) == 3, (
+        f"expected retained + excluded + retired, got {len(tables)}")
     assert len(retained()[1]) >= 8
-    assert len(excluded()[1]) >= 2
+    assert len(excluded()[1]) >= 1
+    assert len(retired()[1]) >= 2
 
 
 def test_the_function_scanner_finds_known_functions():
     """The known-positive for the range scanner."""
     ranges = _function_ranges()
-    for fn in ("_classify_ci_failure", "merge_ready_pr", "parse_marker",
+    for fn in ("_classify_ci_failure", "merge_ready_pr", "observe_outcome",
                "_merge_gate", "_reopen_reverted_issues"):
         assert fn in ranges, f"{fn} not found by the scanner"
     lo, hi = ranges["_classify_ci_failure"]
@@ -183,3 +190,31 @@ def test_effects_cells_name_only_real_effect_classes():
             assert token in EffectClass.ALL, (
                 f"{row[0]}: {token!r} is not an effect class"
             )
+
+
+def retired():
+    """The third table: scars whose code no longer exists.
+
+    Deliberately NOT citation-checked -- there is nothing to cite -- which is
+    exactly why it needs its own rule below. An uncheckable table is where
+    retired rows would otherwise go to stop meaning anything.
+    """
+    t = _tables()[2]
+    return t[0], t[1:]
+
+
+def test_every_retired_row_names_a_replacement_guard():
+    """A retirement with no replacement is a coverage loss. The rule that keeps
+    the retired table from becoming a place to put things."""
+    for row in retired()[1]:
+        assert re.search(r"`test_[\w.]+\.py`|`--self-test`", row[-1]), (
+            f"{row[0]}: retired without naming a replacement guard")
+
+
+def test_the_retired_replacements_actually_exist():
+    """And the named guard has to be a real file, or the row is a claim about
+    coverage that nothing provides."""
+    for row in retired()[1]:
+        for name in re.findall(r"`(test_[\w.]+\.py)`", row[-1]):
+            hits = list((REPO_ROOT / "v2" / "tests").rglob(name))
+            assert hits, f"{row[0]}: names {name}, which does not exist"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bircher batch runner: work queue/*.md one at a time through a
-# fresh Bircher session each, detect completion via the PR's bircher-status
+# fresh Bircher session each, derive completion from the repository
 # marker, append a scorecard row, then move on. Sequential by design (M4).
 set -uo pipefail
 
@@ -141,57 +141,7 @@ _branch_code_filter() {
   printf '[.[] | select(.headRefName | ascii_downcase | test("(^|[^a-z0-9])%s([^a-z0-9]|$)"))]' "$1"
 }
 
-# parse_marker <text> -> "outcome|ci|ci_first|review|rounds|note|head"; rc 1 if no marker
-parse_marker() {
-  local line
-  # Extract the marker WHEREVER it appears, not only at a line start. Coordinators
-  # sometimes post `gh pr comment --body "...\nbircher-status:..."` where the \n is
-  # a LITERAL backslash-n (bash double quotes don't expand it), so the marker sits
-  # mid-line and a strict `^bircher-status:` anchor misses it -- the item then polls
-  # to timeout and never merges (EXP02, 2026-07-08). `grep -oE` pulls the marker
-  # substring from wherever it begins to end-of-line; tail -1 takes the last if the
-  # prose mentions it more than once. Portable (no sed newline substitution).
-  line=$(printf '%s\n' "$1" | grep -oE 'bircher-status:.*' | tail -1)
-  [ -n "$line" ] || { echo "|||||"; return 1; }
-  local o c cf r n note head
-  o=$(printf '%s' "$line"  | sed -n 's/.*outcome=\([^ ]*\).*/\1/p')
-  c=$(printf '%s' "$line"  | sed -n 's/.* ci=\([^ ]*\).*/\1/p')
-  cf=$(printf '%s' "$line" | sed -n 's/.* ci_first=\([^ ]*\).*/\1/p')
-  r=$(printf '%s' "$line"  | sed -n 's/.*review=\([^ ]*\).*/\1/p')
-  n=$(printf '%s' "$line"  | sed -n 's/.*rounds=\([0-9]*\).*/\1/p')
-  note=$(printf '%s' "$line" | sed -n 's/.*note="\([^"]*\)".*/\1/p')
-  # head=<40-hex>: the commit the REVIEWER actually reviewed (issue #24). Optional —
-  # a marker written by an older reviewer has no head= and yields empty, which the
-  # caller must treat as "unverifiable" and fail closed rather than re-deriving it.
-  # Anchored to 7-40 hex so a malformed value yields empty instead of garbage.
-  # No `\|` alternation here: BSD sed (macOS) does not support it in a BRE, so a
-  # boundary group like \([ ]\|$\) silently never matches and every head= is lost.
-  # `\{7,40\}` is POSIX and portable; a shorter or non-hex value simply fails to
-  # match and yields empty, which is the fail-closed case the caller wants.
-  head=$(printf '%s' "$line" | sed -n 's/.*[ ]head=\([0-9a-fA-F]\{7,40\}\).*/\1/p')
-  echo "${o}|${c}|${cf}|${r}|${n}|${note}|${head}"
-}
 
-# _marker_bodies_since <pr> <since_epoch> -> bodies of PR comments posted at or
-# after <since_epoch>, one per line.
-#
-# Issue #47: a PR keeps every marker any run ever posted. Grepping ALL comment
-# bodies means a re-queued item adopts the PREVIOUS run's verdict on its first
-# poll and breaks out ~one poll interval in, abandoning the session it just
-# launched. muesli #621 burned two full runs this way (wall=45 each, identical
-# note, PR head never moved) and read as "the agent disagrees with you" rather
-# than "your re-queue was ignored" -- which makes human escalation a one-way
-# door, since the documented recovery path is diagnose-and-hand-back.
-#
-# Filtering by timestamp rather than by head= is deliberate: a coordinator that
-# pushes a commit and THEN posts its marker would momentarily disagree with a
-# head comparison, and markers written by older reviewers carry no head= at all.
-_marker_bodies_since() {
-  BIRCHER_MARKER_SINCE="$2" gh pr view "$1" --repo "$REPO" --json comments \
-    -q '.comments[]
-        | select((.createdAt | fromdateiso8601) >= (env.BIRCHER_MARKER_SINCE | tonumber))
-        | .body' 2>/dev/null
-}
 
 # _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty = NO USABLE VERDICT).
 #
@@ -2355,7 +2305,7 @@ _reconcile_item_pr() {
 # observe_outcome <item> <code> <pr> [issue]
 # Called when a coordinator ended (idle-reaper ~30 min) before posting its
 # marker. Derives a truthful outcome from the PR and, for a CI-green PR, an
-# out-of-band cross-vendor review. Posts a self-describing bircher-status
+# out-of-band cross-vendor review. Posts a self-describing
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
 # `issue` (optional) enables the issue-linkage PR fallback when both signal and
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
@@ -2578,8 +2528,19 @@ if not isinstance(comments, list):
     sys.exit(0)
 
 def is_bircher_status(body):
+    # Filters the comments BIRCHER ITSELF wrote out of the digest handed to a
+    # session, so it does not read its own machinery as human discussion.
+    #
+    # The two legacy prefixes stay AFTER Phase 2 retired the marker, and that is
+    # deliberate: real PRs carry thousands of them, and a filter that stopped
+    # recognising them would start feeding a session the status lines written
+    # by its predecessor. Retiring a channel means never writing one again; it
+    # does not mean forgetting how to read the archive.
     head = body.lstrip()
-    return head.startswith("bircher: outcome=") or head.startswith("bircher-status:")
+    return (head.startswith("bircher: outcome=")
+            or head.startswith("bircher-status:")
+            or head.startswith("Outcome derived from the repository")
+            or head.startswith("Cross-vendor review (outcome derived"))
 
 kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
 maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])
@@ -4041,50 +4002,6 @@ self_test() {
       && { echo "FAIL #62: $_fn uses MAIN_CI_POLL_INTERVAL without _clamp_int"; exit 1; }
   done
   unset _cs _fn
-  local m
-  # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
-  # caller fails closed on that rather than merging an unverified commit.
-  m=$(parse_marker $'some prose\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note="wired it in"')
-  [ "$m" = "ready|green|true|codex:pass|0|wired it in|" ] || { echo "FAIL parse: '$m'"; exit 1; }
-  # Regression (EXP02, 2026-07-08): marker posted with a LITERAL backslash-n before
-  # it (no real newline) must still parse -- single quotes keep \n literal here.
-  m=$(parse_marker 'Ready for merge.\nbircher-status: outcome=ready ci=green ci_first=true review=claude_code:pass rounds=1 note="txt export"')
-  [ "$m" = "ready|green|true|claude_code:pass|1|txt export|" ] || { echo "FAIL parse literal-\\n: '$m'"; exit 1; }
-  m=$(parse_marker "no marker here") && { echo "FAIL: expected rc1"; exit 1; }
-  # --- #24: the reviewed head travels in the marker ---------------------------
-  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=a502a88e20f959c908d00871ee7f25572512dd6d note="with head"')
-  [ "$m" = "ready|green|true|codex:pass|1|with head|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
-    || { echo "FAIL parse head=: '$m'"; exit 1; }
-  # A malformed head (non-hex / too short) must yield EMPTY, not garbage: better to
-  # fail closed than hand merge_ready_pr a sha that can never match.
-  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=zzz note="bad"')
-  [ "${m##*|}" = "" ] || { echo "FAIL parse head=: malformed head must be empty, got '${m##*|}'"; exit 1; }
-  echo "parse_marker head= OK (#24)"
-  # --- #47: marker freshness. A marker from an earlier run must not be adopted -
-  # muesli #621 re-queued twice and each run reported the previous run's verdict
-  # (wall=45, identical note, PR head unmoved) because the poll loop grepped ALL
-  # comment bodies. The stub exercises the REAL jq filter, since that expression
-  # is the thing that was missing.
-  gh() {
-    local q="" prev=""
-    for a in "$@"; do [ "$prev" = "-q" ] && q="$a"; prev="$a"; done
-    printf '%s' '{"comments":[
-      {"createdAt":"2026-08-10T08:02:07Z","body":"old run\nbircher-status: outcome=escalated ci=red ci_first=false review=codex:pass rounds=1 note=\"stale\""},
-      {"createdAt":"2026-08-10T14:44:00Z","body":"this run\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note=\"fresh\""}
-    ]}' | jq -r "$q"
-  }
-  local _mb
-  # since = 14:00Z -> only the fresh marker survives the filter.
-  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T14:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T14:00:00Z' +%s)")
-  [ "$(parse_marker "$_mb" | cut -d'|' -f1)" = "ready" ] \
-    || { echo "FAIL #47: fresh marker should win, got '$(parse_marker "$_mb")'"; exit 1; }
-  _contains "$_mb" 'stale' && { echo "FAIL #47: stale marker leaked through the filter"; exit 1; }
-  # since = after BOTH -> nothing survives, so the caller keeps polling instead of
-  # adopting a verdict no run produced.
-  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T23:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T23:00:00Z' +%s)")
-  [ -z "$_mb" ] || { echo "FAIL #47: no marker should survive, got '$_mb'"; exit 1; }
-  unset -f gh
-  echo "_marker_bodies_since OK (#47)"
   # --- #22: one boundary-anchored branch-code filter, not three copies --------
   local bf; bf=$(_branch_code_filter i23)
   case "$bf" in *'(^|[^a-z0-9])i23([^a-z0-9]|$)'*) : ;; *) echo "FAIL branch filter: '$bf'"; exit 1 ;; esac

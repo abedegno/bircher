@@ -66,10 +66,10 @@ prompt: |
   - Then STOP. Return the PR URL + a short summary (what changed, file:line, how
     verified). Your job ENDS at the PR: do NOT watch or gate CI, do NOT review
     any diff (yours or anyone's), do NOT spawn/dispatch a reviewer or
-    sub-agent, and do NOT post a bircher-status marker or classify the PR
+    sub-agent, and do NOT post a status marker or classify the PR
     outcome. The generic Agent tool must NEVER stand in for review — that
     defeats cross-vendor independence. The orchestrator ALONE owns the CI gate,
-    the cross-vendor review, and the bircher-status marker; if you flag a
+    the cross-vendor review, and the outcome; if you flag a
     concern, report it in your result and let the orchestrator route it.
 
   REVIEW — verify another agent's diff (you are given the diff + the acceptance

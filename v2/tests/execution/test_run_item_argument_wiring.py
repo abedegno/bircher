@@ -132,7 +132,9 @@ PR = "777"
 #: call here. `_merge_gate` is deliberately NOT in this list -- see
 #: REVIEWED_SHA above -- it is stubbed instead, in `_STUB_TEMPLATE`.
 _NEEDED_REAL_FUNCTIONS = [
-    "_contains", "_is_blank", "_is_limit_message", "parse_marker",
+    # `parse_marker` was here until C8 Phase 2 deleted it; run_item no longer
+    # calls it because there is no marker to parse.
+    "_contains", "_is_blank", "_is_limit_message",
     "_pr_signal", "_session_died", "_item_issue",
     "_local_host_id", "_json_get", "_host_ids_match", "_writeback_plan",
     "_issue_writeback", "_ensure_issue_closed", "_record_deferred_ready",
