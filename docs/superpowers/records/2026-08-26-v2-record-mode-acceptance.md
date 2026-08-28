@@ -887,3 +887,48 @@ Written from the source, NOT from an observed run — see Task 6 above.
 | `rounds` | **null** — no observation exists; renamed, not redefined |
 | `pr`, `wall_seconds`, `bound`, `implementer` | unchanged, already observed |
 | `cost` | **null** — unchanged, never populated |
+
+### SECOND CORRECTION, same night: the boundary DOES enforce
+
+The correction above was right to withdraw the original mechanism and wrong in
+what it put in its place. Both errors have the same root, and it is worth
+naming twice rather than hiding the second one.
+
+**What settled it.** A real session, asked to run `curl https://example.com`
+and print its proxy environment, reported:
+
+    example=000
+    HTTP_PROXY=http://omnigent:<token>@127.0.0.1:40463   (and https_/http_/HTTPS_)
+
+`example.com` appears nowhere in the bundle's allow-list, and the request
+FAILED. The session's traffic is routed through an authenticated local relay
+that the parent process (`os_env`) injects into the environment — not through
+Landlock, which matches TCP by port and cannot see a host or a path.
+
+**Why my test said otherwise.** I built a launcher from a captured session
+config and ran `git push` and `curl` under it directly. That process had no
+parent to set `HTTP_PROXY`, so nothing routed through the relay and everything
+went straight out. `run_launcher`'s own docstring says the wrap "inherits
+HTTP_PROXY / CA env vars set by the parent" — I read the file that says so and
+still concluded from my own unfaithful reproduction.
+
+**Where criterion 1 now stands: PARTIALLY DEMONSTRATED.**
+
+- DEMONSTRATED: a real session under this bundle cannot reach a host outside
+  its allow-list. The egress boundary is enforced, by the relay.
+- NOT OBSERVED: a `git push` returning a denial. Session dispatch failed on
+  six of eight attempts tonight (`omnigent run` returns while the harness is
+  still starting; the session goes idle without executing its queued message),
+  and the two that worked were spent on the questions above.
+- MOST LIKELY, and still an inference: the hung push went to the relay and was
+  refused there, which is consistent with a call that never returns. Recorded
+  as a hypothesis, not a finding, because that is the distinction this whole
+  section exists to enforce.
+
+**The lesson, since it is now the third instance.** Twice tonight I explained
+an outcome with a mechanism I had not tested, and once I disproved a real
+mechanism with a test that did not reproduce the conditions. The common error
+is not carelessness about evidence — it is treating a reproduction as faithful
+without checking what the real path supplies that mine does not. The question
+that would have caught all three: **what does the production path do that my
+test does not?**
