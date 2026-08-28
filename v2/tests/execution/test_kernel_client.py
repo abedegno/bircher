@@ -284,3 +284,45 @@ def test_a_hung_python_does_not_block_dispatch(tmp_path):
     assert "SURVIVED" in r.stdout, r.stdout
     assert "[]" in r.stdout, r.stdout
     assert elapsed < 15, f"took {elapsed:.1f}s -- the bound did not fire"
+
+
+def test_find_run_and_run_base_read_a_REAL_store(tmp_path):
+    """Both lookups drive a live database. Without this, every guard in
+    `publish_cmd` is defended only by stubs, and a client mis-wired to fail
+    every call would look identical to one correctly reporting "no such run"
+    -- the shape that shipped an unreachable adapter with 494 tests green.
+    """
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    store.create_run(run_id="ITEM-9-abc", base_repo="abedegno/muesli",
+                     base_sha="cafebabe" * 5)
+
+    found = _run('_kernel_find_run ITEM-9', env={"BIRCHER_KERNEL_DB": str(db)})
+    assert found.stdout == "ITEM-9-abc", (found.stdout, found.stderr)
+
+    base = _run('_kernel_run_base ITEM-9-abc', env={"BIRCHER_KERNEL_DB": str(db)})
+    assert base.stdout == "cafebabe" * 5, (base.stdout, base.stderr)
+
+
+def test_an_unknown_run_reads_back_EMPTY_not_a_plausible_sha(tmp_path):
+    """Empty is the refusal. A lookup that invents a value on a miss would hand
+    `publish_cmd` provenance for work the kernel never dispatched."""
+    db = tmp_path / "kernel.db"
+    Store.open(db).create_run(run_id="OTHER-1-x", base_repo="o/r", base_sha="ab" * 20)
+
+    assert _run('_kernel_find_run ITEM-9',
+                env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
+    assert _run('_kernel_run_base ITEM-9-nope',
+                env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
+
+
+def test_find_run_matches_the_code_PREFIX_not_a_substring(tmp_path):
+    """`ITEM-9` must not adopt `ITEM-90`'s run. The separator is load-bearing:
+    without it a publication would inherit a neighbouring item's base and check
+    its provenance against the wrong history."""
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    store.create_run(run_id="ITEM-90-zzz", base_repo="o/r", base_sha="cd" * 20)
+
+    assert _run('_kernel_find_run ITEM-9',
+                env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""

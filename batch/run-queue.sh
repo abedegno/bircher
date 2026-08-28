@@ -1947,6 +1947,57 @@ reconcile_deferred_ready() {
 # branch-protection bypass. rc mirrors merge_ready_pr (0 = merged or left open
 # with a marker; 2 = merged but main-CI HALT). Reviewer defaults to claude_code
 # (the overnight implementer was codex; the reviewer must be the opposite vendor).
+# publish_cmd <code> <worktree> <branch> [claimed_oid] -- publish an
+# implementer's nominated commit from the KERNEL's credential domain.
+#
+# The implementer cannot do any of this: its egress denies git-receive-pack and
+# its API rules are GET-only. This is the other half of the sentence in its own
+# prompt, and until it existed that prompt described a capability nothing
+# provided.
+publish_cmd() {
+  local code="${1:?usage: --publish <code> <worktree> <branch> [oid]}"
+  local wt="${2:?usage: --publish <code> <worktree> <branch> [oid]}"
+  local branch="${3:?usage: --publish <code> <worktree> <branch> [oid]}"
+  local claimed="${4:-}"
+
+  # ASK BEFORE ADOPTING. `_kernel_adopt_run` mints when it finds nothing, so
+  # routing this question through it would answer "was this dispatched?" by
+  # dispatching it. Refusing work the kernel never started is the correct
+  # answer, and it must not have a side effect.
+  local run_id; run_id=$(_kernel_find_run "$code")
+  if [ -z "$run_id" ]; then
+    echo "[batch:publish] $code: no run behind this code -- the kernel did not dispatch this work and cannot vouch for where it came from" >&2
+    return 1
+  fi
+
+  # The base the kernel RECORDED. `git rev-parse HEAD` in the implementer's
+  # worktree is the TIP of the work, not the base it started from; checking
+  # provenance against it would make every nomination trivially valid.
+  local recorded; recorded=$(_kernel_run_base "$run_id")
+  if [ -z "$recorded" ]; then
+    echo "[batch:publish] $code: run $run_id has no recorded base -- nothing to check provenance against" >&2
+    return 1
+  fi
+
+  _kernel_adopt_run "$code" "$REPO" "$recorded" codex implementer >/dev/null
+
+  local oid; oid=$(_kernel_verify_nomination "${BIRCHER_RUN_ID:-}" "$wt" "$branch" "$claimed")
+  if [ -z "$oid" ]; then
+    echo "[batch:publish] $code: the kernel refused the nomination -> publishing nothing" >&2
+    return 1
+  fi
+  echo "[batch:publish] $code: kernel will publish $oid on '$branch'" >&2
+
+  _effect ref_update "publish:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
+    git push origin "$oid:refs/heads/$branch" || {
+      echo "[batch:publish] $code: push refused or failed" >&2; return 1; }
+
+  _effect pull_request "publish-pr:$code:$oid" "$BIRCHER_NET_TIMEOUT" \
+    gh pr create --repo "$REPO" --head "$branch" --base main \
+      --title "$code" --body "Published by the Bircher kernel from $oid." \
+    || { echo "[batch:publish] $code: PR creation refused or failed" >&2; return 1; }
+}
+
 recover_pr_cmd() {
   local code="${1:?usage: --recover-pr <code> <pr> [reviewer_vendor]}"
   local pr="${2:?usage: --recover-pr <code> <pr> [reviewer_vendor]}"
@@ -7222,6 +7273,11 @@ __HELP__
   #   run-queue.sh --recover-pr <code> <pr> [reviewer_vendor]
   if [ "${1:-}" = "--recover-pr" ]; then
     recover_pr_cmd "${2:-}" "${3:-}" "${4:-}"; exit $?
+  fi
+
+  #   run-queue.sh --publish <code> <worktree> <branch> [claimed_oid]
+  if [ "${1:-}" = "--publish" ]; then
+    publish_cmd "${2:-}" "${3:-}" "${4:-}" "${5:-}"; exit $?
   fi
 
   # RC-1 singleton: only one batch may drain the queue at a time. The 2026-06-22

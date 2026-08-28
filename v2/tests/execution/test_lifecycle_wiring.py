@@ -313,6 +313,11 @@ _EFFECT_SITE_CONTEXT = {
     # before its first effect, so it runs under a valid one of its own.
     "recover_pr_cmd": "ADOPTS",
     "reconcile_deferred_ready": "ADOPTS",
+    # Adopts, and UNLIKE the two above it never mints: it asks
+    # `_kernel_find_run` first and refuses work the kernel never dispatched,
+    # so a refusal leaves no run behind for the next call to mistake for
+    # provenance.
+    "publish_cmd": "ADOPTS",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about

@@ -139,6 +139,68 @@ _kernel() {
 # stdout is CAPTURED here, unlike `_kernel`, which discards it: the answer is
 # the point. An uncertain effect halts its run and nothing may be performed
 # until someone looks, so this is the "what do I look at" half of the halt.
+# _kernel_find_run <code> -> the newest run id starting "<code>-", or empty.
+#
+# NON-MINTING, unlike `_kernel_adopt_run`, and that is the whole point.
+# Publication has to be able to ask "did the kernel dispatch this work?" and
+# be told NO. Asking adopt would answer by creating the run that makes the
+# answer yes -- a junk `queued` row per refusal, and a caller that then reads
+# its own minting as provenance.
+_kernel_find_run() {  # <code>
+  local code="$1" out=""
+  out=$( K_CODE="$code" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.store import Store
+code = os.environ["K_CODE"]
+runs = [r for r in Store.open(os.environ["BIRCHER_KERNEL_DB"]).all_run_ids()
+        if r.startswith(code + "-")]
+print(runs[-1] if runs else "")' 2>/dev/null
+  ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_run_base <run_id> -> the base sha the kernel recorded, or empty.
+# Empty means the kernel has nothing to check provenance against, which for
+# publication is a refusal, not a default.
+_kernel_run_base() {  # <run_id>
+  local run_id="$1" out=""
+  out=$( K_RUN="$run_id" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.store import Store
+try:
+    print(Store.open(os.environ["BIRCHER_KERNEL_DB"]).run_base_sha(
+        os.environ["K_RUN"]) or "")
+except Exception:
+    print("")' 2>/dev/null
+  ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_verify_nomination <run_id> <worktree> <branch> [claimed_oid]
+#   -> echoes the object id the kernel will publish, or EMPTY on refusal.
+#
+# stdout is captured, like `_kernel_pending`: the answer is the point. Empty
+# means refused and the caller must publish NOTHING -- an empty oid reaching a
+# push is the "no answer read as an answer" shape this project has shipped
+# three times.
+_kernel_verify_nomination() {  # <run_id> <worktree> <branch> [claimed_oid]
+  local run_id="$1" wt="$2" branch="$3" claimed="${4:-}" out="" extra=()
+  [ -n "$claimed" ] && extra=(--claimed-oid "$claimed")
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m kernel.cli verify-nomination \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$run_id" \
+           --worktree "$wt" --branch "$branch" "${extra[@]}" 2>/dev/null
+  ) || out=""
+  printf '%s' "$out"
+}
+
 _kernel_pending() {  # <run_id>
   local run_id="$1" out=""
   out=$( PYTHONPATH="$(_kernel_pythonpath)" \
