@@ -387,13 +387,17 @@ part that was broken: adoption finds the run, fences a generation, and gives
 the path's effects a valid context. A complete recovery through merge under
 kernel mode is still unrun.
 
-**Superseded, and left here because the correction matters.** This section
-originally said `_reopen_reverted_issues` and `_pr` remain STALE GENERATION —
-they run after `run_item` returns and nothing unsets the exported run id.
-`test_every_effect_site_is_classified` keeps them enumerated, and
-`test_every_adopting_function_adopts_before_its_first_effect` asserts the order
-for the two that now adopt, because an effect above the adopt call fails
-silently either way.
+**Corrected.** No stale-generation site remains. `_reopen_reverted_issues` is
+classified REACHED — its only caller is `merge_ready_pr`'s revert path, which
+is itself reached from `run_item` — and `_pr` is not in the table at all: it
+was a parser artefact, a one-line function whose span never closed, which
+appeared to own an `_effect` occurrence inside a quoted self-test assertion.
+
+This paragraph previously said both "remain STALE GENERATION". Only its first
+clause was scoped as historical; the rest continued in the present tense and
+was false, so a reader was left believing a checked claim. Announcing that a
+correction matters is not the correction — the same shape as bolting a fix onto
+code without removing what it replaced.
 
 ## Run 10 — a real item on abedegno/muesli, merged by the pipeline
 
@@ -483,7 +487,12 @@ cannot arise. Two of them are real:
    sweep rows are outside the scope of the class-closure tests, which read
    `run_item` only. **This is an open gap, not a solved one.**
 
-### Criterion 2 — every mutation is journalled: **NARROW, not verified**
+### Criterion 2 (as of Run 3) — every mutation is journalled: **NARROW, not verified**
+
+> Superseded by Runs 6, 7 and 10, which journalled `status_check` and a real
+> kernel-mediated `merge`. See "Criterion 2, revisited" above and the Verdict
+> below. Kept because the reasoning that produced it is the reasoning the
+> later runs had to defeat.
 
 The journal contains exactly two effects per run that got that far, both
 `session_control` (the prompt send).
@@ -504,7 +513,10 @@ Also noted: `effect_confirmed` facts carry `effect_class=None`. The intent fact
 carries the class and the confirmation does not, so the journal cannot be
 filtered by class on confirmations alone.
 
-### Criterion 3 — the shadow report: **zero rows, genuinely, on a narrow path**
+### Criterion 3 (as of Run 3) — the shadow report: **zero rows, genuinely, on a narrow path**
+
+> Superseded. Run 6 produced three decision-grade rows that drove two real
+> fixes. See "Criterion 3, revisited" above.
 
 ```
 []
@@ -584,7 +596,12 @@ a reader who stops at the end gets the state of the work eight runs ago.
   kernel-mediated merge; the implementer's own PR and marker still never reach
   the kernel (C8), so it cannot hold fully until that changes.
 - **Criterion 3** is implemented and returned decision-grade rows that drove
-  two real fixes, then a true zero on the path that merged.
+  two real fixes (Run 6, shadow mode). No shadow-report evidence exists for
+  Run 10: it ran under ENFORCE, where `shadow_rejected` facts cannot exist, and
+  this record's own rule four sections above says an empty report there is
+  worth nothing. An earlier draft of this bullet claimed "a true zero on the
+  path that merged" — a claim with no figure behind it, added by a pass whose
+  subject is claims outrunning evidence.
 - **Criterion 4** does not hold in kernel effect mode, by design: the kernel is
   a HARD dependency there, not an advisory observer.
 - **Criterion 5** holds.
