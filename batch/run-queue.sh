@@ -1761,7 +1761,7 @@ merge_ready_pr() {
 }
 
 # _record_deferred_ready <item> <pr> <merge_rc> [issue] [reviewed_sha]: append
-# (item,pr,issue,reviewed_sha) to DEFERRED_READY_FILE iff the PR deferred on a
+# (item,pr,issue,reviewed_sha,run_id) to DEFERRED_READY_FILE iff the PR deferred on a
 # transient/retry-eligible class, so the end-of-run sweep can re-drive it by its
 # EXACT pr number (no re-discovery -> no GOTCHA-1 mapping blind spot), close its
 # issue on merge, and refuse to merge a head that changed since review. The caller
@@ -1789,7 +1789,7 @@ _record_deferred_ready() {
 # loud escalation scorecard row for the (now rare) human hand-off. NEVER --admin.
 reconcile_deferred_ready() {
   echo "[batch:sweep] reconciling ready-but-open PRs deferred by transient failures" >&2
-  local line rest item pr issue sha st cur mss mrc
+  local line rest item pr issue sha st cur mss mrc deferred_run
   # awk dedup PRESERVES the original append order (queue/manifest order); `sort -u`
   # would reorder lexicographically (i10 before i2) and reintroduce the merge-order
   # conflicts the sequential runner avoids.
@@ -2016,12 +2016,26 @@ for e in json.load(sys.stdin)["pending"]:
       # version exists to refuse -- and `kernel/cli.py` says so in the comment
       # forbidding exactly this. Incrementing locally expects the version to
       # have advanced only by MY OWN reconciliations, so anything else refuses.
+      # "attempting", not "reconciled". `_kernel` is advisory and returns 0
+      # whatever happened, so this cannot know it succeeded -- and the previous
+      # wording printed "reconciled" over the top of a swallowed
+      # "stale: ... which has moved". The commit that introduced this loop
+      # named that exact shape as its motivation and then repaired only the
+      # staleness half.
+      echo "[batch:recover-pr] $code: attempting reconcile of $_k (expected version ${_pver:-?})" >&2
       _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
-      echo "[batch:recover-pr] $code: reconciled $_k (expected version ${_pver:-?})" >&2
       _pver=$(( ${_pver:-0} + 1 ))
     done <<EOF
 $_pkeys
 EOF
+    # What is ACTUALLY left, read back rather than inferred from the calls
+    # above having returned 0 -- which they always do.
+    local _still
+    _still=$(_kernel_pending "$BIRCHER_RUN_ID" | "${BIRCHER_PY:-python3}" -c 'import json,sys
+d = json.load(sys.stdin)
+print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>/dev/null)
+    echo "[batch:recover-pr] $code: after reconciliation the kernel reports: ${_still:-<no answer>}" >&2
+
     if [ -n "${_unspoken//[[:space:]]/}" ]; then
       echo "[batch:recover-pr] $code: NOT reconciled -- this observation says nothing about them, so they need a human:" >&2
       printf '%s\n' "$_unspoken" | while IFS= read -r _u; do
@@ -3794,10 +3808,17 @@ EOF
       # and it fires automatically whenever an implementer session dies, which
       # makes it the common case rather than the exotic one.
       #
-      # Guarded on a head: the blind path sets review="na" and no head, and a
-      # run nobody reviewed must not acquire a verdict. `_kernel_verdict` maps
-      # "na" to nothing, and `_kernel_ci_status` passes an unknown CI value
-      # through unchanged so it never counts as green.
+      # GUARDED ON A HEAD, and that guard does all the work. The blind path
+      # sets review="na" and NO head, so a bare "na" never reaches
+      # _kernel_record_review from here at all -- which also means the
+      # "unmapped verdicts are now refused visibly" trade is not being made on
+      # this path, whatever its commit message argued.
+      #
+      # An earlier version of this comment justified the guard partly by
+      # "`_kernel_verdict` maps na to nothing". It no longer does: the fix that
+      # stopped unmapped verdicts being skipped changed exactly that, and
+      # walked past this comment. `_kernel_ci_status` still passes an unknown
+      # CI value through unchanged, so it never counts as green.
       if [ -n "${marker_head:-}" ]; then
         local _rec_body="recovered: outcome=$outcome review=$review head=$marker_head note=$note"
         _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_rec_body")

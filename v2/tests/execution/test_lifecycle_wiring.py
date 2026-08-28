@@ -797,3 +797,28 @@ def test_the_recovery_bindings_CONSUME_the_adopted_base():
         assert "BIRCHER_RUN_BASE" in l, (
             "a recovery binding uses the checkout's HEAD instead of the base "
             f"the kernel recorded for the adopted run:\n  {l.strip()}")
+
+
+def test_reconciliation_does_not_claim_a_success_it_cannot_know():
+    """`_kernel` is advisory and returns 0 whatever happened, so the loop
+    cannot know a reconciliation succeeded. It printed "reconciled" over the
+    top of a swallowed "stale: ... which has moved" -- and the commit that
+    introduced the loop named that exact shape as its motivation, then repaired
+    only the staleness half."""
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+    joined = "\n".join(body)
+
+    loop = next(i for i, l in enumerate(body) if "while IFS= read -r _k" in l)
+    done = next(i for i in range(loop, len(body)) if body[i].strip() == "EOF")
+    inside = "\n".join(body[loop:done])
+    assert "reconciled $_k" not in inside, (
+        "the loop asserts a reconciliation succeeded; the advisory wrapper "
+        "cannot tell it that")
+    assert "attempting reconcile" in inside
+
+    assert "after reconciliation the kernel reports" in joined, (
+        "nothing reads the halt back, so the log's only account of the outcome "
+        "is an assumption")
