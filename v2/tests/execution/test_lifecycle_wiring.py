@@ -772,3 +772,28 @@ def test_an_unreadable_run_state_stops_the_drive():
     assert "knows no run" not in "\n".join(body) or "cannot read run state" in "\n".join(body), (
         "the unreachable-vs-missing distinction is claimed but cannot be "
         "implemented from here; say one honest thing instead")
+
+
+def test_the_recovery_bindings_CONSUME_the_adopted_base():
+    """The prior fix was bound at the producer and not the consumer.
+
+    `test_adopting_a_run_reports_the_base_the_KERNEL_recorded` binds
+    `_kernel_adopt_run`'s export. Reverting the two call sites that USE it back
+    to `"$_rec_base"` -- re-introducing the exact defect the finding was about
+    -- left the whole suite passing, because nothing looked at the consumers.
+    Dropping the export killed a test; restoring the bug did not.
+    """
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith("recover_pr_cmd()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    body = [l for l in src[start:end] if not l.strip().startswith("#")]
+
+    # The QUOTED usages, not the `local _rp_out _rp_ctx` declaration, which
+    # names both and binds neither.
+    binds = [l for l in body if '"$_rp_out"' in l and '"$_rp_ctx"' in l]
+    assert len(binds) == 2, (
+        f"expected the review and merge bindings, found {len(binds)}: {binds}")
+    for l in binds:
+        assert "BIRCHER_RUN_BASE" in l, (
+            "a recovery binding uses the checkout's HEAD instead of the base "
+            f"the kernel recorded for the adopted run:\n  {l.strip()}")
