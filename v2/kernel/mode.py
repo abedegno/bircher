@@ -26,7 +26,19 @@ def kernel_mode() -> str:
     """The configured mode. An unrecognised value raises rather than
     defaulting: a typo that silently meant `shadow` would disable every guard
     without saying so."""
-    mode = os.environ.get("BIRCHER_KERNEL_MODE", SHADOW)
+    # CUTOVER (2026-08-28): the default is ENFORCE, not shadow.
+    #
+    # Shadow was right while the question was "what would enforcement refuse".
+    # A run that answered it -- muesli #728 -> PR #730, merged under enforce
+    # with every command accepted -- settled that, and shadow is now the LESS
+    # safe of the two: under it a refused EFFECT still executes, so the kernel
+    # watches a mutation it has just declined and lets it happen anyway.
+    #
+    # The availability cost was already paid by routing effects through the
+    # kernel at all; enforce adds refusals, not a new dependency. Roll back
+    # with BIRCHER_KERNEL_MODE=shadow, or further with
+    # BIRCHER_EFFECT_MODE=legacy.
+    mode = os.environ.get("BIRCHER_KERNEL_MODE", ENFORCE)
     if mode not in _MODES:
         raise ValueError(
             f"BIRCHER_KERNEL_MODE={mode!r} is not one of {list(_MODES)}"

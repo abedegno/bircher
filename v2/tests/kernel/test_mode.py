@@ -79,10 +79,20 @@ def _authorized_merge():
     return s, out
 
 
-def test_the_default_is_shadow(monkeypatch):
+def test_the_default_is_ENFORCE(monkeypatch):
+    """Cutover, 2026-08-28. Shadow was right while the question was "what would
+    enforcement refuse"; a run that answered it -- muesli #728 -> PR #730,
+    merged under enforce with every command accepted -- settled it.
+
+    Shadow is now the LESS safe default: under it a refused EFFECT still
+    executes, so the kernel watches a mutation it has just declined and lets it
+    happen anyway. Enforce adds refusals, not a new dependency -- the
+    availability cost was already paid by routing effects through the kernel at
+    all.
+    """
     monkeypatch.delenv("BIRCHER_KERNEL_MODE", raising=False)
     from kernel.mode import kernel_mode
-    assert kernel_mode() == SHADOW
+    assert kernel_mode() == ENFORCE
 
 
 def test_an_unknown_mode_is_refused(monkeypatch):
@@ -213,13 +223,17 @@ def test_a_shadow_rejection_mid_sequence_does_not_derail_later_legal_commands(mo
     """Nothing in the suite previously chained two commands under shadow, so
     this survived: an illegal attempt in the middle of an otherwise-legal
     sequence must neither advance the run nor block a LATER command that does
-    not depend on it. Uses the real, unset default -- not an explicit
-    monkeypatch to SHADOW -- because this is the behaviour a run gets when
-    nobody has configured anything. tests/kernel/conftest.py defaults this
-    whole suite to `enforce` (the rest of the suite predates the mode switch);
-    `delenv` here removes that override to reach the code's actual default.
+    not depend on it.
+
+    SHADOW IS NOW SET EXPLICITLY. This test used to reach it by deleting the
+    variable, because an unconfigured run got shadow -- and the docstring said
+    so. After the 2026-08-28 cutover an unconfigured run gets ENFORCE, so
+    `delenv` would have quietly turned this into an enforce test that passes
+    for a different reason than it names. What an unconfigured run gets is now
+    the subject of `test_the_default_is_ENFORCE`; this one is about shadow's
+    behaviour, which remains a supported mode.
     """
-    monkeypatch.delenv("BIRCHER_KERNEL_MODE", raising=False)
+    monkeypatch.setenv("BIRCHER_KERNEL_MODE", "shadow")
     s = Store.open(":memory:", clock=Clock(start_us=1))
     s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
     spec = put_artifact(s, b"# spec")
