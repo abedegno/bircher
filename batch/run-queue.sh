@@ -18,6 +18,10 @@ BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  #
 # (`_net_run`) resolve at call time, so the order of definition does not bind.
 # shellcheck source=lib/effect-adapter.sh
 . "$BUNDLE_DIR/batch/lib/effect-adapter.sh"
+# The observers: what run-queue can see for itself, replacing what the
+# coordinator used to assert in its `bircher-status:` marker.
+# shellcheck source=lib/observe.sh
+. "$BUNDLE_DIR/batch/lib/observe.sh"
 # The kernel client: the coordinator's advisory interface to the v2 kernel.
 # Sourced after the effect adapter and before anything can call `_kernel` /
 # `_kernel_dispatch`. Every call it makes is advisory -- see the file's own
@@ -2462,13 +2466,14 @@ recover_from_ground_truth() {
            reviewed_sha="" ;;
       esac
       echo "[batch:recover] $item: PR #$pr CI green, no marker -> $RECOVERY_REVIEWER recovery review at ${reviewed_sha:0:7}" >&2
-      local prompt rlog
-      prompt=$(_recovery_review_prompt "$pr" "$reviewed_sha")
-      rlog="/tmp/recover-$item.log"
-      ( cd "$BUNDLE_DIR" && omnigent run "agents/$RECOVERY_REVIEWER" \
-          --server "$SERVER" -p "$prompt" ) >"$rlog" 2>&1 || true
-      reviewer_out=$(cat "$rlog" 2>/dev/null)
-      verdict=$(_extract_verdict "$reviewer_out")
+      local _rv
+      _rv=$(BIRCHER_REVIEW_LOG="/tmp/recover-$item.log" \
+              observe_review "$pr" "$reviewed_sha")
+      verdict="${_rv%%|*}"
+      reviewer_out=$(cat "${_rv#*|}" 2>/dev/null)
+      # `classify_recovery`'s `*)` arm already routes an absent verdict to
+      # `escalated`; NONE is spelled empty here so that mapping is untouched.
+      [ "$verdict" = NONE ] && verdict=""
     fi
   fi
 

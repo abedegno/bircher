@@ -78,3 +78,67 @@ observe_ci_history feat-x
     f.write_text(script)
     r = subprocess.run(["bash", str(f)], capture_output=True, text=True)
     assert r.stdout.strip() == "unknown|", (r.stdout, r.stderr)
+
+
+def _review_script(tmp_path, log, *, verdict_fn, omnigent_fn, extra=""):
+    return f"""
+set -uo pipefail
+REPO=demo/demo
+RECOVERY_REVIEWER=codex
+BUNDLE_DIR={tmp_path}
+SERVER=http://x
+BIRCHER_REVIEW_LOG={log}
+_recovery_review_prompt() {{ printf 'review pr %s at %s' "$1" "$2"; }}
+_extract_verdict() {{ {verdict_fn} }}
+omnigent() {{ {omnigent_fn} }}
+{extra}
+. "{OBSERVE}"
+observe_review 42 cafebabe0000
+"""
+
+
+def _run(tmp_path, name, script):
+    f = tmp_path / name
+    f.write_text(script)
+    return subprocess.run(["bash", str(f)], capture_output=True, text=True)
+
+
+def test_a_reviewer_that_says_PASS_is_read_as_PASS(tmp_path):
+    r = _run(tmp_path, "rev-pass.sh", _review_script(
+        tmp_path, tmp_path / "rlog",
+        verdict_fn="printf '%s' \"$(printf '%s' \"$1\" | grep -oE 'VERDICT: [A-Z]+' | sed 's/VERDICT: //')\";",
+        omnigent_fn="echo 'findings here'; echo 'VERDICT: PASS';"))
+    assert r.stdout.strip().startswith("PASS|"), (r.stdout, r.stderr)
+
+
+def test_a_reviewer_that_produces_NO_verdict_is_NONE_not_PASS(tmp_path):
+    """A reviewer that crashed, timed out, or rambled has not approved
+    anything. Defaulting to PASS would authorise a merge on silence."""
+    r = _run(tmp_path, "rev-none.sh", _review_script(
+        tmp_path, tmp_path / "rlog2",
+        verdict_fn="printf '';",
+        omnigent_fn="echo 'I could not complete the review.';"))
+    assert r.stdout.strip().startswith("NONE|"), (r.stdout, r.stderr)
+
+
+def test_a_reviewer_that_EXITS_NONZERO_is_NONE(tmp_path):
+    """A dead reviewer's stdout is not evidence. Mining it for a verdict would
+    let a crash that echoed its own prompt authorise a merge."""
+    r = _run(tmp_path, "rev-rc1.sh", _review_script(
+        tmp_path, tmp_path / "rlog3",
+        verdict_fn="printf 'PASS';",
+        omnigent_fn="echo 'VERDICT: PASS'; return 1;"))
+    assert r.stdout.strip().startswith("NONE|"), (
+        f"a reviewer that died had its stdout mined for a verdict: {r.stdout}")
+
+
+def test_the_review_is_dispatched_against_the_SHA_it_was_given(tmp_path):
+    """#66: the prompt carries the sha run-queue observed. A reviewer asked to
+    find its own head can bless a concurrent push."""
+    seen = tmp_path / "seen"
+    r = _run(tmp_path, "rev-sha.sh", _review_script(
+        tmp_path, tmp_path / "rlog4",
+        verdict_fn="printf 'PASS';",
+        omnigent_fn=f"printf '%s\\n' \"$*\" > {seen}; echo 'VERDICT: PASS';"))
+    assert seen.exists(), (r.stdout, r.stderr)
+    assert "cafebabe0000" in seen.read_text(), seen.read_text()
