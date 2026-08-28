@@ -246,7 +246,15 @@ def _perform_unhalted(
         store.append_fact(
             run_id=run_id, kind=EventKind.EFFECT_UNCERTAIN, actor=actor,
             causal_command_id=idempotency_key,
-            payload={"effect_id": eid, "error": type(exc).__name__},
+            payload={"effect_id": eid, "error": type(exc).__name__,
+                     # WHAT IT SAID, not just what it was. Without this a halt
+                     # reads "RuntimeError" and nothing else, and the only way
+                     # to learn why is to re-run the effect by hand against the
+                     # live world -- which is exactly what a journal exists to
+                     # make unnecessary. Diagnosing one halted publish cost
+                     # three such round-trips. Capped, because the executor
+                     # folds the failed command's stderr into this string.
+                     "detail": str(exc)[:500]},
         )
         enter_reconciliation_required(store, run_id, _halt_evidence(
             store, run_id, generation, effect_class, idempotency_key))

@@ -163,3 +163,4 @@ def test_the_cli_refuses_with_a_nonzero_code_and_says_why(repo, capsys):
                "--worktree", str(repo), "--branch", "work"])
     assert rc != 0
     assert "does not descend" in capsys.readouterr().err
+

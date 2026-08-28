@@ -91,9 +91,17 @@ RC_FAILED = 90
 def _executor(effect_class, intent, idempotency_key):
     """Run the real command. Raising here is what makes an effect uncertain.
 
-    `check=False` plus an explicit raise, rather than `check=True`: the journal
-    distinguishes "ran and failed" from "outcome unknown", and letting
-    CalledProcessError escape unlabelled would collapse the two.
+    `check=False` plus an explicit raise, rather than `check=True`: the raised
+    message carries the command's rc and stderr, which the journal records as
+    the halt's `detail`.
+
+    NOTE what this does NOT do. Every executor failure -- a clean non-zero exit
+    as much as a crash mid-flight -- becomes `effect_uncertain` and halts the
+    run. The effect STATE does not distinguish "ran and failed" from "outcome
+    unknown"; only the recorded error name and detail do. An earlier version of
+    this docstring claimed the journal drew that distinction. It does not, and
+    reading it as a promise would leave a caller expecting a failed push to be
+    retryable without reconciliation.
     """
     r = subprocess.run(resolve_command(list(intent["argv"])),
                        capture_output=True, text=True)
