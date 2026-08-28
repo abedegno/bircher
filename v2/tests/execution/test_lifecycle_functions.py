@@ -698,20 +698,35 @@ def test_adopting_a_run_reports_the_base_the_KERNEL_recorded(tmp_path):
         f"recorded ({BASE_SHA!r}); a review bound to it would be refused")
 
 
-def test_a_MINTED_run_is_usable_for_what_it_was_minted_for(tmp_path):
-    """A minted run sat at `queued`, where record_implementation_output is
-    illegal -- so the caller's lifecycle drive earned exactly the four refusals
-    the state field exists to prevent, and minting produced a run that could not
-    be used for the thing it was minted for."""
+def test_a_MINTED_run_has_NO_fabricated_history(tmp_path):
+    """A minted run must stay at `queued`, and the caller's lifecycle drive
+    must be refused. Those refusals are the gate working.
+
+    THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE -- that minting advances the run
+    to `implementing` -- and the code seeded submit_spec/submit_plan/
+    start_implementation with a synthesized blob to satisfy it. That fabricated
+    the history the merge gate exists to check: a PR that never came from the
+    queue reached `merge_requested` with an empty shadow report, its spec and
+    plan both reading "adopted: <code> in <repo>". The test pinned the
+    fabrication, so the suite defended it.
+
+    A PR with no run behind it has no recorded spec, plan, output, CI or
+    review. Declining to authorize its merge is the correct answer, not a gap.
+    """
     db = tmp_path / "k.db"
     r = _run('_kernel_adopt_run brand-new abedegno/muesli '
              f'{BASE_SHA} codex implementer >/dev/null; printf "%s" "$BIRCHER_RUN_ID"',
              env=_db_env(db))
     run_id = r.stdout.strip()
     assert run_id.startswith("brand-new-adopted-"), run_id
-    assert Store.open(db).run_state(run_id) == "implementing", (
-        "a minted run is not at `implementing`, so the first thing the caller "
-        "does with it is refused")
+
+    st = Store.open(db)
+    assert st.run_state(run_id) == "queued", (
+        f"a minted run is at {st.run_state(run_id)!r}: something advanced it, "
+        "which means a history was manufactured for a PR that has none")
+    accepted = {(f.payload or {}).get("command_name") for f in st.facts_for(run_id)
+                if f.kind == EventKind.COMMAND_ACCEPTED}
+    assert not accepted, f"a minted run accepted commands it has no basis for: {accepted}"
 
 
 # --- the reconciliation WIRING, not just the kernel function -------------------

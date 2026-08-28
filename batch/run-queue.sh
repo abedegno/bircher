@@ -1822,6 +1822,16 @@ reconcile_deferred_ready() {
       BIRCHER_RUN_ID="$deferred_run"; export BIRCHER_RUN_ID
       BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
       export BIRCHER_GENERATION
+      # A recorded id the kernel does not know yields NO generation, and the
+      # first `_effect` then aborts on `${BIRCHER_GENERATION:?}` -- which under
+      # `set -u` exits the shell and silently kills the whole sweep loop, at
+      # rc 0, with the remaining PRs never looked at. Fall back to adoption
+      # rather than carrying an empty generation into an effect.
+      if [ -z "$BIRCHER_GENERATION" ]; then
+        echo "[batch:sweep] $item: recorded run '$deferred_run' yielded no generation -> falling back to adoption" >&2
+        _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
+          "$RECOVERY_REVIEWER" >/dev/null
+      fi
     else
       _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
         "$RECOVERY_REVIEWER" >/dev/null
@@ -1992,18 +2002,23 @@ for e in json.load(sys.stdin)["pending"]:
     k = e.get("idempotency_key","")
     if e.get("effect_class") != "merge" or not k.startswith(want):
         print(e["effect_class"], k)' 2>/dev/null)
+    local _pver
+    _pver=$(printf '%s' "$_pend" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
     echo "[batch:recover-pr] $code: run is HALTED -> $_resolution" >&2
     local _k
     while IFS= read -r _k; do
       [ -n "$_k" ] || continue
-      # The version is re-read PER KEY. Each successful reconciliation bumps it
-      # under CAS, so a version captured once and reused made every
-      # reconciliation after the first stale -- and the advisory wrapper
-      # swallowed the failure while the script printed "reconciled" anyway.
-      local _pver
-      _pver=$(_kernel_pending "$BIRCHER_RUN_ID" | "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
+      # LOCALLY INCREMENTED, not re-read. Each successful reconciliation bumps
+      # the version by one, so a version captured once and reused made every
+      # key after the first stale. But RE-READING it from the store defeats the
+      # CAS entirely: it absorbs an unrelated writer's change and reconciles
+      # against a run that has moved, which is the one thing the expected
+      # version exists to refuse -- and `kernel/cli.py` says so in the comment
+      # forbidding exactly this. Incrementing locally expects the version to
+      # have advanced only by MY OWN reconciliations, so anything else refuses.
       _kernel_reconcile "$BIRCHER_RUN_ID" "$_k" "$_resolution" "${_pver:-0}"
-      echo "[batch:recover-pr] $code: reconciled $_k (at version ${_pver:-?})" >&2
+      echo "[batch:recover-pr] $code: reconciled $_k (expected version ${_pver:-?})" >&2
+      _pver=$(( ${_pver:-0} + 1 ))
     done <<EOF
 $_pkeys
 EOF

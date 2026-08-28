@@ -228,20 +228,22 @@ print(Store.open(os.environ["BIRCHER_KERNEL_DB"]).run_base_sha(os.environ["K_RUN
   export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || _kernel_warn "adopt: no generation for $BIRCHER_RUN_ID"
 
-  # A MINTED run is at `queued`, where record_implementation_output is illegal.
-  # Leaving it there meant the caller's lifecycle drive earned the exact four
-  # refusals the state field was added to prevent -- so minting produced a run
-  # that could not be used for the thing it was minted for. Advance it to
-  # `implementing`, which is where an adopted run normally is, so both cases
-  # hand the caller the same shape.
-  if [ "$found" = "" ] && [ -n "$BIRCHER_GENERATION" ]; then
-    local _seed; _seed=$(_kernel_put_artifact "adopted: $code in $repo")
-    if [ -n "$_seed" ]; then
-      _kernel_submit_spec "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_seed"
-      _kernel_submit_plan "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_seed"
-      _kernel_start_implementation "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION"
-    fi
-  fi
+  # A MINTED run stays at `queued`, and its caller's lifecycle drive is
+  # refused. That is CORRECT and it is left alone deliberately.
+  #
+  # An earlier version seeded submit_spec/submit_plan/start_implementation with
+  # a synthesized blob so the caller would not meet those refusals. That
+  # FABRICATED THE HISTORY THE MERGE GATE EXISTS TO CHECK: a PR that never came
+  # from the queue went from `queued` plus four refusals to `merge_requested`
+  # with an empty shadow report, every command accepted, its spec and plan both
+  # the string "adopted: <code> in <repo>". The comment forty lines above says
+  # minting is a fallback precisely "because a fresh run would present an empty
+  # history to a merge gate whose whole job is to check history" -- and the
+  # seeding made that empty history look full.
+  #
+  # The refusals are the gate working. A PR with no run behind it has no
+  # recorded spec, plan, output, CI or review, and the kernel should decline to
+  # authorize its merge for exactly that reason.
   printf '%s' "$BIRCHER_RUN_ID"
 }
 
@@ -537,13 +539,11 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context>
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
   local verdict; verdict=$(_kernel_verdict "$raw")
-  # No early return for an unmapped verdict: it is submitted and refused, so
-  # the refusal lands in the shadow report instead of vanishing. Only a
-  # genuinely EMPTY verdict is skipped, because there is nothing to submit.
-  if [ -z "$verdict" ]; then
-    _kernel_warn "empty verdict -- not recording a review"
-    return 0
-  fi
+  # No early return: every input now maps to something submittable -- a mapped
+  # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
+  # used to skip an empty verdict became unreachable when the fallback stopped
+  # returning empty, and a dead guard with a live comment reads as a check that
+  # is still happening.
   if [ -z "$artifact" ] || [ -z "$base" ] || [ -z "$context" ]; then
     _kernel_warn "incomplete verdict binding (artifact='$artifact' base='$base' context='$context') -- not recording a review"
     return 0
