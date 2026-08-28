@@ -754,3 +754,70 @@ deletions, at two points outside both functions.
 **The marker is still how `run_item` learns outcomes.** `--publish` is reachable
 only as its own subcommand; nothing in the normal item path calls it yet. Phase
 2 retires the marker.
+
+---
+
+## CORRECTION to C8 Phase 1, criterion 1 (2026-08-29)
+
+**The claim recorded above is withdrawn.** I wrote that the implementer's push
+"HANGS" because "the egress policy blackholes the connection". That mechanism
+is disproved, and criterion 1 is **not demonstrated**.
+
+### What the evidence actually shows
+
+The session that ran `git push origin c8impl-branch` and never returned was
+running under sandbox launcher `/tmp/omnigent-sandbox-ork3z59r.py`, created
+21:12 — matching the 21:13 start of that session's `claude` process. Decoding
+its embedded config:
+
+    backend: linux_landlock | allow_network: True
+    egress_relay_port: None | egress_socket_path: None
+
+**There was no egress relay in that session at all.** The bundle declared four
+egress rules; the sandbox that ran carried none of them.
+
+I then built a launcher from that exact config with `/usr/bin/git` as the
+target instead of `/usr/local/bin/claude`, and pushed:
+
+    [omnigent-sandbox] landlock active abi=6 write_roots=8 read_roots=unrestricted
+    To https://github.com/abedegno/bircher-smoke.git
+       e00d445..81a71a0  c8impl-branch -> c8impl-branch
+    elapsed=2s
+
+Two seconds, rc=0. Repeated against a *different* session's config that DOES
+carry a relay (`egress_relay_port: 57927`): also 2 seconds, also rc=0.
+
+The launcher sets no proxy environment variables, and Landlock restricts TCP
+by PORT, not by destination host — so a direct connection to github.com:443 is
+not something the allow-list is positioned to stop. The bundle's own comment
+says as much about TCP-only enforcement; I read it as a caveat and should have
+read it as the mechanism's limit.
+
+### What remains true, and what does not
+
+TRUE: the session produced a local commit, and nothing it did reached the
+remote. `c8impl-branch` appeared on GitHub only when I pushed it myself.
+
+NOT ESTABLISHED: that it *could not* have pushed. The tool call hung for
+reasons I have not identified, and the same command outside the harness
+completes in two seconds. A session that does not push is not the same as a
+session that cannot, and criterion 1 is about *cannot*.
+
+**OPEN, and it is the load-bearing question for C8:** does the v2_implementer
+boundary actually deny a push? On this evidence I cannot say it does. The
+whole design rests on "the credential never enters this session, and the
+network policy denies the paths those operations use" — the second half of
+that sentence is now in question, and the first half deserves its own test.
+
+### Why this happened
+
+I asked "did the push land?", got "no", and wrote down a mechanism. The
+observation was real; the explanation was invented to fit it and never
+checked. It is the same error as the propagation-delay misdiagnosis recorded
+above — twice in one session, both times a mechanism asserted from an outcome.
+The check that settled it took four minutes and could have been run first.
+
+**Neither the Phase 1 nor the Phase 2 work depends on this being resolved** —
+the kernel publishes correctly either way, and that is separately proved. What
+depends on it is the claim that publication through the kernel is the *only*
+route available to an implementer.
