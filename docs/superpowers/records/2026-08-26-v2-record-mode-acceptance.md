@@ -606,8 +606,39 @@ a reader who stops at the end gets the state of the work eight runs ago.
   a HARD dependency there, not an advisory observer.
 - **Criterion 5** holds.
 
-The outstanding gates are C8, and a second review seat over the ~25 commits
-that followed Run 6 — two of the three HIGH findings in the last such review
-were introduced by fixes written to close earlier findings, so this branch's
-repair work has a demonstrated failure rate and should not be trusted on the
-author's word.
+The outstanding gate is C8. Five review rounds closed everything else.
+
+### On "fixes introduce defects" — what the evidence does and does not support
+
+An earlier version of this paragraph said this branch's repair work has "a
+demonstrated failure rate". It does not, and the claim was a sampling artefact
+reported as a finding — in a document whose subject is claims outrunning
+evidence.
+
+**Supported, and causal rather than co-located.** Three defects did not exist
+before the commit that closed the previous round's finding:
+
+| introduced by the fix for | defect |
+|---|---|
+| round 2's verdict-skip | `review=accept` from a model-authored field minted a real kernel verdict |
+| round 3's verdict fix | a local CAS increment absorbing a foreign writer's version |
+| round 4's JSON fix | CI sanitisation normalising `suc"cess` into `success`, authorizing a merge |
+
+**Not supported: any rate, or that repair work is worse than fresh work.**
+From round 3 onward the reviewers were given ONLY the fix diff — 6, 5 and 2
+commits against round 2's 28. "The new findings are in the fixes" is close to
+tautological when the fixes are the entire corpus under review. No round
+compared repair work against fresh work, so no rate exists to cite.
+
+**What would test it:** hand a seat a diff containing both fresh feature work
+and repair work, unlabelled, and compare finding density. That has not been
+done.
+
+**Separately supported, and independent of scope:** eleven specific mutations
+survived a full green suite and were then killed — `kernel.NOPE`,
+`runs[-1]`→`runs[0]`, a hardcoded adopt role, a deleted `_kernel_reconcile`
+call, a reverted base binding, `&& false`, a deleted `_rp_drive` guard,
+`&&`→`||`, `and`→`or`, `continue`→`break`, and hoisting a reconcile above its
+guard. The shape they share is concrete and worth carrying forward: this
+author binds PRODUCERS rather than consumers, and asserts TEXT or ABSENCES
+rather than effects.
