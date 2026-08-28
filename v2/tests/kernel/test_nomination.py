@@ -126,3 +126,40 @@ def test_a_run_with_no_recorded_base_is_refused(repo):
 
     with pytest.raises(NotPublishable, match="no base"):
         verify_nomination(_store(""), "r", repo, "work")
+
+
+def test_the_cli_prints_the_oid_it_will_publish(repo, capsys):
+    from kernel.cli import main
+
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-qb", "work")
+    (repo / "f").write_text("changed")
+    _git(repo, "commit", "-aqm", "work")
+    tip = _git(repo, "rev-parse", "HEAD")
+
+    db = repo.parent / "k.db"
+    s = Store.open(db)
+    s.create_run(run_id="r", base_repo="o/r", base_sha=base)
+
+    rc = main(["verify-nomination", "--db", str(db), "--run-id", "r",
+               "--worktree", str(repo), "--branch", "work"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == tip
+
+
+def test_the_cli_refuses_with_a_nonzero_code_and_says_why(repo, capsys):
+    """The coordinator branches on the code and reports the reason; a refusal
+    that exits 0 is a publication."""
+    from kernel.cli import main
+
+    db = repo.parent / "k2.db"
+    s = Store.open(db)
+    s.create_run(run_id="r", base_repo="o/r", base_sha="0" * 40)
+    _git(repo, "checkout", "-qb", "work")
+    (repo / "f").write_text("changed")
+    _git(repo, "commit", "-aqm", "work")
+
+    rc = main(["verify-nomination", "--db", str(db), "--run-id", "r",
+               "--worktree", str(repo), "--branch", "work"])
+    assert rc != 0
+    assert "does not descend" in capsys.readouterr().err

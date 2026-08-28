@@ -151,12 +151,36 @@ def main(argv=None) -> int:
     # against itself and check nothing.
     r.add_argument("--expected-version", type=int, required=True)
 
+    v = subs.add_parser("verify-nomination")
+    v.add_argument("--db", required=True)
+    v.add_argument("--run-id", required=True)
+    v.add_argument("--worktree", required=True)
+    v.add_argument("--branch", required=True)
+    # OPTIONAL, and it may only agree with what the kernel reads at --branch.
+    # It is never a tiebreak and never a fallback: the observation decides.
+    v.add_argument("--claimed-oid", default=None)
+
     a = p.parse_args(argv)
     if a.mode == "pending":
         return _do_pending(a)
     if a.mode == "reconcile":
         return _do_reconcile(a)
+    if a.mode == "verify-nomination":
+        return _do_verify_nomination(a)
     return _do_effect(a) if a.mode == "effect" else _do_command(a)
+
+
+def _do_verify_nomination(a) -> int:
+    from kernel.nomination import NotPublishable, verify_nomination
+
+    store = Store.open(a.db)
+    try:
+        print(verify_nomination(store, a.run_id, a.worktree, a.branch,
+                                a.claimed_oid))
+    except NotPublishable as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return RC_REFUSED
+    return RC_OK
 
 
 def _do_pending(a) -> int:
