@@ -24,6 +24,10 @@ class GhError(Exception):
     """`gh` failed. Distinct from "gh succeeded and returned nothing"."""
 
 
+#: The repo `_gh` adds to subcommands that accept it. Set by `cli derive`
+#: from its own `--repo` argument -- NOT read from `REPO`, which run-queue.sh
+#: never exports.
+#:
 #: Subcommands that take `--repo`. `gh api` does NOT: it carries the repo in
 #: the URL and REJECTS the flag outright.
 #:
@@ -37,7 +41,7 @@ _TAKES_REPO = ("pr", "issue", "run", "release", "workflow", "cache")
 
 def _gh(args: list[str]) -> str:
     """The default runner. Injected in tests so none of this needs network."""
-    repo = os.environ.get("REPO") or os.environ.get("BIRCHER_REPO") or ""
+    repo = os.environ.get("BIRCHER_GH_REPO") or ""
     takes_repo = bool(args) and args[0] in _TAKES_REPO
     cmd = ["gh", *args] + (["--repo", repo]
                            if repo and takes_repo and "--repo" not in args else [])

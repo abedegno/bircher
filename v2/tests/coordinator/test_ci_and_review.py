@@ -611,7 +611,7 @@ def test_gh_api_is_never_given_a_repo_flag(monkeypatch):
     the real tool hides exactly this.
     """
     seen = {}
-    monkeypatch.setenv("REPO", "o/r")
+    monkeypatch.setenv("BIRCHER_GH_REPO", "o/r")
     mod = _capture(monkeypatch, seen)
     mod._gh(["api", "repos/o/r/pulls/1", "--jq", ".head.sha"])
     assert "--repo" not in seen["cmd"], seen["cmd"]
@@ -619,7 +619,7 @@ def test_gh_api_is_never_given_a_repo_flag(monkeypatch):
 
 def test_pr_subcommands_still_get_the_repo_flag(monkeypatch):
     seen = {}
-    monkeypatch.setenv("REPO", "o/r")
+    monkeypatch.setenv("BIRCHER_GH_REPO", "o/r")
     mod = _capture(monkeypatch, seen)
     mod._gh(["pr", "checks", "1"])
     assert "--repo" in seen["cmd"] and "o/r" in seen["cmd"]

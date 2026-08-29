@@ -18,10 +18,6 @@ from coordinator.observe import ci_history
 from coordinator.outcome import Deps
 
 
-def _repo() -> str:
-    return os.environ.get("REPO") or os.environ.get("BIRCHER_REPO") or ""
-
-
 def _int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name) or default)
@@ -29,17 +25,24 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-def live_deps(item: str, *, reviewer: str, log=None) -> Deps:
+def live_deps(item: str, *, repo: str, reviewer: str, server: str,
+              bundle_dir: str, log=None) -> Deps:
     """Wire `derive` to the real world.
 
-    `reviewer` is REQUIRED and passed in, never read from the environment.
-    `RECOVERY_REVIEWER` is a plain shell assignment rather than an export, so a
-    subprocess never saw it -- and a default here made the reviewer the same
-    vendor as the implementer, quietly ending the cross-vendor independence the
-    whole review exists for. A live run caught it; nothing in the suite could,
-    because every test passes a reviewer explicitly.
+    EVERYTHING IS PASSED IN. Nothing here reads `REPO`, `SERVER`, `BUNDLE_DIR`
+    or `RECOVERY_REVIEWER` from the environment, because in `run-queue.sh` all
+    four are PLAIN ASSIGNMENTS rather than exports -- a subprocess sees none of
+    them.
+
+    That cost three live runs to learn one instance at a time. The reviewer
+    defaulted to the implementer's own vendor and quietly ended cross-vendor
+    independence; the repo defaulted to empty, which only worked because the
+    acceptance launcher happened to export `BIRCHER_REPO`; the bundle dir
+    defaulted to `.`, so `agents/<reviewer>` resolved against whatever
+    directory the runner was standing in.
+
+    A required argument turns each of those into an argparse error instead.
     """
-    repo = _repo()
     required_cache: dict = {}
     interval = _int("MAIN_CI_POLL_INTERVAL", 30)
 
@@ -84,9 +87,8 @@ def live_deps(item: str, *, reviewer: str, log=None) -> Deps:
 
     def do_review(pr, sha):
         return review.dispatch(
-            str(pr), repo, sha, reviewer=reviewer,
-            bundle_dir=os.environ.get("BUNDLE_DIR") or ".",
-            server=os.environ.get("SERVER") or "http://omnigent:8000",
+            str(pr), repo, sha, reviewer=reviewer, bundle_dir=bundle_dir,
+            server=server,
             log_path=os.environ.get("BIRCHER_REVIEW_LOG") or f"/tmp/review-{item}.log")
 
     def close_sibling(loser, winner):
