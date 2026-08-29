@@ -93,12 +93,23 @@ def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
     """
     import subprocess
 
+    # `stderr=STDOUT`, exactly like the bash's `2>&1` -- ONE stream, interleaved
+    # as it is produced.
+    #
+    # Capturing them separately and concatenating looks equivalent and is not:
+    # omnigent writes its progress lines ("Launching your agent...") to stderr,
+    # so the joined text ended with those instead of the reviewer's last line.
+    # `extract_verdict` reads the LAST non-blank line, so a genuine
+    # `VERDICT: PASS` was read as no verdict and every review escalated. Four
+    # live runs to find; invisible to every test, because the tests inject a
+    # runner and never produce two streams.
     runner = run or (lambda argv, cwd: subprocess.run(
-        argv, cwd=cwd, capture_output=True, text=True))
+        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True))
     prompt = review_prompt(pr, repo, sha)
     r = runner(["omnigent", "run", f"agents/{reviewer}", "--server", server,
                 "-p", prompt], bundle_dir)
-    out = (r.stdout or "") + (r.stderr or "")
+    out = r.stdout or ""
     try:
         with open(log_path, "w") as fh:
             fh.write(out)

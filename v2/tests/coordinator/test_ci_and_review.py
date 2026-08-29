@@ -623,3 +623,30 @@ def test_pr_subcommands_still_get_the_repo_flag(monkeypatch):
     mod = _capture(monkeypatch, seen)
     mod._gh(["pr", "checks", "1"])
     assert "--repo" in seen["cmd"] and "o/r" in seen["cmd"]
+
+
+def test_trailing_progress_output_does_not_defeat_the_verdict(tmp_path):
+    """omnigent writes progress to stderr. Captured SEPARATELY and joined, that
+    noise lands after the reviewer's last line, and `extract_verdict` -- which
+    reads the last non-blank line -- sees "Launching your agent..." instead of
+    the verdict. Every review escalated. The runner now merges the streams as
+    the bash's `2>&1` did, so a runner returning one interleaved stream is what
+    this asserts."""
+    merged = ("omnigent: Connecting...\n"
+              "## Review\nfindings here\n"
+              "VERDICT: PASS")
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(0, merged))
+    assert v == "PASS"
+
+
+def test_the_default_runner_merges_stderr_into_stdout():
+    """Pinned because the separation is invisible until something writes to
+    stderr, and by then every review has escalated."""
+    import inspect
+
+    import coordinator.review as mod
+    src = inspect.getsource(mod.dispatch)
+    assert "stderr=subprocess.STDOUT" in src
+    assert "capture_output=True" not in src
