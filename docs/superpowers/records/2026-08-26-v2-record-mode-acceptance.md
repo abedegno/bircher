@@ -1134,3 +1134,86 @@ least likely to have finished.
 **Also fixed:** the teardown logged "cap reached, session still alive" even
 when the loop ended early, so every fast item's log contained a false
 statement about why it stopped. It now says which.
+
+---
+
+## The derivation in Python — acceptance (2026-08-30)
+
+Item `s13-python-derivation` on `abedegno/bircher-smoke`, PR #17 merged, main CI
+green. `observe_outcome` is now `coordinator.cli derive`; run-queue.sh lost 253
+lines.
+
+### The comparison that matters
+
+Every scorecard field, against `s08` — the last item the BASH derived:
+
+    same  bound              ok            | ok
+    same  ci_pass_first_try  True          | True
+    same  implementer        codex         | codex
+    same  note               out-of-band review PASS | out-of-band review PASS
+    same  outcome            ready         | ready
+    same  resubmissions      0             | 0
+    same  review             claude_code:pass | claude_code:pass
+    same  rounds             None          | None
+    *     wall_seconds       318           | 408
+
+Nine of ten identical. The tenth is implementer and CI timing, not derivation.
+
+The kernel journal is the same shape as the bash-derived run: 9 commands
+requested, 9 accepted, 6 effects intended, 6 confirmed, one merge authorized,
+`state=ended`.
+
+### Criterion 1 does NOT hold as worded, and the reason is worth keeping
+
+There IS a `bircher-status:` comment on PR #17. It was written by the
+IMPLEMENTER's own session:
+
+    bircher-status: outcome=ready ci=green ci_first=true review=claude_code:pass
+    rounds=1 head=c5027ca... note="s13: DERIVED.md added, contract exact"
+
+Nothing read it. The outcome came from the repository, and the journal shows
+the derivation never looked at a comment. But the criterion says "no
+`bircher-status:` comment anywhere", and there is one.
+
+**The bundle prompt already forbids it** — `agents/codex/config.yaml` says "do
+NOT post a status marker or classify the PR outcome" — and the model did it
+anyway. What differed from `s07` and `s08`, which had ZERO occurrences, is the
+ITEM text: those said "do not write a `bircher-status` line anywhere" and this
+one only said "do not post a status comment of any kind."
+
+So the honest statement is: **the marker is no longer READ, and a model can
+still WRITE one.** Prompt wording is the only thing discouraging it, and prompt
+wording is not a mechanism. Retiring a channel removes the reader; it cannot
+remove the habit.
+
+### Five live runs, five defects, none of them findable by the suite
+
+The port was green on 900+ tests before the first live run. Every one of these
+came from an actual wave:
+
+  1. `gh api` REJECTS `--repo`, which the generic runner appended to every
+     call. Every api call failed, `head_of` returned an empty sha, no merge
+     could be pinned, and a green PR escalated. The self-test's fake `gh`
+     ignores unknown arguments, so it passed -- a stub more permissive than the
+     real tool hides exactly this.
+  2. `RECOVERY_REVIEWER` is a plain shell assignment, not an export. The
+     subprocess never saw it and defaulted to the implementer's OWN vendor.
+     Codex would have reviewed codex's work; cross-vendor independence ended
+     silently, with nothing failing.
+  3. `REPO`, `SERVER` and `BUNDLE_DIR` are unexported too. The run only worked
+     because the acceptance launcher happened to export `BIRCHER_REPO`.
+  4. The reviewer's streams were captured SEPARATELY and concatenated, so
+     omnigent's stderr progress lines landed after the verdict. `extract_verdict`
+     reads the last non-blank line -- by design, because a verdict mid-report is
+     not a verdict -- so a genuine `VERDICT: PASS` was read as no verdict and
+     every review escalated. The bash used `2>&1`: one interleaved stream.
+  5. The reviewer's FINDINGS were dropped from the posted comment (caught by
+     `--self-test` rather than the live run, but the same class).
+
+Four of the five are the same shape: **the port assumed an environment it did
+not have.** Unexported globals, a flag the real tool rejects, two streams where
+the shell had one. None is a logic error, and no test that injects its
+dependencies can see any of them.
+
+**That is the argument for the plan having ended in a live run**, and against
+ever treating a green suite as sufficient for a port of an I/O-bound path.
