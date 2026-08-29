@@ -1003,3 +1003,92 @@ Driven through the REST sequence run-queue.sh actually uses — upload bundle �
 holder session → agent id → create session → post event — every attempt worked
 first time. I had been testing through a mechanism the pipeline never uses,
 and reading its flakiness as the runner's.
+
+---
+
+## C8 Phase 2 — ACCEPTED (2026-08-29)
+
+Item `s07-phase2-derivation` ran end to end on `abedegno/bircher-smoke`,
+launched through `batch/launch.sh` so the run also exercised the new
+effect-mode default. Implementer codex, reviewer claude_code, PR #11 merged,
+main CI green.
+
+### The three criteria
+
+**1. A full item runs with no `bircher-status:` comment anywhere, and merges —
+HELD.** `gh pr view 11 --json comments` contains zero occurrences. The only
+comment on the PR is the derived prose, which opens "Cross-vendor review
+(outcome derived from the repository, not reported)". `PHASE2.md` is on main.
+
+The log shows the new path taking over where the marker used to be read:
+
+    cap reached, session ... still alive -> cancelling
+    deriving the outcome from the repository
+    PR #11 CI green, no marker -> claude_code recovery review at da059eb
+    posted+verified bircher/cross-review=success on da059eb
+    PR #11 MERGED; watching main CI -> green
+    -> outcome=ready pr=11 review=claude_code:pass rounds=? bound=ok
+
+**2. Every scorecard field is traceable to an observation — HELD, and now from
+an OBSERVED run rather than from the source.** The row:
+
+    {"item": "s07-phase2-derivation", "pr": 11, "outcome": "ready",
+     "implementer": "codex", "review": "claude_code:pass",
+     "ci_pass_first_try": true, "rounds": null, "resubmissions": 0,
+     "wall_seconds": 1536, "cost": null, "bound": "ok",
+     "note": "out-of-band review PASS"}
+
+`rounds: null` and `resubmissions: 0` are Decision 2 working: the field with no
+observation behind it reports nothing, and the one that replaced it reports
+what CI history showed. The note carries no `RECOVERED:` prefix.
+
+**3. `--self-test` green and every removed guard's replacement named — HELD.**
+691 tests pass, 1 skipped (a detached-launch test that needs `setsid`, verified
+separately on the Linux runner). The replacement table is in the commit that
+deleted the marker vocabulary.
+
+### Criterion 5 from Phase 1 is now satisfied
+
+Phase 1 recorded it as UNTESTED because `--publish` issues no commands, so the
+positive evidence it asks for could not exist. This run issues them:
+
+    command_requested x9   command_accepted x9
+    effect_intended x6     effect_confirmed x6
+    merge_authorized x1    review_verdict x1
+    transition_performed x7   state=ended
+
+Nine commands, nine accepted, no refusals. The shadow report reads `[]`, and
+here that means something — under enforce, with commands actually flowing, an
+empty report is the absence of refusals rather than the absence of traffic.
+
+The six journalled effects, with their external ids:
+
+    session_control  {"id":"47bf2a29...","agent_id":"77db59f...   (session create)
+    session_control  {"queued":true,"item_id":"a3c7416c...        (prompt)
+    session_control  {"queued":false}                             (stop)
+    comment          .../pull/11#issuecomment-...
+    status_check     .../repos/abedegno/bircher-smoke/...
+    merge            ok
+
+**The first and third were unrouted and INVISIBLE to the detector until earlier
+the same day.** They are in this journal because that was fixed hours before
+this run; a Phase 2 acceptance taken yesterday would have recorded a complete
+journal that silently omitted session creation and termination.
+
+### The cost of removing the marker, measured
+
+    s05-enforce (marker era)     wall_seconds =  136
+    s07 (derived)                wall_seconds = 1536
+
+**Eleven times longer, and almost all of it is waiting.** The implementer
+opened its PR within about four minutes; the run then sat until the 25-minute
+`ITEM_TIMEOUT` cap, because the coordinator can no longer say "I am done" and
+`idle` is not death. The derivation itself, once it started, took under a
+minute.
+
+This was predicted when the poll loop's marker check was removed, and it is
+recorded here as a measurement rather than an estimate. It is the single
+largest regression in Phase 2 and it is structural, not a bug: the fix is a
+completion signal that is an OBSERVATION rather than a model-authored comment
+— the session's own terminal state, or the PR's — and that is Phase 3 work, not
+a tuning problem.
