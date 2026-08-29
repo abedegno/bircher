@@ -63,3 +63,28 @@ def test_a_real_verdict_warns_about_nothing(capsys):
     assert main(["verdict", "--text", "VERDICT: PASS"]) == 0
     out = capsys.readouterr()
     assert out.out == "PASS" and out.err == ""
+
+
+# --- the effect subcommand ---------------------------------------------------
+
+def test_a_denied_effect_exits_with_the_adapters_own_code(capsys):
+    """87, matching `_EFFECT_RC_DENIED`. A caller that already distinguishes
+    "refused" from "failed" must keep working when it is swapped from the bash
+    entry point to this one."""
+    from coordinator.cli import RC_EFFECT_DENIED
+    rc = main(["effect", "--class", "comment", "--key", "k",
+               "--", "gh", "pr", "comment", "1"])
+    assert rc == RC_EFFECT_DENIED == 87
+    assert "refused" in capsys.readouterr().err
+
+
+def test_an_effect_with_no_command_is_a_usage_error(capsys):
+    from coordinator.cli import RC_USAGE
+    assert main(["effect", "--class", "comment", "--key", "k", "--"]) == RC_USAGE
+
+
+def test_legacy_mode_runs_the_command_and_prints_its_output(capsys, monkeypatch):
+    monkeypatch.setenv("BIRCHER_EFFECT_MODE", "legacy")
+    assert main(["effect", "--class", "comment", "--key", "k",
+                 "--", "echo", "posted"]) == 0
+    assert capsys.readouterr().out.strip() == "posted"

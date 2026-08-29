@@ -94,3 +94,54 @@ def classify_failure(failed_step_count) -> str:
         return "genuine" if int(failed_step_count) > 0 else "infra"
     except (TypeError, ValueError):
         return "infra"
+
+
+_RUN_ID = re.compile(r"/actions/runs/(\d+)(?:/.*)?$")
+
+
+def run_ids_from_links(lines: str, ignore: str = DEFAULT_IGNORED) -> list[str]:
+    """Workflow run ids from `name|link` rows, ignored checks dropped.
+
+    Sorted and unique, matching `sort -u`: several checks belong to one run, and
+    re-running the same id once per check would multiply the CI cost of a single
+    infrastructure failure by the number of jobs in it.
+    """
+    ids = set()
+    for row in drop_ignored(lines, ignore).splitlines():
+        for field in row.split("|")[1:]:
+            m = _RUN_ID.search(field.strip())
+            if m:
+                ids.add(m.group(1))
+    return sorted(ids)
+
+
+def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
+         interval: int = 30) -> str:
+    """Watch until CI settles, or `pending` if it never does.
+
+    `sleep` and `gh` are injected so a test can drive many iterations without
+    waiting -- the bash this replaces could only be tested by watching it, so
+    it was not.
+
+    NOT YET CALLED FROM BASH, and deliberately so. `_coordinator` wraps every
+    call in `_net_run` at `BIRCHER_KERNEL_TIMEOUT` (5s), which would kill a
+    1500-second watch. Adding a long-call variant of that helper for one caller
+    that is about to become Python would be scaffolding built to be deleted.
+    `_poll_ci` keeps its loop and already delegates the per-iteration decisions
+    here, so there is one implementation of the JUDGEMENT either way; this
+    exists for when `observe_outcome` itself is Python and owns the loop.
+
+    RETURNS PENDING ON TIMEOUT, deliberately. "I stopped looking" is not "the
+    checks failed", and reporting red here would fail a PR whose CI was merely
+    slow -- while reporting green would merge one nobody watched.
+    """
+    waited = 0
+    while waited < timeout:
+        buckets = gh(["pr", "checks", str(pr), "--json", "name,bucket",
+                      "-q", r'.[] | "\(.name)|\(.bucket)"'])
+        settled = normalize(keep_blocking(buckets, required))
+        if settled != "pending":
+            return settled
+        sleep(interval)
+        waited += interval
+    return "pending"

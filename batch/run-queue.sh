@@ -2439,8 +2439,18 @@ note: $r_note"
       body="Outcome derived from the repository: outcome=$r_outcome ci=$r_ci${_head_field}
 note: $r_note"
     fi
-    _effect comment "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
-      || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
+    # THE FIRST EFFECT PERFORMED THROUGH THE PYTHON PATH. Identical journal --
+    # same class, key, run and generation, same `perform()` -- so this run's
+    # facts are indistinguishable from one where bash performed it. It is wired
+    # here, on the one effect the design allows to move, so the path is proven
+    # in production before `observe_outcome` itself depends on it.
+    #
+    # `_effect`'s exit codes are preserved by the CLI (87 = refused), so the
+    # caller's check is unchanged.
+    _coordinator effect --class comment \
+      --key "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" \
+      -- gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
+      || echo "[batch:recover] WARN $item: failed to post the derived comment to PR #$pr" >&2
   fi
 
   # 4th field (#66): the orchestrator-captured reviewed SHA, empty unless this is
@@ -3139,9 +3149,12 @@ _pr_signal() {
 # PR sat green and mergeable. Any item whose criteria demand a demonstrated failure
 # can reproduce this, so the tracked PR must be re-checked, not trusted once.
 _pr_is_abandoned() {
-  local state="$1" merged="${2:-}"
-  [ "$state" = "CLOSED" ] || return 1
-  [ -z "$merged" ] || [ "$merged" = "null" ]
+  # A PR CLOSED without merging can never satisfy its item. `gh` reports an
+  # unmerged PR's mergedAt as empty OR the string "null" depending on the
+  # query, and both mean the same thing -- reading "null" as a timestamp would
+  # mark every closed-unmerged PR merged. Rule and tests in
+  # v2/coordinator/pr_selection.py.
+  _coordinator pr-abandoned --state "$1" --merged "${2:-}"
 }
 
 # _read_note <file> -> the signal file's text, flattened to one line for JSONL,
@@ -3199,17 +3212,16 @@ _read_note() {
 # use-signal|<pr>, use-the-one-match|<pr>, no-match|, ambiguous/escalate|<prs>.
 # Pure selection only: the caller owns any gh query and the .escalated write.
 _select_pr_candidate() {
-  local signal="$1" matches="$2"
-  if [ -n "$signal" ]; then
-    printf 'use-signal|%s\n' "$signal"
-    return 0
-  fi
-  set -- $matches
-  case "$#" in
-    0) printf 'no-match|\n' ;;
-    1) printf 'use-the-one-match|%s\n' "$1" ;;
-    *) printf 'ambiguous/escalate|%s\n' "$*" ;;
-  esac
+  # An explicit signal wins; otherwise EXACTLY ONE match is required and two or
+  # more escalate rather than picking -- choosing would be a guess about which
+  # PR an item produced, and a wrong guess merges someone else's work under
+  # this item's name. Rule and tests in v2/coordinator/pr_selection.py.
+  local out=""
+  out=$(_coordinator pr-select --signal "$1" --matches "$2") || out=""
+  # A failed call must not read as "no PR". Escalating is the answer that
+  # stops rather than the one that quietly proceeds.
+  [ -n "$out" ] || out="ambiguous/escalate|selection unavailable"
+  printf '%s\n' "$out"
 }
 
 # _item_issue <prompt-text> -> the issue number from an `Issue: #<n>` header, or empty.

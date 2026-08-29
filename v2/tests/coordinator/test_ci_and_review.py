@@ -302,3 +302,76 @@ def test_keep_blocking_agrees_with_the_bash_it_duplicates(lines):
                 '_keep_blocking_checks "$ARG" "$REQ"', arg=lines)
     assert keep_blocking(lines, "") == out.rstrip("\n"), (
         f"python={keep_blocking(lines, '')!r} bash={out.rstrip(chr(10))!r}")
+
+
+# --- run id extraction -------------------------------------------------------
+
+from coordinator.ci import poll, run_ids_from_links
+
+
+def test_run_ids_are_pulled_from_check_links():
+    lines = ("build|https://github.com/o/r/actions/runs/123/job/9\n"
+             "test|https://github.com/o/r/actions/runs/456")
+    assert run_ids_from_links(lines) == ["123", "456"]
+
+
+def test_several_checks_in_one_run_yield_ONE_id():
+    """`sort -u`. Re-running the same id once per check would multiply the CI
+    cost of a single infrastructure failure by the number of jobs in it."""
+    lines = ("a|https://github.com/o/r/actions/runs/123/job/1\n"
+             "b|https://github.com/o/r/actions/runs/123/job/2")
+    assert run_ids_from_links(lines) == ["123"]
+
+
+def test_ignored_checks_contribute_no_run_ids():
+    lines = ("review-gate|https://github.com/o/r/actions/runs/999\n"
+             "build|https://github.com/o/r/actions/runs/123")
+    assert run_ids_from_links(lines) == ["123"]
+
+
+def test_a_link_that_is_not_a_workflow_run_is_skipped():
+    assert run_ids_from_links("ext|https://example.com/status/7") == []
+
+
+# --- the poll loop -----------------------------------------------------------
+
+def _gh_returning(*sequence):
+    calls = {"n": 0}
+
+    def gh(args):
+        i = min(calls["n"], len(sequence) - 1)
+        calls["n"] += 1
+        return sequence[i]
+    gh.calls = calls
+    return gh
+
+
+def test_poll_returns_as_soon_as_ci_settles():
+    slept = []
+    out = poll("1", "", gh=_gh_returning("build|pass"), sleep=slept.append)
+    assert out == "green"
+    assert slept == [], "it must not sleep after a settled answer"
+
+
+def test_poll_waits_while_pending_then_reports_the_settled_answer():
+    gh = _gh_returning("build|pending", "build|pending", "build|fail")
+    slept = []
+    assert poll("1", "", gh=gh, sleep=slept.append, interval=5) == "red"
+    assert slept == [5, 5], "one sleep per pending poll, no more"
+
+
+def test_poll_gives_up_as_PENDING_not_red():
+    """"I stopped looking" is not "the checks failed". Reporting red would fail
+    a PR whose CI was merely slow; reporting green would merge one nobody
+    watched."""
+    slept = []
+    out = poll("1", "", gh=_gh_returning("build|pending"), sleep=slept.append,
+               timeout=10, interval=5)
+    assert out == "pending"
+    assert slept == [5, 5], "it must honour its own bound"
+
+
+def test_poll_applies_the_required_contexts_filter():
+    """Otherwise a non-required flaky check would hold every PR pending."""
+    gh = _gh_returning("build|pass\nflaky|pending")
+    assert poll("1", "build", gh=gh, sleep=lambda _s: None) == "green"

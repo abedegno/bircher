@@ -32,7 +32,19 @@ MUTATION = re.compile(r"""
   | git\s+(-C\s+\S+\s+)?["']?push
   | curl\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
   | _http_json\s+["']?(POST|PUT|PATCH|DELETE)
+  | gh\s+["']?run["']?\s+["']?(rerun|cancel|delete)
 """, re.VERBOSE)
+#: `gh run <verb>` -- a whole COMMAND FAMILY the pattern did not know, found
+#: 2026-08-29 while porting the CI loops. `gh run rerun` re-triggers a workflow:
+#: it consumes CI minutes and changes the check state the merge gate reads, and
+#: it was unrouted, undetected and absent from the inventory.
+#:
+#: This is the second instance of one class in a day. The first was a mutation
+#: hidden behind a wrapper; this one was hidden behind a NOUN the pattern had
+#: never been taught. The pattern enumerates verbs, so every noun it does not
+#: know is a silent gap -- which is why the fix is paired with
+#: `test_every_gh_subcommand_is_classified`, an enumerating test that fails
+#: when a new `gh <noun> <verb>` appears in the source at all.
 #: `_http_json <METHOD> <path>` -- an INDIRECT mutation, and the whole class of
 #: them was invisible until 2026-08-29. The helper does
 #: `curl -sf -X "$method"`, and every pattern above requires a LITERAL method
@@ -73,8 +85,18 @@ MUTATION = re.compile(r"""
 #: `if`/`while`/`until`/`!` are command positions too: `if _effect ... ; then`
 #: is how a routed call gets its exit status tested.
 ROUTED = re.compile(
-    r"(^|\|\||&&|;|\{|\(|!|\b(then|else|do|if|elif|while|until)\b)\s*_effect\s"
+    r"(^|\|\||&&|;|\{|\(|!|\b(then|else|do|if|elif|while|until)\b)"
+    r"\s*(_effect|_coordinator\s+effect)\s"
 )
+#: TWO routing forms since 2026-08-29. `_effect` goes to the kernel CLI;
+#: `_coordinator effect` goes to the same `perform()` through
+#: v2/coordinator/effects.py, which additionally applies the deny/legacy/kernel
+#: mode. Both journal identically.
+#:
+#: The detector has to know BOTH or the migration builds exactly the blind spot
+#: fixed earlier the same day: a real mutation, routed, reported as unrouted --
+#: or worse, a routing form nobody recognises becoming the place mutations
+#: hide.
 
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 

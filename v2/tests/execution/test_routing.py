@@ -16,6 +16,8 @@ import pathlib
 import re
 import textwrap
 
+import pytest
+
 from tools.detect_direct_effects import find_direct_effects, scan
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -270,3 +272,69 @@ def test_the_detector_sees_an_indirect_mutation(tmp_path):
 def test_an_indirect_GET_is_not_a_mutation(tmp_path):
     """The counterpart: flagging reads would make the inventory meaningless."""
     assert not _scan(tmp_path, '  _http_json GET "/v1/sessions/$1"\n')
+
+
+# --- the command family the pattern did not know -----------------------------
+
+#: Every `gh <noun> <verb>` used in run-queue.sh, and whether it MUTATES.
+#:
+#: The detector enumerates verbs, so a noun it has never been taught is a
+#: silent gap: `gh run rerun` re-triggered workflows unrouted, undetected and
+#: unlisted until 2026-08-29. Enumerating here means a NEW subcommand fails
+#: this test rather than joining quietly -- which is the property the pattern
+#: itself cannot have.
+_GH_SUBCOMMANDS = {
+    ("issue", "close"): True,
+    ("issue", "comment"): True,
+    ("issue", "edit"): True,
+    ("issue", "reopen"): True,
+    ("issue", "view"): False,
+    ("pr", "checks"): False,
+    ("pr", "close"): True,
+    ("pr", "comment"): True,
+    ("pr", "create"): True,
+    ("pr", "list"): False,
+    ("pr", "merge"): True,
+    ("pr", "view"): False,
+    ("run", "rerun"): True,
+    ("run", "view"): False,
+}
+
+
+def _gh_subcommands_in_source():
+    from tools.detect_direct_effects import code_lines
+    found = set()
+    for _n, line, mask, is_comment in code_lines(str(RUN_QUEUE)):
+        if is_comment:
+            continue
+        for m in re.finditer(r"\bgh\s+([a-z-]+)\s+([a-z-]+)", line):
+            if not mask[m.start()]:
+                found.add((m.group(1), m.group(2)))
+    return found
+
+
+def test_every_gh_subcommand_is_classified():
+    """A new `gh <noun> <verb>` must be declared mutating or not.
+
+    Without this, adding `gh release create` or `gh cache delete` would be
+    invisible to MUTATION exactly as `gh run rerun` was -- and criterion 1
+    cannot notice, because it only checks findings the detector produced.
+    """
+    found = _gh_subcommands_in_source()
+    unknown = found - set(_GH_SUBCOMMANDS)
+    assert not unknown, (
+        "unclassified gh subcommands -- say whether each MUTATES, and if it "
+        f"does, add it to MUTATION: {sorted(unknown)}")
+    stale = set(_GH_SUBCOMMANDS) - found
+    assert not stale, f"no longer used and should be dropped: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("pair,mutates", sorted(_GH_SUBCOMMANDS.items()))
+def test_the_detector_agrees_about_which_gh_subcommands_mutate(tmp_path, pair, mutates):
+    """The known-positive AND known-negative for each. Flagging reads would
+    make the inventory meaningless; missing a write is how one hid."""
+    noun, verb = pair
+    line = f'  gh {noun} {verb} "$x" --repo "$REPO"\n'
+    assert bool(_scan(tmp_path, line)) is mutates, (
+        f"gh {noun} {verb}: detector says "
+        f"{'mutating' if not mutates else 'read-only'}")

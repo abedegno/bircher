@@ -323,6 +323,8 @@ _EFFECT_SITE_CONTEXT = {
     "_ensure_issue_closed": "REACHED",
     # Renamed from `recover_from_ground_truth` in Phase 2: it is no longer a
     # recovery path, it is the ONLY path, and run_item calls it for every item.
+    # Still performs an effect -- its comment -- but through
+    # `_coordinator effect`, the Python entry point, since 2026-08-29.
     "observe_outcome": "REACHED",
     "_reconcile_item_pr": "REACHED",
     # Only caller is merge_ready_pr's revert path, which is itself REACHED.
@@ -395,7 +397,13 @@ def _effect_sites_by_function():
     for i, l in enumerate(src):
         if l.strip().startswith("#"):
             continue
-        if re.search(r"(?<!_)\b_effect\s+\w", _QUOTED.sub("", l)):
+        # BOTH routing forms. `_coordinator effect` reaches the same
+        # `perform()` through the Python entry point, so a function using it is
+        # still an effect site -- and one this table must still classify, or
+        # the migration quietly empties the very list that stops a new effect
+        # joining unnoticed.
+        if re.search(r"(?<!_)\b_effect\s+\w|\b_coordinator\s+effect\b",
+                     _QUOTED.sub("", l)):
             out.setdefault(owner(i), []).append(i + 1)
     return out
 

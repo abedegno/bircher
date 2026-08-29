@@ -24,7 +24,13 @@ RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
 #: command substitutions containing spaces and pipes -- `comment:$pr:$(printf
 #: ... | shasum ...)` -- so positional splitting does not work. The command is
 #: located instead by finding the first known binary at or after position 3.
-CALL = re.compile(r"_effect\s+([a-z_]+)\s+(.*)$")
+#: Both routing forms. `_effect <class> <key> <cap> -- argv` and
+#: `_coordinator effect --class <class> --key <key> -- argv` reach the same
+#: `perform()`, so both must satisfy the same argv contract -- an effect that
+#: escaped the contract by changing entry point would be a bypass, not a
+#: migration.
+CALL = re.compile(r"_effect\s+([a-z_]+)\s+(.*)$"
+                  r"|_coordinator\s+effect\s+--class\s+([a-z_]+)\s+(.*)$")
 BINARIES = ("gh", "git", "curl")
 
 
@@ -40,7 +46,8 @@ def routed_calls():
         # about the source, not a call -- the same rule the detector uses.
         if not m or mask[m.start()]:
             continue
-        cls, rest = m.groups()
+        g = m.groups()
+        cls, rest = (g[0], g[1]) if g[0] else (g[2], g[3])
         # `)` and `}` end a command too: the recovery push sits inside a
         # subshell and ends `-q ); then`, so `);` and `then` were being read
         # as operands and failed the operand-count rule.
