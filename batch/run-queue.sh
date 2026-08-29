@@ -160,41 +160,12 @@ _branch_code_filter() {
 # Anything else yields empty, which every caller already treats as "no verdict"
 # and escalates. Fail closed, like the rest of this file.
 _extract_verdict() {
-  local last
-  last=$(printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -n1)
-  # Normalise the decoration real agents emit around a final line. Byte-exact
-  # matching escalates on `**VERDICT: PASS**`, which is benign output rather than
-  # a malformed review -- but the grammar accepted here must stay NARROW, because
-  # this string authorises an automatic merge.
-  #
-  # Accepted: balanced markdown/code ornament in any order, plus AT MOST ONE
-  # terminal period or exclamation. Rejected (fails closed): `VERDICT: PASS!!!`
-  # and `VERDICT: PASS...`, which are not ornament but non-contractual output.
-  #
-  # Stripping is order-INDEPENDENT and bounded. A first attempt stripped all
-  # decoration then punctuation, which made `` `VERDICT: FAIL`. `` fail while
-  # `` `VERDICT: FAIL.` `` passed -- the trailing tick was never reconsidered.
-  # The loop removes one character per side per pass instead, so interleaving
-  # does not matter, and the bound stops a line of pure decoration ever
-  # normalising into a verdict.
-  local _punct=0 _i=0 _before
-  while [ "$_i" -lt 8 ]; do
-    _before="$last"
-    last="${last#"${last%%[![:space:]]*}"}"
-    last="${last%"${last##*[![:space:]]}"}"
-    case "$last" in [*\`_]*) last="${last#?}" ;; esac
-    case "$last" in
-      *[*\`_]) last="${last%?}" ;;
-      *[.!])    [ "$_punct" -eq 0 ] && { last="${last%?}"; _punct=1; } ;;
-    esac
-    [ "$last" = "$_before" ] && break
-    _i=$((_i + 1))
-  done
-  case "$last" in
-    "VERDICT: PASS") printf 'PASS' ;;
-    "VERDICT: FAIL") printf 'FAIL' ;;
-    *) [ -n "$last" ] && echo "[batch] WARN: review's final line is not a bare verdict -> treating as no verdict" >&2 ;;
-  esac
+  # `PASS`, `FAIL`, or EMPTY. Reads the LAST non-blank line and requires a BARE
+  # verdict: one mentioned mid-report is not a verdict. Markdown decoration and
+  # a single trailing `.`/`!` are tolerated; `...` is prose. The trimming loop,
+  # its bound, and the warning on a non-verdict final line are in
+  # v2/coordinator/review.py and cli.py.
+  _coordinator verdict --text "$1" || printf ''
 }
 
 # _normalize_ci <newline-separated gh check buckets> -> green|red|pending
@@ -203,32 +174,18 @@ _extract_verdict() {
 # Precedence: any fail/cancel -> red; else any pending -> pending; else green.
 # No checks at all (empty) -> pending: CI has not registered yet, do not review.
 _normalize_ci() {
-  local buckets="$1"
-  # `case`, not `${buckets//[[:space:]]/}`: that global substitution walks and rebuilds
-  # the whole string and is pathologically slow on a large one -- a 140KB input took
-  # minutes, which is how it was found. A single pattern match answers the same question
-  # ("is there any non-whitespace character?") in one pass. Buckets are normally tiny, so
-  # this never bit in production, but the SIGPIPE fixture below has to be big.
-  case "$buckets" in *[![:space:]]*) : ;; *) echo pending; return ;; esac
-  # PIPE-FREE, and this one is not cosmetic. Under `set -o pipefail`, `grep -q` exits
-  # the instant it matches and the producing `printf` takes SIGPIPE; the pipeline then
-  # reports FAILURE despite the match. On this function that inverts a merge-safety
-  # verdict: a bucket list beginning with `fail` matches, grep exits, printf dies at 141,
-  # the `if` is skipped -- and so is the pending check, for the same reason -- and red CI
-  # is reported GREEN. Whether it fires depends on buffer size and scheduling, so it
-  # would present as a rare, unreproducible bad merge.
-  local line red=0 pend=0
-  while IFS= read -r line; do
-    case "$line" in
-      fail|cancel) red=1 ;;
-      pending)     pend=1 ;;
-    esac
-  done <<EOF
-$buckets
-EOF
-  [ "$red" = 1 ]  && { echo red; return; }
-  [ "$pend" = 1 ] && { echo pending; return; }
-  echo green
+  # `green` | `red` | `pending`. The rule lives in v2/coordinator/ci.py.
+  # EMPTY IS PENDING, not green: no checks reported yet is the absence of a
+  # verdict, and reading it as success merges a PR whose CI never started.
+  local out=""
+  out=$(_coordinator ci-normalize --buckets "$1") || out=""
+  # A failed call must not read as green. `pending` keeps the caller waiting,
+  # which is the survivable answer -- but note `_wait_ci` loops on pending, so
+  # a PERMANENTLY failing call hangs rather than errors. That trade is why the
+  # package must stay reachable, and why `_coordinator` no longer hides its
+  # stderr.
+  [ -n "$out" ] || out=pending
+  printf '%s' "$out"
 }
 
 # classify_recovery <pr> <ci_state> <verdict> -> "outcome|review|ci|note"
@@ -2925,42 +2882,14 @@ _drop_ignored() {
 }
 
 _keep_blocking_checks() {
-  local lines="$1" required="$2" filtered name _r
-  filtered=$(_drop_ignored "$lines")
-  if [ -z "$required" ]; then
-    printf '%s\n' "$filtered" | cut -d'|' -f2,3
-    return
-  fi
-  local kept
-  kept=$(printf '%s\n' "$filtered" | while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    name="${line%%|*}"
-    if printf '%s\n' "$required" | grep -Fxq "$name"; then
-      # PROJECT to exactly status|conclusion. #73 added a fourth field (the producing
-      # app), and `_checkrun_state`'s allowlist is strict by design since #67 -- handing
-      # it `status|conclusion|app` would match nothing and read RED for every check.
-      _r=${line#*|}; printf '%s\n' "${_r%|*}"
-    fi
-  done)
-  # A required-set that matches NOTHING is a misconfiguration or a naming mismatch
-  # (contexts that never run on this event, a renamed job), not a genuine "no checks".
-  # Returning empty there reads as "CI has not registered yet" -> pending forever, or
-  # worse, hides a red. Fall back to ignore-list-only, which errs toward red.
-  #
-  # REJECTED (2026-08-16, raised by review): "require EVERY required context to be
-  # present, else pending". That is right for a PR head and wrong here. Required
-  # contexts are a branch-protection property of the PR, and the post-merge watcher
-  # reads a MERGE COMMIT, where most of them legitimately never report -- muesli's
-  # merge commits carry 0 statuses and a combined `pending`, and `review-gate` /
-  # `bircher/cross-review` only ever appear on PR heads. Demanding completeness there
-  # would make every post-merge watch poll to timeout, i.e. halt the pipeline. The
-  # completeness this function CANNOT provide is instead enforced upstream, by
-  # _commit_ci_lines failing closed on any response that is not whole.
-  if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
-    printf '%s\n' "$filtered" | cut -d'|' -f2,3
-    return
-  fi
-  printf '%s\n' "$kept"
+  # Reduce `name|bucket|state` rows to the `bucket|state` of BLOCKING ones.
+  # `review-gate` is dropped or the derivation deadlocks against itself; a
+  # required list matching nothing falls back to all checks rather than
+  # reducing to an empty set that reads as pending for ever; and a row with NO
+  # delimiter passes through whole, because `cut` does and real `gh pr checks`
+  # output arrives that way. All three rules, and their tests, are in
+  # v2/coordinator/ci.py.
+  _coordinator ci-keep-blocking --lines "$1" --required "${2:-}" || printf '%s' "$1"
 }
 
 # _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.

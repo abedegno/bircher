@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import sys
 
+from coordinator.ci import keep_blocking, normalize
 from coordinator.observe import ci_history, classify
+from coordinator.review import extract_verdict
 from coordinator.session import (LookupFailed, item_count, last_assistant_text,
                                  settle, state)
 
@@ -41,6 +43,16 @@ def main(argv=None) -> int:
     st.add_argument("--server", required=True)
     st.add_argument("--id", required=True, dest="conv_id")
 
+    cn = subs.add_parser("ci-normalize")
+    cn.add_argument("--buckets", required=True)
+
+    cb = subs.add_parser("ci-keep-blocking")
+    cb.add_argument("--lines", required=True)
+    cb.add_argument("--required", default="")
+
+    vd = subs.add_parser("verdict")
+    vd.add_argument("--text", required=True)
+
     se = subs.add_parser("session-settle")
     se.add_argument("--server", required=True)
     se.add_argument("--id", required=True, dest="conv_id")
@@ -68,6 +80,27 @@ def main(argv=None) -> int:
     if a.mode == "session-state":
         s_ = state(a.server, a.conv_id)
         print(f"{s_.status}|{s_.error_code}", end="")
+        return RC_OK
+
+    if a.mode == "ci-normalize":
+        print(normalize(a.buckets), end="")
+        return RC_OK
+
+    if a.mode == "ci-keep-blocking":
+        print(keep_blocking(a.lines, a.required), end="")
+        return RC_OK
+
+    if a.mode == "verdict":
+        v = extract_verdict(a.text)
+        print(v or "", end="")
+        # WARN when a reviewer said SOMETHING that was not a verdict. Silence
+        # would leave an operator unable to tell "the reviewer never ran" from
+        # "the reviewer rambled", and those need different responses. The first
+        # port dropped this and `--self-test` caught it; `extract_verdict` stays
+        # pure, so the warning belongs at the boundary, not in the rule.
+        if v is None and a.text.strip():
+            print("[batch] WARN: review's final line is not a bare verdict "
+                  "-> treating as no verdict", file=sys.stderr)
         return RC_OK
 
     if a.mode == "session-settle":

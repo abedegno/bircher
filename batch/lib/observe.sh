@@ -17,9 +17,18 @@
 # v2/coordinator/ the callers become Python and this helper disappears with
 # the file it lives in.
 _coordinator() {
+  # STDERR IS NOT SUPPRESSED. An earlier version of this helper ended
+  # `2>/dev/null`, which swallowed every reason the package had for failing --
+  # and silently ate `verdict`'s warning that a review's final line was not a
+  # bare verdict, a message an operator needs to tell "the reviewer never ran"
+  # from "the reviewer rambled". `--self-test` caught it.
+  #
+  # Callers that genuinely want quiet redirect at their own call site. A helper
+  # that hides the reason from all of them is the shape this project keeps
+  # finding on the wrong end of a diagnosis.
   PYTHONPATH="$(_kernel_pythonpath)" \
     _net_run "$(_kernel_net_cap)" \
-    "${BIRCHER_PY:-python3}" -m coordinator.cli "$@" 2>/dev/null
+    "${BIRCHER_PY:-python3}" -m coordinator.cli "$@"
 }
 
 # observe_ci_history <branch> -> "<ci_first>|<resubmissions>"
