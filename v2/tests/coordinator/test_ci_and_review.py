@@ -446,3 +446,134 @@ def test_an_unreadable_run_is_GENUINE_not_infra():
 
 def test_a_pr_with_no_workflow_runs_is_genuine():
     assert failure_kind("7", gh=lambda a: "external|https://example.com/x") == "genuine"
+
+
+# --- the review prompt and dispatch (plan task 5 prerequisite) ---------------
+
+from coordinator.review import dispatch, review_prompt
+
+
+def test_the_rendered_prompt_is_byte_identical_to_the_bash():
+    """Prose carrying scars (#705, #666, #66). A paraphrase would drop one
+    silently, so both are rendered and compared rather than eyeballed."""
+    src = RUN_QUEUE.read_text().splitlines()
+    i = next(k for k, l in enumerate(src)
+             if l.startswith("_recovery_review_prompt() {"))
+    end = next(k for k in range(i + 1, len(src)) if src[k] == "}")
+    fn = "\n".join(src[i:end + 1])
+    script = (f'set -uo pipefail\nREPO="$REPO_IN"\n{fn}\n'
+              '_recovery_review_prompt "$PR_IN" "$SHA_IN"')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "REPO_IN": "o/r",
+                            "PR_IN": "7", "SHA_IN": "abc123"})
+    assert r.stdout.rstrip("\n") == review_prompt("7", "o/r", "abc123").rstrip("\n")
+
+
+def test_an_absent_sha_falls_back_to_FETCH_HEAD():
+    assert "FETCH_HEAD" in review_prompt("7", "o/r", "")
+    assert "FETCH_HEAD" not in review_prompt("7", "o/r", "a" * 40)
+
+
+class _R:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+
+
+def test_dispatch_reads_the_verdict(tmp_path):
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(0, "findings\nVERDICT: PASS"))
+    assert v == "PASS"
+
+
+def test_a_dead_reviewer_returns_NO_verdict_without_reading_its_output(tmp_path):
+    """Mining a crashed reviewer's stdout would let one that echoed its own
+    prompt authorise a merge."""
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(1, "VERDICT: PASS"))
+    assert v is None
+
+
+def test_the_prompt_and_reviewer_reach_the_runner(tmp_path):
+    seen = {}
+
+    def run(argv, cwd):
+        seen["argv"], seen["cwd"] = argv, cwd
+        return _R(0, "VERDICT: PASS")
+
+    dispatch("7", "o/r", "dead", reviewer="claude_code", bundle_dir="/b",
+             server="http://s", log_path=str(tmp_path / "l"), run=run)
+    assert seen["cwd"] == "/b"
+    assert "agents/claude_code" in seen["argv"]
+    assert any("dead" in a for a in seen["argv"]), "the sha must reach the prompt"
+
+
+# --- re-running an infrastructure failure ------------------------------------
+
+from coordinator.ci import rerun_and_wait
+
+
+def _gh_script(responses):
+    """Answer by command shape rather than call order."""
+    seen = []
+
+    def gh(args):
+        seen.append(args)
+        for key, val in responses.items():
+            if all(k in " ".join(args) for k in key.split()):
+                if isinstance(val, Exception):
+                    raise val
+                return val
+        return ""
+    gh.seen = seen
+    return gh
+
+
+def test_a_failed_run_is_re_run_then_polled():
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "failure"}),
+        "run rerun": "",
+    })
+    out = rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None)
+    assert any("rerun" in " ".join(a) for a in gh.seen)
+    assert out in ("green", "red", "pending")
+
+
+def test_a_SUCCESSFUL_run_is_never_re_run():
+    """`gh run rerun` on a green run burns CI for no reason and can turn a
+    green PR amber while it repeats."""
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "success"}),
+    })
+    assert rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None) == "red"
+    assert not any("rerun" in " ".join(a) for a in gh.seen)
+
+
+def test_nothing_to_re_run_is_red_without_waiting():
+    """With no run to retry there is no reason to wait, and reporting anything
+    else would claim an outcome the retry never produced."""
+    slept = []
+    gh = _gh_script({"pr checks": "external|https://example.com/x"})
+    assert rerun_and_wait("7", "", gh=gh, sleep=slept.append) == "red"
+    assert slept == []
+
+
+def test_an_unreadable_checks_call_is_red():
+    gh = _gh_script({"pr checks": GhError("boom")})
+    assert rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None) == "red"
+
+
+def test_it_settles_before_polling():
+    """The re-run takes a beat to register; asking immediately reads the OLD
+    conclusion and calls it settled."""
+    slept = []
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "failure"}),
+        "run rerun": "",
+    })
+    rerun_and_wait("7", "", gh=gh, sleep=slept.append, settle=20)
+    assert slept and slept[0] == 20

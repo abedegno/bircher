@@ -217,3 +217,53 @@ def failure_kind(pr: str, *, gh=_gh) -> str:
                 total += sum(1 for st in (job.get("steps") or [])
                              if st.get("conclusion") == "failure")
     return classify_failure(total)
+
+
+#: States that mean a run can usefully be re-run. A SUCCESSFUL run must never
+#: be: `gh run rerun` on a green run burns CI for no reason and can turn a
+#: green PR amber while it repeats.
+_RERUNNABLE = ("failure", "cancelled", "timed_out", "startup_failure")
+
+
+def rerun_and_wait(pr: str, required: str, *, gh=_gh, sleep, settle: int = 20,
+                   timeout: int = 900, interval: int = 30) -> str:
+    """Re-run the failed runs on a PR, then wait for CI to settle again.
+
+    `red` if nothing could be re-run: with no run to retry there is no reason
+    to wait, and reporting anything else would claim an outcome the retry never
+    produced.
+    """
+    try:
+        links = gh(["pr", "checks", str(pr), "--json", "name,link",
+                    "-q", r'.[] | "\(.name)|\(.link)"'])
+    except GhError:
+        return "red"
+    ids = run_ids_from_links(links)
+    if not ids:
+        return "red"
+
+    did = False
+    for rid in ids:
+        try:
+            conc = (json.loads(gh(["run", "view", rid, "--json", "conclusion"]))
+                    or {}).get("conclusion")
+        except (GhError, ValueError, AttributeError):
+            continue
+        if conc not in _RERUNNABLE:
+            continue
+        try:
+            gh(["run", "rerun", rid, "--failed"])
+        except GhError:
+            try:
+                gh(["run", "rerun", rid])
+            except GhError:
+                continue
+        did = True
+
+    if not did:
+        return "red"
+    # A moment before polling: the re-run takes a beat to register, and asking
+    # immediately reads the OLD conclusion and calls it settled.
+    sleep(settle)
+    return poll(pr, required, gh=gh, sleep=sleep, timeout=timeout,
+                interval=interval)
