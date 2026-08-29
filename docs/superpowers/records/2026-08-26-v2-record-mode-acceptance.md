@@ -950,3 +950,56 @@ exactly the one still outstanding.
 Worth recording precisely because it had NO advantage over me except distance:
 same facts, no execution, and it went straight to "is your reproduction the
 thing that runs?" while I was busy running more of it.
+
+### THIRD AND FINAL: criterion 1 is DEMONSTRATED, and the push does not hang
+
+A real session under the v2_implementer bundle, asked to attempt the push as an
+authorised boundary verification, ran:
+
+    timeout 45 git push origin c8impl-branch 2>&1; echo "EXIT=$?"
+
+and reported:
+
+    error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403
+    send-pack: unexpected disconnect while reading sideband packet
+    fatal: the remote end hung up unexpectedly
+    Everything up-to-date
+    EXIT=1
+
+**EXIT=1, not 124.** Not a timeout. An HTTP 403 from the egress relay, refusing
+the `git-receive-pack` path that the bundle's allow-list deliberately omits.
+The session's commits never reached the remote — local `78db634`, remote
+`a76029f`.
+
+**Criterion 1 holds.** A v2_implementer produces a commit and cannot publish
+it, and the refusal is immediate, legible and attributable to the allow-list.
+
+**And the push does NOT hang — that claim is withdrawn for the last time.**
+Twice a session wedged after being asked to push, which I read as the push
+hanging. The harness watchdog said what I did not: "likely a wedged LLM **or**
+tool call". It was the model. Bounded, the push answers in under a second.
+
+### Why it took three attempts, and the one thing that fixed it
+
+Every earlier attempt let the command run UNBOUNDED, so a wedge anywhere in the
+stack swallowed the result and I inferred a mechanism from the silence. The
+answer arrived the moment the command was bounded — `timeout 45` — because a
+bound converts "no result" into a result. **When an observation keeps failing
+to arrive, the problem is usually that nothing forces it to.**
+
+That is a different failure from the earlier two. Those were reproductions that
+omitted what production supplies. This one was an observation with no deadline,
+which cannot distinguish "slow", "hung" and "never going to answer".
+
+### Task 5 does not exist
+
+"Make the denied push legible" assumed a stall to bound. There is none: the
+denial is a fast, explicit HTTP 403. The task is deleted rather than done.
+
+### Session dispatch: `omnigent run` was the problem, not the runner
+
+Six of eight `omnigent run` invocations went idle holding an unread message.
+Driven through the REST sequence run-queue.sh actually uses — upload bundle →
+holder session → agent id → create session → post event — every attempt worked
+first time. I had been testing through a mechanism the pipeline never uses,
+and reading its flakiness as the runner's.
