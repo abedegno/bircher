@@ -1092,3 +1092,45 @@ largest regression in Phase 2 and it is structural, not a bug: the fix is a
 completion signal that is an OBSERVATION rather than a model-authored comment
 — the session's own terminal state, or the PR's — and that is Phase 3 work, not
 a tuning problem.
+
+### The wall-clock regression, addressed and measured
+
+    s05-enforce   marker era              136s
+    s07           derived, cap-bound     1536s   (11x)
+    s08           derived, settle-bound   318s   (2.3x)
+
+**4.8x faster than s07**, on the same repo with the same shape of item. The log
+line that replaced the wait:
+
+    s08-settle-probe: PR #12 open and session quiet for 4 polls
+                      -> deriving now rather than waiting for the cap
+
+The remaining 318s is roughly three minutes of implementer work plus the four
+quiet polls the check requires (180s at the 45s poll interval). The threshold
+is `BIRCHER_SETTLE_POLLS`, so the residual is tunable against the risk below,
+not structural.
+
+**What the signal is, and what it is not.** The marker was the coordinator
+REPORTING convergence. The replacement OBSERVES it: the session is idle and
+has stopped producing items, held for four consecutive polls, with a PR
+already open. Neither half suffices alone -- `idle` is not done (a coordinator
+awaiting a sub-agent is idle, which is why `died()` refuses to read it as
+death), and a stable item count is not done either (a session mid-tool-call
+produces no items while it works).
+
+**The residual risk, stated rather than mitigated away.** A coordinator whose
+sub-agent takes longer than four quiet polls looks settled. The guard against
+deriving too early is the PR requirement plus the fact that the derivation
+re-reads CI and dispatches its own review -- it does not trust a snapshot taken
+at break time. But an item whose coordinator would have pushed a fix after 200
+seconds of silence would now be derived on the earlier head. Raising
+`BIRCHER_SETTLE_POLLS` trades wall-clock for that margin.
+
+A failed lookup RESETS the streak rather than extending it: "I cannot see the
+session" is not "nothing is happening", and treating an unreadable session as
+quiet would settle during a server outage -- exactly when a coordinator is
+least likely to have finished.
+
+**Also fixed:** the teardown logged "cap reached, session still alive" even
+when the loop ended early, so every fast item's log contained a false
+statement about why it stopped. It now says which.

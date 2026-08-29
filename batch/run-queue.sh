@@ -3783,14 +3783,24 @@ ${prompt}"
     fi
   done
   # If we exited the loop without a noop signal and the server session is still
-  # ALIVE (cap reached, not a death), cancel it via the API so it actually
-  # stops -- killing the local client alone does NOT stop the server-side
-  # session, and a live coordinator would otherwise race the recovery review.
+  # ALIVE -- because the cap fired, or because the session went quiet and we
+  # ended early -- cancel it via the API so it actually stops. Killing the local
+  # client alone does NOT stop the server-side session, and a live coordinator
+  # would otherwise race the review the derivation is about to dispatch.
+  #
+  # This matters MORE since settle detection: a quiet session is idle, not
+  # finished, so the run now routinely reaches here with a live session that
+  # could still wake up.
   local _blind=0
   if [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
     local _ss; _ss=$(_session_state "$conv_id")
     if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = alive ]; then
-      echo "[batch] $item: cap reached, session $conv_id still alive -> cancelling" >&2
+      # Says WHY, because "cap reached" was printed even when the loop ended
+      # early on a quiet session -- a false statement in the log of every fast
+      # item, and the sort that gets believed later.
+      local _why="cap reached"
+      [ "${_settle_polls:-0}" -ge "${BIRCHER_SETTLE_POLLS:-4}" ] && _why="session settled"
+      echo "[batch] $item: $_why, session $conv_id still alive -> cancelling" >&2
       _stop_session "$conv_id"
       local _w=0
       while [ "$_w" -lt 30 ]; do
