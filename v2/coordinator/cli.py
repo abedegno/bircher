@@ -13,6 +13,7 @@ import argparse
 import sys
 
 from coordinator.ci import keep_blocking, normalize
+from coordinator.effects import EffectDenied, NotDispatched, perform_effect
 from coordinator.observe import ci_history, classify
 from coordinator.pr_selection import is_abandoned, select
 from coordinator.review import extract_verdict
@@ -22,6 +23,9 @@ from coordinator.session import (LookupFailed, item_count, last_assistant_text,
 RC_OK = 0
 RC_USAGE = 2
 RC_LOOKUP_FAILED = 3
+#: The adapter's `_EFFECT_RC_DENIED`. Kept identical so the two entry points
+#: are interchangeable to a caller that checks the code.
+RC_EFFECT_DENIED = 87
 
 
 def main(argv=None) -> int:
@@ -53,6 +57,15 @@ def main(argv=None) -> int:
 
     vd = subs.add_parser("verdict")
     vd.add_argument("--text", required=True)
+
+    # Mirrors `_effect <class> <key> <cap> -- argv...`, including its exit
+    # codes, so a caller can be swapped from one entry point to the other
+    # without changing how it checks the result.
+    ef = subs.add_parser("effect")
+    ef.add_argument("--class", dest="effect_class", required=True)
+    ef.add_argument("--key", required=True)
+    ef.add_argument("--timeout", type=float, default=None)
+    ef.add_argument("cmd", nargs=argparse.REMAINDER)
 
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
@@ -110,6 +123,23 @@ def main(argv=None) -> int:
         if v is None and a.text.strip():
             print("[batch] WARN: review's final line is not a bare verdict "
                   "-> treating as no verdict", file=sys.stderr)
+        return RC_OK
+
+    if a.mode == "effect":
+        cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+        if not cmd:
+            print("no command given", file=sys.stderr)
+            return RC_USAGE
+        try:
+            print(perform_effect(a.effect_class, a.key, cmd, timeout=a.timeout))
+        except EffectDenied as exc:
+            # 87, the adapter's own RC_DENIED: a caller that already
+            # distinguishes "refused" from "failed" keeps working unchanged.
+            print(f"effect refused: {exc}", file=sys.stderr)
+            return RC_EFFECT_DENIED
+        except NotDispatched as exc:
+            print(f"effect not dispatched: {exc}", file=sys.stderr)
+            return RC_EFFECT_DENIED
         return RC_OK
 
     if a.mode == "pr-abandoned":

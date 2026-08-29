@@ -2439,8 +2439,18 @@ note: $r_note"
       body="Outcome derived from the repository: outcome=$r_outcome ci=$r_ci${_head_field}
 note: $r_note"
     fi
-    _effect comment "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
-      || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
+    # THE FIRST EFFECT PERFORMED THROUGH THE PYTHON PATH. Identical journal --
+    # same class, key, run and generation, same `perform()` -- so this run's
+    # facts are indistinguishable from one where bash performed it. It is wired
+    # here, on the one effect the design allows to move, so the path is proven
+    # in production before `observe_outcome` itself depends on it.
+    #
+    # `_effect`'s exit codes are preserved by the CLI (87 = refused), so the
+    # caller's check is unchanged.
+    _coordinator effect --class comment \
+      --key "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" \
+      -- gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
+      || echo "[batch:recover] WARN $item: failed to post the derived comment to PR #$pr" >&2
   fi
 
   # 4th field (#66): the orchestrator-captured reviewed SHA, empty unless this is

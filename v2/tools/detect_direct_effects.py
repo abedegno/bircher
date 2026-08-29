@@ -73,8 +73,18 @@ MUTATION = re.compile(r"""
 #: `if`/`while`/`until`/`!` are command positions too: `if _effect ... ; then`
 #: is how a routed call gets its exit status tested.
 ROUTED = re.compile(
-    r"(^|\|\||&&|;|\{|\(|!|\b(then|else|do|if|elif|while|until)\b)\s*_effect\s"
+    r"(^|\|\||&&|;|\{|\(|!|\b(then|else|do|if|elif|while|until)\b)"
+    r"\s*(_effect|_coordinator\s+effect)\s"
 )
+#: TWO routing forms since 2026-08-29. `_effect` goes to the kernel CLI;
+#: `_coordinator effect` goes to the same `perform()` through
+#: v2/coordinator/effects.py, which additionally applies the deny/legacy/kernel
+#: mode. Both journal identically.
+#:
+#: The detector has to know BOTH or the migration builds exactly the blind spot
+#: fixed earlier the same day: a real mutation, routed, reported as unrouted --
+#: or worse, a routing form nobody recognises becoming the place mutations
+#: hide.
 
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
