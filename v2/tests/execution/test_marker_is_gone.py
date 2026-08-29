@@ -60,6 +60,10 @@ _ALLOWED_LINES = {
         "ASSERTS ABSENCE. The structural check that run_item reads no marker.",
     'assert "bircher-status:" not in body, "observe_outcome still writes a marker"':
         "ASSERTS ABSENCE. The check that the posted comment carries no channel.",
+    'assert "bircher-status" not in " ".join(str(a) for _c, _k, a in d.posted)':
+        "ASSERTS ABSENCE. The check that the DERIVED comment carries no "
+        "channel -- the Python half of the same property the shell guard "
+        "above covers.",
     '{"id": 2, "author": "bircher-bot", "body": "bircher-status: running"},':
         "ARCHIVE DATA. Real issues carry these comments and always will; the "
         "bundle freezer has to hash an issue as it actually exists, and a "
