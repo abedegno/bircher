@@ -577,3 +577,49 @@ def test_it_settles_before_polling():
     })
     rerun_and_wait("7", "", gh=gh, sleep=slept.append, settle=20)
     assert slept and slept[0] == 20
+
+
+# --- the runner's own argument handling --------------------------------------
+
+def _capture(monkeypatch, seen):
+    """Record the argv and return a successful result.
+
+    NOT a `setdefault(...) or ...` lambda: setdefault returns the list, which is
+    truthy, so the `or` short-circuits and the caller gets a list where it
+    expects a CompletedProcess.
+    """
+    import coordinator.ci as mod
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    return mod
+
+
+def test_gh_api_is_never_given_a_repo_flag(monkeypatch):
+    """`gh api` carries the repo in its URL and REJECTS `--repo`.
+
+    Appending it unconditionally made every api call fail, so `head_of`
+    returned an empty sha, no merge could be pinned, and a green PR escalated
+    instead of merging. Caught by a LIVE RUN, not by the suite: the self-test's
+    shim ignored unknown arguments, so it passed. A stub more permissive than
+    the real tool hides exactly this.
+    """
+    seen = {}
+    monkeypatch.setenv("REPO", "o/r")
+    mod = _capture(monkeypatch, seen)
+    mod._gh(["api", "repos/o/r/pulls/1", "--jq", ".head.sha"])
+    assert "--repo" not in seen["cmd"], seen["cmd"]
+
+
+def test_pr_subcommands_still_get_the_repo_flag(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("REPO", "o/r")
+    mod = _capture(monkeypatch, seen)
+    mod._gh(["pr", "checks", "1"])
+    assert "--repo" in seen["cmd"] and "o/r" in seen["cmd"]

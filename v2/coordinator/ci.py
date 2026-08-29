@@ -24,10 +24,23 @@ class GhError(Exception):
     """`gh` failed. Distinct from "gh succeeded and returned nothing"."""
 
 
+#: Subcommands that take `--repo`. `gh api` does NOT: it carries the repo in
+#: the URL and REJECTS the flag outright.
+#:
+#: Appending `--repo` unconditionally made every `gh api` call fail, so
+#: `head_of` returned an empty sha, no merge could be pinned, and a green PR
+#: escalated instead of merging. The self-test's shim ignored unknown
+#: arguments, so it passed; the live run on the smoke repo did not. A stub more
+#: permissive than the real tool hides exactly this.
+_TAKES_REPO = ("pr", "issue", "run", "release", "workflow", "cache")
+
+
 def _gh(args: list[str]) -> str:
     """The default runner. Injected in tests so none of this needs network."""
     repo = os.environ.get("REPO") or os.environ.get("BIRCHER_REPO") or ""
-    cmd = ["gh", *args] + (["--repo", repo] if repo and "--repo" not in args else [])
+    takes_repo = bool(args) and args[0] in _TAKES_REPO
+    cmd = ["gh", *args] + (["--repo", repo]
+                           if repo and takes_repo and "--repo" not in args else [])
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise GhError(r.stderr.strip()[:200])
