@@ -754,3 +754,383 @@ deletions, at two points outside both functions.
 **The marker is still how `run_item` learns outcomes.** `--publish` is reachable
 only as its own subcommand; nothing in the normal item path calls it yet. Phase
 2 retires the marker.
+
+---
+
+## CORRECTION to C8 Phase 1, criterion 1 (2026-08-29)
+
+**The claim recorded above is withdrawn.** I wrote that the implementer's push
+"HANGS" because "the egress policy blackholes the connection". That mechanism
+is disproved, and criterion 1 is **not demonstrated**.
+
+### What the evidence actually shows
+
+The session that ran `git push origin c8impl-branch` and never returned was
+running under sandbox launcher `/tmp/omnigent-sandbox-ork3z59r.py`, created
+21:12 — matching the 21:13 start of that session's `claude` process. Decoding
+its embedded config:
+
+    backend: linux_landlock | allow_network: True
+    egress_relay_port: None | egress_socket_path: None
+
+**There was no egress relay in that session at all.** The bundle declared four
+egress rules; the sandbox that ran carried none of them.
+
+I then built a launcher from that exact config with `/usr/bin/git` as the
+target instead of `/usr/local/bin/claude`, and pushed:
+
+    [omnigent-sandbox] landlock active abi=6 write_roots=8 read_roots=unrestricted
+    To https://github.com/abedegno/bircher-smoke.git
+       e00d445..81a71a0  c8impl-branch -> c8impl-branch
+    elapsed=2s
+
+Two seconds, rc=0. Repeated against a *different* session's config that DOES
+carry a relay (`egress_relay_port: 57927`): also 2 seconds, also rc=0.
+
+The launcher sets no proxy environment variables, and Landlock restricts TCP
+by PORT, not by destination host — so a direct connection to github.com:443 is
+not something the allow-list is positioned to stop. The bundle's own comment
+says as much about TCP-only enforcement; I read it as a caveat and should have
+read it as the mechanism's limit.
+
+### What remains true, and what does not
+
+TRUE: the session produced a local commit, and nothing it did reached the
+remote. `c8impl-branch` appeared on GitHub only when I pushed it myself.
+
+NOT ESTABLISHED: that it *could not* have pushed. The tool call hung for
+reasons I have not identified, and the same command outside the harness
+completes in two seconds. A session that does not push is not the same as a
+session that cannot, and criterion 1 is about *cannot*.
+
+**OPEN, and it is the load-bearing question for C8:** does the v2_implementer
+boundary actually deny a push? On this evidence I cannot say it does. The
+whole design rests on "the credential never enters this session, and the
+network policy denies the paths those operations use" — the second half of
+that sentence is now in question, and the first half deserves its own test.
+
+### Why this happened
+
+I asked "did the push land?", got "no", and wrote down a mechanism. The
+observation was real; the explanation was invented to fit it and never
+checked. It is the same error as the propagation-delay misdiagnosis recorded
+above — twice in one session, both times a mechanism asserted from an outcome.
+The check that settled it took four minutes and could have been run first.
+
+**Neither the Phase 1 nor the Phase 2 work depends on this being resolved** —
+the kernel publishes correctly either way, and that is separately proved. What
+depends on it is the claim that publication through the kernel is the *only*
+route available to an implementer.
+
+---
+
+# C8 Phase 2 — retire the marker (in progress)
+
+Branch `c8/phase-2`, four of six tasks complete. Phase 1 landed on `main`
+first (fast-forward, 170 commits, verified green on the merged result).
+
+## What is done and proved
+
+**Tasks 1-4: the marker is gone from the code.** `parse_marker` (30 lines),
+`_marker_bodies_since` (20) and their self-tests (44) are deleted;
+`run_item` derives every outcome field from the repository via
+`observe_outcome`; `test_marker_is_gone.py` fails if any shipped file writes or
+reads a `bircher-status:` line again. 640 tests pass, `--self-test` green.
+
+Twelve mutations across the three tasks, each proved applied and restored
+clean; all twelve killed. The one the plan left open — "delete the empty-tuple
+guard; if no existing test reds, the guard is unbound and the task is not
+done" — reds
+`test_an_empty_recovery_tuple_is_treated_as_a_failure[run_item]`.
+
+**`observe_ci_history` verified against live GitHub**, which no unit test can
+do since they all stub `gh`:
+
+    main -> true|8
+    raw API: finished_runs=100 distinct_shas=9
+    earliest finished run: 2026-08-17T23:07:29Z success
+    a branch that never existed -> unknown|
+
+Nine distinct shas gives eight resubmissions; the earliest finished run
+succeeded, so `ci_first=true`. A branch with no history reports `unknown`, not
+`false|0` — the distinction the mutation table exists to protect.
+
+**`observe_outcome` emits seven fields with live CI history** against a real
+PR (`escalated|codex:na|...|||true|2`, the `true|2` read from the API).
+
+## What is NOT done
+
+**Task 6 (a full item end to end, no marker anywhere) has not run.** It needs a
+live coordinator session, and session dispatch on this runner failed four of
+five attempts tonight: `omnigent run` returns while the harness is still
+starting, and the session goes idle without executing its queued message. That
+is an orchestration problem, not a Phase 2 result, but it means criterion 1 of
+Phase 2 is untested and the field-mapping table (criterion 2) is written from
+the code rather than from an observed run.
+
+**Task 5 (make the denied push legible) is suspended, not skipped.** Its whole
+premise — that a denied push hangs — rests on the criterion-1 claim withdrawn
+above. If the boundary does not deny the push at all, there is no stall to
+bound and the task should be deleted rather than done. Resolving the boundary
+question comes first.
+
+## The scorecard mapping, from the code
+
+Written from the source, NOT from an observed run — see Task 6 above.
+
+| field | observation |
+|---|---|
+| `outcome` | `classify_recovery(pr, ci, verdict)` |
+| `review` | `observe_review` — a reviewer run-queue dispatched itself |
+| `ci_pass_first_try` | earliest finished workflow run's conclusion |
+| `resubmissions` | distinct head shas CI ran on, minus one |
+| `rounds` | **null** — no observation exists; renamed, not redefined |
+| `pr`, `wall_seconds`, `bound`, `implementer` | unchanged, already observed |
+| `cost` | **null** — unchanged, never populated |
+
+### SECOND CORRECTION, same night: the boundary DOES enforce
+
+The correction above was right to withdraw the original mechanism and wrong in
+what it put in its place. Both errors have the same root, and it is worth
+naming twice rather than hiding the second one.
+
+**What settled it.** A real session, asked to run `curl https://example.com`
+and print its proxy environment, reported:
+
+    example=000
+    HTTP_PROXY=http://omnigent:<token>@127.0.0.1:40463   (and https_/http_/HTTPS_)
+
+`example.com` appears nowhere in the bundle's allow-list, and the request
+FAILED. The session's traffic is routed through an authenticated local relay
+that the parent process (`os_env`) injects into the environment — not through
+Landlock, which matches TCP by port and cannot see a host or a path.
+
+**Why my test said otherwise.** I built a launcher from a captured session
+config and ran `git push` and `curl` under it directly. That process had no
+parent to set `HTTP_PROXY`, so nothing routed through the relay and everything
+went straight out. `run_launcher`'s own docstring says the wrap "inherits
+HTTP_PROXY / CA env vars set by the parent" — I read the file that says so and
+still concluded from my own unfaithful reproduction.
+
+**Where criterion 1 now stands: PARTIALLY DEMONSTRATED.**
+
+- DEMONSTRATED: a real session under this bundle cannot reach a host outside
+  its allow-list. The egress boundary is enforced, by the relay.
+- NOT OBSERVED: a `git push` returning a denial. Session dispatch failed on
+  six of eight attempts tonight (`omnigent run` returns while the harness is
+  still starting; the session goes idle without executing its queued message),
+  and the two that worked were spent on the questions above.
+- MOST LIKELY, and still an inference: the hung push went to the relay and was
+  refused there, which is consistent with a call that never returns. Recorded
+  as a hypothesis, not a finding, because that is the distinction this whole
+  section exists to enforce.
+
+**The lesson, since it is now the third instance.** Twice tonight I explained
+an outcome with a mechanism I had not tested, and once I disproved a real
+mechanism with a test that did not reproduce the conditions. The common error
+is not carelessness about evidence — it is treating a reproduction as faithful
+without checking what the real path supplies that mine does not. The question
+that would have caught all three: **what does the production path do that my
+test does not?**
+
+**The cross-vendor seat caught it first, with no tooling at all.** A codex
+reviewer was dispatched to attack the withdrawal while I kept testing. Every
+container command it tried failed (`exit 7` — its sandbox has no route to the
+NAS), so it ran nothing and read nothing. It still returned:
+
+> **Verdict: REFUTED — insufficiently demonstrated.** The direct-`git`
+> launcher proves network-level push capability, but not that a real
+> Claude-driven v2 implementer can push; it bypasses the unresolved layers.
+
+and declined to answer the two questions it had no evidence for rather than
+manufacturing a mechanism for either. Its nominated decisive experiment — have
+the real harness invoke `git push` under the session's own launcher — is
+exactly the one still outstanding.
+
+Worth recording precisely because it had NO advantage over me except distance:
+same facts, no execution, and it went straight to "is your reproduction the
+thing that runs?" while I was busy running more of it.
+
+### THIRD AND FINAL: criterion 1 is DEMONSTRATED, and the push does not hang
+
+A real session under the v2_implementer bundle, asked to attempt the push as an
+authorised boundary verification, ran:
+
+    timeout 45 git push origin c8impl-branch 2>&1; echo "EXIT=$?"
+
+and reported:
+
+    error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403
+    send-pack: unexpected disconnect while reading sideband packet
+    fatal: the remote end hung up unexpectedly
+    Everything up-to-date
+    EXIT=1
+
+**EXIT=1, not 124.** Not a timeout. An HTTP 403 from the egress relay, refusing
+the `git-receive-pack` path that the bundle's allow-list deliberately omits.
+The session's commits never reached the remote — local `78db634`, remote
+`a76029f`.
+
+**Criterion 1 holds.** A v2_implementer produces a commit and cannot publish
+it, and the refusal is immediate, legible and attributable to the allow-list.
+
+**And the push does NOT hang — that claim is withdrawn for the last time.**
+Twice a session wedged after being asked to push, which I read as the push
+hanging. The harness watchdog said what I did not: "likely a wedged LLM **or**
+tool call". It was the model. Bounded, the push answers in under a second.
+
+### Why it took three attempts, and the one thing that fixed it
+
+Every earlier attempt let the command run UNBOUNDED, so a wedge anywhere in the
+stack swallowed the result and I inferred a mechanism from the silence. The
+answer arrived the moment the command was bounded — `timeout 45` — because a
+bound converts "no result" into a result. **When an observation keeps failing
+to arrive, the problem is usually that nothing forces it to.**
+
+That is a different failure from the earlier two. Those were reproductions that
+omitted what production supplies. This one was an observation with no deadline,
+which cannot distinguish "slow", "hung" and "never going to answer".
+
+### Task 5 does not exist
+
+"Make the denied push legible" assumed a stall to bound. There is none: the
+denial is a fast, explicit HTTP 403. The task is deleted rather than done.
+
+### Session dispatch: `omnigent run` was the problem, not the runner
+
+Six of eight `omnigent run` invocations went idle holding an unread message.
+Driven through the REST sequence run-queue.sh actually uses — upload bundle →
+holder session → agent id → create session → post event — every attempt worked
+first time. I had been testing through a mechanism the pipeline never uses,
+and reading its flakiness as the runner's.
+
+---
+
+## C8 Phase 2 — ACCEPTED (2026-08-29)
+
+Item `s07-phase2-derivation` ran end to end on `abedegno/bircher-smoke`,
+launched through `batch/launch.sh` so the run also exercised the new
+effect-mode default. Implementer codex, reviewer claude_code, PR #11 merged,
+main CI green.
+
+### The three criteria
+
+**1. A full item runs with no `bircher-status:` comment anywhere, and merges —
+HELD.** `gh pr view 11 --json comments` contains zero occurrences. The only
+comment on the PR is the derived prose, which opens "Cross-vendor review
+(outcome derived from the repository, not reported)". `PHASE2.md` is on main.
+
+The log shows the new path taking over where the marker used to be read:
+
+    cap reached, session ... still alive -> cancelling
+    deriving the outcome from the repository
+    PR #11 CI green, no marker -> claude_code recovery review at da059eb
+    posted+verified bircher/cross-review=success on da059eb
+    PR #11 MERGED; watching main CI -> green
+    -> outcome=ready pr=11 review=claude_code:pass rounds=? bound=ok
+
+**2. Every scorecard field is traceable to an observation — HELD, and now from
+an OBSERVED run rather than from the source.** The row:
+
+    {"item": "s07-phase2-derivation", "pr": 11, "outcome": "ready",
+     "implementer": "codex", "review": "claude_code:pass",
+     "ci_pass_first_try": true, "rounds": null, "resubmissions": 0,
+     "wall_seconds": 1536, "cost": null, "bound": "ok",
+     "note": "out-of-band review PASS"}
+
+`rounds: null` and `resubmissions: 0` are Decision 2 working: the field with no
+observation behind it reports nothing, and the one that replaced it reports
+what CI history showed. The note carries no `RECOVERED:` prefix.
+
+**3. `--self-test` green and every removed guard's replacement named — HELD.**
+691 tests pass, 1 skipped (a detached-launch test that needs `setsid`, verified
+separately on the Linux runner). The replacement table is in the commit that
+deleted the marker vocabulary.
+
+### Criterion 5 from Phase 1 is now satisfied
+
+Phase 1 recorded it as UNTESTED because `--publish` issues no commands, so the
+positive evidence it asks for could not exist. This run issues them:
+
+    command_requested x9   command_accepted x9
+    effect_intended x6     effect_confirmed x6
+    merge_authorized x1    review_verdict x1
+    transition_performed x7   state=ended
+
+Nine commands, nine accepted, no refusals. The shadow report reads `[]`, and
+here that means something — under enforce, with commands actually flowing, an
+empty report is the absence of refusals rather than the absence of traffic.
+
+The six journalled effects, with their external ids:
+
+    session_control  {"id":"47bf2a29...","agent_id":"77db59f...   (session create)
+    session_control  {"queued":true,"item_id":"a3c7416c...        (prompt)
+    session_control  {"queued":false}                             (stop)
+    comment          .../pull/11#issuecomment-...
+    status_check     .../repos/abedegno/bircher-smoke/...
+    merge            ok
+
+**The first and third were unrouted and INVISIBLE to the detector until earlier
+the same day.** They are in this journal because that was fixed hours before
+this run; a Phase 2 acceptance taken yesterday would have recorded a complete
+journal that silently omitted session creation and termination.
+
+### The cost of removing the marker, measured
+
+    s05-enforce (marker era)     wall_seconds =  136
+    s07 (derived)                wall_seconds = 1536
+
+**Eleven times longer, and almost all of it is waiting.** The implementer
+opened its PR within about four minutes; the run then sat until the 25-minute
+`ITEM_TIMEOUT` cap, because the coordinator can no longer say "I am done" and
+`idle` is not death. The derivation itself, once it started, took under a
+minute.
+
+This was predicted when the poll loop's marker check was removed, and it is
+recorded here as a measurement rather than an estimate. It is the single
+largest regression in Phase 2 and it is structural, not a bug: the fix is a
+completion signal that is an OBSERVATION rather than a model-authored comment
+— the session's own terminal state, or the PR's — and that is Phase 3 work, not
+a tuning problem.
+
+### The wall-clock regression, addressed and measured
+
+    s05-enforce   marker era              136s
+    s07           derived, cap-bound     1536s   (11x)
+    s08           derived, settle-bound   318s   (2.3x)
+
+**4.8x faster than s07**, on the same repo with the same shape of item. The log
+line that replaced the wait:
+
+    s08-settle-probe: PR #12 open and session quiet for 4 polls
+                      -> deriving now rather than waiting for the cap
+
+The remaining 318s is roughly three minutes of implementer work plus the four
+quiet polls the check requires (180s at the 45s poll interval). The threshold
+is `BIRCHER_SETTLE_POLLS`, so the residual is tunable against the risk below,
+not structural.
+
+**What the signal is, and what it is not.** The marker was the coordinator
+REPORTING convergence. The replacement OBSERVES it: the session is idle and
+has stopped producing items, held for four consecutive polls, with a PR
+already open. Neither half suffices alone -- `idle` is not done (a coordinator
+awaiting a sub-agent is idle, which is why `died()` refuses to read it as
+death), and a stable item count is not done either (a session mid-tool-call
+produces no items while it works).
+
+**The residual risk, stated rather than mitigated away.** A coordinator whose
+sub-agent takes longer than four quiet polls looks settled. The guard against
+deriving too early is the PR requirement plus the fact that the derivation
+re-reads CI and dispatches its own review -- it does not trust a snapshot taken
+at break time. But an item whose coordinator would have pushed a fix after 200
+seconds of silence would now be derived on the earlier head. Raising
+`BIRCHER_SETTLE_POLLS` trades wall-clock for that margin.
+
+A failed lookup RESETS the streak rather than extending it: "I cannot see the
+session" is not "nothing is happening", and treating an unreadable session as
+quiet would settle during a server outage -- exactly when a coordinator is
+least likely to have finished.
+
+**Also fixed:** the teardown logged "cap reached, session still alive" even
+when the loop ended early, so every fast item's log contained a false
+statement about why it stopped. It now says which.

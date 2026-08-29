@@ -232,7 +232,7 @@ def test_record_output_puts_before_it_names_the_hash(tmp_path):
     hash landed in the artifacts table, and it is the SAME hash a Python
     caller computes over the same bytes -- not merely "some string"."""
     db = tmp_path / "kernel.db"
-    body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
+    body = "derived: outcome=ready review=codex:pass head=" + HEAD_SHA
     _run('_kernel_run_start run-4 abedegno/muesli ' + BASE_SHA, env=_db_env(db))
     r = _run(
         f'g=$(_kernel_dispatch claude_code implementer); '
@@ -394,7 +394,7 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     spec_hash = r.stdout.strip()
     _run(f"_kernel_start_implementation {run_id} {gen1}", env=_db_env(db))
 
-    body = "bircher-status: outcome=ready ci=success head=" + HEAD_SHA
+    body = "derived: outcome=ready review=codex:pass head=" + HEAD_SHA
     r = _run(f"_kernel_record_output {run_id} {gen1} {body!r}", env=_db_env(db))
     out_hash = r.stdout.strip()
     # `green`, not `success`: the PRODUCTION vocabulary. run-queue.sh reads
@@ -486,7 +486,7 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     expected_hash = hashlib.sha256(b"do the thing").hexdigest()
     assert store.has_artifact(expected_hash)
     assert store.current_artifact(run_id) == hashlib.sha256(
-        ("bircher-status: outcome=ready ci=success head=" + HEAD_SHA).encode()
+        ("derived: outcome=ready review=codex:pass head=" + HEAD_SHA).encode()
     ).hexdigest()
 
 

@@ -27,7 +27,7 @@ grep -nE "git .*push" batch/run-queue.sh
 grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 ```
 
-## Mutations — 15 routed sites
+## Mutations — 19 routed sites
 
 | Line | Call | Effect class |
 |---|---|---|
@@ -89,4 +89,4 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 1155 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed.** `resp=$(curl -s -w '\n%{http_code}' ...)` captures the status and body together, and the caller reads both to report why an upload failed. Routing it changes what the caller receives on failure — the kernel returns the effect's external id and reports errors on stderr — and this sits on the coordinator's hot path, where every run begins. Routing it needs the intent contract to carry a response, which is the same work as C1/C2's full form. Recorded rather than done blind. |
+| 1054 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed.** `resp=$(curl -s -w '\n%{http_code}' ...)` captures the status and body together, and the caller reads both to report why an upload failed. Routing it changes what the caller receives on failure — the kernel returns the effect's external id and reports errors on stderr — and this sits on the coordinator's hot path, where every run begins. Routing it needs the intent contract to carry a response, which is the same work as C1/C2's full form. Recorded rather than done blind. |

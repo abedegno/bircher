@@ -132,7 +132,9 @@ PR = "777"
 #: call here. `_merge_gate` is deliberately NOT in this list -- see
 #: REVIEWED_SHA above -- it is stubbed instead, in `_STUB_TEMPLATE`.
 _NEEDED_REAL_FUNCTIONS = [
-    "_contains", "_is_blank", "_is_limit_message", "parse_marker",
+    # `parse_marker` was here until C8 Phase 2 deleted it; run_item no longer
+    # calls it because there is no marker to parse.
+    "_contains", "_is_blank", "_is_limit_message",
     "_pr_signal", "_session_died", "_item_issue",
     "_local_host_id", "_json_get", "_host_ids_match", "_writeback_plan",
     "_issue_writeback", "_ensure_issue_closed", "_record_deferred_ready",
@@ -220,15 +222,14 @@ MERGE_RETRY_ELIGIBLE=""
 #: the heredoc it did not know how to rewrite) rather than silently
 #: reverting to the broken form.
 def _heredoc_to_herestring(run_item_src):
+    # Since Phase 2 there is ONE heredoc: the marker branch is gone and the
+    # derived tuple is the only thing run_item parses.
     pairs = [
         (
-            "IFS='|' read -r outcome _ci ci_first review rounds note marker_head <<EOF\n"
-            "$marker\nEOF",
-            'IFS=\'|\' read -r outcome _ci ci_first review rounds note marker_head <<< "$marker"',
-        ),
-        (
-            "IFS='|' read -r outcome review note marker_head _rec_ci <<EOF\n$rec\nEOF",
-            'IFS=\'|\' read -r outcome review note marker_head _rec_ci <<< "$rec"',
+            "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
+            "resubmissions <<EOF\n$obs\nEOF",
+            "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
+            'resubmissions <<< "$obs"',
         ),
     ]
     for old, new in pairs:
@@ -261,9 +262,9 @@ _kernel_submit_spec()        {{ _log_call _kernel_submit_spec "$@"; }}
 _kernel_submit_plan()        {{ _log_call _kernel_submit_plan "$@"; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
-recover_from_ground_truth() {{
-  _log_call recover_from_ground_truth "$@"
-  printf '%s' 'ready|claude_code:pass|recovered from ground truth|{reviewed_sha}|green'
+observe_outcome() {{
+  _log_call observe_outcome "$@"
+  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1'
 }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
@@ -279,6 +280,10 @@ _kernel_dispatch() {{
   printf '%s' "$n"
 }}
 
+# Stubbed so no test reaches the network. Returning EMPTY means "no settle",
+# which keeps these tests on the path they were written for -- the loop running
+# to its existing exits rather than ending early on a quiet session.
+_coordinator()     {{ printf ''; return 1; }}
 _create_session()  {{ printf 'conv-test-1'; }}
 _send_prompt()     {{ return 0; }}
 _http_json()       {{ printf '{{}}'; }}
@@ -290,10 +295,9 @@ _last_assistant_text() {{ printf ''; return 0; }}
 # argument wiring regardless.
 json_row()         {{ :; }}
 merge_ready_pr()   {{ _log_call merge_ready_pr "$@"; return 0; }}
-_marker_bodies_since() {{ printf '%s' {marker_body!r}; }}
 # Deliberately NOT the real _merge_gate: see REVIEWED_SHA's module-level
 # comment for why this fixture needs its own, distinct answer rather than
-# echoing back the marker head it was given.
+# echoing back the observed head it was given.
 _merge_gate() {{ [ -n "${{2:-}}" ] && {{ printf 'pin|%s' {reviewed_sha!r}; return 0; }}; printf 'skip'; }}
 '''
 
@@ -320,7 +324,7 @@ def _base_env(tmp_path, queue_dir, noop_dir):
 
 
 def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
-                   marker_review="codex:pass", merge_ok=True, marker=True):
+                   observed_review="codex:pass", merge_ok=True):
     """Drives ONE queue item through `run_item`, for real, with every
     session/network function stubbed. Returns (calls, result) where `calls`
     is an ordered list of (name, [args...]) tuples logged by `_log_call`,
@@ -344,18 +348,13 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     gencounter = tmp_path / "gencounter"
     gencounter.write_text("0")
 
-    # marker=False drives the NO-MARKER recovery branch -- the path that runs
-    # whenever an implementer session dies. It was never driven here, which is
-    # how `local _out_hash` inside the marker branch reached production and
-    # killed a live run on `set -u`.
-    marker_body = (
-        "bircher-status: outcome=ready ci=success ci_first=true "
-        f"review={marker_review} rounds=1 note=\"wired for real\" head={HEAD_SHA}"
-    ) if marker else ""
-
+    # SINCE PHASE 2 THERE IS ONE PATH. The marker branch and the ground-truth
+    # branch were the same lifecycle driven from two sources; only the derived
+    # one remains, so every test here drives it.
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
-        marker_body=marker_body, reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH,
+        observed_review=observed_review, head_sha=HEAD_SHA,
+        reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH,
     )
     if not merge_ok:
         stub = stub.replace(
@@ -404,10 +403,16 @@ def happy_drive(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def recovery_drive(tmp_path_factory):
-    """No marker: the ground-truth recovery branch."""
-    d = tmp_path_factory.mktemp("run-item-recovery")
-    return _run_one_item(d, marker=False)
+def recovery_drive(happy_drive):
+    """PHASE 2: the marker branch and the ground-truth branch converged into a
+    single derived path, so this IS `happy_drive`.
+
+    Kept as a name because the tests below were written to describe the derived
+    path's obligations, and those obligations did not change -- only the number
+    of ways to reach them did. Aliasing rather than re-driving keeps the
+    coverage honest: two fixtures running identical code would look like two
+    tested paths."""
+    return happy_drive
 
 
 @pytest.fixture(scope="module")
@@ -425,7 +430,7 @@ def test_the_drive_reaches_every_kernel_call_site(happy_drive):
     assert names == [
         "_kernel_run_start", "_kernel_dispatch", "_kernel_put_artifact",
         "_kernel_submit_spec", "_kernel_submit_plan",
-        "_kernel_start_implementation", "_kernel_record_output",
+        "_kernel_start_implementation", "observe_outcome", "_kernel_record_output",
         "_kernel_record_ci", "_kernel_dispatch", "_kernel_record_review",
         "_kernel_dispatch", "_kernel_request_merge", "merge_ready_pr",
         "_kernel_record_outcome",
@@ -489,33 +494,45 @@ def test_start_implementation_gets_the_implementer_generation(happy_drive):
     assert args == [run_id, "1"], args
 
 
-def test_record_output_gets_the_actual_marker_body(happy_drive):
+def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
+    """`observe_outcome` sits at index 6, between start_implementation and
+    record_output. Everything the kernel records afterwards is derived from
+    what it returned -- so if this call ever moves after the recording, the
+    recorded facts would describe a run nobody had observed yet."""
     calls, _ = happy_drive
-    name, args = calls[6]
+    name, _args = calls[6]
+    assert name == "observe_outcome", [c[0] for c in calls]
+    assert calls[5][0] == "_kernel_start_implementation"
+    assert calls[7][0] == "_kernel_record_output"
+
+
+def test_record_output_gets_the_actual_derived_body(happy_drive):
+    calls, _ = happy_drive
+    name, args = calls[7]
     assert name == "_kernel_record_output"
     run_id = calls[0][1][0]
     run_id_arg, gen_arg, body_arg = args
     assert run_id_arg == run_id
     assert gen_arg == "1"
-    assert body_arg.startswith("bircher-status: outcome=ready ci=success"), body_arg
+    assert body_arg.startswith("derived: outcome=ready review=codex:pass"), body_arg
     assert f"head={HEAD_SHA}" in body_arg, body_arg
 
 
 def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
     """The reviewer's finding, reproduced as a positive assertion: the THIRD
-    argument to record_ci is $_ci ("success"), never $outcome ("ready") --
-    two in-scope variables from the same marker line with different
+    argument to record_ci is $_obs_ci ("green"), never $outcome ("ready") --
+    two in-scope variables from the same derived tuple with different
     vocabularies (see module docstring for the mutation this must catch)."""
     calls, _ = happy_drive
-    name, args = calls[7]
+    name, args = calls[8]
     assert name == "_kernel_record_ci"
     run_id = calls[0][1][0]
-    assert args == [run_id, "1", "success", HEAD_SHA], args
+    assert args == [run_id, "1", "green", HEAD_SHA], args
 
 
 def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[8]
+    name, args = calls[9]
     assert name == "_kernel_dispatch"
     assert args == ["codex", "reviewer"], args
 
@@ -526,7 +543,7 @@ def test_record_review_gets_the_raw_marker_verdict_at_the_reviewer_generation(ha
     would put the mapping on the side that cannot be tested against the
     kernel's vocabulary."""
     calls, _ = happy_drive
-    name, args = calls[9]
+    name, args = calls[10]
     assert name == "_kernel_record_review"
     run_id = calls[0][1][0]
     assert args[:3] == [run_id, "2", "codex:pass"], args
@@ -545,7 +562,7 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
     """
     calls, _ = happy_drive
     by_name = {n: a for n, a in calls}
-    _, args = calls[9]
+    _, args = calls[10]
 
     assert args[3] == OUT_HASH, (
         "the review does not bind the hash _kernel_record_output returned")
@@ -558,7 +575,7 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
 
 def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[10]
+    name, args = calls[11]
     assert name == "_kernel_dispatch"
     assert args == ["claude_code", "implementer"], args
 
@@ -571,7 +588,7 @@ def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3(happy_drive):
     module-level comment for why the swap that motivated this test was
     invisible before that separation."""
     calls, _ = happy_drive
-    name, args = calls[11]
+    name, args = calls[12]
     assert name == "_kernel_request_merge"
     run_id = calls[0][1][0]
     assert args[:5] == [run_id, "3", PR, "acme/widgets", HEAD_SHA], args
@@ -585,8 +602,8 @@ def test_request_merge_presents_the_SAME_binding_the_review_did(happy_drive):
     field, and asserting them against each other is the only way to catch a
     drift that leaves both individually plausible."""
     calls, _ = happy_drive
-    _, review = calls[9]
-    _, merge = calls[11]
+    _, review = calls[10]
+    _, merge = calls[12]
     assert merge[5:8] == review[3:6], (
         f"merge binds {merge[5:8]} but the review bound {review[3:6]}; the "
         "merge gate will find no approval for this tuple")
@@ -597,7 +614,7 @@ def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):
     argument is `$reviewed_sha` -- REVIEWED_SHA, `_merge_gate`'s answer --
     never the marker's own `$marker_head`."""
     calls, _ = happy_drive
-    name, args = calls[12]
+    name, args = calls[13]
     assert name == "merge_ready_pr"
     assert args == ["t01-test-item", PR, REVIEWED_SHA], args
 
@@ -607,7 +624,7 @@ def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):
     0) at generation 3 -- the SAME generation request_merge used, not a
     stale one from an earlier dispatch."""
     calls, _ = happy_drive
-    name, args = calls[13]
+    name, args = calls[14]
     assert name == "_kernel_record_outcome"
     run_id = calls[0][1][0]
     assert args == [run_id, "3", "merged"], args
@@ -655,20 +672,20 @@ def test_the_recovery_branch_records_the_lifecycle(recovery_drive):
 
 
 def test_the_recovery_ci_observation_is_the_one_recovery_MADE(recovery_drive):
-    """The CI value comes back from recover_from_ground_truth as a fifth field,
-    not inferred from `outcome=ready`. "ready implies green" is true today and
-    is still an inference -- a ledger built on one is a claim with nothing
-    behind it."""
+    """The CI value comes back from `observe_outcome` as a fifth field, not
+    inferred from `outcome=ready`. "ready implies green" is true today and is
+    still an inference -- a ledger built on one is a claim with nothing behind
+    it."""
     calls, _ = recovery_drive
     ci = next(a for n, a in calls if n == "_kernel_record_ci")
     assert ci[2] == "green", f"expected the recovered CI value, got {ci[2]!r}"
-    assert ci[3] == REVIEWED_SHA, "CI was not bound to the recovered head"
+    assert ci[3] == HEAD_SHA, "CI was not bound to the observed head"
 
 
 def test_the_recovery_review_carries_the_recovered_verdict_and_binding(recovery_drive):
     calls, _ = recovery_drive
     rv = next(a for n, a in calls if n == "_kernel_record_review")
-    assert rv[2] == "claude_code:pass", rv
+    assert rv[2] == "codex:pass", rv
     assert rv[3] == OUT_HASH, "the review does not bind the recovered output"
     by_name = {n: a for n, a in calls}
     assert rv[4] == by_name["_kernel_run_start"][2], "base differs from run_start's"

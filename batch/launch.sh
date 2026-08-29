@@ -17,6 +17,7 @@
 #   batch/launch.sh --log wave.log     # custom log
 #   batch/launch.sh --source queue     # drain queue/*.md instead of issues
 #   batch/launch.sh --foreground       # run attached (debugging)
+#   batch/launch.sh --mode legacy      # unjournalled v1 effects (bisecting only)
 #
 # Any other args pass through to run-queue.sh untouched.
 set -euo pipefail
@@ -24,6 +25,22 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$HERE/../run.log"
 SOURCE="${BIRCHER_SOURCE:-issues}"
+
+# THE MODE A WAVE RUNS IN, decided here because this is where deployment intent
+# belongs.
+#
+# The adapter's own default is `deny`, and that stays right for a bare
+# `run-queue.sh` invocation: refusing beats acting without a journal. But a WAVE
+# launched under `deny` refuses every effect and does nothing at all -- no
+# labels, no PRs, no merges -- which an operator reads as a broken runner rather
+# than as a policy. Nothing else in the deployment set this: not the runner's
+# environment, not a scheduled task, not an env file. So an unset mode was not a
+# conservative default, it was an inert one.
+#
+# `kernel` routes every mutation through the argv contract, authorization and
+# the journal. `legacy` executes them directly and journals nothing -- v1
+# behaviour, kept for bisecting a suspected kernel fault, never for normal use.
+EFFECT_MODE="${BIRCHER_EFFECT_MODE:-kernel}"
 FOREGROUND=0
 PASSTHRU=()
 
@@ -32,6 +49,7 @@ while [ $# -gt 0 ]; do
     --log)        LOG="$2"; shift 2 ;;
     --source)     SOURCE="$2"; shift 2 ;;
     --foreground) FOREGROUND=1; shift ;;
+    --mode)       EFFECT_MODE="$2"; shift 2 ;;
     *)            PASSTHRU+=("$1"); shift ;;
   esac
 done
@@ -47,7 +65,8 @@ cd "$HERE/.."
 # lock do its job and surface what the runner says.
 
 if [ "$FOREGROUND" = 1 ]; then
-  exec env BIRCHER_SOURCE="$SOURCE" bash batch/run-queue.sh "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
+  exec env BIRCHER_SOURCE="$SOURCE" BIRCHER_EFFECT_MODE="$EFFECT_MODE" \
+    bash batch/run-queue.sh "${PASSTHRU[@]+"${PASSTHRU[@]}"}"
 fi
 
 command -v setsid >/dev/null 2>&1 || {
@@ -57,7 +76,7 @@ command -v setsid >/dev/null 2>&1 || {
 }
 
 : > "$LOG"
-setsid env BIRCHER_SOURCE="$SOURCE" \
+setsid env BIRCHER_SOURCE="$SOURCE" BIRCHER_EFFECT_MODE="$EFFECT_MODE" \
   bash batch/run-queue.sh "${PASSTHRU[@]+"${PASSTHRU[@]}"}" > "$LOG" 2>&1 < /dev/null &
 
 # Confirm it actually survived, rather than reporting success for a process that
@@ -76,5 +95,5 @@ fi
 
 # Non-empty log only proves it got far enough to speak. Show the first line so the
 # operator sees which it was: a real start, or run-queue's singleton refusal.
-echo "launch: wave started (source=$SOURCE, log=$LOG)"
+echo "launch: wave started (source=$SOURCE, effect-mode=$EFFECT_MODE, log=$LOG)"
 echo "        $(head -1 "$LOG")"

@@ -32,12 +32,28 @@ def test_run_item_is_found():
     assert len(_run_item().splitlines()) > 100
 
 
-@pytest.mark.parametrize("name", [
-    "enqueue", "record_implementation_output", "record_ci_observation",
-    "record_review", "request_merge", "record_merge_outcome",
-])
+#: Each lifecycle stage and the shell function that PERFORMS it.
+#:
+#: Previously this test looked for the stage's own name as a substring of
+#: run_item -- and two of them appeared only inside a COMMENT, so deleting the
+#: comment in Phase 2 broke a test whose subject was still working perfectly.
+#: A substring of prose is not evidence that a stage is driven. The call is.
+_STAGE_CALLS = {
+    # There is no `_kernel command --name enqueue`; the run's row is created by
+    # _kernel_run_start. run-queue.sh says so at the call site.
+    "enqueue": "_kernel_run_start",
+    "record_implementation_output": "_kernel_record_output",
+    "record_ci_observation": "_kernel_record_ci",
+    "record_review": "_kernel_record_review",
+    "request_merge": "_kernel_request_merge",
+    "record_merge_outcome": "_kernel_record_outcome",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_STAGE_CALLS))
 def test_each_stage_calls_the_kernel(name):
-    assert name in _run_item(), f"run_item never records {name}"
+    fn = _STAGE_CALLS[name]
+    assert fn in _run_item(), f"run_item never calls {fn}, which performs {name}"
 
 
 def test_the_reviewer_gets_its_own_dispatch():
@@ -305,7 +321,9 @@ _EFFECT_SITE_CONTEXT = {
     "merge_ready_pr": "REACHED",
     "_issue_writeback": "REACHED",
     "_ensure_issue_closed": "REACHED",
-    "recover_from_ground_truth": "REACHED",
+    # Renamed from `recover_from_ground_truth` in Phase 2: it is no longer a
+    # recovery path, it is the ONLY path, and run_item calls it for every item.
+    "observe_outcome": "REACHED",
     "_reconcile_item_pr": "REACHED",
     # Only caller is merge_ready_pr's revert path, which is itself REACHED.
     "_reopen_reverted_issues": "REACHED",
@@ -318,6 +336,13 @@ _EFFECT_SITE_CONTEXT = {
     # so a refusal leaves no run behind for the next call to mistake for
     # provenance.
     "publish_cmd": "ADOPTS",
+    # Routed 2026-08-29, having been unrouted AND undetected since the initial
+    # public release. Both run inside run_item after the implementer dispatch,
+    # so a generation exists before either fires -- `_create_session` is called
+    # immediately after `_kernel_dispatch`, which is why that dispatch was moved
+    # above session creation in the first place.
+    "_create_session": "REACHED",
+    "_stop_session": "REACHED",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about
@@ -629,7 +654,7 @@ def test_recover_pr_cmd_writes_back_to_the_issue():
 
 @pytest.mark.parametrize("fn", ["recover_pr_cmd", "run_item"])
 def test_an_empty_recovery_tuple_is_treated_as_a_failure(fn):
-    """recover_from_ground_truth has ONE exit and always emits five fields, so
+    """observe_outcome has ONE exit and always emits seven fields, so
     no output means it died before reaching that line -- and `rec=$(...)`
     swallows the death into an empty string. Parsed straight it reads as
     outcome="" and the caller reports "NOT ready", which is a benign-looking
@@ -640,11 +665,12 @@ def test_an_empty_recovery_tuple_is_treated_as_a_failure(fn):
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
     body = [l for l in src[start:end] if not l.strip().startswith("#")]
 
-    call = next(i for i, l in enumerate(body) if "rec=$(recover_from_ground_truth" in l)
+    call = next(i for i, l in enumerate(body) if "=$(observe_outcome" in l)
     parse = next(i for i, l in enumerate(body)
                  if "read -r" in l and ("r_outcome" in l or "outcome review note" in l))
+    var = "rec" if "rec=$(observe_outcome" in "\n".join(body) else "obs"
     window = "\n".join(body[call:parse])
-    assert "${rec//[[:space:]]/}" in window, (
+    assert f"${{{var}//[[:space:]]/}}" in window, (
         f"{fn} parses the recovery tuple without checking it is non-empty, so a "
         "crashed recovery reads as a verdict of ''")
 

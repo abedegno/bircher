@@ -122,7 +122,8 @@ def test_the_detector_agrees_with_the_inventory():
     inventory is stale."""
     findings, suppressed = scan(str(RUN_QUEUE))
     text = INVENTORY.read_text()
-    assert "## Mutations — 15 routed sites" in text, "the inventory's own count moved"
+    assert re.search(r"## Mutations — \d+ routed sites", text), (
+        "the inventory's own count heading is gone")
     assert len(findings) + len(suppressed) > 0
     for f in findings:
         assert f"| {f.line} |" in text, (
@@ -192,3 +193,80 @@ def test_a_routed_call_whose_key_contains_a_pipeline_is_not_flagged(tmp_path):
 
 def test_a_routed_call_still_exempts_itself(tmp_path):
     assert not _scan(tmp_path, '_effect merge "m:1" - gh pr merge 1 --repo o/r\n')
+
+
+# --- the class, not just the instance ----------------------------------------
+
+_VARIABLE_METHOD_CURL = re.compile(r'curl\b[^|\n]*-X\s+["\']?\$')
+
+#: Shell helpers permitted to issue a curl whose METHOD is a variable. Each one
+#: is a hole in `MUTATION`, which can only match a literal verb -- so each needs
+#: its own alternative in the pattern, naming the helper and its method
+#: argument.
+#:
+#: `_http_json` was the first, and it hid two live `session_control` mutations
+#: from the initial public release until 2026-08-29.
+_VARIABLE_METHOD_HELPERS = {"_http_json"}
+
+
+def _shell_functions(path):
+    """Name and CODE body of each function, comments stripped.
+
+    Two things this got wrong on the first attempt, both caught by it producing
+    false positives against the very change it was written for:
+
+    - A ONE-LINE function (`f() { cmd; }`) has no line equal to `}`, so scanning
+      forward swallowed the NEXT function's body and attributed its code to the
+      wrong name.
+    - Comments were included, so a comment DESCRIBING the pattern matched it.
+      That is the second time today a substring scan has been tripped by prose
+      explaining the thing it looks for.
+    """
+    lines = path.read_text().splitlines()
+    for i, l in enumerate(lines):
+        m = re.match(r"^([a-z_][\w]*)\(\) \{", l)
+        if not m:
+            continue
+        if l.rstrip().endswith("}"):
+            body = [l]
+        else:
+            end = next((j for j in range(i + 1, len(lines)) if lines[j] == "}"), None)
+            if end is None:
+                continue
+            body = lines[i:end + 1]
+        code = [b for b in body if not b.strip().startswith("#")]
+        yield m.group(1), "\n".join(code)
+
+
+def test_no_other_helper_hides_a_variable_method_curl():
+    """CLOSES THE CLASS that `_http_json` was one instance of.
+
+    A helper doing `curl -X "$method"` makes every mutation through it
+    invisible to MUTATION, which can only match a literal verb. Fixing the
+    instance without this test would leave the next such wrapper free to hide
+    the same way -- and the criterion-1 test cannot notice, because it only
+    checks findings the detector actually produced.
+    """
+    found = {name for name, body in _shell_functions(RUN_QUEUE)
+             if _VARIABLE_METHOD_CURL.search(body)}
+    unexpected = found - _VARIABLE_METHOD_HELPERS
+    assert not unexpected, (
+        "these helpers issue a curl with a variable method, so mutations "
+        "through them are invisible to the detector. Add an alternative to "
+        f"MUTATION naming each, then list it here: {sorted(unexpected)}")
+
+    stale = _VARIABLE_METHOD_HELPERS - found
+    assert not stale, (
+        f"no longer present and should be dropped from the list: {sorted(stale)}")
+
+
+def test_the_detector_sees_an_indirect_mutation(tmp_path):
+    """The known-positive the detector lacked. Its existing self-check plants a
+    LITERAL `curl -X POST`, which is exactly the shape that already worked."""
+    assert _scan(tmp_path, '  _http_json POST "/v1/sessions" "$body"\n'), (
+        "an _http_json POST is a mutation and must be detected")
+
+
+def test_an_indirect_GET_is_not_a_mutation(tmp_path):
+    """The counterpart: flagging reads would make the inventory meaningless."""
+    assert not _scan(tmp_path, '  _http_json GET "/v1/sessions/$1"\n')

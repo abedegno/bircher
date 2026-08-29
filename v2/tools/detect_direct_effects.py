@@ -31,7 +31,25 @@ MUTATION = re.compile(r"""
   | gh\s+["']?api["']?\b[^|\n]*\bstatuses/
   | git\s+(-C\s+\S+\s+)?["']?push
   | curl\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
+  | _http_json\s+["']?(POST|PUT|PATCH|DELETE)
 """, re.VERBOSE)
+#: `_http_json <METHOD> <path>` -- an INDIRECT mutation, and the whole class of
+#: them was invisible until 2026-08-29. The helper does
+#: `curl -sf -X "$method"`, and every pattern above requires a LITERAL method
+#: after `-X`, so a mutation went undetected the moment it was routed through a
+#: wrapper. Two live ones were hiding there since the initial public release:
+#: creating a model session and stopping one -- both `session_control`, neither
+#: journalled, neither generation-fenced.
+#:
+#: The suite was green throughout, and could not have been otherwise:
+#: `test_criterion_1_every_mutation_is_routed_or_dispositioned` asserts every
+#: FINDING is accounted for, so a detector that finds nothing satisfies it
+#: perfectly. A blind spot is invisible to a test that can only see through the
+#: thing that is blind.
+#:
+#: Naming `_http_json` fixes the instance. What closes the CLASS is
+#: `test_no_other_helper_hides_a_variable_method_curl`, which fails if a second
+#: such wrapper is ever added.
 #: `curl` with a mutating method. Added in round 6: the pattern knew only `gh`
 #: and `git push`, and the inventory claimed to union "five independent grep
 #: patterns" -- all five of which looked for those same two commands, so the

@@ -716,64 +716,16 @@ loud:**
 
 ---
 
-### Task 5: make the denied push legible
+### Task 5: DELETED — the premise was false
 
-**Files:** determined by Step 1 — see below.
+"Make the denied push legible" assumed a denied push hangs. It does not: a real
+session's push is refused immediately with HTTP 403 from the egress relay, exit
+status 1. There is no stall to bound.
 
-Independent of Tasks 1-4 and reorderable. Recorded in the Phase 1 acceptance
-section: the implementer's `git push` does not fail, it **hangs** — measured at
-over ten minutes before cancellation. The bundle's prompt tells the implementer
-that a failure is the boundary working, and no failure ever arrives.
-
-**This task begins as a spike, because the obvious fix does not exist.**
-`run_item` never creates the implementer's worktree — `run-queue.sh:3579` is
-PROMPT TEXT instructing the session to create its own. There is no
-run-queue-side worktree to configure, so any plan step of the form
-`git -C "$wt" config …` is unimplementable. Establish the mechanism by
-measurement before writing the fix.
-
-- [ ] **Step 1: Spike — find a mechanism that actually bounds the stall**
-
-On `bircher-smoke`, in a clone under the v2_implementer bundle, time
-`git push origin <branch>` under each candidate. Record elapsed seconds for
-each; a candidate that does not bound the stall is eliminated, not adjusted.
-
-| candidate | where it lives | unknown to settle |
-|---|---|---|
-| `GIT_HTTP_LOW_SPEED_LIMIT` / `GIT_HTTP_LOW_SPEED_TIME` env vars | the bundle's `os_env`, if omnigent supports an env block | **no existing bundle sets env** — support is unverified. Check the omnigent bundle schema before assuming it. |
-| `git config --global http.lowSpeedLimit/Time` in the runner image | homelab, not bircher | crosses a repo boundary; needs the operator's agreement |
-| the instruction added to the worktree-creation prompt at `run-queue.sh:3579` | bircher | model-dependent — but the worktree creation it joins is already model-dependent, so it adds no new class of failure |
-
-`lowSpeed` rather than a connect timeout, for all three: the connection
-SUCCEEDS and then stalls, so there is no connect failure to catch. No bytes
-move, so the low-speed bound is the one that can fire. **If the measurement
-shows the stall happens before any HTTP exchange begins, lowSpeed will not fire
-either and all three candidates are wrong** — say so and stop rather than
-picking the least-bad one.
-
-- [ ] **Step 2: Report the spike's result and pick**
-
-Write the measured seconds per candidate into the task's report. The winner is
-the one that bounded the stall, not the one that was tidiest.
-
-- [ ] **Step 3: Implement the winner**, with a comment stating the measured
-      bound and the date it was measured.
-
-- [ ] **Step 4: Re-measure after implementing**
-
-Run a fresh session under the bundle and time its push. **If the push still
-hangs past the bound, the mechanism does not work and the task is not done.**
-Say so and stop rather than shipping a comment claiming a bound it does not
-deliver. The Phase 1 record already contains one fix built on a hypothesis its
-own measurement could not have refuted; do not add a second.
-
-- [ ] **Step 5: Commit**, stating the measured seconds before and after.
-
-**No unit test is prescribed for this task**, deliberately. A test asserting
-`"http.lowSpeedLimit" in source` asserts TEXT, not behaviour — it passes when
-the setting is present and inert, which is the exact failure mode in question.
-The measurement in Step 4 is the evidence. If the winning mechanism turns out
-to have a behavioural seam worth binding, write the test then.
+The task is recorded as deleted rather than removed silently, because its
+premise came from a claim in the Phase 1 record that took three attempts to
+settle — see the acceptance record's three corrections. A task built on a wrong
+observation is worth leaving visible.
 
 ---
 

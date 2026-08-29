@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bircher batch runner: work queue/*.md one at a time through a
-# fresh Bircher session each, detect completion via the PR's bircher-status
+# fresh Bircher session each, derive completion from the repository
 # marker, append a scorecard row, then move on. Sequential by design (M4).
 set -uo pipefail
 
@@ -18,6 +18,10 @@ BUNDLE_DIR="${BIRCHER_BUNDLE_DIR:-$(_derive_bundle_dir "${BASH_SOURCE[0]}")}"  #
 # (`_net_run`) resolve at call time, so the order of definition does not bind.
 # shellcheck source=lib/effect-adapter.sh
 . "$BUNDLE_DIR/batch/lib/effect-adapter.sh"
+# The observers: what run-queue can see for itself, replacing what the
+# coordinator used to assert in its `bircher-status:` marker.
+# shellcheck source=lib/observe.sh
+. "$BUNDLE_DIR/batch/lib/observe.sh"
 # The kernel client: the coordinator's advisory interface to the v2 kernel.
 # Sourced after the effect adapter and before anything can call `_kernel` /
 # `_kernel_dispatch`. Every call it makes is advisory -- see the file's own
@@ -128,7 +132,7 @@ export OMNIGENT_RUNNER="${OMNIGENT_RUNNER:-omnigent-runner-bircher}"
 
 # _branch_code_filter <code> -> a jq filter selecting PRs whose head branch carries
 # the item code on a token boundary. Single source of truth for a regex that was
-# copy-pasted at three call sites (poll-loop discovery, recover_from_ground_truth,
+# copy-pasted at three call sites (poll-loop discovery, observe_outcome,
 # _reconcile_item_pr) — issue #22.
 #
 # The boundary anchors matter: a bare substring test makes `i23` match branch
@@ -137,57 +141,7 @@ _branch_code_filter() {
   printf '[.[] | select(.headRefName | ascii_downcase | test("(^|[^a-z0-9])%s([^a-z0-9]|$)"))]' "$1"
 }
 
-# parse_marker <text> -> "outcome|ci|ci_first|review|rounds|note|head"; rc 1 if no marker
-parse_marker() {
-  local line
-  # Extract the marker WHEREVER it appears, not only at a line start. Coordinators
-  # sometimes post `gh pr comment --body "...\nbircher-status:..."` where the \n is
-  # a LITERAL backslash-n (bash double quotes don't expand it), so the marker sits
-  # mid-line and a strict `^bircher-status:` anchor misses it -- the item then polls
-  # to timeout and never merges (EXP02, 2026-07-08). `grep -oE` pulls the marker
-  # substring from wherever it begins to end-of-line; tail -1 takes the last if the
-  # prose mentions it more than once. Portable (no sed newline substitution).
-  line=$(printf '%s\n' "$1" | grep -oE 'bircher-status:.*' | tail -1)
-  [ -n "$line" ] || { echo "|||||"; return 1; }
-  local o c cf r n note head
-  o=$(printf '%s' "$line"  | sed -n 's/.*outcome=\([^ ]*\).*/\1/p')
-  c=$(printf '%s' "$line"  | sed -n 's/.* ci=\([^ ]*\).*/\1/p')
-  cf=$(printf '%s' "$line" | sed -n 's/.* ci_first=\([^ ]*\).*/\1/p')
-  r=$(printf '%s' "$line"  | sed -n 's/.*review=\([^ ]*\).*/\1/p')
-  n=$(printf '%s' "$line"  | sed -n 's/.*rounds=\([0-9]*\).*/\1/p')
-  note=$(printf '%s' "$line" | sed -n 's/.*note="\([^"]*\)".*/\1/p')
-  # head=<40-hex>: the commit the REVIEWER actually reviewed (issue #24). Optional —
-  # a marker written by an older reviewer has no head= and yields empty, which the
-  # caller must treat as "unverifiable" and fail closed rather than re-deriving it.
-  # Anchored to 7-40 hex so a malformed value yields empty instead of garbage.
-  # No `\|` alternation here: BSD sed (macOS) does not support it in a BRE, so a
-  # boundary group like \([ ]\|$\) silently never matches and every head= is lost.
-  # `\{7,40\}` is POSIX and portable; a shorter or non-hex value simply fails to
-  # match and yields empty, which is the fail-closed case the caller wants.
-  head=$(printf '%s' "$line" | sed -n 's/.*[ ]head=\([0-9a-fA-F]\{7,40\}\).*/\1/p')
-  echo "${o}|${c}|${cf}|${r}|${n}|${note}|${head}"
-}
 
-# _marker_bodies_since <pr> <since_epoch> -> bodies of PR comments posted at or
-# after <since_epoch>, one per line.
-#
-# Issue #47: a PR keeps every marker any run ever posted. Grepping ALL comment
-# bodies means a re-queued item adopts the PREVIOUS run's verdict on its first
-# poll and breaks out ~one poll interval in, abandoning the session it just
-# launched. muesli #621 burned two full runs this way (wall=45 each, identical
-# note, PR head never moved) and read as "the agent disagrees with you" rather
-# than "your re-queue was ignored" -- which makes human escalation a one-way
-# door, since the documented recovery path is diagnose-and-hand-back.
-#
-# Filtering by timestamp rather than by head= is deliberate: a coordinator that
-# pushes a commit and THEN posts its marker would momentarily disagree with a
-# head comparison, and markers written by older reviewers carry no head= at all.
-_marker_bodies_since() {
-  BIRCHER_MARKER_SINCE="$2" gh pr view "$1" --repo "$REPO" --json comments \
-    -q '.comments[]
-        | select((.createdAt | fromdateiso8601) >= (env.BIRCHER_MARKER_SINCE | tonumber))
-        | .body' 2>/dev/null
-}
 
 # _extract_verdict <text> -> "PASS" | "FAIL" | "" (empty = NO USABLE VERDICT).
 #
@@ -206,41 +160,12 @@ _marker_bodies_since() {
 # Anything else yields empty, which every caller already treats as "no verdict"
 # and escalates. Fail closed, like the rest of this file.
 _extract_verdict() {
-  local last
-  last=$(printf '%s\n' "$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -n1)
-  # Normalise the decoration real agents emit around a final line. Byte-exact
-  # matching escalates on `**VERDICT: PASS**`, which is benign output rather than
-  # a malformed review -- but the grammar accepted here must stay NARROW, because
-  # this string authorises an automatic merge.
-  #
-  # Accepted: balanced markdown/code ornament in any order, plus AT MOST ONE
-  # terminal period or exclamation. Rejected (fails closed): `VERDICT: PASS!!!`
-  # and `VERDICT: PASS...`, which are not ornament but non-contractual output.
-  #
-  # Stripping is order-INDEPENDENT and bounded. A first attempt stripped all
-  # decoration then punctuation, which made `` `VERDICT: FAIL`. `` fail while
-  # `` `VERDICT: FAIL.` `` passed -- the trailing tick was never reconsidered.
-  # The loop removes one character per side per pass instead, so interleaving
-  # does not matter, and the bound stops a line of pure decoration ever
-  # normalising into a verdict.
-  local _punct=0 _i=0 _before
-  while [ "$_i" -lt 8 ]; do
-    _before="$last"
-    last="${last#"${last%%[![:space:]]*}"}"
-    last="${last%"${last##*[![:space:]]}"}"
-    case "$last" in [*\`_]*) last="${last#?}" ;; esac
-    case "$last" in
-      *[*\`_]) last="${last%?}" ;;
-      *[.!])    [ "$_punct" -eq 0 ] && { last="${last%?}"; _punct=1; } ;;
-    esac
-    [ "$last" = "$_before" ] && break
-    _i=$((_i + 1))
-  done
-  case "$last" in
-    "VERDICT: PASS") printf 'PASS' ;;
-    "VERDICT: FAIL") printf 'FAIL' ;;
-    *) [ -n "$last" ] && echo "[batch] WARN: review's final line is not a bare verdict -> treating as no verdict" >&2 ;;
-  esac
+  # `PASS`, `FAIL`, or EMPTY. Reads the LAST non-blank line and requires a BARE
+  # verdict: one mentioned mid-report is not a verdict. Markdown decoration and
+  # a single trailing `.`/`!` are tolerated; `...` is prose. The trimming loop,
+  # its bound, and the warning on a non-verdict final line are in
+  # v2/coordinator/review.py and cli.py.
+  _coordinator verdict --text "$1" || printf ''
 }
 
 # _normalize_ci <newline-separated gh check buckets> -> green|red|pending
@@ -249,53 +174,38 @@ _extract_verdict() {
 # Precedence: any fail/cancel -> red; else any pending -> pending; else green.
 # No checks at all (empty) -> pending: CI has not registered yet, do not review.
 _normalize_ci() {
-  local buckets="$1"
-  # `case`, not `${buckets//[[:space:]]/}`: that global substitution walks and rebuilds
-  # the whole string and is pathologically slow on a large one -- a 140KB input took
-  # minutes, which is how it was found. A single pattern match answers the same question
-  # ("is there any non-whitespace character?") in one pass. Buckets are normally tiny, so
-  # this never bit in production, but the SIGPIPE fixture below has to be big.
-  case "$buckets" in *[![:space:]]*) : ;; *) echo pending; return ;; esac
-  # PIPE-FREE, and this one is not cosmetic. Under `set -o pipefail`, `grep -q` exits
-  # the instant it matches and the producing `printf` takes SIGPIPE; the pipeline then
-  # reports FAILURE despite the match. On this function that inverts a merge-safety
-  # verdict: a bucket list beginning with `fail` matches, grep exits, printf dies at 141,
-  # the `if` is skipped -- and so is the pending check, for the same reason -- and red CI
-  # is reported GREEN. Whether it fires depends on buffer size and scheduling, so it
-  # would present as a rare, unreproducible bad merge.
-  local line red=0 pend=0
-  while IFS= read -r line; do
-    case "$line" in
-      fail|cancel) red=1 ;;
-      pending)     pend=1 ;;
-    esac
-  done <<EOF
-$buckets
-EOF
-  [ "$red" = 1 ]  && { echo red; return; }
-  [ "$pend" = 1 ] && { echo pending; return; }
-  echo green
+  # `green` | `red` | `pending`. The rule lives in v2/coordinator/ci.py.
+  # EMPTY IS PENDING, not green: no checks reported yet is the absence of a
+  # verdict, and reading it as success merges a PR whose CI never started.
+  local out=""
+  out=$(_coordinator ci-normalize --buckets "$1") || out=""
+  # A failed call must not read as green. `pending` keeps the caller waiting,
+  # which is the survivable answer -- but note `_wait_ci` loops on pending, so
+  # a PERMANENTLY failing call hangs rather than errors. That trade is why the
+  # package must stay reachable, and why `_coordinator` no longer hides its
+  # stderr.
+  [ -n "$out" ] || out=pending
+  printf '%s' "$out"
 }
 
 # classify_recovery <pr> <ci_state> <verdict> -> "outcome|review|ci|note"
 # Pure mapping from ground truth to a scorecard row. Maps ONLY onto the existing
-# outcome vocabulary; the RECOVERED: note carries the detail. Reads the global
+# outcome vocabulary; the note carries the detail. Reads the global
 # RECOVERY_REVIEWER for the review-vendor label.
 classify_recovery() {
-  local pr="$1" ci="$2" verdict="$3"
-  if [ -z "$pr" ]; then
-    echo "timeout|na|na|no PR at timeout (reaped before implement delivered)"; return
+  # Ground truth to outcome. The mapping lives in v2/coordinator/observe.py,
+  # where it is pure and directly testable; this is the shell's call into it.
+  #
+  # Empty output would parse as outcome="" and read as "NOT ready" -- a crash
+  # wearing a verdict's clothes, which this project has shipped three times. So
+  # a failed call escalates loudly instead.
+  local out=""
+  out=$(_coordinator classify --pr "$1" --ci "$2" --verdict "$3" \
+          --reviewer "$RECOVERY_REVIEWER") || out=""
+  if [ -z "$out" ]; then
+    out="escalated|na|$2|outcome classification failed (no output); needs a human"
   fi
-  case "$ci" in
-    red)     echo "failed|na|red|RECOVERED: PR up, CI red, coordinator died before fix"; return ;;
-    pending) echo "escalated|na|pending|RECOVERED: CI still pending at timeout"; return ;;
-  esac
-  # ci == green
-  case "$verdict" in
-    PASS) echo "ready|${RECOVERY_REVIEWER}:pass|green|RECOVERED: coordinator reaped; out-of-band review PASS" ;;
-    FAIL) echo "failed|${RECOVERY_REVIEWER}:fail|green|RECOVERED: out-of-band review FAIL" ;;
-    *)    echo "escalated|${RECOVERY_REVIEWER}:na|green|RECOVERED: review produced no verdict; needs human" ;;
-  esac
+  printf '%s' "$out"
 }
 
 # _checkrun_state <lines of "status|conclusion"> -> green|red|pending
@@ -1036,6 +946,15 @@ _codex_usage() {
 # unknown status -> alive (never recover against a session we can't confirm
 # dead).
 _session_died() {
+  # PURE, and it stays in bash for that reason. `coordinator.session.died` holds
+  # the same rule and is what the Python coordinator will use, but routing THIS
+  # caller through a subprocess was a mistake: it spawns a interpreter per poll
+  # for a four-line predicate, and when the spawn cannot run the loop never sees
+  # death and polls to the cap. The argument-wiring harness found it by running
+  # run_item, not by reading it.
+  #
+  # IDLE IS NOT DEATH -- a coordinator awaiting a sub-agent is idle, and reading
+  # that as death starts recovery against a session still working the PR.
   local status="$1" errcode="$2"
   [ -n "${errcode//[[:space:]]/}" ] && { echo died; return; }
   case "$status" in
@@ -1056,16 +975,14 @@ _session_died() {
 # Reads the server session so run_item can detect death (vs the ambiguous
 # local client process). $SERVER is the omnigent server (e.g. http://omnigent:8000).
 _session_state() {
-  local conv_id="$1" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf 'unknown|'; return; }
-  printf '%s' "$json" | python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin)
-except Exception:
-    print("unknown|"); sys.exit(0)
-print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.last_task_error_code") or ""))
-' 2>/dev/null || printf 'unknown|'
+  # Reads omnigent. The parsing lives in v2/coordinator/session.py; this is the
+  # shell's call into it. An unreachable or unparseable server is `unknown|`,
+  # never a guess -- run_item counts consecutive unknowns and keeps waiting
+  # rather than recovering while blind.
+  local out=""
+  out=$(_coordinator session-state --server "$SERVER" --id "$1") || out=""
+  [ -n "$out" ] || out="unknown|"
+  printf '%s' "$out"
 }
 
 # _last_assistant_text <conv_id> [n] -> concatenated text of the newest n (default
@@ -1084,36 +1001,16 @@ print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.la
 # The rc split exists because that is what made the regression invisible: an
 # empty string meant BOTH "no assistant text yet" and "we could not ask".
 _last_assistant_text() {
-  local conv_id="$1" n="${2:-3}" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id/items?order=desc&limit=20" 2>/dev/null) || {
-    echo "[batch] WARN: session-items lookup failed for $conv_id (limit check cannot run this poll)" >&2
+  # rc 1 means the lookup FAILED, which the caller must not confuse with "no
+  # assistant text" -- that distinction is what the provider-limit check runs
+  # on. v2/coordinator/session.py raises rather than returning empty, and the
+  # CLI turns that into a non-zero exit.
+  local out=""
+  if ! out=$(_coordinator last-assistant-text --server "$SERVER" \
+               --id "$1" --n "${2:-3}"); then
+    echo "[batch] WARN: session-items lookup failed for $1 (limit check cannot run this poll)" >&2
     return 1
-  }
-  local out
-  # A 200 carrying malformed or unexpectedly-shaped JSON is ALSO a failed lookup.
-  # The first cut of this fix only handled curl rc, leaving `sys.exit(0)` and
-  # `|| true` to reproduce the very ambiguity it removed (codex review).
-  out=$(printf '%s' "$json" | python3 -c '
-import json,sys
-n=int(sys.argv[1])
-try:
-    data=json.load(sys.stdin).get("data")
-except Exception:
-    sys.exit(1)
-if data is None or not isinstance(data, list):
-    sys.exit(1)
-out=[]
-for it in data:
-    if not isinstance(it, dict) or it.get("role")!="assistant": continue
-    for c in (it.get("content") or []):
-        t=c.get("text") if isinstance(c, dict) else None
-        if t: out.append(t)
-    if len(out)>=n: break
-print("\n".join(out))
-' "$n" 2>/dev/null) || {
-    echo "[batch] WARN: session-items response for $conv_id was unparseable (limit check cannot run this poll)" >&2
-    return 1
-  }
+  fi
   printf '%s' "$out"
 }
 
@@ -1131,6 +1028,8 @@ _http_json() {
 }
 
 # _json_get <key> -- read stdin JSON, print d[key] or "" (never errors).
+# The last python-in-bash left here. Kept only because `_create_session` still
+# lives in this file; it moves with it when the mutating session calls do.
 _json_get() {
   python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get(sys.argv[1]) or "")
@@ -1178,9 +1077,25 @@ _get_agent_id() { _http_json GET "/v1/sessions/$1" | _json_get agent_id; }
 
 # _create_session <agent_id> <host_id> <workspace> -> conv_id ("") = SessionResponse.id
 _create_session() {
+  # ROUTED since 2026-08-29. It was an unrouted mutation from the initial public
+  # release, and INVISIBLE to the routing detector with it: the call went
+  # through `_http_json`, whose curl takes `-X "$method"`, and every detector
+  # pattern required a literal verb. Creating a model session is exactly the
+  # kind of externally visible act the journal exists to record.
+  #
+  # Keyed on the RUN, not the workspace: a replay must return the session this
+  # run already created rather than start a second one, and `perform` returns
+  # the recorded external id without re-executing.
   local body
   body=$(python3 -c 'import json,sys; print(json.dumps({"agent_id":sys.argv[1],"host_id":sys.argv[2],"workspace":sys.argv[3]}))' "$1" "$2" "$3" 2>/dev/null) || return 1
-  _http_json POST "/v1/sessions" "$body" | _json_get id
+  # CAPTURED, then parsed -- not piped straight out of `_effect`. A pipeline
+  # masks the effect's exit status behind `_json_get`'s, so a refused or failed
+  # create would look like a successful call that happened to return no id.
+  local resp
+  resp=$(_effect session_control "sess-create:${BIRCHER_RUN_ID:-$3}" 30 \
+    curl -sf --max-time 30 -X POST "$SERVER/v1/sessions" \
+    -H 'content-type: application/json' -d "$body") || return 1
+  printf '%s' "$resp" | _json_get id
 }
 
 # _send_prompt <conv_id> <prompt> -> rc 0 on success. POST events (message).
@@ -1198,7 +1113,14 @@ _send_prompt() {
 
 # _stop_session <conv_id> -> POST stop_session (hard-terminate incl. host runner).
 _stop_session() {
-  _http_json POST "/v1/sessions/$1/events" '{"type":"stop_session"}' >/dev/null 2>&1 \
+  # ROUTED since 2026-08-29 -- see _create_session for how both hid. Stopping a
+  # session is the act that makes an unconfirmed attempt confirmable, and the
+  # design turns on that distinction: an unconfirmed stop leaves the attempt
+  # non-terminal and halts the run. A stop that is never journalled cannot be
+  # cited as evidence that it happened.
+  _effect session_control "sess-stop:$1" 30 \
+    curl -sf --max-time 30 -X POST "$SERVER/v1/sessions/$1/events" \
+    -H 'content-type: application/json' -d '{"type":"stop_session"}' >/dev/null 2>&1 \
     || echo "[batch] WARN: stop_session for $1 failed" >&2
 }
 
@@ -2161,7 +2083,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # Strict branch protection blocks a BEHIND branch from merging. Normal runs
   # dodge this by creating PRs sequentially off fresh main; a stale orphan must
   # be brought up to date first. update-branch re-triggers the required checks on
-  # the new head, which recover_from_ground_truth's CI-wait then settles before
+  # the new head, which observe_outcome's CI-wait then settles before
   # the review -- so the subsequent (non-admin) merge sees a green, up-to-date PR.
   local mss
   mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
@@ -2173,7 +2095,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
   local rec r_outcome r_review r_note r_sha r_ci
-  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
+  # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
   # reaching that line -- and `rec=$(...)` swallows the death into an empty
   # string. Parsed straight, that reads as outcome="" and the caller reports
@@ -2181,12 +2103,12 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
   # note= head=) and not reproducible since; the specific crash is unknown and
   # the misreading is the part worth making impossible.
-  rec=$(recover_from_ground_truth "$item" "$code" "$pr")
+  rec=$(observe_outcome "$item" "$code" "$pr")
   if [ -z "${rec//[[:space:]]/}" ]; then
     echo "[batch:recover-pr] $code: recovery produced NO tuple -> it failed; PR left untouched for a human" >&2
     return 1
   fi
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ <<EOF
 $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
@@ -2348,14 +2270,14 @@ _reconcile_item_pr() {
   echo "$chosen"
 }
 
-# recover_from_ground_truth <item> <code> <pr> [issue]
+# observe_outcome <item> <code> <pr> [issue]
 # Called when a coordinator ended (idle-reaper ~30 min) before posting its
 # marker. Derives a truthful outcome from the PR and, for a CI-green PR, an
-# out-of-band cross-vendor review. Posts a self-describing bircher-status
+# out-of-band cross-vendor review. Posts a self-describing
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
 # `issue` (optional) enables the issue-linkage PR fallback when both signal and
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
-recover_from_ground_truth() {
+observe_outcome() {
   local item="$1" code="$2" pr="$3" issue="${4:-}"
   local ci="na" verdict="" reviewer_out="" reviewed_sha=""
   # A tracked PR that was CLOSED without merging can never satisfy this item --
@@ -2408,6 +2330,18 @@ recover_from_ground_truth() {
       pr="$_rp"
     fi
   fi
+  # THE CI HISTORY. What the repository shows about how this branch got here,
+  # replacing the marker's `ci_first` (asserted) and `rounds` (asserted, and
+  # about a quantity nothing observed -- see Decision 2 in the Phase 2 plan).
+  local ci_first="unknown" resubmissions=""
+  if [ -n "$pr" ]; then
+    local _br; _br=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.ref' 2>/dev/null) || _br=""
+    if [ -n "$_br" ]; then
+      local _hist; _hist=$(observe_ci_history "$_br")
+      ci_first="${_hist%%|*}"; resubmissions="${_hist#*|}"
+    fi
+  fi
+
   if [ -n "$pr" ]; then
     local buckets
     # Fetch NAME too, so non-CI checks are filtered before deciding.
@@ -2462,13 +2396,14 @@ recover_from_ground_truth() {
            reviewed_sha="" ;;
       esac
       echo "[batch:recover] $item: PR #$pr CI green, no marker -> $RECOVERY_REVIEWER recovery review at ${reviewed_sha:0:7}" >&2
-      local prompt rlog
-      prompt=$(_recovery_review_prompt "$pr" "$reviewed_sha")
-      rlog="/tmp/recover-$item.log"
-      ( cd "$BUNDLE_DIR" && omnigent run "agents/$RECOVERY_REVIEWER" \
-          --server "$SERVER" -p "$prompt" ) >"$rlog" 2>&1 || true
-      reviewer_out=$(cat "$rlog" 2>/dev/null)
-      verdict=$(_extract_verdict "$reviewer_out")
+      local _rv
+      _rv=$(BIRCHER_REVIEW_LOG="/tmp/recover-$item.log" \
+              observe_review "$pr" "$reviewed_sha")
+      verdict="${_rv%%|*}"
+      reviewer_out=$(cat "${_rv#*|}" 2>/dev/null)
+      # `classify_recovery`'s `*)` arm already routes an absent verdict to
+      # `escalated`; NONE is spelled empty here so that mapping is untouched.
+      [ "$verdict" = NONE ] && verdict=""
     fi
   fi
 
@@ -2484,22 +2419,25 @@ EOF
 
   # Post a self-describing marker to the PR (reviewer findings above it, if any).
   if [ -n "$pr" ]; then
-    local marker_line body
+    local body
     # head= only on a ready/PASS outcome: it is the merge-authorising evidence,
-    # and a failed or escalated recovery must never carry one.
+    # and a failed or escalated derivation must never carry one.
     local _head_field=""
     [ "$r_outcome" = "ready" ] && [ -n "$reviewed_sha" ] && _head_field=" head=$reviewed_sha"
-    marker_line="bircher-status: outcome=$r_outcome ci=$r_ci ci_first=false review=$r_review rounds=0${_head_field} note=\"$r_note\""
+    # DECISION 3 OF PHASE 2. The findings stay -- they are the most useful
+    # thing on the PR for a human. The `bircher-status:` prefix goes, because
+    # it was a machine channel and nothing reads it any more. This text is
+    # documentation now; `test_marker_is_gone` keeps it that way.
     if [ -n "$reviewer_out" ]; then
-      body="Recovery cross-vendor review (coordinator session ended before posting a marker):
+      body="Cross-vendor review (outcome derived from the repository, not reported):
 
 $reviewer_out
 
-$marker_line"
+outcome=$r_outcome ci=$r_ci review=$r_review${_head_field}
+note: $r_note"
     else
-      body="Recovery (coordinator session ended before posting a marker; outcome derived from ground truth).
-
-$marker_line"
+      body="Outcome derived from the repository: outcome=$r_outcome ci=$r_ci${_head_field}
+note: $r_note"
     fi
     _effect comment "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
       || echo "[batch:recover] WARN $item: failed to post recovery marker to PR #$pr" >&2
@@ -2517,7 +2455,9 @@ $marker_line"
   # claim with nothing behind it -- which is the one thing the kernel exists to
   # refuse. Both callers parse five fields; a four-field read would silently
   # absorb this into the sha.
-  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci"
+  # SEVEN fields since Phase 2. A caller reading five absorbs the CI-history
+  # pair into `ci`, silently. Both callers were updated with this change.
+  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci|$ci_first|$resubmissions"
 }
 
 # _is_blank <text> -> rc 0 if text is empty or whitespace-only.
@@ -2556,8 +2496,19 @@ if not isinstance(comments, list):
     sys.exit(0)
 
 def is_bircher_status(body):
+    # Filters the comments BIRCHER ITSELF wrote out of the digest handed to a
+    # session, so it does not read its own machinery as human discussion.
+    #
+    # The two legacy prefixes stay AFTER Phase 2 retired the marker, and that is
+    # deliberate: real PRs carry thousands of them, and a filter that stopped
+    # recognising them would start feeding a session the status lines written
+    # by its predecessor. Retiring a channel means never writing one again; it
+    # does not mean forgetting how to read the archive.
     head = body.lstrip()
-    return head.startswith("bircher: outcome=") or head.startswith("bircher-status:")
+    return (head.startswith("bircher: outcome=")
+            or head.startswith("bircher-status:")
+            or head.startswith("Outcome derived from the repository")
+            or head.startswith("Cross-vendor review (outcome derived"))
 
 kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
 maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])
@@ -2931,42 +2882,14 @@ _drop_ignored() {
 }
 
 _keep_blocking_checks() {
-  local lines="$1" required="$2" filtered name _r
-  filtered=$(_drop_ignored "$lines")
-  if [ -z "$required" ]; then
-    printf '%s\n' "$filtered" | cut -d'|' -f2,3
-    return
-  fi
-  local kept
-  kept=$(printf '%s\n' "$filtered" | while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    name="${line%%|*}"
-    if printf '%s\n' "$required" | grep -Fxq "$name"; then
-      # PROJECT to exactly status|conclusion. #73 added a fourth field (the producing
-      # app), and `_checkrun_state`'s allowlist is strict by design since #67 -- handing
-      # it `status|conclusion|app` would match nothing and read RED for every check.
-      _r=${line#*|}; printf '%s\n' "${_r%|*}"
-    fi
-  done)
-  # A required-set that matches NOTHING is a misconfiguration or a naming mismatch
-  # (contexts that never run on this event, a renamed job), not a genuine "no checks".
-  # Returning empty there reads as "CI has not registered yet" -> pending forever, or
-  # worse, hides a red. Fall back to ignore-list-only, which errs toward red.
-  #
-  # REJECTED (2026-08-16, raised by review): "require EVERY required context to be
-  # present, else pending". That is right for a PR head and wrong here. Required
-  # contexts are a branch-protection property of the PR, and the post-merge watcher
-  # reads a MERGE COMMIT, where most of them legitimately never report -- muesli's
-  # merge commits carry 0 statuses and a combined `pending`, and `review-gate` /
-  # `bircher/cross-review` only ever appear on PR heads. Demanding completeness there
-  # would make every post-merge watch poll to timeout, i.e. halt the pipeline. The
-  # completeness this function CANNOT provide is instead enforced upstream, by
-  # _commit_ci_lines failing closed on any response that is not whole.
-  if [ -z "${kept//[[:space:]]/}" ] && [ -n "${filtered//[[:space:]]/}" ]; then
-    printf '%s\n' "$filtered" | cut -d'|' -f2,3
-    return
-  fi
-  printf '%s\n' "$kept"
+  # Reduce `name|bucket|state` rows to the `bucket|state` of BLOCKING ones.
+  # `review-gate` is dropped or the derivation deadlocks against itself; a
+  # required list matching nothing falls back to all checks rather than
+  # reducing to an empty set that reads as pending for ever; and a row with NO
+  # delimiter passes through whole, because `cut` does and real `gh pr checks`
+  # output arrives that way. All three rules, and their tests, are in
+  # v2/coordinator/ci.py.
+  _coordinator ci-keep-blocking --lines "$1" --required "${2:-}" || printf '%s' "$1"
 }
 
 # _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.
@@ -3470,7 +3393,12 @@ print(json.dumps({
  "item": item, "pr": int(pr) if pr.isdigit() else None, "outcome": outcome,
  "implementer": implementer or None, "review": review or None,
  "ci_pass_first_try": ci_first=="true",
- "rounds": int(rounds) if rounds.isdigit() else None,
+ # DECISION 2 OF PHASE 2. `rounds` was the coordinator's own count of its fix
+ # loop, asserted in a marker and observed by nothing. It is emitted null from
+ # the first Phase 2 run onward rather than quietly redefined, so a reader
+ # comparing an old row to a new one is not misled about what the number means.
+ "rounds": None,
+ "resubmissions": int(rounds) if rounds.isdigit() else None,
  "wall_seconds": int(wall) if wall.isdigit() else None, "cost": None,
  "bound": bound or None, "note": note}))
 PY
@@ -3659,7 +3587,11 @@ ${prompt}"
     return 5
   fi
 
-  local start; start=$(date +%s); local pr="" marker="" elapsed=0 polls=0 _unknown_polls=0
+  local start; start=$(date +%s); local pr="" elapsed=0 polls=0 _unknown_polls=0
+  # Settle-detection state: the last observed item count and how many
+  # consecutive quiet polls we have seen. The judgement lives in
+  # coordinator.session.settle; the loop only carries these two values.
+  local _settle_count="" _settle_polls=0
   while [ "$elapsed" -lt "$ITEM_TIMEOUT" ]; do
     sleep "$POLL"; elapsed=$(( $(date +%s) - start )); polls=$((polls + 1))
     # B-2 within-item fast limit check: only in the early window (first 2 polls).
@@ -3714,18 +3646,34 @@ ${prompt}"
         esac
       fi
     fi
-    if [ -n "$pr" ]; then
-      # Only markers posted by THIS run count (issue #47). A stale marker from an
-      # earlier run must not short-circuit the session now in flight.
-      local body; body=$(_marker_bodies_since "$pr" "$start")
-      if _contains "$body" 'bircher-status:'; then marker=$(parse_marker "$body"); break; fi
-      # Last of the status-deciding pipelines (see _contains). This one is only a
-      # stale-marker diagnostic -- a SIGPIPE false negative cannot adopt a marker,
-      # change an outcome or authorise a merge -- but leaving a known instance of the
-      # class behind after removing the rest is how it grows back.
-      if [ "$polls" = 1 ] \
-         && _contains "$(gh pr view "$pr" --repo "$REPO" --json comments -q '.comments[].body' 2>/dev/null)" 'bircher-status:'; then
-        echo "[batch] $item: PR #$pr carries a marker predating this run - ignoring it and waiting for a fresh verdict" >&2
+    # NO COMPLETION SIGNAL FROM THE COORDINATOR, and none is wanted: a v2
+    # implementer holds no comment authority, so there is nothing it could post
+    # here even if something read it. What replaced the marker is an
+    # OBSERVATION -- the session has gone quiet.
+    #
+    # Removing the marker without this cost item s07 twenty-three minutes of
+    # pure waiting (measured 136s -> 1536s): the work finished in about four
+    # and the run then sat until its cap, because nothing said "done".
+    #
+    # Requires a PR to already exist. Quiet with NO PR is a session that failed
+    # to deliver, and that belongs to the cap -- ending early there would
+    # convert a silent failure into a fast one without learning anything.
+    if [ -n "$pr" ] && [ -n "$conv_id" ]; then
+      local _sr
+      # `${SERVER:-}`: an unset server makes the call fail immediately, which
+      # `|| _sr=""` turns into "no settle" and the loop falls back to the cap.
+      # That is the right degradation -- waiting too long is survivable, and
+      # `set -u` killing run_item mid-item is not.
+      _sr=$(_coordinator session-settle --server "${SERVER:-}" --id "$conv_id" \
+              --prev-count "$_settle_count" --stable-polls "$_settle_polls" \
+              --needed "${BIRCHER_SETTLE_POLLS:-4}") || _sr=""
+      if [ -n "$_sr" ]; then
+        _settle_count="${_sr%%|*}"; _sr="${_sr#*|}"
+        _settle_polls="${_sr%%|*}"
+        if [ "${_sr#*|}" = yes ]; then
+          echo "[batch] $item: PR #$pr open and session quiet for $_settle_polls polls -> deriving now rather than waiting for the cap" >&2
+          break
+        fi
       fi
     fi
     # No-op signal: the coordinator decided the item is already satisfied (gap #3)
@@ -3763,15 +3711,25 @@ ${prompt}"
       fi
     fi
   done
-  # If we exited the loop without a marker/noop and the server session is still
-  # ALIVE (cap reached, not a death), cancel it via the API so it actually
-  # stops -- killing the local client alone does NOT stop the server-side
-  # session, and a live coordinator would otherwise race the recovery review.
+  # If we exited the loop without a noop signal and the server session is still
+  # ALIVE -- because the cap fired, or because the session went quiet and we
+  # ended early -- cancel it via the API so it actually stops. Killing the local
+  # client alone does NOT stop the server-side session, and a live coordinator
+  # would otherwise race the review the derivation is about to dispatch.
+  #
+  # This matters MORE since settle detection: a quiet session is idle, not
+  # finished, so the run now routinely reaches here with a live session that
+  # could still wake up.
   local _blind=0
-  if [ -z "$marker" ] && [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
+  if [ ! -f "$NOOP_DIR/$code.noop" ] && [ ! -f "$NOOP_DIR/$code.escalated" ] && [ -n "$conv_id" ]; then
     local _ss; _ss=$(_session_state "$conv_id")
     if [ "$(_session_died "${_ss%%|*}" "${_ss#*|}")" = alive ]; then
-      echo "[batch] $item: cap reached, session $conv_id still alive -> cancelling" >&2
+      # Says WHY, because "cap reached" was printed even when the loop ended
+      # early on a quiet session -- a false statement in the log of every fast
+      # item, and the sort that gets believed later.
+      local _why="cap reached"
+      [ "${_settle_polls:-0}" -ge "${BIRCHER_SETTLE_POLLS:-4}" ] && _why="session settled"
+      echo "[batch] $item: $_why, session $conv_id still alive -> cancelling" >&2
       _stop_session "$conv_id"
       local _w=0
       while [ "$_w" -lt 30 ]; do
@@ -3840,117 +3798,57 @@ ${prompt}"
     return 0
   fi
 
-  # Final marker re-check: a coordinator marker may have landed between the last
-  # poll and now (or as the session ended). Prefer it over recovery so a
-  # converged coordinator always wins and we never post a conflicting marker.
-  if [ -z "$marker" ] && [ -n "$pr" ]; then
-    # Same freshness rule as the poll loop (issue #47): a marker left by an
-    # earlier run is not this run's verdict, and adopting it here would record a
-    # stale outcome as if the session had produced it.
-    local _fb; _fb=$(_marker_bodies_since "$pr" "$start")
-    # $body, not just $marker, must track whichever text actually produced
-    # the marker in use -- the kernel's implementation-output artifact is
-    # hashed from $body below, and leaving it holding a stale (or never
-    # assigned) value from the poll loop would record the wrong bytes, or
-    # none, under a hash that looks like it came from this marker.
-    if _contains "$_fb" 'bircher-status:'; then marker=$(parse_marker "$_fb"); body="$_fb"; fi
-  fi
-
-  local outcome ci_first review rounds note
-  if [ -n "$marker" ]; then
-    # Coordinator posted its own marker -> trust it (existing path).
-    local _ci
-    IFS='|' read -r outcome _ci ci_first review rounds note marker_head <<EOF
-$marker
-EOF
-    : "${outcome:=timeout}" "${ci_first:=false}"
-
-    # record_implementation_output, record_ci_observation: what this attempt
-    # produced, and what CI said about the head it produced.
-    # The hash is the object under review. Captured rather than discarded so
-    # the verdict below can bind to it.
-    _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$body")
-    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_ci" "$marker_head"
-
-    # A role change is a NEW dispatch and re-fences the generation.
-    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-    export BIRCHER_GENERATION
-    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-      "$_out_hash" "$_base_sha" "$_spec_hash"
-
-    BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-    export BIRCHER_GENERATION
+  local outcome ci_first review rounds note resubmissions observed_head _obs_ci
+  if [ "${_blind:-0}" = 1 ]; then
+    # Unchanged from the marker era, and still correct: the cancel was never
+    # confirmed, so the coordinator may still be running. Deriving an outcome
+    # means READING and WRITING the PR, which races a live session.
+    outcome="escalated"; review="na"; ci_first="unknown"; resubmissions=""
+    observed_head=""
+    note="server unreachable at cap; could not confirm the session stopped, so outcome derivation was skipped to avoid racing a live coordinator - needs a human"
+    echo "[batch] $item: blind at teardown -> escalating without derivation" >&2
   else
-    # No marker. Two cases, and they must not be conflated:
-    #
-    #   - the session is known to have ended (died, or a cancel we CONFIRMED):
-    #     recover from ground truth -- the implementer's PR usually exists and is
-    #     CI-green, so complete or truthfully label the item here rather than
-    #     recording a bare timeout that re-balloons it;
-    #   - we are BLIND (`_blind`): the cancel was never confirmed because the
-    #     server was unreachable, so the coordinator may still be running.
-    #     Recovery reads and WRITES the PR, so it must not run here.
-    if [ "${_blind:-0}" = 1 ]; then
-      # Blind at teardown (see above): do not touch the PR.
-      outcome="escalated"; review="na"
-      note="server unreachable at cap; could not confirm the session stopped, so ground-truth recovery was skipped to avoid racing a live coordinator - needs a human"
-      echo "[batch] $item: blind at teardown -> escalating without recovery" >&2
-    else
-      echo "[batch] $item: no marker at timeout -> ground-truth recovery" >&2
-      local rec
-      rec=$(recover_from_ground_truth "$item" "$code" "$pr" "$_iss")
-  # An EMPTY tuple is a CRASH, not a verdict. recover_from_ground_truth has a
-  # single exit and always emits five fields, so no output means it died before
-  # reaching that line -- and `rec=$(...)` swallows the death into an empty
-  # string. Parsed straight, that reads as outcome="" and the caller reports
-  # "NOT ready", which is a benign-looking sentence for "the recovery
-  # crashed". Seen once on the smoke repo (s01, review -> outcome= review=
-  # note= head=) and not reproducible since; the specific crash is unknown and
-  # the misreading is the part worth making impossible.
-      if [ -z "${rec//[[:space:]]/}" ]; then
-        echo "[batch] $item: recovery produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-        rec="escalated|na|ground-truth recovery failed (no tuple); needs a human||na"
-      fi
-      local _rec_ci=""
-      IFS='|' read -r outcome review note marker_head _rec_ci <<EOF
-$rec
-EOF
-      # Drive the SAME kernel lifecycle the marker branch drives. Without this
-      # the recovery path reached the merge gate having recorded no output, no
-      # CI observation and no verdict, so request_merge was refused and the
-      # kernel could not authorize a merge it had no evidence for. That is the
-      # gate behaving correctly on an input the coordinator failed to supply --
-      # and it fires automatically whenever an implementer session dies, which
-      # makes it the common case rather than the exotic one.
-      #
-      # GUARDED ON A HEAD, and that guard does all the work. The blind path
-      # sets review="na" and NO head, so a bare "na" never reaches
-      # _kernel_record_review from here at all -- which also means the
-      # "unmapped verdicts are now refused visibly" trade is not being made on
-      # this path, whatever its commit message argued.
-      #
-      # An earlier version of this comment justified the guard partly by
-      # "`_kernel_verdict` maps na to nothing". It no longer does: the fix that
-      # stopped unmapped verdicts being skipped changed exactly that, and
-      # walked past this comment. `_kernel_ci_status` no longer passes an
-      # unknown CI value through unchanged either -- it prefixes it
-      # `unmapped:`, because bare stripping normalised `suc"cess` INTO
-      # `success` and authorized a merge. This sentence has now been wrong
-      # twice, in a comment whose subject is fixes walking past comments.
-      if [ -n "${marker_head:-}" ]; then
-        local _rec_body="recovered: outcome=$outcome review=$review head=$marker_head note=$note"
-        _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_rec_body")
-        _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_rec_ci:-na}" "$marker_head"
-        BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-        export BIRCHER_GENERATION
-        _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-          "$_out_hash" "$_base_sha" "$_spec_hash"
-        BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-        export BIRCHER_GENERATION
-      fi
+    echo "[batch] $item: deriving the outcome from the repository" >&2
+    local obs
+    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss")
+    # An EMPTY tuple is a CRASH, not a verdict -- and since Phase 2 this is the
+    # ONLY path, so the guard that used to protect recovery alone now protects
+    # every item. `obs=$(...)` swallows a mid-function death into an empty
+    # string, which parses as outcome="" and reports "NOT ready": a crash
+    # wearing a verdict's clothes.
+    if [ -z "${obs//[[:space:]]/}" ]; then
+      echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
+      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown|"
     fi
-    ci_first="false"; rounds="0"
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions <<EOF
+$obs
+EOF
+    : "${outcome:=timeout}" "${ci_first:=unknown}"
+
+    # The kernel lifecycle, unchanged in order and in roles. Its INPUTS are now
+    # observations; the sequence is the one the marker branch used to drive.
+    #
+    # GUARDED ON A HEAD, and that guard does the work: the blind path above
+    # never reaches here, so a bare "na" verdict cannot arrive at
+    # _kernel_record_review from this function.
+    if [ -n "${observed_head:-}" ]; then
+      local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
+      _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
+      _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head"
+      BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+      export BIRCHER_GENERATION
+      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
+        "$_out_hash" "$_base_sha" "$_spec_hash"
+      BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
+      export BIRCHER_GENERATION
+    fi
   fi
+  # DECISION 2 OF PHASE 2. `rounds` was the coordinator's count of its own fix
+  # loop and nothing observed it, so it is no longer reported at all.
+  # `resubmissions` -- distinct commits CI ran on, minus one -- replaces it
+  # under its own name, because it is a different measurement and a reader
+  # comparing old rows to new ones must not think otherwise.
+  rounds=""
 
   # B-1 in-run merge: merge a ready PR now so the NEXT item builds on it
   # (eliminates the merge-order conflict class). Deferral appends to the note;
@@ -3968,8 +3866,9 @@ EOF
     # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
     # also refuses an empty sha, so this is now belt and braces rather than the only
     # guard.
-    local _had_marker=0; [ -n "$marker" ] && _had_marker=1
-    local _gate; _gate=$(_merge_gate "$_had_marker" "${marker_head:-}")
+    # `_merge_gate` reads only its SECOND argument; the first was a
+    # had-a-marker flag it never consulted, and there is no marker now.
+    local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
     local reviewed_sha=""
     case "$_gate" in
       pin\|*)   reviewed_sha="${_gate#pin|}" ;;
@@ -3982,7 +3881,7 @@ EOF
     esac
     if [ "$_gate" != "skip" ]; then
       # request_merge, record_merge_outcome
-      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$marker_head" \
+      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
         "$_out_hash" "$_base_sha" "$_spec_hash"
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
       local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
@@ -4010,13 +3909,16 @@ EOF
   # An earlier version of this comment claimed they "agree by construction",
   # which is the unearned-claim shape this change exists to remove.
   #
-  # This site can also diverge on VALUE: $outcome comes from a model-authored
-  # `bircher-status:` marker parsed with no schema validation, so a word
-  # outside the kernel's vocabulary is refused -- correctly and visibly --
-  # while the scorecard records it regardless.
+  # This site could once diverge on VALUE: $outcome came from a model-authored
+  # marker parsed with no schema validation, so a word outside the kernel's
+  # vocabulary was refused -- correctly and visibly -- while the scorecard
+  # recorded it regardless. Since Phase 2 the value comes from
+  # `classify_recovery`, which emits only the fixed vocabulary, so that
+  # particular divergence has no route left. The two records can still
+  # disagree for other reasons, which is why this note stays.
   _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${rounds:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
-  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${rounds:-}" "${ci_first:-}"
+  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
+  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}"
   # #3: guarantee the issue closes when its PR actually merged (backstops a
   # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
   [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
@@ -4074,50 +3976,6 @@ self_test() {
       && { echo "FAIL #62: $_fn uses MAIN_CI_POLL_INTERVAL without _clamp_int"; exit 1; }
   done
   unset _cs _fn
-  local m
-  # A pre-#24 marker (no head=) must still parse, with an EMPTY 7th field — the
-  # caller fails closed on that rather than merging an unverified commit.
-  m=$(parse_marker $'some prose\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note="wired it in"')
-  [ "$m" = "ready|green|true|codex:pass|0|wired it in|" ] || { echo "FAIL parse: '$m'"; exit 1; }
-  # Regression (EXP02, 2026-07-08): marker posted with a LITERAL backslash-n before
-  # it (no real newline) must still parse -- single quotes keep \n literal here.
-  m=$(parse_marker 'Ready for merge.\nbircher-status: outcome=ready ci=green ci_first=true review=claude_code:pass rounds=1 note="txt export"')
-  [ "$m" = "ready|green|true|claude_code:pass|1|txt export|" ] || { echo "FAIL parse literal-\\n: '$m'"; exit 1; }
-  m=$(parse_marker "no marker here") && { echo "FAIL: expected rc1"; exit 1; }
-  # --- #24: the reviewed head travels in the marker ---------------------------
-  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=a502a88e20f959c908d00871ee7f25572512dd6d note="with head"')
-  [ "$m" = "ready|green|true|codex:pass|1|with head|a502a88e20f959c908d00871ee7f25572512dd6d" ] \
-    || { echo "FAIL parse head=: '$m'"; exit 1; }
-  # A malformed head (non-hex / too short) must yield EMPTY, not garbage: better to
-  # fail closed than hand merge_ready_pr a sha that can never match.
-  m=$(parse_marker 'bircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=1 head=zzz note="bad"')
-  [ "${m##*|}" = "" ] || { echo "FAIL parse head=: malformed head must be empty, got '${m##*|}'"; exit 1; }
-  echo "parse_marker head= OK (#24)"
-  # --- #47: marker freshness. A marker from an earlier run must not be adopted -
-  # muesli #621 re-queued twice and each run reported the previous run's verdict
-  # (wall=45, identical note, PR head unmoved) because the poll loop grepped ALL
-  # comment bodies. The stub exercises the REAL jq filter, since that expression
-  # is the thing that was missing.
-  gh() {
-    local q="" prev=""
-    for a in "$@"; do [ "$prev" = "-q" ] && q="$a"; prev="$a"; done
-    printf '%s' '{"comments":[
-      {"createdAt":"2026-08-10T08:02:07Z","body":"old run\nbircher-status: outcome=escalated ci=red ci_first=false review=codex:pass rounds=1 note=\"stale\""},
-      {"createdAt":"2026-08-10T14:44:00Z","body":"this run\nbircher-status: outcome=ready ci=green ci_first=true review=codex:pass rounds=0 note=\"fresh\""}
-    ]}' | jq -r "$q"
-  }
-  local _mb
-  # since = 14:00Z -> only the fresh marker survives the filter.
-  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T14:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T14:00:00Z' +%s)")
-  [ "$(parse_marker "$_mb" | cut -d'|' -f1)" = "ready" ] \
-    || { echo "FAIL #47: fresh marker should win, got '$(parse_marker "$_mb")'"; exit 1; }
-  _contains "$_mb" 'stale' && { echo "FAIL #47: stale marker leaked through the filter"; exit 1; }
-  # since = after BOTH -> nothing survives, so the caller keeps polling instead of
-  # adopting a verdict no run produced.
-  _mb=$(REPO=x _marker_bodies_since 1 "$(date -u -d '2026-08-10T23:00:00Z' +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-10T23:00:00Z' +%s)")
-  [ -z "$_mb" ] || { echo "FAIL #47: no marker should survive, got '$_mb'"; exit 1; }
-  unset -f gh
-  echo "_marker_bodies_since OK (#47)"
   # --- #22: one boundary-anchored branch-code filter, not three copies --------
   local bf; bf=$(_branch_code_filter i23)
   case "$bf" in *'(^|[^a-z0-9])i23([^a-z0-9]|$)'*) : ;; *) echo "FAIL branch filter: '$bf'"; exit 1 ;; esac
@@ -4547,19 +4405,22 @@ SH
   [ "$(_select_pr_candidate '' '297 298')" = "ambiguous/escalate|297 298" ] \
     || { echo "FAIL _select_pr_candidate ambiguous"; exit 1; }
   rm -rf "$_std"
-  [ "$(classify_recovery '' green PASS)" = "timeout|na|na|no PR at timeout (reaped before implement delivered)" ] \
-    || { echo "FAIL classify no-pr"; exit 1; }
-  [ "$(classify_recovery 7 red '')" = "failed|na|red|RECOVERED: PR up, CI red, coordinator died before fix" ] \
-    || { echo "FAIL classify red"; exit 1; }
-  [ "$(classify_recovery 7 pending '')" = "escalated|na|pending|RECOVERED: CI still pending at timeout" ] \
-    || { echo "FAIL classify pending"; exit 1; }
-  [ "$(classify_recovery 7 green PASS)" = "ready|codex:pass|green|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
-    || { echo "FAIL classify green+pass"; exit 1; }
-  [ "$(classify_recovery 7 green FAIL)" = "failed|codex:fail|green|RECOVERED: out-of-band review FAIL" ] \
-    || { echo "FAIL classify green+fail"; exit 1; }
-  [ "$(classify_recovery 7 green '')" = "escalated|codex:na|green|RECOVERED: review produced no verdict; needs human" ] \
-    || { echo "FAIL classify green+noverdict"; exit 1; }
-  echo "classify_recovery OK"
+  # ONE case, not six. The mapping moved to v2/coordinator/observe.py and is
+  # covered there by nineteen native tests -- including four the shell version
+  # never had (a lowercase verdict, an empty verdict, the reviewer name
+  # travelling into the string, and CI being checked before the verdict).
+  #
+  # What is kept is what those tests CANNOT see: that this shell can actually
+  # reach the Python and parse what comes back. Delete this and a broken call
+  # path is green in both suites.
+  #
+  # The `RECOVERED:` prefix is gone from the notes deliberately. It described a
+  # recovery path; since Phase 2 this is the ONLY path, and prefixing every
+  # scorecard note with a word that means "something went wrong earlier" would
+  # be false on every ordinary run.
+  [ "$(classify_recovery 7 green PASS)" = "ready|codex:pass|green|out-of-band review PASS" ] \
+    || { echo "FAIL classify: shell cannot reach the coordinator package: '$(classify_recovery 7 green PASS)'"; exit 1; }
+  echo "classify_recovery -> coordinator.observe OK"
   # --- Layer-2 recovery: wrapper end-to-end with fake gh/omnigent on PATH -----
   local shimdir; shimdir=$(mktemp -d)
   cat >"$shimdir/gh" <<'SH'
@@ -4595,31 +4456,41 @@ SH
   local rec_out
   rec_out=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
             GH_COMMENT_OUT="$shimdir/comment.txt" RECOVERY_REVIEWER=codex \
-            recover_from_ground_truth demo demo 7)
+            observe_outcome demo demo 7)
   # #66: 4th field is the orchestrator-captured reviewed head, so the recovery
   # merge can be pinned exactly as the marker path is.
-  # 5th field is the CI value recovery OBSERVED. It is returned rather than
-  # inferred from `outcome=ready` so the caller records an observation instead
-  # of a deduction, and pinned here because both callers read five fields -- a
-  # four-field read would silently absorb it into the sha.
-  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
-    || { echo "FAIL recover happy-path tuple: '$rec_out'"; exit 1; }
+  # 5th field is the CI value the derivation OBSERVED. It is returned rather
+  # than inferred from `outcome=ready` so the caller records an observation
+  # instead of a deduction, and pinned here because both callers read the full
+  # tuple -- a short read would silently absorb it into the sha.
+  #
+  # 6th and 7th are the CI history (Phase 2). This shim's `gh` answers nothing
+  # for the branch lookup, so they are `unknown` and empty -- which is the
+  # correct answer to "no history was visible", and is pinned here so a change
+  # that starts inventing `false|0` on a failed lookup is caught.
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+    || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
-    || { echo "FAIL recover: marker must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
-  grep -q '^bircher-status: outcome=ready ci=green ' "$shimdir/comment.txt" \
-    || { echo "FAIL recover: marker not posted to PR"; exit 1; }
+    || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
+  grep -q '^outcome=ready ci=green ' "$shimdir/comment.txt" \
+    || { echo "FAIL derive: outcome line not posted to PR"; cat "$shimdir/comment.txt"; exit 1; }
+  # PHASE 2: the machine marker is gone. Its replacement is the prose above --
+  # and this assertion is what keeps a future edit from quietly restoring the
+  # channel by restoring its prefix.
+  grep -q 'bircher-status:' "$shimdir/comment.txt" \
+    && { echo "FAIL derive: the retired marker was posted"; exit 1; }
   grep -q 'VERDICT: PASS' "$shimdir/comment.txt" \
     || { echo "FAIL recover: reviewer findings not included in comment"; exit 1; }
   local rec_nopr
   rec_nopr=$(PATH="$shimdir:$PATH" WORKDIR="$shimdir" REPO=demo/demo SERVER=http://x \
-             recover_from_ground_truth demo demo "")
+             observe_outcome demo demo "")
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na" ] \
-    || { echo "FAIL recover no-pr tuple: '$rec_nopr'"; exit 1; }
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown|" ] \
+    || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
-  echo "recover_from_ground_truth OK"
+  echo "observe_outcome OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
   local ddir; ddir=$(mktemp -d)
   cat >"$ddir/gh" <<'SH'
@@ -4645,8 +4516,8 @@ SH
   chmod +x "$ddir/gh" "$ddir/omnigent"
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
-             RECOVERY_REVIEWER=codex recover_from_ground_truth i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
+             RECOVERY_REVIEWER=codex observe_outcome i300 i300 "")
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -4710,8 +4581,8 @@ SH
   chmod +x "$idir/gh"
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
-            RECOVERY_REVIEWER=codex recover_from_ground_truth iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green" ] \
+            RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
