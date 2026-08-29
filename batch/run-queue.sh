@@ -2236,7 +2236,8 @@ observe_outcome() {  # <item> <code> <pr> [issue]
   out=$( PYTHONPATH="$(_kernel_pythonpath)" \
          _net_run "${BIRCHER_DERIVE_TIMEOUT:-1800}" \
          "${BIRCHER_PY:-python3}" -m coordinator.cli derive \
-           --item "$1" --code "${2:-}" --pr "${3:-}" --issue "${4:-}"
+           --item "$1" --code "${2:-}" --pr "${3:-}" --issue "${4:-}" \
+           --reviewer "$RECOVERY_REVIEWER"
   ) || out=""
   # An EMPTY tuple is a CRASH, not a verdict -- the caller checks for it and
   # escalates rather than reading outcome="" as "NOT ready".

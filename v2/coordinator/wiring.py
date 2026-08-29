@@ -29,10 +29,17 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-def live_deps(item: str, *, log=None) -> Deps:
-    """Wire `derive` to the real world."""
+def live_deps(item: str, *, reviewer: str, log=None) -> Deps:
+    """Wire `derive` to the real world.
+
+    `reviewer` is REQUIRED and passed in, never read from the environment.
+    `RECOVERY_REVIEWER` is a plain shell assignment rather than an export, so a
+    subprocess never saw it -- and a default here made the reviewer the same
+    vendor as the implementer, quietly ending the cross-vendor independence the
+    whole review exists for. A live run caught it; nothing in the suite could,
+    because every test passes a reviewer explicitly.
+    """
     repo = _repo()
-    reviewer = os.environ.get("RECOVERY_REVIEWER") or "codex"
     required_cache: dict = {}
     interval = _int("MAIN_CI_POLL_INTERVAL", 30)
 

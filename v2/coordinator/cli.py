@@ -74,6 +74,10 @@ def main(argv=None) -> int:
     dv.add_argument("--code", default="")
     dv.add_argument("--pr", default="")
     dv.add_argument("--issue", default="")
+    # EXPLICIT, never inherited. `RECOVERY_REVIEWER` is a plain shell
+    # assignment, not an export, so a subprocess never saw it -- and the
+    # default silently made the reviewer the SAME vendor as the implementer.
+    dv.add_argument("--reviewer", required=True)
 
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
@@ -154,7 +158,8 @@ def main(argv=None) -> int:
         # Imported here so the rest of the CLI stays usable when the world is
         # not reachable -- `wiring` builds real gh and effect callables.
         from coordinator.wiring import live_deps
-        r = derive(a.item, a.code, a.pr, a.issue, deps=live_deps(a.item),
+        r = derive(a.item, a.code, a.pr, a.issue,
+                   deps=live_deps(a.item, reviewer=a.reviewer),
                    rerun_max=int(os.environ.get("BIRCHER_CI_RERUN_MAX") or 4))
         print(r.as_line(), end="")
         return RC_OK

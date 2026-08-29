@@ -189,3 +189,14 @@ def test_with_no_findings_the_short_form_is_used():
     derive("i1", "i1", "7", "", deps=d)
     body = " ".join(str(a) for _c, _k, a in d.posted)
     assert "Outcome derived from the repository" in body
+
+
+def test_the_reviewer_vendor_is_carried_into_the_verdict():
+    """Cross-vendor independence. The reviewer must be the OPPOSITE vendor to
+    the implementer, and a live run found it silently defaulting to the same
+    one -- `RECOVERY_REVIEWER` is a shell assignment, not an export, so the
+    subprocess never saw it."""
+    d = _deps()
+    d.reviewer = "claude_code"
+    r = derive("i1", "i1", "7", "", deps=d)
+    assert r.review == "claude_code:pass"
