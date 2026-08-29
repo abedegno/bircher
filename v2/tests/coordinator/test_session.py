@@ -121,3 +121,69 @@ def test_malformed_content_entries_are_skipped_not_fatal():
         {"role": "assistant", "content": ["a bare string", {"text": "kept"}, {}]},
     ]}))
     assert txt == "kept"
+
+
+# --- settle ------------------------------------------------------------------
+
+from coordinator.session import item_count, settle
+
+
+def test_a_quiet_idle_session_settles_after_the_required_polls():
+    s = settle("idle", 31, 31, 2, needed=3)
+    assert (s.settled, s.stable_polls, s.count) == (True, 3, 31)
+
+
+def test_it_does_not_settle_before_the_required_polls():
+    assert settle("idle", 31, 31, 1, needed=3).settled is False
+
+
+def test_a_RUNNING_session_never_settles_however_stable_its_count():
+    """A session mid-tool-call produces no items while it works. Counting that
+    as quiet would derive an outcome from a coordinator still writing."""
+    s = settle("running", 31, 31, 99, needed=3)
+    assert (s.settled, s.stable_polls) == (False, 0)
+
+
+def test_a_GROWING_session_resets_the_streak():
+    s = settle("idle", 32, 31, 2, needed=3)
+    assert (s.settled, s.stable_polls, s.count) == (False, 0, 32)
+
+
+def test_a_FAILED_LOOKUP_resets_the_streak_rather_than_extending_it():
+    """"I cannot see the session" is not "nothing is happening". Treating an
+    unreadable session as quiet would settle during a server outage -- exactly
+    when the coordinator is least likely to have finished."""
+    s = settle("idle", None, 31, 2, needed=3)
+    assert (s.settled, s.stable_polls) == (False, 0)
+    assert s.count == 31, "the last known count must survive a failed poll"
+
+
+def test_the_streak_survives_across_consecutive_quiet_polls():
+    prev, streak = None, 0
+    for _ in range(4):
+        s = settle("idle", 31, prev, streak, needed=3)
+        prev, streak = s.count, s.stable_polls
+    assert s.settled is True
+
+
+def test_one_noisy_poll_in_the_middle_restarts_the_count():
+    prev, streak = 31, 2
+    s = settle("idle", 32, prev, streak, needed=3)      # a new item appears
+    assert s.stable_polls == 0
+    s = settle("idle", 32, s.count, s.stable_polls, needed=3)
+    assert s.settled is False, "must start again, not resume at 2"
+
+
+# --- item_count --------------------------------------------------------------
+
+def test_item_count_reads_the_list_length():
+    assert item_count("http://x", "c1", fetch=_serving({"items": [1, 2, 3]})) == 3
+
+
+def test_item_count_is_None_when_the_session_cannot_be_read():
+    assert item_count("http://x", "c1", fetch=_failing()) is None
+
+
+def test_item_count_is_None_when_items_is_missing_or_wrong_shaped():
+    assert item_count("http://x", "c1", fetch=_serving({})) is None
+    assert item_count("http://x", "c1", fetch=_serving({"items": "no"})) is None

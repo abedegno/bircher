@@ -280,6 +280,10 @@ _kernel_dispatch() {{
   printf '%s' "$n"
 }}
 
+# Stubbed so no test reaches the network. Returning EMPTY means "no settle",
+# which keeps these tests on the path they were written for -- the loop running
+# to its existing exits rather than ending early on a quiet session.
+_coordinator()     {{ printf ''; return 1; }}
 _create_session()  {{ printf 'conv-test-1'; }}
 _send_prompt()     {{ return 0; }}
 _http_json()       {{ printf '{{}}'; }}

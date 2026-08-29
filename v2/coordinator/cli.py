@@ -13,7 +13,8 @@ import argparse
 import sys
 
 from coordinator.observe import ci_history, classify
-from coordinator.session import LookupFailed, last_assistant_text, state
+from coordinator.session import (LookupFailed, item_count, last_assistant_text,
+                                 settle, state)
 
 RC_OK = 0
 RC_USAGE = 2
@@ -40,6 +41,13 @@ def main(argv=None) -> int:
     st.add_argument("--server", required=True)
     st.add_argument("--id", required=True, dest="conv_id")
 
+    se = subs.add_parser("session-settle")
+    se.add_argument("--server", required=True)
+    se.add_argument("--id", required=True, dest="conv_id")
+    se.add_argument("--prev-count", default="")
+    se.add_argument("--stable-polls", type=int, default=0)
+    se.add_argument("--needed", type=int, default=4)
+
     la = subs.add_parser("last-assistant-text")
     la.add_argument("--server", required=True)
     la.add_argument("--id", required=True, dest="conv_id")
@@ -60,6 +68,17 @@ def main(argv=None) -> int:
     if a.mode == "session-state":
         s_ = state(a.server, a.conv_id)
         print(f"{s_.status}|{s_.error_code}", end="")
+        return RC_OK
+
+    if a.mode == "session-settle":
+        # ONE call does the read and the decision, so the shell carries only two
+        # loop variables and none of the judgement.
+        prev = int(a.prev_count) if a.prev_count.strip().isdigit() else None
+        r = settle(state(a.server, a.conv_id).status,
+                   item_count(a.server, a.conv_id),
+                   prev, a.stable_polls, needed=a.needed)
+        print(f"{'' if r.count is None else r.count}|{r.stable_polls}|"
+              f"{'yes' if r.settled else 'no'}", end="")
         return RC_OK
 
     if a.mode == "last-assistant-text":

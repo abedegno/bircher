@@ -3659,6 +3659,10 @@ ${prompt}"
   fi
 
   local start; start=$(date +%s); local pr="" elapsed=0 polls=0 _unknown_polls=0
+  # Settle-detection state: the last observed item count and how many
+  # consecutive quiet polls we have seen. The judgement lives in
+  # coordinator.session.settle; the loop only carries these two values.
+  local _settle_count="" _settle_polls=0
   while [ "$elapsed" -lt "$ITEM_TIMEOUT" ]; do
     sleep "$POLL"; elapsed=$(( $(date +%s) - start )); polls=$((polls + 1))
     # B-2 within-item fast limit check: only in the early window (first 2 polls).
@@ -3713,16 +3717,36 @@ ${prompt}"
         esac
       fi
     fi
-    # NO COMPLETION SIGNAL FROM THE COORDINATOR, BY DESIGN (Phase 2). A v2
+    # NO COMPLETION SIGNAL FROM THE COORDINATOR, and none is wanted: a v2
     # implementer holds no comment authority, so there is nothing it could post
-    # here even if something read it. The loop ends on a noop signal, an
-    # escalation signal, a dead session, or the cap -- and the outcome is then
-    # DERIVED from the repository.
+    # here even if something read it. What replaced the marker is an
+    # OBSERVATION -- the session has gone quiet.
     #
-    # THE COST IS REAL AND IS NOT A BUG: an item that finishes early no longer
-    # says so, and waits for its session to die or its cap to expire. Anyone
-    # reading this loop looking for the fast path should know it was removed
-    # deliberately and not lost.
+    # Removing the marker without this cost item s07 twenty-three minutes of
+    # pure waiting (measured 136s -> 1536s): the work finished in about four
+    # and the run then sat until its cap, because nothing said "done".
+    #
+    # Requires a PR to already exist. Quiet with NO PR is a session that failed
+    # to deliver, and that belongs to the cap -- ending early there would
+    # convert a silent failure into a fast one without learning anything.
+    if [ -n "$pr" ] && [ -n "$conv_id" ]; then
+      local _sr
+      # `${SERVER:-}`: an unset server makes the call fail immediately, which
+      # `|| _sr=""` turns into "no settle" and the loop falls back to the cap.
+      # That is the right degradation -- waiting too long is survivable, and
+      # `set -u` killing run_item mid-item is not.
+      _sr=$(_coordinator session-settle --server "${SERVER:-}" --id "$conv_id" \
+              --prev-count "$_settle_count" --stable-polls "$_settle_polls" \
+              --needed "${BIRCHER_SETTLE_POLLS:-4}") || _sr=""
+      if [ -n "$_sr" ]; then
+        _settle_count="${_sr%%|*}"; _sr="${_sr#*|}"
+        _settle_polls="${_sr%%|*}"
+        if [ "${_sr#*|}" = yes ]; then
+          echo "[batch] $item: PR #$pr open and session quiet for $_settle_polls polls -> deriving now rather than waiting for the cap" >&2
+          break
+        fi
+      fi
+    fi
     # No-op signal: the coordinator decided the item is already satisfied (gap #3)
     # and dropped a marker here instead of forcing a (garbage) PR.
     [ -f "$NOOP_DIR/$code.noop" ] && break

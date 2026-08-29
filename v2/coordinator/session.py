@@ -126,3 +126,57 @@ def last_assistant_text(server: str, conv_id: str, n: int = 3, *, fetch=_fetch) 
         if len(out) >= n:
             break
     return "\n".join(out)
+
+
+@dataclass(frozen=True)
+class Settled:
+    """Whether a session has gone quiet, and the count to carry to the next poll."""
+
+    count: int | None
+    stable_polls: int
+    settled: bool
+
+
+def settle(status: str, count: int | None, prev_count: int | None,
+           stable_polls: int, *, needed: int) -> Settled:
+    """Has the coordinator finished, judged by OBSERVATION rather than report?
+
+    The marker used to answer this: the coordinator posted one when it decided
+    it had converged. Removing it cost an item ~23 minutes of waiting for a cap
+    (measured: 136s -> 1536s), because nothing else said "done".
+
+    The observable stand-in is a session that is IDLE and has stopped producing
+    items. Neither alone is enough:
+
+    - `idle` is not done. A coordinator awaiting a sub-agent is idle, which is
+      why `died()` refuses to treat it as death.
+    - a stable item count is not done either, because a session mid-tool-call
+      produces no items while it works.
+
+    Together, held for `needed` consecutive polls, they say the session is not
+    doing anything and has not been for a while. The caller adds the condition
+    that carries the real weight: a PR must already exist. Quiet with no PR is
+    a session that failed to deliver, and belongs to the cap.
+
+    A failed lookup (`count is None`) RESETS the streak rather than extending
+    it: an unreadable session is not an idle one, and treating "I cannot see"
+    as "nothing is happening" is how a run derives an outcome while the
+    coordinator is still writing.
+    """
+    if count is None or status != "idle" or count != prev_count:
+        return Settled(count=count if count is not None else prev_count,
+                       stable_polls=0, settled=False)
+    n = stable_polls + 1
+    return Settled(count=count, stable_polls=n, settled=n >= needed)
+
+
+def item_count(server: str, conv_id: str, *, fetch=_fetch) -> int | None:
+    """How many items the session has produced. None if it cannot be read."""
+    try:
+        payload = json.loads(fetch(f"{server}/v1/sessions/{conv_id}"))
+    except (LookupFailed, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    items = payload.get("items")
+    return len(items) if isinstance(items, list) else None
