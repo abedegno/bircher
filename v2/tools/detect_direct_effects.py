@@ -32,7 +32,19 @@ MUTATION = re.compile(r"""
   | git\s+(-C\s+\S+\s+)?["']?push
   | curl\b[^|\n]*-X\s+["']?(POST|PUT|PATCH|DELETE)
   | _http_json\s+["']?(POST|PUT|PATCH|DELETE)
+  | gh\s+["']?run["']?\s+["']?(rerun|cancel|delete)
 """, re.VERBOSE)
+#: `gh run <verb>` -- a whole COMMAND FAMILY the pattern did not know, found
+#: 2026-08-29 while porting the CI loops. `gh run rerun` re-triggers a workflow:
+#: it consumes CI minutes and changes the check state the merge gate reads, and
+#: it was unrouted, undetected and absent from the inventory.
+#:
+#: This is the second instance of one class in a day. The first was a mutation
+#: hidden behind a wrapper; this one was hidden behind a NOUN the pattern had
+#: never been taught. The pattern enumerates verbs, so every noun it does not
+#: know is a silent gap -- which is why the fix is paired with
+#: `test_every_gh_subcommand_is_classified`, an enumerating test that fails
+#: when a new `gh <noun> <verb>` appears in the source at all.
 #: `_http_json <METHOD> <path>` -- an INDIRECT mutation, and the whole class of
 #: them was invisible until 2026-08-29. The helper does
 #: `curl -sf -X "$method"`, and every pattern above requires a LITERAL method
