@@ -78,3 +78,27 @@ def test_each_routed_call_satisfies_its_contract(n, cls, argv):
             f"run-queue.sh:{n} routes class {cls!r} with argv whose signature "
             f"is {signature(argv)!r}\n  argv: {argv}\n  {exc}"
         )
+
+
+def test_the_inventory_count_matches_the_routed_sites_that_exist():
+    """The heading was a DECORATION until 2026-08-29.
+
+    It said "15 routed sites" while there were 19, and had been wrong by some
+    margin for a while. Nothing noticed, because the only test touching it
+    asserted the literal string was PRESENT -- so the number could say anything
+    and still pass -- and the extractor's own test asserts a floor (`>= 12`),
+    which a stale count sails past.
+
+    A count nothing checks is a claim outrunning its evidence, in a document
+    whose entire job is to be the authority on what mutates.
+    """
+    import pathlib
+    import re
+
+    inventory = (pathlib.Path(__file__).resolve().parents[3]
+                 / "docs" / "design" / "effect-site-inventory.md").read_text()
+    m = re.search(r"## Mutations — (\d+) routed sites", inventory)
+    assert m, "the inventory's routed-count heading is gone"
+    assert int(m.group(1)) == len(routed_calls()), (
+        f"the inventory says {m.group(1)} routed sites; the extractor finds "
+        f"{len(routed_calls())}")

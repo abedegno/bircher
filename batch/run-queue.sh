@@ -1120,9 +1120,25 @@ _get_agent_id() { _http_json GET "/v1/sessions/$1" | _json_get agent_id; }
 
 # _create_session <agent_id> <host_id> <workspace> -> conv_id ("") = SessionResponse.id
 _create_session() {
+  # ROUTED since 2026-08-29. It was an unrouted mutation from the initial public
+  # release, and INVISIBLE to the routing detector with it: the call went
+  # through `_http_json`, whose curl takes `-X "$method"`, and every detector
+  # pattern required a literal verb. Creating a model session is exactly the
+  # kind of externally visible act the journal exists to record.
+  #
+  # Keyed on the RUN, not the workspace: a replay must return the session this
+  # run already created rather than start a second one, and `perform` returns
+  # the recorded external id without re-executing.
   local body
   body=$(python3 -c 'import json,sys; print(json.dumps({"agent_id":sys.argv[1],"host_id":sys.argv[2],"workspace":sys.argv[3]}))' "$1" "$2" "$3" 2>/dev/null) || return 1
-  _http_json POST "/v1/sessions" "$body" | _json_get id
+  # CAPTURED, then parsed -- not piped straight out of `_effect`. A pipeline
+  # masks the effect's exit status behind `_json_get`'s, so a refused or failed
+  # create would look like a successful call that happened to return no id.
+  local resp
+  resp=$(_effect session_control "sess-create:${BIRCHER_RUN_ID:-$3}" 30 \
+    curl -sf --max-time 30 -X POST "$SERVER/v1/sessions" \
+    -H 'content-type: application/json' -d "$body") || return 1
+  printf '%s' "$resp" | _json_get id
 }
 
 # _send_prompt <conv_id> <prompt> -> rc 0 on success. POST events (message).
@@ -1140,7 +1156,14 @@ _send_prompt() {
 
 # _stop_session <conv_id> -> POST stop_session (hard-terminate incl. host runner).
 _stop_session() {
-  _http_json POST "/v1/sessions/$1/events" '{"type":"stop_session"}' >/dev/null 2>&1 \
+  # ROUTED since 2026-08-29 -- see _create_session for how both hid. Stopping a
+  # session is the act that makes an unconfirmed attempt confirmable, and the
+  # design turns on that distinction: an unconfirmed stop leaves the attempt
+  # non-terminal and halts the run. A stop that is never journalled cannot be
+  # cited as evidence that it happened.
+  _effect session_control "sess-stop:$1" 30 \
+    curl -sf --max-time 30 -X POST "$SERVER/v1/sessions/$1/events" \
+    -H 'content-type: application/json' -d '{"type":"stop_session"}' >/dev/null 2>&1 \
     || echo "[batch] WARN: stop_session for $1 failed" >&2
 }
 

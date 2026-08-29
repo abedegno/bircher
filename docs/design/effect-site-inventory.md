@@ -27,7 +27,7 @@ grep -nE "git .*push" batch/run-queue.sh
 grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 ```
 
-## Mutations — 15 routed sites
+## Mutations — 19 routed sites
 
 | Line | Call | Effect class |
 |---|---|---|

@@ -336,6 +336,13 @@ _EFFECT_SITE_CONTEXT = {
     # so a refusal leaves no run behind for the next call to mistake for
     # provenance.
     "publish_cmd": "ADOPTS",
+    # Routed 2026-08-29, having been unrouted AND undetected since the initial
+    # public release. Both run inside run_item after the implementer dispatch,
+    # so a generation exists before either fires -- `_create_session` is called
+    # immediately after `_kernel_dispatch`, which is why that dispatch was moved
+    # above session creation in the first place.
+    "_create_session": "REACHED",
+    "_stop_session": "REACHED",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about
