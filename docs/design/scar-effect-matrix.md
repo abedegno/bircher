@@ -28,10 +28,10 @@ v1's own `--self-test` catches the mutation: where it does not, the v2 test is
 | v1 behaviour | source | mutation that breaks it | v2 owner | test fixture | fault injected | expected durable events | effects |
 |---|---|---|---|---|---|---|---|
 | CI failure classification | `run-queue.sh:303` `_classify_ci_failure` `echo genuine` | `-gt 0` → `-ge 0`; or always `infra` — **v1 binds, both directions** | not yet ported — M1-5 | v1 `--self-test` | 0 and 3 failed steps | `external_observation` | none |
-| Merge gate fail-closed | `run-queue.sh:3243` `_merge_gate` `printf 'skip'` | drop the empty-head `skip` branch — **v1 binds** | kernel `request_merge` head binding | v1 `--self-test` | no head supplied | `command_rejected` | none |
-| Merge-authorizing status publication | `run-queue.sh:1242` `_post_cross_review_status` `_effect status_check` | write the `gh api` call directly instead of through `_effect` — **v2 binds** | kernel effect journal, class `status_check` | `test_routing.py` | an unrouted call planted in the source | `effect_intended`, `effect_confirmed` | `status_check` |
-| Merge orchestration | `run-queue.sh:1482` `merge_ready_pr` `_effect merge` | route as `pull_request` instead of `merge` — **v2 binds** | `perform` + `revalidate_merge` | `test_merge_revalidation.py` | reviewed artifact deleted after authorization | `command_rejected`, no `effect_intended` | `merge` |
-| Recovery push is bounded | `run-queue.sh:1688` `merge_ready_pr` `revert-push:$pr` | cap → `-`; or `_net_run` drops `-k` — **v1 binds both** | effect adapter cap → `_net_run` | v1 `--self-test` #62 | the bound removed | `effect_uncertain` on timeout | `ref_update` |
+| Merge gate fail-closed | `run-queue.sh:3232` `_merge_gate` `printf 'skip'` | drop the empty-head `skip` branch — **v1 binds** | kernel `request_merge` head binding | v1 `--self-test` | no head supplied | `command_rejected` | none |
+| Merge-authorizing status publication | `run-queue.sh:1231` `_post_cross_review_status` `_effect status_check` | write the `gh api` call directly instead of through `_effect` — **v2 binds** | kernel effect journal, class `status_check` | `test_routing.py` | an unrouted call planted in the source | `effect_intended`, `effect_confirmed` | `status_check` |
+| Merge orchestration | `run-queue.sh:1471` `merge_ready_pr` `_effect merge` | route as `pull_request` instead of `merge` — **v2 binds** | `perform` + `revalidate_merge` | `test_merge_revalidation.py` | reviewed artifact deleted after authorization | `command_rejected`, no `effect_intended` | `merge` |
+| Recovery push is bounded | `run-queue.sh:1677` `merge_ready_pr` `revert-push:$pr` | cap → `-`; or `_net_run` drops `-k` — **v1 binds both** | effect adapter cap → `_net_run` | v1 `--self-test` #62 | the bound removed | `effect_uncertain` on timeout | `ref_update` |
 | Reopening reverted issues is bounded | `run-queue.sh:331` `_reopen_reverted_issues` `_effect issue_or_label` | cap → `-` — **v1 binds** | effect adapter cap → `_net_run` | v1 `--self-test` #62 | the bound removed | `effect_intended` | `issue_or_label` |
 | The adapter is actually wired in | `run-queue.sh:20` `«top-level»` `effect-adapter.sh` | remove the `source` line — **v1 binds, via #50** | `batch/lib/effect-adapter.sh` | v1 `--self-test` | adapter not sourced | none — the run cannot start | none |
 | Effect denial fails closed | `effect-adapter.sh:84` `_effect` `BIRCHER_EFFECT_MODE:-deny` | default mode `deny` → `legacy` — **v2 binds** | `batch/lib/effect-adapter.sh` | `test_fault_injection.py` | `BIRCHER_EFFECT_MODE` unset | none — refused before execution | none |
@@ -40,7 +40,7 @@ v1's own `--self-test` catches the mutation: where it does not, the v2 test is
 
 | v1 behaviour | source | disposition |
 |---|---|---|
-| PR recovery checkout chaining | `run-queue.sh:1988` `recover_pr_cmd` `recover_pr_cmd()` | **Unprobed.** The plan proposed joining commands with `;` instead of `&&` as the breaking mutation. Not executed this session, so no claim is made about whether v1 binds it. Carried to M1-5. |
+| PR recovery checkout chaining | `run-queue.sh:1977` `recover_pr_cmd` `recover_pr_cmd()` | **Unprobed.** The plan proposed joining commands with `;` instead of `&&` as the breaking mutation. Not executed this session, so no claim is made about whether v1 binds it. Carried to M1-5. |
 
 ## Retired — the code they described no longer exists
 

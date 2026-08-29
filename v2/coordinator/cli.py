@@ -13,9 +13,11 @@ import argparse
 import sys
 
 from coordinator.observe import ci_history, classify
+from coordinator.session import LookupFailed, last_assistant_text, state
 
 RC_OK = 0
 RC_USAGE = 2
+RC_LOOKUP_FAILED = 3
 
 
 def main(argv=None) -> int:
@@ -34,6 +36,15 @@ def main(argv=None) -> int:
     c.add_argument("--verdict", default="")
     c.add_argument("--reviewer", required=True)
 
+    st = subs.add_parser("session-state")
+    st.add_argument("--server", required=True)
+    st.add_argument("--id", required=True, dest="conv_id")
+
+    la = subs.add_parser("last-assistant-text")
+    la.add_argument("--server", required=True)
+    la.add_argument("--id", required=True, dest="conv_id")
+    la.add_argument("--n", type=int, default=3)
+
     a = p.parse_args(argv)
 
     if a.mode == "ci-history":
@@ -44,6 +55,21 @@ def main(argv=None) -> int:
         # so `unknown|` cannot be mistaken for `false|0`.
         print(f"{r.ci_first}|{'' if r.resubmissions is None else r.resubmissions}",
               end="")
+        return RC_OK
+
+    if a.mode == "session-state":
+        s_ = state(a.server, a.conv_id)
+        print(f"{s_.status}|{s_.error_code}", end="")
+        return RC_OK
+
+    if a.mode == "last-assistant-text":
+        try:
+            print(last_assistant_text(a.server, a.conv_id, a.n), end="")
+        except LookupFailed as exc:
+            # NON-ZERO, so the caller can tell "no assistant text" from "could
+            # not read the session" -- the distinction the limit check needs.
+            print(f"session-items lookup failed: {exc}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
         return RC_OK
 
     o = classify(a.pr or None, a.ci, a.verdict or None, reviewer=a.reviewer)

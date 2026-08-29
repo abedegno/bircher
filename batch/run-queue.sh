@@ -989,6 +989,15 @@ _codex_usage() {
 # unknown status -> alive (never recover against a session we can't confirm
 # dead).
 _session_died() {
+  # PURE, and it stays in bash for that reason. `coordinator.session.died` holds
+  # the same rule and is what the Python coordinator will use, but routing THIS
+  # caller through a subprocess was a mistake: it spawns a interpreter per poll
+  # for a four-line predicate, and when the spawn cannot run the loop never sees
+  # death and polls to the cap. The argument-wiring harness found it by running
+  # run_item, not by reading it.
+  #
+  # IDLE IS NOT DEATH -- a coordinator awaiting a sub-agent is idle, and reading
+  # that as death starts recovery against a session still working the PR.
   local status="$1" errcode="$2"
   [ -n "${errcode//[[:space:]]/}" ] && { echo died; return; }
   case "$status" in
@@ -1009,16 +1018,14 @@ _session_died() {
 # Reads the server session so run_item can detect death (vs the ambiguous
 # local client process). $SERVER is the omnigent server (e.g. http://omnigent:8000).
 _session_state() {
-  local conv_id="$1" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id" 2>/dev/null) || { printf 'unknown|'; return; }
-  printf '%s' "$json" | python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin)
-except Exception:
-    print("unknown|"); sys.exit(0)
-print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.last_task_error_code") or ""))
-' 2>/dev/null || printf 'unknown|'
+  # Reads omnigent. The parsing lives in v2/coordinator/session.py; this is the
+  # shell's call into it. An unreachable or unparseable server is `unknown|`,
+  # never a guess -- run_item counts consecutive unknowns and keeps waiting
+  # rather than recovering while blind.
+  local out=""
+  out=$(_coordinator session-state --server "$SERVER" --id "$1") || out=""
+  [ -n "$out" ] || out="unknown|"
+  printf '%s' "$out"
 }
 
 # _last_assistant_text <conv_id> [n] -> concatenated text of the newest n (default
@@ -1037,36 +1044,16 @@ print("%s|%s" % (d.get("status") or "", (d.get("labels") or {}).get("omnigent.la
 # The rc split exists because that is what made the regression invisible: an
 # empty string meant BOTH "no assistant text yet" and "we could not ask".
 _last_assistant_text() {
-  local conv_id="$1" n="${2:-3}" json
-  json=$(curl -sf --max-time 10 "$SERVER/v1/sessions/$conv_id/items?order=desc&limit=20" 2>/dev/null) || {
-    echo "[batch] WARN: session-items lookup failed for $conv_id (limit check cannot run this poll)" >&2
+  # rc 1 means the lookup FAILED, which the caller must not confuse with "no
+  # assistant text" -- that distinction is what the provider-limit check runs
+  # on. v2/coordinator/session.py raises rather than returning empty, and the
+  # CLI turns that into a non-zero exit.
+  local out=""
+  if ! out=$(_coordinator last-assistant-text --server "$SERVER" \
+               --id "$1" --n "${2:-3}"); then
+    echo "[batch] WARN: session-items lookup failed for $1 (limit check cannot run this poll)" >&2
     return 1
-  }
-  local out
-  # A 200 carrying malformed or unexpectedly-shaped JSON is ALSO a failed lookup.
-  # The first cut of this fix only handled curl rc, leaving `sys.exit(0)` and
-  # `|| true` to reproduce the very ambiguity it removed (codex review).
-  out=$(printf '%s' "$json" | python3 -c '
-import json,sys
-n=int(sys.argv[1])
-try:
-    data=json.load(sys.stdin).get("data")
-except Exception:
-    sys.exit(1)
-if data is None or not isinstance(data, list):
-    sys.exit(1)
-out=[]
-for it in data:
-    if not isinstance(it, dict) or it.get("role")!="assistant": continue
-    for c in (it.get("content") or []):
-        t=c.get("text") if isinstance(c, dict) else None
-        if t: out.append(t)
-    if len(out)>=n: break
-print("\n".join(out))
-' "$n" 2>/dev/null) || {
-    echo "[batch] WARN: session-items response for $conv_id was unparseable (limit check cannot run this poll)" >&2
-    return 1
-  }
+  fi
   printf '%s' "$out"
 }
 
@@ -1084,6 +1071,8 @@ _http_json() {
 }
 
 # _json_get <key> -- read stdin JSON, print d[key] or "" (never errors).
+# The last python-in-bash left here. Kept only because `_create_session` still
+# lives in this file; it moves with it when the mutating session calls do.
 _json_get() {
   python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get(sys.argv[1]) or "")
