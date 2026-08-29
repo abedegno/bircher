@@ -56,3 +56,32 @@ def by_code(repo: str, code: str, *, gh=_gh) -> list[str]:
         return []
     return [str(p["number"]) for p in prs
             if isinstance(p, dict) and matches_code(p.get("headRefName") or "", code)]
+
+
+def reconcile(repo: str, code: str, tracked: str, *, gh=_gh, ci_of, close) -> str:
+    """Adopt a CI-green sibling when an item opened more than one PR.
+
+    Run #20 (#141): a CI-red retry opened a second branch and PR before the
+    coordinator died, leaving two open PRs for one item. Adopting the green one
+    is the recovery; leaving the red one open is a second PR nobody closes.
+
+    `ci_of` and `close` are injected -- `close` performs a `pull_request`
+    effect, and a test must be able to assert WHAT was closed without touching
+    GitHub.
+    """
+    if not code:
+        return tracked
+    matches = by_code(repo, code, gh=gh)
+    if len(matches) <= 1:
+        return tracked
+
+    green = next((m for m in matches if ci_of(m) == "green"), None)
+    if green is None:
+        # NOTHING is closed without evidence. Closing on no green sibling would
+        # destroy the only candidate the item has.
+        return tracked
+
+    for m in matches:
+        if m != green:
+            close(m, green)
+    return green

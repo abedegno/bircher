@@ -64,3 +64,67 @@ def test_by_code_is_empty_when_the_lookup_fails():
     def boom(args):
         raise GhError("boom")
     assert by_code("o/r", "i23", gh=boom) == []
+
+
+# --- sibling reconciliation (plan task 3) ------------------------------------
+
+from coordinator.discovery import reconcile
+
+
+def _listing(numbers):
+    return lambda args: json.dumps(
+        [{"number": int(n), "headRefName": f"i23-{n}"} for n in numbers])
+
+
+def test_a_single_match_is_returned_untouched():
+    closed = []
+    got = reconcile("o/r", "i23", "5", gh=_listing(["5"]),
+                    ci_of=lambda n: "green",
+                    close=lambda m, g: closed.append(m))
+    assert got == "5" and closed == []
+
+
+def test_a_ci_GREEN_sibling_is_adopted_and_the_others_closed():
+    """Run #20 #141: a CI-red retry opened a second PR before the coordinator
+    died. Adopting the green one is the recovery."""
+    closed = []
+    got = reconcile("o/r", "i23", "5", gh=_listing(["5", "6"]),
+                    ci_of=lambda n: "green" if n == "6" else "red",
+                    close=lambda m, g: closed.append(m))
+    assert got == "6" and closed == ["5"]
+
+
+def test_with_no_green_sibling_the_tracked_pr_is_kept_and_nothing_is_closed():
+    """Closing on no evidence would destroy the only candidate."""
+    closed = []
+    got = reconcile("o/r", "i23", "5", gh=_listing(["5", "6"]),
+                    ci_of=lambda n: "red", close=lambda m, g: closed.append(m))
+    assert got == "5" and closed == []
+
+
+def test_the_adopted_pr_is_never_closed():
+    closed = []
+    got = reconcile("o/r", "i23", "5", gh=_listing(["5", "6", "7"]),
+                    ci_of=lambda n: "green" if n == "6" else "red",
+                    close=lambda m, g: closed.append(m))
+    assert got == "6"
+    assert got not in closed
+    assert sorted(closed) == ["5", "7"]
+
+
+def test_the_superseding_pr_is_named_to_the_closer():
+    """The close comment says which PR superseded it. Without the second
+    argument it would say nothing useful to whoever reads the closed PR."""
+    seen = []
+    reconcile("o/r", "i23", "5", gh=_listing(["5", "6"]),
+              ci_of=lambda n: "green" if n == "6" else "red",
+              close=lambda m, g: seen.append((m, g)))
+    assert seen == [("5", "6")]
+
+
+def test_no_code_means_no_reconciliation():
+    closed = []
+    assert reconcile("o/r", "", "5", gh=_listing(["5", "6"]),
+                     ci_of=lambda n: "green",
+                     close=lambda m, g: closed.append(m)) == "5"
+    assert closed == []
