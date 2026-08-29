@@ -5,12 +5,14 @@ it disagrees with the code it replaces on an input nobody thought of. So the
 property tests below are paired with tests that run the ORIGINAL bash and the
 new Python on the same inputs and require identical answers.
 """
+import json
 import pathlib
 import subprocess
 
 import pytest
 
-from coordinator.ci import classify_failure, drop_ignored, keep_blocking, normalize
+from coordinator.ci import (GhError, classify_failure, drop_ignored,
+                            keep_blocking, normalize)
 from coordinator.review import extract_verdict
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -375,3 +377,72 @@ def test_poll_applies_the_required_contexts_filter():
     """Otherwise a non-required flaky check would hold every PR pending."""
     gh = _gh_returning("build|pass\nflaky|pending")
     assert poll("1", "build", gh=gh, sleep=lambda _s: None) == "green"
+
+
+# --- required contexts and failure kind (plan task 1) ------------------------
+
+from coordinator.ci import failure_kind, required_contexts
+
+
+def test_required_contexts_unions_both_shapes():
+    """Branch protection reports required checks under TWO keys, and a repo can
+    use either. Reading one would leave the other's checks non-blocking."""
+    payload = {"required_status_checks": {
+        "contexts": ["build"],
+        "checks": [{"context": "test"}, {"context": "build"}]}}
+    gh = lambda args: json.dumps(payload)
+    assert sorted(required_contexts("o/r", gh=gh).split()) == ["build", "test"]
+
+
+def test_required_contexts_is_EMPTY_when_the_lookup_fails():
+    """Empty means "everything blocks" downstream, which is conservative.
+    Inventing a context list would make real checks non-blocking."""
+    def boom(args):
+        raise GhError("404")
+    assert required_contexts("o/r", gh=boom) == ""
+
+
+def test_required_contexts_is_fetched_once():
+    calls = []
+
+    def gh(args):
+        calls.append(args)
+        return json.dumps({"required_status_checks": {"contexts": ["build"]}})
+
+    cache = {}
+    required_contexts("o/r", gh=gh, cache=cache)
+    required_contexts("o/r", gh=gh, cache=cache)
+    assert len(calls) == 1, "branch protection is fetched once per run"
+
+
+def test_a_red_run_with_failed_steps_is_genuine():
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        return json.dumps({"jobs": [{"conclusion": "failure",
+                                     "steps": [{"conclusion": "failure"}]}]})
+    assert failure_kind("7", gh=gh) == "genuine"
+
+
+def test_a_red_run_with_NO_failed_step_is_infrastructure():
+    """B-5: a runner never acquired, or a cancelled job, fails with zero failed
+    steps. Burying those as `failed` buried three green PRs in one incident."""
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        return json.dumps({"jobs": [{"conclusion": "cancelled", "steps": []}]})
+    assert failure_kind("7", gh=gh) == "infra"
+
+
+def test_an_unreadable_run_is_GENUINE_not_infra():
+    """Fails toward NOT re-running. `infra` triggers a re-run that costs CI
+    minutes; if we cannot see why a run failed, spending them is a guess."""
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        raise GhError("boom")
+    assert failure_kind("7", gh=gh) == "genuine"
+
+
+def test_a_pr_with_no_workflow_runs_is_genuine():
+    assert failure_kind("7", gh=lambda a: "external|https://example.com/x") == "genuine"

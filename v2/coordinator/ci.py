@@ -11,12 +11,29 @@ produce the text stay with their callers for now.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 
 #: Checks that never block a merge. `review-gate` MUST stay excluded or the
 #: derivation DEADLOCKS: it stays pending until a cross-vendor review is posted,
 #: and the caller is the thing about to post one. Each waits for the other.
 #: Seen on muesli PR #549, which hung with every other check green.
+class GhError(Exception):
+    """`gh` failed. Distinct from "gh succeeded and returned nothing"."""
+
+
+def _gh(args: list[str]) -> str:
+    """The default runner. Injected in tests so none of this needs network."""
+    repo = os.environ.get("REPO") or os.environ.get("BIRCHER_REPO") or ""
+    cmd = ["gh", *args] + (["--repo", repo] if repo and "--repo" not in args else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise GhError(r.stderr.strip()[:200])
+    return r.stdout
+
+
 DEFAULT_IGNORED = "Dependabot|review-gate"
 
 
@@ -145,3 +162,58 @@ def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
         sleep(interval)
         waited += interval
     return "pending"
+
+
+def required_contexts(repo: str, *, gh=_gh, cache=None) -> str:
+    """The contexts branch protection requires, newline separated.
+
+    UNIONS BOTH SHAPES. Protection reports required checks under `contexts`
+    (legacy) and `checks[].context` (current), and a repo may use either;
+    reading one would leave the other's checks non-blocking.
+
+    EMPTY on any failure, which downstream means "everything blocks" -- the
+    conservative reading. Inventing a list would silently make real checks
+    non-blocking, and that failure cannot be noticed from the outside.
+    """
+    if cache is not None and "v" in cache:
+        return cache["v"]
+    try:
+        branch = os.environ.get("MAIN_BRANCH") or "main"
+        d = json.loads(gh(["api", f"repos/{repo}/branches/{branch}/protection"]))
+        rsc = (d or {}).get("required_status_checks") or {}
+        names = set(rsc.get("contexts") or [])
+        names |= {c.get("context") for c in (rsc.get("checks") or [])
+                  if isinstance(c, dict) and c.get("context")}
+        out = "\n".join(sorted(n for n in names if n))
+    except (GhError, ValueError, AttributeError, TypeError):
+        out = ""
+    if cache is not None:
+        cache["v"] = out
+    return out
+
+
+def failure_kind(pr: str, *, gh=_gh) -> str:
+    """`genuine` | `infra` for a RED pr, by counting failed STEPS.
+
+    Fails toward `genuine`: `infra` triggers a re-run that costs CI minutes, so
+    an unreadable run must not spend them on a guess.
+    """
+    try:
+        links = gh(["pr", "checks", str(pr), "--json", "name,link",
+                    "-q", r'.[] | "\(.name)|\(.link)"'])
+    except GhError:
+        return "genuine"
+    ids = run_ids_from_links(links)
+    if not ids:
+        return "genuine"
+    total = 0
+    for rid in ids:
+        try:
+            jobs = json.loads(gh(["run", "view", rid, "--json", "jobs"])).get("jobs") or []
+        except (GhError, ValueError, AttributeError):
+            return "genuine"
+        for job in jobs:
+            if job.get("conclusion") in ("failure", "cancelled"):
+                total += sum(1 for st in (job.get("steps") or [])
+                             if st.get("conclusion") == "failure")
+    return classify_failure(total)
