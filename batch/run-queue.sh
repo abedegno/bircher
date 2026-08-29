@@ -233,23 +233,22 @@ EOF
 
 # classify_recovery <pr> <ci_state> <verdict> -> "outcome|review|ci|note"
 # Pure mapping from ground truth to a scorecard row. Maps ONLY onto the existing
-# outcome vocabulary; the RECOVERED: note carries the detail. Reads the global
+# outcome vocabulary; the note carries the detail. Reads the global
 # RECOVERY_REVIEWER for the review-vendor label.
 classify_recovery() {
-  local pr="$1" ci="$2" verdict="$3"
-  if [ -z "$pr" ]; then
-    echo "timeout|na|na|no PR at timeout (reaped before implement delivered)"; return
+  # Ground truth to outcome. The mapping lives in v2/coordinator/observe.py,
+  # where it is pure and directly testable; this is the shell's call into it.
+  #
+  # Empty output would parse as outcome="" and read as "NOT ready" -- a crash
+  # wearing a verdict's clothes, which this project has shipped three times. So
+  # a failed call escalates loudly instead.
+  local out=""
+  out=$(_coordinator classify --pr "$1" --ci "$2" --verdict "$3" \
+          --reviewer "$RECOVERY_REVIEWER") || out=""
+  if [ -z "$out" ]; then
+    out="escalated|na|$2|outcome classification failed (no output); needs a human"
   fi
-  case "$ci" in
-    red)     echo "failed|na|red|RECOVERED: PR up, CI red, coordinator died before fix"; return ;;
-    pending) echo "escalated|na|pending|RECOVERED: CI still pending at timeout"; return ;;
-  esac
-  # ci == green
-  case "$verdict" in
-    PASS) echo "ready|${RECOVERY_REVIEWER}:pass|green|RECOVERED: coordinator reaped; out-of-band review PASS" ;;
-    FAIL) echo "failed|${RECOVERY_REVIEWER}:fail|green|RECOVERED: out-of-band review FAIL" ;;
-    *)    echo "escalated|${RECOVERY_REVIEWER}:na|green|RECOVERED: review produced no verdict; needs human" ;;
-  esac
+  printf '%s' "$out"
 }
 
 # _checkrun_state <lines of "status|conclusion"> -> green|red|pending
@@ -4431,19 +4430,22 @@ SH
   [ "$(_select_pr_candidate '' '297 298')" = "ambiguous/escalate|297 298" ] \
     || { echo "FAIL _select_pr_candidate ambiguous"; exit 1; }
   rm -rf "$_std"
-  [ "$(classify_recovery '' green PASS)" = "timeout|na|na|no PR at timeout (reaped before implement delivered)" ] \
-    || { echo "FAIL classify no-pr"; exit 1; }
-  [ "$(classify_recovery 7 red '')" = "failed|na|red|RECOVERED: PR up, CI red, coordinator died before fix" ] \
-    || { echo "FAIL classify red"; exit 1; }
-  [ "$(classify_recovery 7 pending '')" = "escalated|na|pending|RECOVERED: CI still pending at timeout" ] \
-    || { echo "FAIL classify pending"; exit 1; }
-  [ "$(classify_recovery 7 green PASS)" = "ready|codex:pass|green|RECOVERED: coordinator reaped; out-of-band review PASS" ] \
-    || { echo "FAIL classify green+pass"; exit 1; }
-  [ "$(classify_recovery 7 green FAIL)" = "failed|codex:fail|green|RECOVERED: out-of-band review FAIL" ] \
-    || { echo "FAIL classify green+fail"; exit 1; }
-  [ "$(classify_recovery 7 green '')" = "escalated|codex:na|green|RECOVERED: review produced no verdict; needs human" ] \
-    || { echo "FAIL classify green+noverdict"; exit 1; }
-  echo "classify_recovery OK"
+  # ONE case, not six. The mapping moved to v2/coordinator/observe.py and is
+  # covered there by nineteen native tests -- including four the shell version
+  # never had (a lowercase verdict, an empty verdict, the reviewer name
+  # travelling into the string, and CI being checked before the verdict).
+  #
+  # What is kept is what those tests CANNOT see: that this shell can actually
+  # reach the Python and parse what comes back. Delete this and a broken call
+  # path is green in both suites.
+  #
+  # The `RECOVERED:` prefix is gone from the notes deliberately. It described a
+  # recovery path; since Phase 2 this is the ONLY path, and prefixing every
+  # scorecard note with a word that means "something went wrong earlier" would
+  # be false on every ordinary run.
+  [ "$(classify_recovery 7 green PASS)" = "ready|codex:pass|green|out-of-band review PASS" ] \
+    || { echo "FAIL classify: shell cannot reach the coordinator package: '$(classify_recovery 7 green PASS)'"; exit 1; }
+  echo "classify_recovery -> coordinator.observe OK"
   # --- Layer-2 recovery: wrapper end-to-end with fake gh/omnigent on PATH -----
   local shimdir; shimdir=$(mktemp -d)
   cat >"$shimdir/gh" <<'SH'
@@ -4491,7 +4493,7 @@ SH
   # for the branch lookup, so they are `unknown` and empty -- which is the
   # correct answer to "no history was visible", and is pinned here so a change
   # that starts inventing `false|0` on a failed lookup is caught.
-  [ "$rec_out" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -4540,7 +4542,7 @@ SH
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex observe_outcome i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -4605,7 +4607,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|RECOVERED: coordinator reaped; out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"

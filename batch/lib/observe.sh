@@ -10,40 +10,31 @@
 # Sourced by run-queue.sh. `gh` and `$REPO` resolve at call time, so the tests
 # can substitute both.
 
+# _coordinator <subcommand> [args...] -> the coordinator package's stdout.
+#
+# The same shape as `_kernel_*`: bash reaches Python through a subprocess.
+# TEMPORARY, and the temporariness is the point -- as run_item moves into
+# v2/coordinator/ the callers become Python and this helper disappears with
+# the file it lives in.
+_coordinator() {
+  PYTHONPATH="$(_kernel_pythonpath)" \
+    _net_run "$(_kernel_net_cap)" \
+    "${BIRCHER_PY:-python3}" -m coordinator.cli "$@" 2>/dev/null
+}
+
 # observe_ci_history <branch> -> "<ci_first>|<resubmissions>"
 #
-#   ci_first        true | false | unknown  -- did the FIRST finished CI run
-#                                              on this branch succeed?
-#   resubmissions   integer | empty         -- distinct commits CI ran on,
-#                                              minus one.
-#
-# ONE call, not one per commit: `actions/runs?branch=` carries every run with
-# its head sha and conclusion. Verified against the live API 2026-08-28.
-#
-# `unknown` is a real answer and is never collapsed into `false`. No CI history
-# is the absence of evidence, and a scorecard that records `false` there is
-# making a claim nothing observed -- the exact shape this project keeps
-# finding.
+# Now a thin call. The logic -- earliest finished run decides `ci_first`,
+# distinct commits decide `resubmissions`, and `unknown` never collapses into
+# `false` -- lives in v2/coordinator/observe.py with nineteen native tests. It
+# was written here in bash first and tested by extracting this function from
+# the script and driving it with stubs; that harness was the tell.
 observe_ci_history() {  # <branch>
-  local branch="$1" raw=""
-  raw=$(gh api "repos/$REPO/actions/runs?branch=$branch&per_page=100" \
-          --jq '.workflow_runs[] | "\(.head_sha)|\(.conclusion // "")|\(.created_at)"' \
-          2>/dev/null) || { printf 'unknown|'; return 0; }
-
-  printf '%s\n' "$raw" | awk -F'|' '
-    $1 == "" { next }
-    $2 == "" { next }               # still running: not a verdict
-    { finished[NR] = $1 "|" $2 "|" $3; seen[$1] = 1; n++ }
-    END {
-      if (n == 0) { printf "unknown|"; exit }
-      first_t = ""; first_c = ""
-      for (i in finished) {
-        split(finished[i], f, "|")
-        if (first_t == "" || f[3] < first_t) { first_t = f[3]; first_c = f[2] }
-      }
-      d = 0; for (s in seen) d++
-      printf "%s|%d", (first_c == "success" ? "true" : "false"), d - 1
-    }'
+  local out=""
+  out=$(_coordinator ci-history --repo "$REPO" --branch "$1") || out=""
+  # A failed call is `unknown|`, never a fabricated `false|0`.
+  [ -n "$out" ] || out="unknown|"
+  printf '%s' "$out"
 }
 
 # observe_review <pr> <reviewed_sha> -> "<verdict>|<log_path>"
