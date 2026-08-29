@@ -3139,9 +3139,12 @@ _pr_signal() {
 # PR sat green and mergeable. Any item whose criteria demand a demonstrated failure
 # can reproduce this, so the tracked PR must be re-checked, not trusted once.
 _pr_is_abandoned() {
-  local state="$1" merged="${2:-}"
-  [ "$state" = "CLOSED" ] || return 1
-  [ -z "$merged" ] || [ "$merged" = "null" ]
+  # A PR CLOSED without merging can never satisfy its item. `gh` reports an
+  # unmerged PR's mergedAt as empty OR the string "null" depending on the
+  # query, and both mean the same thing -- reading "null" as a timestamp would
+  # mark every closed-unmerged PR merged. Rule and tests in
+  # v2/coordinator/pr_selection.py.
+  _coordinator pr-abandoned --state "$1" --merged "${2:-}"
 }
 
 # _read_note <file> -> the signal file's text, flattened to one line for JSONL,
@@ -3199,17 +3202,16 @@ _read_note() {
 # use-signal|<pr>, use-the-one-match|<pr>, no-match|, ambiguous/escalate|<prs>.
 # Pure selection only: the caller owns any gh query and the .escalated write.
 _select_pr_candidate() {
-  local signal="$1" matches="$2"
-  if [ -n "$signal" ]; then
-    printf 'use-signal|%s\n' "$signal"
-    return 0
-  fi
-  set -- $matches
-  case "$#" in
-    0) printf 'no-match|\n' ;;
-    1) printf 'use-the-one-match|%s\n' "$1" ;;
-    *) printf 'ambiguous/escalate|%s\n' "$*" ;;
-  esac
+  # An explicit signal wins; otherwise EXACTLY ONE match is required and two or
+  # more escalate rather than picking -- choosing would be a guess about which
+  # PR an item produced, and a wrong guess merges someone else's work under
+  # this item's name. Rule and tests in v2/coordinator/pr_selection.py.
+  local out=""
+  out=$(_coordinator pr-select --signal "$1" --matches "$2") || out=""
+  # A failed call must not read as "no PR". Escalating is the answer that
+  # stops rather than the one that quietly proceeds.
+  [ -n "$out" ] || out="ambiguous/escalate|selection unavailable"
+  printf '%s\n' "$out"
 }
 
 # _item_issue <prompt-text> -> the issue number from an `Issue: #<n>` header, or empty.

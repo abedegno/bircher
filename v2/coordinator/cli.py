@@ -14,6 +14,7 @@ import sys
 
 from coordinator.ci import keep_blocking, normalize
 from coordinator.observe import ci_history, classify
+from coordinator.pr_selection import is_abandoned, select
 from coordinator.review import extract_verdict
 from coordinator.session import (LookupFailed, item_count, last_assistant_text,
                                  settle, state)
@@ -52,6 +53,14 @@ def main(argv=None) -> int:
 
     vd = subs.add_parser("verdict")
     vd.add_argument("--text", required=True)
+
+    pa = subs.add_parser("pr-abandoned")
+    pa.add_argument("--state", default="")
+    pa.add_argument("--merged", default="")
+
+    ps = subs.add_parser("pr-select")
+    ps.add_argument("--signal", default="")
+    ps.add_argument("--matches", default="")
 
     se = subs.add_parser("session-settle")
     se.add_argument("--server", required=True)
@@ -101,6 +110,17 @@ def main(argv=None) -> int:
         if v is None and a.text.strip():
             print("[batch] WARN: review's final line is not a bare verdict "
                   "-> treating as no verdict", file=sys.stderr)
+        return RC_OK
+
+    if a.mode == "pr-abandoned":
+        # EXIT CODE, not stdout: the shell calls this in an `if`, and a
+        # printed word would have to be compared, which is one more place to
+        # get a default wrong.
+        return RC_OK if is_abandoned(a.state, a.merged) else 1
+
+    if a.mode == "pr-select":
+        c = select(a.signal, a.matches)
+        print(f"{c.decision}|{c.value}", end="")
         return RC_OK
 
     if a.mode == "session-settle":
