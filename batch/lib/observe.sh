@@ -45,39 +45,3 @@ observe_ci_history() {  # <branch>
   [ -n "$out" ] || out="unknown|"
   printf '%s' "$out"
 }
-
-# observe_review <pr> <reviewed_sha> -> "<verdict>|<log_path>"
-#   verdict: PASS | FAIL | NONE
-#
-# DECISION 1 OF PHASE 2. The verdict that authorises a merge is now read from a
-# reviewer run-queue dispatched, not from a string the coordinator wrote about
-# a reviewer it dispatched. Both spellings produce `codex:pass`; only one of
-# them observed anything.
-#
-# NONE is not a soft PASS. A reviewer that crashed, timed out, or produced no
-# parseable verdict has approved nothing, and the classifier must route that to
-# `escalated`. Reading silence as approval is how a merge gets authorised by an
-# absence.
-observe_review() {  # <pr> <reviewed_sha>
-  local pr="$1" sha="$2" prompt out rc log v
-  log="${BIRCHER_REVIEW_LOG:-/tmp/review-$pr.log}"
-  # The sha travels IN the prompt: the reviewer is told what to read, never
-  # asked to work it out. See #66 -- a reviewer that re-derives its own head
-  # can bless a commit pushed after the review began.
-  prompt=$(_recovery_review_prompt "$pr" "$sha")
-  ( cd "$BUNDLE_DIR" && omnigent run "agents/$RECOVERY_REVIEWER" \
-      --server "$SERVER" -p "$prompt" ) >"$log" 2>&1
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    # A dead reviewer's stdout is not evidence. Mining it for "VERDICT: PASS"
-    # would let a crash that happened to echo its own prompt authorise a merge.
-    printf 'NONE|%s' "$log"
-    return 0
-  fi
-  out=$(cat "$log" 2>/dev/null)
-  v=$(_extract_verdict "$out")
-  case "$v" in
-    PASS|FAIL) printf '%s|%s' "$v" "$log" ;;
-    *)         printf 'NONE|%s' "$log" ;;
-  esac
-}

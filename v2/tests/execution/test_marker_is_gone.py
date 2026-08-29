@@ -56,10 +56,6 @@ _ALLOWED_LINES = {
     "grep -q 'bircher-status:' \"$shimdir/comment.txt\" \\":
         "ASSERTS ABSENCE. The self-test that fails if a future edit restores "
         "the channel by restoring its prefix.",
-    'for banned in ("parse_marker", "_marker_bodies_since", "bircher-status:"):':
-        "ASSERTS ABSENCE. The structural check that run_item reads no marker.",
-    'assert "bircher-status:" not in body, "observe_outcome still writes a marker"':
-        "ASSERTS ABSENCE. The check that the posted comment carries no channel.",
     'assert "bircher-status" not in " ".join(str(a) for _c, _k, a in d.posted)':
         "ASSERTS ABSENCE. The check that the DERIVED comment carries no "
         "channel -- the Python half of the same property the shell guard "

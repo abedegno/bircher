@@ -28,7 +28,7 @@ class Deps:
 
     checks: callable                 # pr -> "name|bucket" text
     head_of: callable                # pr -> sha
-    review: callable                 # (pr, sha) -> "PASS" | "FAIL" | None
+    review: callable                 # (pr, sha) -> (verdict, output)
     effect: callable                 # (cls, key, argv) -> str
     log: callable = lambda msg: None
     failure_kind: callable = lambda pr: "genuine"
@@ -129,7 +129,7 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
         if branch:
             ci_first, resubmissions = d.history(branch)
 
-    ci, verdict, reviewed_sha = "na", None, ""
+    ci, verdict, reviewed_sha, reviewer_out = "na", None, "", ""
     if pr:
         ci = _settle_ci(item, pr, d, rerun_max)
 
@@ -144,7 +144,7 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                 d.log(f"{item}: could not capture a full 40-hex head for PR #{pr} "
                       f"(got {head or '<empty>'!r}) -> cannot pin a merge")
             d.log(f"{item}: PR #{pr} CI green -> {d.reviewer} review at {reviewed_sha[:7]}")
-            verdict = d.review(pr, reviewed_sha)
+            verdict, reviewer_out = d.review(pr, reviewed_sha)
             if verdict == "NONE":
                 verdict = None
 
@@ -152,8 +152,17 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
 
     if pr:
         head_field = f" head={reviewed_sha}" if o.outcome == "ready" and reviewed_sha else ""
-        body = (f"Outcome derived from the repository: outcome={o.outcome} "
-                f"ci={o.ci}{head_field}\nnote: {o.note}")
+        # THE REVIEWER'S FINDINGS STAY. Decision 3 of C8 Phase 2 kept them
+        # deliberately: they are the most useful thing on the PR for a human,
+        # and only the machine-readable `bircher-status:` prefix was retired.
+        # The first port dropped them and always wrote the short form;
+        # `--self-test` caught it.
+        summary = (f"outcome={o.outcome} ci={o.ci}{head_field}\nnote: {o.note}")
+        if reviewer_out:
+            body = ("Cross-vendor review (outcome derived from the repository, "
+                    f"not reported):\n\n{reviewer_out}\n\n{summary}")
+        else:
+            body = f"Outcome derived from the repository: {summary}"
         key = f"pr-comment:{pr}:{abs(hash(body)) % (16 ** 16):016x}"
         d.effect("comment", key,
                  ["gh", "pr", "comment", str(pr), "--body", body])

@@ -10,11 +10,13 @@ migration has stalled and turned into an API.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from coordinator.ci import keep_blocking, normalize
 from coordinator.effects import EffectDenied, NotDispatched, perform_effect
 from coordinator.observe import ci_history, classify
+from coordinator.outcome import derive
 from coordinator.pr_selection import is_abandoned, select
 from coordinator.review import extract_verdict
 from coordinator.session import (LookupFailed, item_count, last_assistant_text,
@@ -66,6 +68,12 @@ def main(argv=None) -> int:
     ef.add_argument("--key", required=True)
     ef.add_argument("--timeout", type=float, default=None)
     ef.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    dv = subs.add_parser("derive")
+    dv.add_argument("--item", required=True)
+    dv.add_argument("--code", default="")
+    dv.add_argument("--pr", default="")
+    dv.add_argument("--issue", default="")
 
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
@@ -140,6 +148,15 @@ def main(argv=None) -> int:
         except NotDispatched as exc:
             print(f"effect not dispatched: {exc}", file=sys.stderr)
             return RC_EFFECT_DENIED
+        return RC_OK
+
+    if a.mode == "derive":
+        # Imported here so the rest of the CLI stays usable when the world is
+        # not reachable -- `wiring` builds real gh and effect callables.
+        from coordinator.wiring import live_deps
+        r = derive(a.item, a.code, a.pr, a.issue, deps=live_deps(a.item),
+                   rerun_max=int(os.environ.get("BIRCHER_CI_RERUN_MAX") or 4))
+        print(r.as_line(), end="")
         return RC_OK
 
     if a.mode == "pr-abandoned":

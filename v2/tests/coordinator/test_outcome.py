@@ -12,7 +12,7 @@ def _deps(**over):
     posted = []
     base = dict(checks=lambda pr: "build|pass",
                 head_of=lambda pr: "a" * 40,
-                review=lambda pr, sha: "PASS",
+                review=lambda pr, sha: ("PASS", ""),
                 effect=lambda c, k, a: posted.append((c, k, a)) or "ok",
                 history=lambda br: ("true", 0),
                 branch_of=lambda pr: "feat-x")
@@ -35,7 +35,7 @@ def test_a_red_pr_never_reaches_the_reviewer():
     dispatching a reviewer at all wastes a run on a foregone answer."""
     asked = []
     d = _deps(checks=lambda pr: "build|fail",
-              review=lambda pr, sha: asked.append(pr) or "PASS")
+              review=lambda pr, sha: (asked.append(pr) or "PASS", ""))
     r = derive("i1", "i1", "7", "", deps=d)
     assert r.outcome == "failed" and asked == []
 
@@ -45,7 +45,7 @@ def test_the_reviewed_sha_is_captured_BEFORE_the_review_is_dispatched():
     a push landing mid-review would otherwise be blessed as reviewed."""
     order = []
     d = _deps(head_of=lambda pr: (order.append("head"), "b" * 40)[1],
-              review=lambda pr, sha: (order.append(f"review:{sha}"), "PASS")[1])
+              review=lambda pr, sha: ((order.append(f"review:{sha}"), "PASS")[1], ""))
     r = derive("i1", "i1", "7", "", deps=d)
     assert order == ["head", "review:" + "b" * 40]
     assert r.sha == "b" * 40
@@ -149,13 +149,13 @@ def test_a_reconciled_sibling_replaces_the_tracked_pr():
 def test_the_sha_rides_out_only_on_a_ready_outcome():
     """It is the merge-authorising evidence; a failed derivation must not carry
     one."""
-    d = _deps(review=lambda pr, sha: "FAIL")
+    d = _deps(review=lambda pr, sha: ("FAIL", ""))
     r = derive("i1", "i1", "7", "", deps=d)
     assert r.outcome == "failed" and r.sha == ""
 
 
 def test_a_reviewer_with_no_verdict_escalates():
-    d = _deps(review=lambda pr, sha: None)
+    d = _deps(review=lambda pr, sha: (None, ""))
     assert derive("i1", "i1", "7", "", deps=d).outcome == "escalated"
 
 
@@ -171,3 +171,21 @@ def test_an_unknown_history_leaves_the_resubmission_field_empty():
     r = derive("i1", "i1", "7", "", deps=d)
     assert (r.ci_first, r.resubmissions) == ("unknown", None)
     assert r.as_line().endswith("|unknown|")
+
+
+def test_the_reviewers_findings_are_kept_in_the_comment():
+    """Decision 3 of C8 Phase 2: the findings are the most useful thing on the
+    PR for a human, and only the machine-readable prefix was retired. The first
+    port dropped them and `--self-test` caught it."""
+    d = _deps(review=lambda pr, sha: ("PASS", "finding: the retry is unbounded"))
+    derive("i1", "i1", "7", "", deps=d)
+    body = " ".join(str(a) for _c, _k, a in d.posted)
+    assert "finding: the retry is unbounded" in body
+    assert "Cross-vendor review" in body
+
+
+def test_with_no_findings_the_short_form_is_used():
+    d = _deps(review=lambda pr, sha: ("PASS", ""))
+    derive("i1", "i1", "7", "", deps=d)
+    body = " ".join(str(a) for _c, _k, a in d.posted)
+    assert "Outcome derived from the repository" in body

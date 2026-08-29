@@ -288,17 +288,21 @@ _GH_SUBCOMMANDS = {
     ("issue", "comment"): True,
     ("issue", "edit"): True,
     ("issue", "reopen"): True,
-    ("issue", "view"): False,
     ("pr", "checks"): False,
     ("pr", "close"): True,
-    ("pr", "comment"): True,
     ("pr", "create"): True,
     ("pr", "list"): False,
     ("pr", "merge"): True,
     ("pr", "view"): False,
+    ("run", "list"): False,
     ("run", "rerun"): True,
-    ("run", "view"): False,
 }
+
+#: `gh api` is excluded: it is noun-then-URL, not noun-then-verb, and MUTATION
+#: already has its own rule for it (`-X POST|PUT|PATCH|DELETE`, and the
+#: `statuses/` endpoint). Enumerating it here would classify URL fragments as
+#: verbs and say nothing about whether they mutate.
+_EXCLUDED_NOUNS = {"api"}
 
 
 def _gh_subcommands_in_source():
@@ -307,8 +311,12 @@ def _gh_subcommands_in_source():
     for _n, line, mask, is_comment in code_lines(str(RUN_QUEUE)):
         if is_comment:
             continue
-        for m in re.finditer(r"\bgh\s+([a-z-]+)\s+([a-z-]+)", line):
-            if not mask[m.start()]:
+        # NOT `\bgh`: the detector's own pattern has no leading boundary, so
+        # it sees `_ci_gh run rerun` while a `\b` version does not. An
+        # enumeration that cannot see what the detector flags is not an
+        # enumeration of the same thing.
+        for m in re.finditer(r"(?:^|[\s;(&|])(?:_[a-z_]*)?gh\s+([a-z-]+)\s+([a-z-]+)", line):
+            if not mask[m.start()] and m.group(1) not in _EXCLUDED_NOUNS:
                 found.add((m.group(1), m.group(2)))
     return found
 
