@@ -114,36 +114,74 @@ be mutually stale. Precedence, evaluated in order:
 | state | interpretation | policy |
 |---|---|---|
 | `CLEAN` | ready | proceed |
-| `BLOCKED` | see the split below | |
-| `BEHIND` | strict mode; base moved | attempt ONE `update-branch` (an existing routed effect), re-poll; if still BEHIND, defer |
+| `BLOCKED` | see the ordered classifier below | |
+| `BEHIND` | strict mode; base moved | **defer. No mutation.** |
 | `UNSTABLE` | a NON-required check is failing | proceed — branch protection does not require it and waiting cannot change it |
 | `DIRTY` | real conflict | defer now |
-| `UNKNOWN` | not computed yet | wait, backoff; defer after N answerless polls |
+| `UNKNOWN` | not computed yet | wait, backoff, bounded by the phase deadline |
 
-### The BLOCKED split, and the race that nearly broke it
+**BEHIND defers rather than updating the branch.** An earlier draft had it
+attempt one `update-branch`, and that was incoherent twice over. Precedence
+rule 2 defers whenever the head is not the reviewed head — and `update-branch`
+MOVES the head, so the path could never reach CLEAN unless an implementer
+silently re-pointed the reviewed SHA, which would merge code no reviewer had
+seen. It is also a routed mutation, contradicting Phase 1's claim to change
+only WHEN a merge is attempted. Updating a BEHIND branch requires re-reviewing
+the new head and issuing a fresh authorization; that is a lifecycle change and
+belongs in its own piece of work, not smuggled into a timing fix.
 
-`BLOCKED` is not a promise that something will finish. It covers both "a
-required check is still running" and "a required check says no, or an approval
-is missing" — and waiting cannot fix the second.
+`UNKNOWN` has no separate poll count: the phase deadline already bounds it,
+and a second bound would be a knob nobody sets correctly.
 
-The tempting split is "any required check pending → wait, else defer". **That
-is wrong, and it fails on exactly the case this design exists for.** During
-the seven-second reaction window, `review-gate` has not merely not finished —
-it has not REGISTERED. A contexts snapshot taken then contains no pending
-check at all, so that rule would defer to a human on the transient condition
-it was written to tolerate. `mergeStateStatus` and the contexts snapshot are
-also two separate reads, so a check can register between them.
+### The BLOCKED classifier, ordered and exhaustive
 
-So the split is three-way, and absence is treated as transient first:
+`BLOCKED` is not a promise that something will finish. It covers a check still
+running, a check that failed, a check that has not registered yet, and
+conditions that are not checks at all — a missing approval satisfies none of
+the check-shaped rules while still blocking forever.
 
-| BLOCKED, and… | policy |
-|---|---|
-| a required context is pending | wait, backoff |
-| a required context is **missing entirely** | wait, but only for `BIRCHER_CHECK_REGISTRATION_GRACE` (default 120s) from the first BLOCKED observation; then re-read the PR state and contexts together as closely as the API allows, and defer only if it is still missing |
-| every required context has reported, and at least one is not success | defer NOW — durable, waiting cannot fix it |
+Evaluated in order; the first match wins:
 
-The grace period is the whole answer to the registration race: an absent check
-is presumed to be arriving until it demonstrably is not.
+| # | condition | policy |
+|---|---|---|
+| 1 | the required-context snapshot is unreadable or errored | **defer, fail closed** — and do NOT consume grace; a degraded API must not be read as a check being absent |
+| 2 | the repository requires no contexts at all | defer — BLOCKED without required checks is a non-check policy blocker |
+| 3 | any required context is present and PENDING | wait, backoff |
+| 4 | any required context is ABSENT from the reported set | wait, within the registration grace below |
+| 5 | every required context has reported, and any is not success | defer — durable; waiting cannot fix a failing check |
+| 6 | every required context has reported success, yet still BLOCKED | defer — a non-check blocker (approval, or a policy this code cannot see) |
+
+Row 6 is the case the obvious three-way split missed entirely: all green, still
+blocked, forever.
+
+Rows 1 and 4 must not be confused. An unreadable snapshot is not evidence of
+absence, and treating it as such would spend the grace period on an API
+outage and then defer for the wrong reason.
+
+### The registration grace, and the race it exists for
+
+The tempting rule — "any check pending → wait, else defer" — **fails on
+exactly the case this design exists for.** During the seven-second reaction
+window `review-gate` has not merely not finished: it has not REGISTERED. The
+snapshot contains no such context, so that rule would defer to a human on the
+transient condition it was written to tolerate.
+
+So an absent required context is presumed to be arriving, bounded:
+
+- Grace is keyed by **(head SHA, context name)** and starts when THAT context
+  is first observed absent — not when the PR was first seen BLOCKED. A PR may
+  sit BLOCKED for another reason first and only later expose a newly required
+  or re-run context as absent; starting the clock at the first BLOCKED
+  observation would defer immediately on a genuine registration race.
+- It is measured on a monotonic clock, so a wall-clock adjustment cannot end
+  it early or extend it indefinitely.
+- It resets when the head changes: a new head is a new set of check runs.
+- If the required SET changes, contexts new to it start their own grace;
+  contexts that leave it are forgotten.
+- Default `BIRCHER_CHECK_REGISTRATION_GRACE` = 120s, and it is bounded by
+  `PREMERGE_DEADLINE_AT` regardless — grace can never outlive the phase.
+- When grace expires, re-read the PR state and contexts as close together as
+  the API allows, and defer only if the context is still absent.
 
 ### Backoff
 
@@ -169,15 +207,21 @@ commit, revert on red — depends on holding that commit at a known moment.
 1. The classifier is driven over the full cross-product of `mergeable` ×
    `mergeStateStatus`, including null, an unknown future enum value, an API
    error, a non-OPEN PR and a moved head. Every fail-closed case asserts defer.
-2. **The registration race has its own test:** BLOCKED observed with the
-   required check absent, the check registering only afterwards, asserting the
-   gate waited rather than deferring.
-3. A durable BLOCKED (all contexts reported, one failing) defers immediately
+2. Every row of the BLOCKED classifier has a test, including row 6 (all
+   required contexts green, still BLOCKED) and row 1 (unreadable snapshot
+   defers WITHOUT consuming grace).
+3. **The registration race has its own test:** BLOCKED with the required check
+   absent, the check registering only afterwards, asserting the gate waited.
+   Plus the late-absence case: BLOCKED for another reason first, the context
+   appearing absent only later, asserting grace starts then and not earlier.
+4. A durable BLOCKED (all contexts reported, one failing) defers immediately
    rather than burning the phase budget.
-4. No sleep crosses the phase deadline.
-5. Mutation: reverting the gate to poll `.mergeable` alone must fail a named
+5. BEHIND defers and performs NO mutation — asserted by driving the gate with
+   a fake gh that fails the test if `update-branch` is ever called.
+6. No sleep crosses the phase deadline, and grace never outlives it.
+7. Mutation: reverting the gate to poll `.mergeable` alone must fail a named
    test.
-6. **A second live muesli item merges with no manual reconciliation.** That is
+8. **A second live muesli item merges with no manual reconciliation.** That is
    the acceptance that matters; the first one needed a human.
 
 ---
