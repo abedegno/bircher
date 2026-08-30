@@ -28,6 +28,67 @@ journal, both codes select their `ended` run:
 case: escalation is the normal outcome whenever anything goes wrong, and three
 of three live muesli runs escalated today.
 
+## CORRECTION: re-queueing already works, and I tested the wrong path
+
+**The premise above is wrong, and the way it went wrong is the more useful
+finding.**
+
+`run_item` MINTS its own run — `BIRCHER_RUN_ID="${item}-$(date +%s)"` followed
+by `_kernel_run_start` with a FRESH base — and never adopts. `_kernel_adopt_run`
+is called only by the end-of-run sweep and by `recover_pr_cmd`. A re-queued
+item therefore gets a brand new run, records the CURRENT base, drives the full
+lifecycle, and can merge. **Work is already resumable by re-queueing the
+issue.**
+
+The verification that produced the wrong conclusion was real: I executed the
+adoption selection against the live journal and it did pick the `ended` run for
+both codes. That result is true. It is simply not the path a re-queued item
+takes. Executing the wrong thing carefully is still executing the wrong thing —
+the same shape as every unfaithful reproduction recorded in this repository.
+
+### What IS actually broken
+
+Only the RECOVERY shortcut. `recover_pr_cmd` adopts by item code, gets a
+terminal run, and inherits its refusals. That is a narrower problem than "an
+escalated item cannot be retried", and it has a narrower answer: adoption
+should not select a run in a terminal state. It should mint — and a minted run
+driven through the full lifecycle by `run_item` is not fabrication, it is
+redoing the work.
+
+Crucially, minting also dissolves all three of the blockers this design was
+accumulating, because a NEW run:
+
+- records a fresh `base_sha` at start, so a review binds the CURRENT base and
+  the tautological check has nothing stale to compare (blocker 2);
+- has a new run id, so `sess-create:<run-id>` is a new key and the implementer
+  gets a genuinely fresh session rather than the old one's confirmed
+  `external_object_id` (blocker 3);
+- passes through `submit_spec`/`submit_plan`/`start_implementation` for real,
+  so nothing is skipped (blocker 1).
+
+### Status of the design below
+
+**Superseded, and kept for the reasoning.** The `escalated` state and
+`resume_run` would let a run continue in place rather than start again, which
+is cheaper — but three review rounds found a critical defect in every version,
+and the last two were defects in claims I had made rather than in code. The
+cheap path is not obviously worth that risk while the expensive one already
+works.
+
+What the reviews established, and what any future attempt must carry:
+
+- `revalidate_merge`'s base check compares `binding.base_sha` against
+  `store.run_base_sha(run_id)` — the run's own recorded base against itself —
+  so it is TAUTOLOGICAL and cannot see main move. Any in-place resumption
+  depends on fixing that first.
+- `failed` is recorded from `queued` when session creation fails, so outcome
+  alone does not imply a spec or a plan exists; a destination chosen by
+  outcome can skip stages that never happened.
+- `sess-create:<run-id>` is run-scoped, so re-fencing the generation does NOT
+  produce a new session. A confirmed effect returns its old external id.
+
+---
+
 ## Why the obvious fix is forbidden
 
 "Skip the dead run and mint a fresh one" does not work, and must not be made
