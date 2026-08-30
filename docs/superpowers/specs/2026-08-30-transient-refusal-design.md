@@ -156,10 +156,14 @@ Evaluated in order; the first match wins:
 | 3 | any required context is present and PENDING | wait, backoff |
 | 4 | any required context is ABSENT from the reported set | wait, within the registration grace below |
 | 5 | every required context has reported, and any is not success | defer — durable; waiting cannot fix a failing check |
-| 6 | every required context has reported success, yet still BLOCKED | defer — a non-check blocker (approval, or a policy this code cannot see) |
+| 6 | every required context has reported success, yet still BLOCKED | **wait**, bounded by the same grace as row 4 — `mergeStateStatus` is itself eventually consistent and lags the checks it derives from. Defer only if it outlives the grace. |
 
-Row 6 is the case the obvious three-way split missed entirely: all green, still
-blocked, forever.
+Row 6 is the case the obvious three-way split missed entirely — and calling it
+DURABLE, as this design first did, was itself wrong. A live run deferred muesli
+PR #736 to a human on that rule; the PR was CLEAN and mergeable seconds later.
+`mergeStateStatus` lags the check states it is derived from, so all-green-but-
+BLOCKED is overwhelmingly GitHub not having recomputed. It is the same
+phenomenon as an unregistered check and takes the same bounded grace.
 
 Rows 1 and 4 must not be confused. An unreadable snapshot is not evidence of
 absence, and treating it as such would spend the grace period on an API

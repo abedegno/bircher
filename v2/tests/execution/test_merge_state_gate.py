@@ -71,7 +71,7 @@ def test_a_required_check_that_has_not_registered_is_not_a_durable_block():
     """The registration race. During the reaction window the required context
     is not pending -- it is ABSENT -- so a naive 'anything pending? else defer'
     rule would escalate to a human on the transient condition."""
-    assert blocked("review-gate", "other-check|success") == "absent"
+    assert blocked("review-gate", "other-check|completed|success") == "absent"
 
 
 # --- the ordered BLOCKED classifier, every row --------------------------------
@@ -79,10 +79,13 @@ def test_a_required_check_that_has_not_registered_is_not_a_durable_block():
 @pytest.mark.parametrize("required,rows,expected", [
     ("?",           "",                      "defer"),   # 1 unreadable -> fail closed
     ("",            "",                      "defer"),   # 2 no required checks
-    ("review-gate", "review-gate|pending",   "wait"),    # 3 running
-    ("review-gate", "other|success",         "absent"),  # 4 not registered yet
-    ("review-gate", "review-gate|failure",   "defer"),   # 5 reported, failed
-    ("review-gate", "review-gate|success",   "defer"),   # 6 all green, still BLOCKED
+    # ROWS ARE `name|status|conclusion`. An earlier version of this table used
+    # two fields, which is precisely why it passed while the classifier read
+    # field 2 alone and called every finished check a failure.
+    ("review-gate", "review-gate|in_progress|", "wait"),              # 3 running
+    ("review-gate", "other|completed|success",  "absent"),            # 4 not registered
+    ("review-gate", "review-gate|completed|failure", "defer"),        # 5 failed
+    ("review-gate", "review-gate|completed|success", "settling"),     # 6 green, still BLOCKED -> transient
 ])
 def test_every_row_of_the_blocked_classifier(required, rows, expected):
     assert blocked(required, rows) == expected
@@ -91,7 +94,7 @@ def test_every_row_of_the_blocked_classifier(required, rows, expected):
 def test_pending_wins_over_absent_when_both_are_true():
     """Order matters: something is demonstrably running, so wait on that rather
     than starting a registration grace for a sibling."""
-    assert blocked("a\nb", "a|pending") == "wait"
+    assert blocked("a\nb", "a|in_progress|") == "wait"
 
 
 def test_an_unreadable_snapshot_is_not_evidence_of_absence():
@@ -166,3 +169,54 @@ def test_the_gate_never_mutates():
                       "git push", "_effect "):
         assert forbidden not in body, (
             f"the pre-merge gate must not mutate, but calls {forbidden!r}")
+
+
+# --- the row format itself, which a wrong assumption made invisible ----------
+
+def test_a_finished_check_is_read_from_its_CONCLUSION_not_its_status():
+    """The defect that deferred muesli #736 to a human.
+
+    `_commit_ci_lines` emits `name|status|conclusion`. For a FINISHED check the
+    status is `completed` and only the conclusion says whether it passed. An
+    earlier classifier read field 2 alone, so every reported context looked
+    like a failure and a transient block was reported durable -- the PR was
+    CLEAN and mergeable seconds later.
+
+    The unit tests did not catch it because they used a two-field row of my own
+    invention. A fixture that does not match what production emits tests a
+    different program.
+    """
+    assert blocked("gate", "gate|completed|success") == "settling"  # green: GitHub is lagging
+    assert blocked("gate", "gate|completed|failure") == "defer"   # failed, durable
+    assert blocked("gate", "gate|in_progress|") == "wait"         # still running
+    assert blocked("gate", "gate|queued|") == "wait"
+    # The conclusions GitHub treats as non-failing must not read as failures.
+    for ok in ("success", "neutral", "skipped"):
+        assert blocked("gate\nother", f"gate|completed|{ok}\nother|in_progress|") == "wait", (
+            f"conclusion {ok!r} must not be read as a failure")
+
+
+def test_a_commit_status_is_read_by_the_same_rule_as_a_check_run():
+    """`_commit_ci_lines` normalises a commit status INTO the check-run shape:
+    pending -> `in_progress|""`, success -> `completed|success`. Both kinds of
+    required context therefore need one rule, not two."""
+    assert blocked("review-gate", "review-gate|in_progress|") == "wait"
+    assert blocked("review-gate", "review-gate|completed|success") == "settling"
+
+
+def test_all_green_but_still_blocked_is_transient_not_durable():
+    """The defect a live run found, twice removed from where I looked.
+
+    muesli PR #736: every required context read `completed|success`, yet
+    `mergeStateStatus` was still BLOCKED, so the gate escalated to a human --
+    and the PR was CLEAN and mergeable seconds later. `mergeStateStatus` is
+    EVENTUALLY CONSISTENT and lags the check states it is derived from.
+
+    It is `settling`, not `defer`: bounded by the same grace as an unregistered
+    check, because it is the same phenomenon.
+    """
+    assert blocked("gate", "gate|completed|success") == "settling"
+    assert blocked("gate\nother",
+                   "gate|completed|success\nother|completed|success") == "settling"
+    # A FAILING required check is still durable -- waiting cannot fix it.
+    assert blocked("gate", "gate|completed|failure") == "defer"

@@ -1333,20 +1333,46 @@ _classify_blocked() {
   local req="$1" rows="$2" name row_state saw_absent=0 saw_pending=0 saw_bad=0
   [ "$req" = "?" ] && { printf 'defer'; return; }          # 1: unreadable -> fail closed
   [ -z "$req" ]    && { printf 'defer'; return; }          # 2: no required checks -> non-check blocker
+  # ROWS ARE `name|status|conclusion`, three fields, and the pair must be read
+  # the way `_checkrun_state` reads it. An earlier cut took field 2 alone --
+  # which for a FINISHED check is `completed`, not `success` -- so every
+  # reported context looked like a failure and a transient block was called
+  # durable. Live evidence: muesli PR #736 was deferred to a human and was
+  # CLEAN and mergeable seconds later.
+  local st cc
   while IFS= read -r name; do
     [ -z "$name" ] && continue
-    row_state=$(printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$1==n {print $2; exit}')
-    if [ -z "$row_state" ]; then saw_absent=1
-    elif [ "$row_state" = pending ]; then saw_pending=1
-    elif [ "$row_state" != success ]; then saw_bad=1
-    fi
+    row_state=$(printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$1==n {print $2 "|" $3; exit}')
+    if [ -z "$row_state" ]; then saw_absent=1; continue; fi
+    st="${row_state%%|*}"; cc="${row_state#*|}"
+    case "$st" in
+      completed)
+        case "$cc" in
+          success|neutral|skipped) ;;             # GitHub's non-failing conclusions
+          *) saw_bad=1 ;;
+        esac ;;
+      # queued/in_progress/waiting/requested/... A commit STATUS is already
+      # NORMALISED into this shape by `_commit_ci_lines` -- pending becomes
+      # `in_progress|""` and success becomes `completed|success` -- so both
+      # kinds of required context are read by one rule.
+      *) saw_pending=1 ;;
+    esac
   done <<EOF
 $req
 EOF
   [ "$saw_pending" = 1 ] && { printf 'wait'; return; }     # 3: something is running
   [ "$saw_absent" = 1 ]  && { printf 'absent'; return; }   # 4: not registered YET -> grace
   [ "$saw_bad" = 1 ]     && { printf 'defer'; return; }    # 5: reported, not success -> durable
-  printf 'defer'                                           # 6: all green, still BLOCKED -> approval etc.
+  # 6: every required context is GREEN and the PR is still BLOCKED.
+  #
+  # An earlier cut called this durable -- "an approval must be missing" -- and
+  # it deferred muesli PR #736 to a human when the PR was CLEAN and mergeable
+  # seconds later. `mergeStateStatus` is EVENTUALLY CONSISTENT and lags the
+  # check states it is derived from, so all-green-but-BLOCKED is overwhelmingly
+  # GitHub not having recomputed yet. Transient, bounded by the same grace that
+  # bounds an unregistered check; only a block that OUTLIVES the grace with
+  # everything green is durable.
+  printf 'settling'
 }
 
 # _classify_merge_state <state> <mergeable> <mergeStateStatus> <head> <expected>
@@ -1423,7 +1449,21 @@ _await_mergeable_state() {
       if [ "${snap%%$'\n'*}" = known ]; then req=$(_req_names "${snap#*$'\n'}"); else req="?"; fi
       rows=$(_commit_ci_lines "$head" "$req") || rows=""
       verdict=$(_classify_blocked "$req" "$rows")
-      if [ "$verdict" = absent ]; then
+      if [ "$verdict" = settling ]; then
+        # Every required context is green and the PR is still BLOCKED. Bounded
+        # by the SAME grace as an unregistered check, and keyed the same way,
+        # because it is the same phenomenon: GitHub has not caught up yet.
+        local skey="settle:$head" snow; snow=$(_now_s) || snow=""
+        [ "$skey" = "$absent_key" ] || { absent_key="$skey"; absent_since="$snow"; }
+        if [ -z "$snow" ] || [ -z "$absent_since" ] \
+           || [ "$(( snow - absent_since ))" -lt "$grace" ]; then
+          verdict=wait
+        else
+          MERGE_GATE_NOTE="merge deferred: blocked with every required check green for ${grace}s (an approval or a policy this cannot see)"
+          echo "[batch:merge] $item: PR #$pr BLOCKED for ${grace}s with every required check green -> left open for the human" >&2
+          return 1
+        fi
+      elif [ "$verdict" = absent ]; then
         # Grace is keyed by (head, the required set) and starts when a context
         # is FIRST observed absent -- not at the first BLOCKED observation. A PR
         # can sit BLOCKED for another reason first and only later expose a
