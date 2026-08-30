@@ -40,7 +40,7 @@ several wrong conclusions.
 |---|---|---|
 | **the runner** | The bash orchestrator. Deterministic, no model. Drives the queue, creates sessions, derives outcomes, performs merges. | `batch/run-queue.sh` |
 | **the coordinator** | A Python package inside the runner. Not an agent, no session, no model. Invoked as a subprocess to derive an outcome. | `v2/coordinator/` |
-| **the kernel** | Authorises commands, journals facts, mediates effects. Never decides policy. | `v2/kernel/` |
+| **the kernel** | Authorises commands, journals facts, mediates effects. Enforces SAFETY policy; does not choose workflow policy (§7). | `v2/kernel/` |
 | **the lead session** | An omnigent session running the `bircher` AGENT. A model. Delegates coding to sub-agents; writes no code itself. | `config.yaml`, `skills/muesli-loop/` |
 | **sub-agents** | `codex` and `claude_code` sessions the lead session dispatches to implement or review. | `agents/codex/`, `agents/claude_code/` |
 
@@ -133,8 +133,10 @@ It returns an eight-field pipe-delimited tuple:
 
 ### 3.3 The kernel — `v2/kernel/`
 
-Authorises and records. Never decides what *should* happen — only whether a
-request is permitted and what actually occurred.
+Authorises and records. It does not choose WHAT the system should do next —
+that is the orchestrator's — but it is not policy-free: it enforces the safety
+rules that make an outcome trustworthy, refusing anything that would let a
+claim stand in for evidence. See §7 for the split and the rules it owns.
 
 **Run states and the commands that move them.** Two commands have
 destinations that depend on their PAYLOAD, which is where the retry and
