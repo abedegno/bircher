@@ -1,13 +1,14 @@
 # GitHub lags, so the merge path must wait and retry
 
-**Status:** design, written before the code. The change touches effect
+**Status:** design, written before the code, and REWRITTEN after a
+cross-vendor review rejected the first version. The change touches effect
 classification in the kernel, where a mistake means treating a
 possibly-merged pull request as not merged.
 
 ## The problem, from a live run
 
 muesli #726 → PR #735, 2026-08-30. The first merge attempt failed and the run
-halted, needing a human to reconcile it before it could be merged at all. On a
+halted, needing a human to reconcile it before it could merge at all. On a
 system whose purpose is running unattended, that is disqualifying if it
 recurs.
 
@@ -15,145 +16,179 @@ Two independent defects produced it.
 
 ### 1. The pre-merge gate watches a field that cannot see the blocker
 
-`merge_ready_pr` waits for mergeability by polling `.mergeable`, which reports
-CONFLICT state only — `MERGEABLE` / `CONFLICTING` / `UNKNOWN`. Branch
-protection lives in a different field, `mergeStateStatus`: `CLEAN` /
-`BLOCKED` / `BEHIND` / `UNSTABLE` / `DIRTY`.
+`merge_ready_pr` polls `.mergeable`, which reports CONFLICT state only —
+`MERGEABLE` / `CONFLICTING` / `UNKNOWN`. Branch protection lives in
+`mergeStateStatus`: `CLEAN` / `BLOCKED` / `BEHIND` / `UNSTABLE` / `DIRTY`.
 
-muesli requires `review-gate`, which bircher does not post directly. The chain
-is: bircher posts `bircher/cross-review`, a workflow reacts to that status
-event, and it posts `review-gate`. Measured on #735:
+muesli requires `review-gate`, which bircher does not post. The chain is:
+bircher posts `bircher/cross-review`, a workflow reacts to that status event
+and posts `review-gate`. Measured on #735:
 
     13:29:11  bircher/cross-review = success   (bircher posts)
     13:29:18  review-gate          = success   (the workflow reacts, +7s)
 
-Inside that window the PR was `mergeable=MERGEABLE` (true — no conflicts) and
+In that window the PR was `mergeable=MERGEABLE` (true — no conflicts) and
 `mergeStateStatus=BLOCKED`. The gate saw MERGEABLE, proceeded, and GitHub
-refused: `base branch policy prohibits the merge`.
+refused.
 
-muesli also sets `strict: true`, so `BEHIND` — a PR needing an update against
-a main that moved — is a second state the current field cannot see.
-
-This is ordinary GitHub eventual consistency. The existing code already waits
-out one instance of it (mergeability is computed lazily: a first query returns
-`UNKNOWN` and only triggers the computation; a second, seconds later, returns
-`MERGEABLE`. Reproduced on four open PRs while writing this). It simply does
+This is ordinary GitHub eventual consistency. The code already waits out one
+instance of it — mergeability is computed lazily, so a first query returns
+`UNKNOWN` and only triggers computation while a second seconds later returns
+`MERGEABLE` (reproduced on four open PRs while writing this). It simply does
 not wait for the other.
 
 ### 2. A definitive refusal is recorded as an unknown outcome
 
 `kernel/cli.py::_executor` raises on any non-zero exit, and `perform` turns
 **any** executor exception into `effect_uncertain` plus a run halt. Its own
-docstring already says so:
+docstring already says so, and calls out the consequence.
 
-> Every executor failure — a clean non-zero exit as much as a crash
-> mid-flight — becomes `effect_uncertain` and halts the run. The effect STATE
-> does not distinguish "ran and failed" from "outcome unknown".
+So the halt is a known gap being reached, not a safety net working.
+`merge_ready_pr` already retries for ~30s — enough to cover a 7-second lag —
+but the first failure halted the run and every retry after it was refused by
+the kernel rather than by GitHub. **The safety mechanism defeated the
+recovery mechanism.**
 
-So the halt is not the safety net working; it is a known gap being reached.
-`merge_ready_pr` already retries the merge for ~30s, which would have covered
-the 7-second lag — but the first failure halted the run, and every retry after
-it was refused by the kernel rather than by GitHub. **The safety mechanism
-defeated the recovery mechanism.**
+## What the first version of this design got wrong
 
-"Base branch policy prohibits the merge" is not an unknown outcome. GitHub
-refused before acting: it is *known* that nothing happened.
+It proposed classifying the failure from an allowlist of stderr substrings
+("base branch policy prohibits"). A cross-vendor review rejected that as
+unsound, and the rejection is correct:
+
+**Stderr describes neither the command's transaction boundary nor the final
+remote state.** `gh pr merge` can complete server-side before the client
+fails — a case `run-queue.sh` already carries a scar for ("a failed ATTEMPT is
+not a failed MERGE. The request can complete server-side before the client
+dies"). So an allowlisted substring could accompany a merge that DID happen,
+and the classifier would mark the journal `refused` and permit a replay
+without ever establishing ground truth. GitHub can also reword the message at
+any time, silently converting a retryable case back into a halt or, worse, the
+reverse.
+
+The lesson generalises: **do not infer a world state from a message about a
+command. Observe the world.**
 
 ## The design
 
-### A. Gate on `mergeStateStatus`, with exponential backoff
+### A. The refusal is decided by OBSERVATION, not by the error text
 
-Poll both fields. Classify:
+No allowlist. Nothing parses stderr for classification; it is kept only as
+`detail` for humans.
 
-| state | meaning | action |
+When the merge command exits non-zero, the executor makes ONE structured
+observation of the pull request — its state, its merge commit, and the head
+that was merged — and classifies from that alone:
+
+| observed | meaning | effect state | run |
+|---|---|---|---|
+| open, head == expected | the merge did not happen | `refused` | not halted, retryable |
+| merged, commit at expected head | it DID happen, client lost the reply | `confirmed`, carrying the merge commit | not halted |
+| merged, commit at a DIFFERENT head | landed unreviewed | `confirmed` + the existing unreviewed alarm | halts downstream as today |
+| closed, not merged | someone closed it | `refused` | not halted; the caller sees a closed PR |
+| observation failed, timed out, or ambiguous | unknown | `uncertain` | **halted, exactly as today** |
+
+**A successful observation is a PRECONDITION for recording `refused`.** If the
+observation cannot be made, the outcome is unknown and the run halts. The
+default does not move: unknown still means halt.
+
+This is also strictly better than the status quo for the second row — today a
+merge that succeeded server-side while the client died is recorded as
+uncertain and halts, when the observation could have confirmed it.
+
+The observation uses the REST/GraphQL PR representation, not CLI wording, and
+compares the merge commit's parentage against the expected head rather than
+trusting a boolean.
+
+### B. Retrying a refused effect: an explicit attempt model
+
+The store keeps one row per `(run_id, idempotency_key)`. Facts are append-only.
+So:
+
+- A `refused` row is **updated in place** to a new attempt: `perform`
+  journals a NEW intent with a NEW `effect_id`, and the row's current
+  `effect_id` moves to it.
+- History is not lost, because it lives in the facts, not the row:
+  `effect_intended(eff_1)` → `effect_refused(eff_1)` →
+  `effect_intended(eff_2)` → `effect_confirmed(eff_2)`. Every fact carries its
+  `effect_id`, so the attempts are unambiguous.
+- `uncertain` and `intended` keep refusing re-execution exactly as today. Only
+  `refused` — a state reachable ONLY through a successful observation proving
+  non-occurrence — is retryable.
+- **Concurrency:** the retry runs under the same generation as the attempt it
+  replaces, and generation fencing already rejects a write from a superseded
+  owner (`OwnershipLost`). A retry under a NEW generation gets a different key
+  and is a different effect. Two callers inside one generation is the
+  pre-existing single-owner assumption, unchanged here.
+- A retry budget bounds this: at most `BIRCHER_MERGE_REFUSED_RETRIES`
+  (default 5) refused→retry cycles per key, after which the effect is left
+  `refused` and the item defers to a human. Without it a permanently-refusing
+  condition spins to the phase deadline every time.
+
+### C. Bounded wait states, each with a transition policy
+
+Polling `mergeStateStatus` is not enough on its own: `BLOCKED` is not a
+promise that something will finish. Each state gets a bounded policy.
+
+| state | interpretation | policy |
 |---|---|---|
-| `CLEAN` | ready | proceed to merge |
-| `BLOCKED` | a required check is not satisfied YET | wait, backoff |
-| `BEHIND` | strict mode; base moved | wait, backoff |
-| `UNKNOWN` | not computed yet | wait, backoff |
-| `UNSTABLE` | non-required check failing | wait, backoff |
-| `DIRTY` | real merge conflict | defer now, retry-eligible=0 |
+| `CLEAN` | ready | proceed |
+| `BLOCKED`, with a required check PENDING | the gate is still computing | wait, exponential backoff, bounded by the phase deadline |
+| `BLOCKED`, with no required check pending | durable (needs approval, or a required check is failing/absent) | defer NOW to a human; waiting cannot fix it |
+| `BEHIND` | strict mode; base moved | attempt ONE update-branch (an existing routed effect), then re-poll; if still BEHIND, defer |
+| `UNSTABLE` | a non-required check is failing | proceed — branch protection does not require it, and waiting cannot change it |
+| `DIRTY` | real conflict | defer now |
+| `UNKNOWN` | not computed yet | wait, backoff; after N polls with no answer, defer |
 
-Backoff is exponential (2s doubling to a 30s ceiling) rather than the current
-fixed 5s, and every sleep stays capped by `PREMERGE_DEADLINE_AT` — a deadline
-check followed by an uncapped sleep crosses the deadline it just tested, which
-this file has already been bitten by once (#71).
+The `BLOCKED` split is the important one: it separates "a gate is being
+computed" from "a gate says no", which is exactly the difference between the
+#735 race and a PR that will never merge on its own. It is decided by reading
+the required contexts and their states — machinery `_required_contexts_snapshot`
+and `_commit_ci_lines` already provide.
 
-`BLOCKED` is deliberately NOT terminal. It is the state a PR sits in while the
-gate it is waiting for is still being computed, which is exactly the case that
-failed.
+Backoff is exponential (2s doubling to a 30s ceiling), and every sleep stays
+capped by `PREMERGE_DEADLINE_AT`: a deadline check followed by an uncapped
+sleep crosses the deadline it just tested, which this file has been bitten by
+once already (#71).
 
-### B. A definitive refusal fails the effect without halting the run
+### D. The combined classifier, fully specified
 
-A new exception, raised by the executor and understood by `perform`:
+`mergeable` and `mergeStateStatus` are read from ONE response so they cannot
+be mutually stale. Precedence:
 
-```python
-class EffectRefused(Exception):
-    """The command was REFUSED before acting: it is known that the effect did
-    not happen. Distinct from an uncertain outcome, which is unknown."""
-```
-
-`perform` handles it separately from every other exception:
-
-- mark the effect `refused` (a new state, not `uncertain`)
-- append an `EFFECT_REFUSED` fact carrying the same `detail`
-- **do not** enter reconciliation; the run is not halted
-- raise `RefusedEffect` so the caller learns it failed and can retry
-
-A `refused` key must be retryable without reconciliation — that is the entire
-point — so `perform`'s existing-key check treats `refused` like a key never
-seen, while `uncertain` and `intended` keep refusing as they do now.
-
-### Recognition, and which way it fails
-
-The executor decides, from the effect class and the command's stderr, using a
-**small allowlist keyed by effect class**, with every entry justified by an
-observation:
-
-```python
-REFUSALS = {
-    "merge": (
-        # Observed on muesli PR #735, 2026-08-30. GitHub evaluates branch
-        # protection BEFORE merging, so this message means no merge occurred.
-        "is not mergeable",
-        "base branch policy prohibits",
-    ),
-}
-```
-
-**Everything unrecognised stays uncertain and still halts.** The default does
-not move. This narrows the halt only where GitHub has said plainly that
-nothing happened, and a new failure shape gets today's conservative treatment
-rather than silent retries.
-
-Two further guards, because a message allowlist is brittle by nature:
-
-1. `merge_ready_pr` already asks GitHub whether the PR merged anyway
-   (`_pr_merge_state`) after a failed attempt. That observation stays, and it
-   is the real check — the allowlist only decides whether to halt, never
-   whether the merge happened.
-2. The allowlist is matched case-insensitively against stderr only, never
-   against an exit code alone, so an unrelated non-zero exit cannot inherit a
-   refusal classification.
+1. PR not `OPEN` → not a merge candidate; report the observed state.
+2. Head != the expected reviewed head → **defer immediately**; the merge must
+   stay pinned to what was reviewed. Never proceed on a moved head.
+3. `mergeable == CONFLICTING` → defer, regardless of `mergeStateStatus`.
+4. Either field `UNKNOWN`/null → wait (both are lazily computed).
+5. An enum value neither field's table knows → **fail closed**: defer, and log
+   the unrecognised value by name. GitHub adding a state must not read as
+   "proceed".
+6. Otherwise dispatch on `mergeStateStatus` per the table above.
+7. Any API error during the poll → treat as `UNKNOWN` and keep waiting inside
+   the deadline; a failed lookup must never read as CLEAN.
 
 ### What is deliberately NOT done
 
-**`gh pr merge --auto`**, which GitHub's own error message suggests, would
-remove the race by handing merge timing to GitHub. Rejected: bircher would no
-longer know when the merge happened, and the whole post-merge safety net —
-watch main CI on the merge commit, revert on red — depends on holding that
-commit at a known moment. Trading the merge-watch for a retry loop is a bad
-exchange.
+**`gh pr merge --auto`**, which GitHub's error suggests, would remove the race
+by handing merge timing to GitHub. Rejected: bircher would not know when the
+merge happened, and the post-merge safety net — watch main CI on the merge
+commit, revert on red — depends on holding that commit at a known moment.
 
-**Auto-reconciling old halts.** Runs already halted stay halted. This changes
-what halts in future, not what a halt means.
+**Auto-reconciling existing halts.** Runs already halted stay halted. This
+changes what halts in future, not what a halt means.
 
 ## Acceptance
 
-1. A unit test drives the real `mergeStateStatus` classifier over all six
-   states and asserts wait-vs-proceed-vs-defer.
-2. A test proves a refused effect leaves the run UNHALTED and the key
-   retryable, and that an unrecognised failure still halts. Both mutation-run.
-3. The backoff is bounded: a test asserts no sleep crosses the phase deadline.
-4. A second live muesli item merges WITHOUT manual reconciliation. That is the
-   acceptance that matters; the first one needed a human.
+1. The combined classifier is driven over the full cross-product of
+   `mergeable` × `mergeStateStatus`, including null, an unknown future enum
+   value, an API error, a non-OPEN PR and a moved head. Fail-closed cases
+   assert defer.
+2. A refused effect leaves the run UNHALTED and the key retryable; an
+   observation that FAILS still halts. Both mutation-run.
+3. A merge that succeeded server-side while the client failed is `confirmed`
+   with its merge commit, not `uncertain`.
+4. The refused-retry budget is enforced, and the attempt facts carry distinct
+   `effect_id`s so history survives.
+5. No sleep crosses the phase deadline.
+6. **A second live muesli item merges with no manual reconciliation.** That is
+   the acceptance that matters; the first one needed a human.
