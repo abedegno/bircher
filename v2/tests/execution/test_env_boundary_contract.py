@@ -36,10 +36,14 @@ PY_DIRS = [REPO_ROOT / "v2" / "coordinator", REPO_ROOT / "v2" / "kernel"]
 #: category: it cannot reach Python, and the fix is to pass it as an argument
 #: (as `--repo`, `--server`, `--bundle-dir`, `--reviewer` and `--poll-interval`
 #: all are) rather than to add an entry here.
+#: BIRCHER_CI_WAIT, BIRCHER_CI_RERUN_MAX and BIRCHER_CI_RERUN_WAIT are NOT
+#: here any more, and their absence is the point: they are now resolved and
+#: validated once by `_ci_policy` in run-queue.sh and passed as CLI arguments.
+#: While Python read them itself, the two languages interpreted one operator
+#: setting differently -- the shell clamped `RERUN_MAX=abc` to 4, Python raised
+#: ValueError, and every item escalated. A variable that crosses this boundary
+#: as an ARGUMENT cannot drift; one read independently on both sides can.
 CONTRACT = {
-    "BIRCHER_CI_RERUN_MAX": "operator",
-    "BIRCHER_CI_RERUN_WAIT": "operator",
-    "BIRCHER_CI_WAIT": "operator",
     "BIRCHER_CI_IGNORE_CHECKS": "operator",
     "BIRCHER_KERNEL_MODE": "operator",
     "BIRCHER_REVIEW_LOG": "operator",
@@ -108,4 +112,4 @@ def test_the_contract_has_not_rotted():
 
 def test_the_enumeration_can_still_see():
     """A guard that finds nothing is indistinguishable from a clean tree."""
-    assert len(_vars_python_reads()) >= 8
+    assert len(_vars_python_reads()) >= 5

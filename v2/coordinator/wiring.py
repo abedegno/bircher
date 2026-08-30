@@ -26,7 +26,8 @@ def _int(name: str, default: int) -> int:
 
 
 def live_deps(item: str, *, repo: str, reviewer: str, server: str,
-              bundle_dir: str, poll_interval: int, log=None) -> Deps:
+              bundle_dir: str, poll_interval: int, ci_wait: int = 1500,
+              rerun_wait: int = 900, log=None) -> Deps:
     """Wire `derive` to the real world.
 
     EVERYTHING IS PASSED IN. Nothing here reads `REPO`, `SERVER`, `BUNDLE_DIR`
@@ -127,8 +128,7 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         failure_kind=lambda pr: ci_mod.failure_kind(pr, ignore=ignore),
         rerun=lambda pr: ci_mod.rerun_and_wait(
             pr, required(), sleep=time.sleep,
-            timeout=_int("BIRCHER_CI_RERUN_WAIT", 900), interval=interval,
-            ignore=ignore),
+            timeout=rerun_wait, interval=interval, ignore=ignore),
         history=lambda br: _history(repo, br),
         branch_of=branch_of,
         pr_state=pr_state,
@@ -144,8 +144,7 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         # already settled.
         wait_ci=lambda pr: ci_mod.poll(
             pr, required(), gh=_gh, sleep=time.sleep,
-            timeout=_int("BIRCHER_CI_WAIT", 1500), interval=interval,
-            ignore=ignore),
+            timeout=ci_wait, interval=interval, ignore=ignore),
         required=required(),
         reviewer=reviewer,
         ignore=ignore,

@@ -2233,11 +2233,28 @@ _reconcile_item_pr() {
 #
 # The bash this replaced had NO whole-derivation cap at all, so a budget that
 # cannot cut a legitimate run short is also the faithful behaviour.
+# _ci_policy -> "<wait> <rerun_max> <rerun_wait>", validated ONCE.
+#
+# One resolution point, because two of them disagree. `_derive_budget` clamped
+# these while the Python CLI re-parsed the RAW environment with a bare `int()`:
+# `BIRCHER_CI_RERUN_MAX=abc` gave bash a budget computed from 4 and gave Python
+# a ValueError, which `observe_outcome` reads as an empty tuple -- so a single
+# malformed operator setting escalated EVERY item while the shell believed it
+# had defaulted safely. A value above 20 diverged the other way: Python would
+# attempt more reruns than the budget bounding it allowed.
+#
+# The clamped values are passed to the coordinator explicitly, so there is no
+# second interpretation to drift.
+_ci_policy() {
+  printf '%s %s %s' \
+    "$(_clamp_int "${BIRCHER_CI_WAIT:-1500}" 1500 1 7200)" \
+    "$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-4}" 4 0 20)" \
+    "$(_clamp_int "${BIRCHER_CI_RERUN_WAIT:-900}" 900 1 7200)"
+}
+
 _derive_budget() {
   local w r rw floor
-  w=$(_clamp_int "${BIRCHER_CI_WAIT:-1500}" 1500 1 7200)
-  r=$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-4}" 4 0 20)
-  rw=$(_clamp_int "${BIRCHER_CI_RERUN_WAIT:-900}" 900 1 7200)
+  read -r w r rw <<<"$(_ci_policy)"
   # +20s settle per rerun (coordinator.ci.rerun_and_wait), +120s slack for
   # process start, the review dispatch and the effect calls.
   floor=$(( w + r * (rw + 20) + 120 ))
@@ -2264,15 +2281,18 @@ observe_outcome() {  # <item> <code> <pr> [issue]
   #
   # Emits the same SEVEN fields it always did:
   #   outcome|review|note|head|ci|ci_first|resubmissions
-  local out="" _budget _rc=0
+  local out="" _budget _rc=0 _pw _pr _prw
   _budget=$(_derive_budget)
+  # The SAME validated numbers the budget was computed from.
+  read -r _pw _pr _prw <<<"$(_ci_policy)"
   out=$( PYTHONPATH="$(_kernel_pythonpath)" \
          _net_run "$_budget" \
          "${BIRCHER_PY:-python3}" -m coordinator.cli derive \
            --item "$1" --code "${2:-}" --pr "${3:-}" --issue "${4:-}" \
            --reviewer "$RECOVERY_REVIEWER" --repo "$REPO" \
            --server "$SERVER" --bundle-dir "$BUNDLE_DIR" \
-           --poll-interval "$MAIN_CI_POLL_INTERVAL"
+           --poll-interval "$MAIN_CI_POLL_INTERVAL" \
+           --ci-wait "$_pw" --rerun-max "$_pr" --rerun-wait "$_prw"
   ) || { _rc=$?; out=""; }
   # A TIMEOUT AND A CRASH BOTH YIELD AN EMPTY TUPLE, and the caller correctly
   # escalates either way -- but a human reading the log cannot tell them apart,

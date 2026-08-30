@@ -105,6 +105,14 @@ def main(argv=None) -> int:
     # the operator's BIRCHER_MAIN_CI_POLL_INTERVAL and always polled at 30s.
     dv.add_argument("--poll-interval", type=int, default=30,
                     dest="poll_interval")
+    # PASSED and already VALIDATED by `_ci_policy` in run-queue.sh. Read from
+    # the environment here instead, they were interpreted a second time and
+    # differently: the shell clamped `BIRCHER_CI_RERUN_MAX=abc` to 4 and
+    # computed a budget from it, while a bare `int()` here raised ValueError
+    # and escalated every item. One malformed operator value, two answers.
+    dv.add_argument("--ci-wait", type=int, default=1500, dest="ci_wait")
+    dv.add_argument("--rerun-max", type=int, default=4, dest="rerun_max")
+    dv.add_argument("--rerun-wait", type=int, default=900, dest="rerun_wait")
 
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
@@ -204,8 +212,9 @@ def main(argv=None) -> int:
         r = derive(a.item, a.code, a.pr, a.issue,
                    deps=live_deps(a.item, repo=a.repo, reviewer=a.reviewer,
                                   server=a.server, bundle_dir=a.bundle_dir,
-                                  poll_interval=a.poll_interval),
-                   rerun_max=int(os.environ.get("BIRCHER_CI_RERUN_MAX") or 4))
+                                  poll_interval=a.poll_interval,
+                                  ci_wait=a.ci_wait, rerun_wait=a.rerun_wait),
+                   rerun_max=a.rerun_max)
         print(r.as_line(), end="")
         return RC_OK
 
