@@ -1304,3 +1304,65 @@ discouraging it, and prompt wording is not a mechanism.**
 - v1 remains deployed at `/workspaces/bircher` (218 commits behind); v2 runs
   from `/workspaces/bircher-v2` on current main. Both exist side by side.
 - The cutover is NOT done: nothing schedules a wave, and v1 is untouched.
+
+---
+
+## Wave 01 — four items unattended, 2026-08-31
+
+The first multi-item wave, run to answer one question: **is the repair gap the
+binding constraint, or is something else?** Four real muesli issues, queued and
+left alone.
+
+| item | pri | PR | outcome |
+|---|---|---|---|
+| #722 python streaming transcriber window cap | p1 | 741 | **escalated** — review FAIL |
+| #721 streaming API drops frames under backpressure | p2 | 742 | **MERGED** |
+| #727 post-publication note writes | p2 | 743 | **escalated** — review FAIL |
+| #725 live stream endpoint gates by note status | p3 | 744 | **MERGED** |
+
+**Zero mechanism failures.** No halt, no uncertain effect, no rejected command,
+no wrong-PR, no budget collapse, no manual intervention of any kind. Journals:
+
+    i722  31 facts  8 intended / 8 confirmed  merge_authorized=0
+    i721  52 facts  9 intended / 9 confirmed  merge_authorized=1
+    i727  29 facts  7 intended / 7 confirmed  merge_authorized=0
+    i725  50 facts  8 intended / 8 confirmed  merge_authorized=1
+
+Two merges, two escalations, both issues correctly labelled and both PRs left
+open for a human.
+
+### What the escalations were
+
+Both were genuine, specific, actionable review findings — not flakes, and not
+the reviewer being conservative.
+
+**#741** — the diff bounded the decode window to the trailing 5s but left `t0`
+computed from the ORIGINAL utterance start, so any utterance over 5s would emit
+a caption whose displayed span was far wider than the text it contained
+("0:00–0:12" showing only the words from 0:07). The reviewer verified against
+`git show <sha>^` that this was introduced by the diff rather than pre-existing,
+noted the new test asserts only on byte counts and never on `t0`/`t1` so the
+suite could not see it, and named the fix.
+
+**#743** — same shape of specificity.
+
+### What this establishes
+
+**The review layer works and the mechanism works. The constraint is repair.**
+
+Four items, two blocked on findings that a fix round would plainly resolve —
+wrap a call, anchor a timestamp, add the missing assertion. Nothing repaired
+them, because the layer that found them (the coordinator's derivation) cannot
+act, and the layer that could (the lead session) had already finished. That is
+gap 1 in `docs/design/ARCHITECTURE.md`, now measured rather than inferred from
+one observation.
+
+**Rate: 50% merged unattended, 50% escalated on repairable findings.** Every
+escalation in this wave would have been a candidate for a bounded fix round.
+
+### What it does NOT establish
+
+Two of four is a small sample, and the two failures are not independent — both
+were transcription-adjacent changes reviewed by the same vendor. It does not
+show the rate holds across item types, and it says nothing about how often a
+fix round would actually converge.
