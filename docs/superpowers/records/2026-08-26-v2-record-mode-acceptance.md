@@ -1320,49 +1320,70 @@ left alone.
 | #727 post-publication note writes | p2 | 743 | **escalated** — review FAIL |
 | #725 live stream endpoint gates by note status | p3 | 744 | **MERGED** |
 
-**Zero mechanism failures.** No halt, no uncertain effect, no rejected command,
-no wrong-PR, no budget collapse, no manual intervention of any kind. Journals:
+**No mechanism failure observed BY THESE CHECKS** — which is a narrower claim
+than the one first written here, and the difference matters. The checks were:
+a grep of the wave log for `halt|uncertain|malformed|BLOCKED|no tuple`, and a
+per-run journal count. Journals:
 
     i722  31 facts  8 intended / 8 confirmed  merge_authorized=0
     i721  52 facts  9 intended / 9 confirmed  merge_authorized=1
     i727  29 facts  7 intended / 7 confirmed  merge_authorized=0
     i725  50 facts  8 intended / 8 confirmed  merge_authorized=1
 
+What those checks CANNOT see: an action the mechanism never journalled at all;
+a wrong action or payload that succeeded; a confirmation that disagrees with
+external state; stale review inputs; a failure expressed under a fact kind the
+grep does not name. Balanced intended/confirmed proves only that everything
+journalled as intended was later confirmed — it is silent about omissions.
+Establishing the broad claim needs each run reconciled against external state
+(PR identity, head SHA, labels, verdict, merge state) and fault injection for
+omissions and wrong-but-successful payloads. That has not been done.
+
 Two merges, two escalations, both issues correctly labelled and both PRs left
 open for a human.
 
 ### What the escalations were
 
-Both were genuine, specific, actionable review findings — not flakes, and not
-the reviewer being conservative.
+Both were specific and actionable, with a named fix — not flakes.
 
 **#741** — the diff bounded the decode window to the trailing 5s but left `t0`
 computed from the ORIGINAL utterance start, so any utterance over 5s would emit
 a caption whose displayed span was far wider than the text it contained
 ("0:00–0:12" showing only the words from 0:07). The reviewer verified against
-`git show <sha>^` that this was introduced by the diff rather than pre-existing,
-noted the new test asserts only on byte counts and never on `t0`/`t1` so the
-suite could not see it, and named the fix.
+`git show <sha>^` that the diff introduced it, noted the new test asserts only
+on byte counts and never on `t0`/`t1` so the suite could not see it, and named
+the fix.
 
-**#743** — same shape of specificity.
+**#743** — not summarised here, because I did not read it in the same detail.
+Recording it as "the same shape" was an assertion about a document I had
+skimmed.
 
-### What this establishes
+### What this establishes, stated narrowly
 
-**The review layer works and the mechanism works. The constraint is repair.**
+**A review finding was the immediate stopping condition in 2 of 4 runs.** That
+is the observation. It is NOT a demonstration that repair is the binding
+constraint on autonomy, and the first version of this section claimed that.
 
-Four items, two blocked on findings that a fix round would plainly resolve —
-wrap a call, anchor a timestamp, add the missing assertion. Nothing repaired
-them, because the layer that found them (the coordinator's derivation) cannot
-act, and the layer that could (the lead session) had already finished. That is
-gap 1 in `docs/design/ARCHITECTURE.md`, now measured rather than inferred from
-one observation.
+There was no control and no repair-enabled arm. The two failures are
+correlated — both transcription-adjacent, both reviewed by the same vendor —
+and the two merges may simply have been easier items. The experiment cannot
+separate a missing repair loop from task difficulty, implementation quality,
+reviewer behaviour or issue-specific risk.
 
-**Rate: 50% merged unattended, 50% escalated on repairable findings.** Every
-escalation in this wave would have been a candidate for a bounded fix round.
+Nor is "these would plainly resolve in a fix round" supported. No repair was
+attempted. #741's implementer already missed that timestamp invariant once,
+with the issue text in front of it; a repair could introduce a different defect
+or draw a new finding. Both escalations are **candidate repairs**, not
+demonstrated ones.
 
-### What it does NOT establish
+### The experiment that would actually discriminate
 
-Two of four is a small sample, and the two failures are not independent — both
-were transcription-adjacent changes reviewed by the same vendor. It does not
-show the rate holds across item types, and it says nothing about how often a
-fix round would actually converge.
+Cheapest first: run the two failed PRs through a bounded repair round with a
+fresh cross-vendor review, recording rounds, regressions and final disposition.
+Convergence within the bound is what would support calling repair the
+constraint; failure to converge would point at implementation quality instead.
+
+Then, to separate the confounders: matched or randomised items through
+current and repair-enabled pipelines, merge/escalation criteria fixed in
+advance, reviewer vendor varied, comparing unattended completion rate AND
+new-defect rate.
