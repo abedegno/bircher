@@ -26,7 +26,7 @@ def _int(name: str, default: int) -> int:
 
 
 def live_deps(item: str, *, repo: str, reviewer: str, server: str,
-              bundle_dir: str, log=None) -> Deps:
+              bundle_dir: str, poll_interval: int, log=None) -> Deps:
     """Wire `derive` to the real world.
 
     EVERYTHING IS PASSED IN. Nothing here reads `REPO`, `SERVER`, `BUNDLE_DIR`
@@ -42,9 +42,25 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
     directory the runner was standing in.
 
     A required argument turns each of those into an argparse error instead.
+
+    `poll_interval` joined them for the same reason and is passed the same way.
+    It used to be read here as `MAIN_CI_POLL_INTERVAL`, which run-queue.sh
+    ASSIGNS WITHOUT EXPORTING (line 86) -- so the operator's
+    `BIRCHER_MAIN_CI_POLL_INTERVAL` override never crossed the boundary and
+    every run silently polled at the 30s default. The paragraph above named
+    four variables and was accurate about those four; the very next line then
+    read a fifth from the environment. That is the whole failure mode in one
+    docstring.
+
+    `BIRCHER_CI_IGNORE_CHECKS` is different and IS read from the environment,
+    correctly: run-queue.sh never assigns it -- every use is
+    `${BIRCHER_CI_IGNORE_CHECKS:-...}` against the operator's own environment
+    -- so both languages read the same exported value or both fall back to the
+    same default. Reading it here keeps ONE list rather than two.
     """
     required_cache: dict = {}
-    interval = _int("MAIN_CI_POLL_INTERVAL", 30)
+    interval = poll_interval
+    ignore = os.environ.get("BIRCHER_CI_IGNORE_CHECKS") or ci_mod.DEFAULT_IGNORED
 
     def required() -> str:
         return ci_mod.required_contexts(repo, cache=required_cache)
@@ -99,7 +115,8 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
              f"CI-red retry; adopting the CI-green one)."])
 
     def ci_of(pr):
-        return ci_mod.normalize(ci_mod.keep_blocking(checks(pr), required()))
+        return ci_mod.normalize(
+            ci_mod.keep_blocking(checks(pr), required(), ignore))
 
     return Deps(
         checks=checks,
@@ -107,10 +124,11 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         review=do_review,
         effect=lambda cls, key, argv: perform_effect(cls, key, argv),
         log=log or (lambda m: print(f"[batch:derive] {m}", file=__import__("sys").stderr)),
-        failure_kind=lambda pr: ci_mod.failure_kind(pr),
+        failure_kind=lambda pr: ci_mod.failure_kind(pr, ignore=ignore),
         rerun=lambda pr: ci_mod.rerun_and_wait(
             pr, required(), sleep=time.sleep,
-            timeout=_int("BIRCHER_CI_RERUN_WAIT", 900), interval=interval),
+            timeout=_int("BIRCHER_CI_RERUN_WAIT", 900), interval=interval,
+            ignore=ignore),
         history=lambda br: _history(repo, br),
         branch_of=branch_of,
         pr_state=pr_state,
@@ -120,7 +138,8 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
             repo, code, pr, ci_of=ci_of, close=close_sibling),
         wait_ci=lambda pr: ci_mod.poll(
             pr, required(), sleep=time.sleep,
-            timeout=_int("BIRCHER_CI_WAIT", 1500), interval=interval),
+            timeout=_int("BIRCHER_CI_WAIT", 1500), interval=interval,
+            ignore=ignore),
         required=required(),
         reviewer=reviewer,
     )

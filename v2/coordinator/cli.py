@@ -81,6 +81,11 @@ def main(argv=None) -> int:
     dv.add_argument("--repo", required=True)
     dv.add_argument("--server", default="http://omnigent:8000")
     dv.add_argument("--bundle-dir", default=".", dest="bundle_dir")
+    # PASSED, not inherited: run-queue.sh assigns MAIN_CI_POLL_INTERVAL without
+    # exporting it, so reading it from the environment here silently discarded
+    # the operator's BIRCHER_MAIN_CI_POLL_INTERVAL and always polled at 30s.
+    dv.add_argument("--poll-interval", type=int, default=30,
+                    dest="poll_interval")
 
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
@@ -165,7 +170,8 @@ def main(argv=None) -> int:
         os.environ["BIRCHER_GH_REPO"] = a.repo
         r = derive(a.item, a.code, a.pr, a.issue,
                    deps=live_deps(a.item, repo=a.repo, reviewer=a.reviewer,
-                                  server=a.server, bundle_dir=a.bundle_dir),
+                                  server=a.server, bundle_dir=a.bundle_dir,
+                                  poll_interval=a.poll_interval),
                    rerun_max=int(os.environ.get("BIRCHER_CI_RERUN_MAX") or 4))
         print(r.as_line(), end="")
         return RC_OK

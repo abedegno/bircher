@@ -2219,6 +2219,35 @@ _reconcile_item_pr() {
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
 # `issue` (optional) enables the issue-linkage PR fallback when both signal and
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
+# _derive_budget -> seconds the Python derivation may take.
+#
+# DERIVED, not a constant. A fixed 1800 was SHORTER THAN THE WORK IT BOUNDED:
+# the derivation may wait BIRCHER_CI_WAIT (1500) for CI, then re-run up to
+# BIRCHER_CI_RERUN_MAX (4) times, each waiting BIRCHER_CI_RERUN_WAIT (900) plus
+# a settle -- 5180s of legitimate work inside a 1800s cap. A healthy infra
+# recovery was killed mid-rerun and reported as a crashed derivation, and the
+# three knobs above accepted values that could never be spent.
+#
+# The bash this replaced had NO whole-derivation cap at all, so a budget that
+# cannot cut a legitimate run short is also the faithful behaviour.
+_derive_budget() {
+  local w r rw floor
+  w=$(_clamp_int "${BIRCHER_CI_WAIT:-1500}" 1500 1 7200)
+  r=$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-4}" 4 0 20)
+  rw=$(_clamp_int "${BIRCHER_CI_RERUN_WAIT:-900}" 900 1 7200)
+  # +20s settle per rerun (coordinator.ci.rerun_and_wait), +120s slack for
+  # process start, the review dispatch and the effect calls.
+  floor=$(( w + r * (rw + 20) + 120 ))
+  if [ -n "${BIRCHER_DERIVE_TIMEOUT:-}" ]; then
+    # An explicit operator value is honoured -- but say so when it cannot
+    # cover the budgets the other knobs already promise.
+    [ "$BIRCHER_DERIVE_TIMEOUT" -lt "$floor" ] 2>/dev/null \
+      && echo "[batch:derive] WARN BIRCHER_DERIVE_TIMEOUT=$BIRCHER_DERIVE_TIMEOUT is below the ${floor}s the CI wait/rerun settings can legitimately spend -> a healthy recovery may be cut short" >&2
+    printf '%s' "$BIRCHER_DERIVE_TIMEOUT"; return
+  fi
+  printf '%s' "$floor"
+}
+
 observe_outcome() {  # <item> <code> <pr> [issue]
   # THE DERIVATION, in Python since 2026-08-29. What was 192 lines here is now
   # v2/coordinator/outcome.py with eighteen tests driving it directly, plus its
@@ -2232,14 +2261,21 @@ observe_outcome() {  # <item> <code> <pr> [issue]
   #
   # Emits the same SEVEN fields it always did:
   #   outcome|review|note|head|ci|ci_first|resubmissions
-  local out=""
+  local out="" _budget _rc=0
+  _budget=$(_derive_budget)
   out=$( PYTHONPATH="$(_kernel_pythonpath)" \
-         _net_run "${BIRCHER_DERIVE_TIMEOUT:-1800}" \
+         _net_run "$_budget" \
          "${BIRCHER_PY:-python3}" -m coordinator.cli derive \
            --item "$1" --code "${2:-}" --pr "${3:-}" --issue "${4:-}" \
            --reviewer "$RECOVERY_REVIEWER" --repo "$REPO" \
-           --server "$SERVER" --bundle-dir "$BUNDLE_DIR"
-  ) || out=""
+           --server "$SERVER" --bundle-dir "$BUNDLE_DIR" \
+           --poll-interval "$MAIN_CI_POLL_INTERVAL"
+  ) || { _rc=$?; out=""; }
+  # A TIMEOUT AND A CRASH BOTH YIELD AN EMPTY TUPLE, and the caller correctly
+  # escalates either way -- but a human reading the log cannot tell them apart,
+  # and they call for opposite responses (raise the budget vs fix the code).
+  # `timeout` reports 124.
+  [ "$_rc" = 124 ] && echo "[batch:derive] $1: derivation exceeded its ${_budget}s budget -> escalating (this is a BUDGET failure, not a crash)" >&2
   # An EMPTY tuple is a CRASH, not a verdict -- the caller checks for it and
   # escalates rather than reading outcome="" as "NOT ready".
   printf '%s' "$out"

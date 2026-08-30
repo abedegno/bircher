@@ -150,7 +150,7 @@ def run_ids_from_links(lines: str, ignore: str = DEFAULT_IGNORED) -> list[str]:
 
 
 def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
-         interval: int = 30) -> str:
+         interval: int = 30, ignore: str = DEFAULT_IGNORED) -> str:
     """Watch until CI settles, or `pending` if it never does.
 
     `sleep` and `gh` are injected so a test can drive many iterations without
@@ -173,7 +173,7 @@ def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
     while waited < timeout:
         buckets = gh(["pr", "checks", str(pr), "--json", "name,bucket",
                       "-q", r'.[] | "\(.name)|\(.bucket)"'])
-        settled = normalize(keep_blocking(buckets, required))
+        settled = normalize(keep_blocking(buckets, required, ignore))
         if settled != "pending":
             return settled
         sleep(interval)
@@ -209,7 +209,7 @@ def required_contexts(repo: str, *, gh=_gh, cache=None) -> str:
     return out
 
 
-def failure_kind(pr: str, *, gh=_gh) -> str:
+def failure_kind(pr: str, *, gh=_gh, ignore: str = DEFAULT_IGNORED) -> str:
     """`genuine` | `infra` for a RED pr, by counting failed STEPS.
 
     Fails toward `genuine`: `infra` triggers a re-run that costs CI minutes, so
@@ -220,7 +220,7 @@ def failure_kind(pr: str, *, gh=_gh) -> str:
                     "-q", r'.[] | "\(.name)|\(.link)"'])
     except GhError:
         return "genuine"
-    ids = run_ids_from_links(links)
+    ids = run_ids_from_links(links, ignore)
     if not ids:
         return "genuine"
     total = 0
@@ -243,7 +243,8 @@ _RERUNNABLE = ("failure", "cancelled", "timed_out", "startup_failure")
 
 
 def rerun_and_wait(pr: str, required: str, *, gh=_gh, sleep, settle: int = 20,
-                   timeout: int = 900, interval: int = 30) -> str:
+                   timeout: int = 900, interval: int = 30,
+                   ignore: str = DEFAULT_IGNORED) -> str:
     """Re-run the failed runs on a PR, then wait for CI to settle again.
 
     `red` if nothing could be re-run: with no run to retry there is no reason
@@ -255,7 +256,7 @@ def rerun_and_wait(pr: str, required: str, *, gh=_gh, sleep, settle: int = 20,
                     "-q", r'.[] | "\(.name)|\(.link)"'])
     except GhError:
         return "red"
-    ids = run_ids_from_links(links)
+    ids = run_ids_from_links(links, ignore)
     if not ids:
         return "red"
 
@@ -282,5 +283,5 @@ def rerun_and_wait(pr: str, required: str, *, gh=_gh, sleep, settle: int = 20,
     # A moment before polling: the re-run takes a beat to register, and asking
     # immediately reads the OLD conclusion and calls it settled.
     sleep(settle)
-    return poll(pr, required, gh=gh, sleep=sleep, timeout=timeout,
+    return poll(pr, required, gh=gh, sleep=sleep, timeout=timeout, ignore=ignore,
                 interval=interval)

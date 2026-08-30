@@ -11,6 +11,7 @@ the real function rather than a rearrangement of it.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 
@@ -163,9 +164,26 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                     f"not reported):\n\n{reviewer_out}\n\n{summary}")
         else:
             body = f"Outcome derived from the repository: {summary}"
-        key = f"pr-comment:{pr}:{abs(hash(body)) % (16 ** 16):016x}"
-        d.effect("comment", key,
-                 ["gh", "pr", "comment", str(pr), "--body", body])
+        # SHA-256, NOT `hash()`. Python randomises string hashing per process
+        # (PYTHONHASHSEED), so `abs(hash(body))` gave a DIFFERENT key on every
+        # invocation: the idempotency key could never match a previous attempt
+        # and a retry would post a duplicate comment rather than dedupe. The
+        # bash this replaced already did the right thing --
+        # `shasum -a 256 | cut -c1-16` -- and the port regressed it.
+        key = f"pr-comment:{pr}:{hashlib.sha256(body.encode()).hexdigest()[:16]}"
+        # BEST EFFORT, as the bash was (`|| echo WARN`). This comment is
+        # documentation for a human, not part of the decision: the outcome is
+        # derived from the repository and is already correct by the time we get
+        # here. Letting a denied or transient comment failure propagate would
+        # abort the derivation and turn a READY item into an escalation --
+        # a non-essential courtesy blocking a merge.
+        try:
+            d.effect("comment", key,
+                     ["gh", "pr", "comment", str(pr), "--body", body])
+        except Exception as exc:                       # noqa: BLE001
+            d.log(f"{item}: failed to post the derived comment to PR #{pr} "
+                  f"({type(exc).__name__}: {exc}) -> continuing; the outcome "
+                  f"is derived from the repository and is unaffected")
 
     # The sha rides out only on a READY outcome: it is the merge-authorising
     # evidence, and a failed or escalated derivation must never carry one.

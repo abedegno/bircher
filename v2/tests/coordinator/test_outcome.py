@@ -200,3 +200,58 @@ def test_the_reviewer_vendor_is_carried_into_the_verdict():
     d.reviewer = "claude_code"
     r = derive("i1", "i1", "7", "", deps=d)
     assert r.review == "claude_code:pass"
+
+
+# --- Cross-vendor review findings, 2026-08-30 (codex adversarial review) -----
+# Four defects, none of which the 910-test suite or the field-by-field live
+# acceptance could see: the acceptance compared OUTPUTS on a happy path, and
+# every one of these only changes behaviour on a slow, failing or retried path.
+
+
+def test_the_comment_key_is_stable_for_the_same_body():
+    """`abs(hash(body))` gave a DIFFERENT key every process.
+
+    Python randomises string hashing per process (PYTHONHASHSEED), so the
+    idempotency key could never match a previous attempt: a retry after a
+    reconciliation would post a DUPLICATE comment instead of deduplicating.
+    The bash this replaced hashed with `shasum -a 256 | cut -c1-16`; the port
+    regressed a working mechanism.
+    """
+    import hashlib
+
+    d1 = _deps()
+    derive("i1", "i1", "7", "", deps=d1)
+    d2 = _deps()
+    derive("i1", "i1", "7", "", deps=d2)
+
+    key1 = d1.posted[0][1]
+    key2 = d2.posted[0][1]
+    assert key1 == key2, "identical bodies must produce identical effect keys"
+
+    # Bound to the ACTUAL digest, not merely to equality: two calls to a
+    # broken-but-deterministic function would also be equal.
+    body = d1.posted[0][2][-1]
+    assert key1 == f"pr-comment:7:{hashlib.sha256(body.encode()).hexdigest()[:16]}"
+
+
+def test_a_failing_comment_effect_does_not_abort_the_derivation():
+    """The comment is documentation, not a decision.
+
+    The outcome is derived from the repository and is already correct when the
+    comment is posted. An unhandled effect failure aborted `derive`, which the
+    caller reads as an empty tuple and escalates -- so a denied or transient
+    comment turned a READY item into an escalation. The bash warned and
+    carried on (`|| echo WARN`).
+    """
+    logged = []
+
+    def boom(cls, key, argv):
+        raise RuntimeError("effect refused")
+
+    d = _deps(effect=boom, log=logged.append)
+    r = derive("i1", "i1", "7", "", deps=d)
+
+    assert r.outcome == "ready", "a failed comment must not change the outcome"
+    assert r.as_tuple()[3] == "a" * 40, "the merge-authorising head must survive"
+    assert any("failed to post" in m for m in logged), \
+        "the failure must be visible in the log, not swallowed"
