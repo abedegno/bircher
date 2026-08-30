@@ -220,3 +220,19 @@ def test_all_green_but_still_blocked_is_transient_not_durable():
                    "gate|completed|success\nother|completed|success") == "settling"
     # A FAILING required check is still durable -- waiting cannot fix it.
     assert blocked("gate", "gate|completed|failure") == "defer"
+
+
+def test_an_unreadable_row_snapshot_waits_rather_than_looking_absent():
+    """Found by cross-review, and the same shape as row 1.
+
+    When `_commit_ci_lines` FAILS the caller used to substitute an empty
+    result, so every required context looked ABSENT -- which started the
+    registration grace on an API outage and eventually stranded the PR with
+    'a required check never registered'. The required-SET snapshot already
+    preserved its uncertainty as `?`; the rows did not.
+
+    Uncertainty must survive both reads or neither.
+    """
+    assert blocked("review-gate", "?") == "wait"
+    assert blocked("review-gate", "?") != "absent"
+    assert blocked("a\nb", "?") == "wait"

@@ -190,3 +190,39 @@ def test_the_ceiling_matches_what_net_run_actually_clamps_to():
     assert int(m.group(3)) == NET_RUN_CEILING, (
         f"_net_run now clamps to {m.group(3)}s but this file assumes "
         f"{NET_RUN_CEILING}s")
+
+
+def test_an_explicit_override_is_clamped_to_the_ceiling_too():
+    """The same collapse, one branch over -- found by cross-review.
+
+    The computed budget was clamped to the ceiling, but an explicit
+    BIRCHER_DERIVE_TIMEOUT was returned RAW. So `BIRCHER_DERIVE_TIMEOUT=5300`
+    still reached `_net_run`, still exceeded 3600, and still came back as the
+    300s DEFAULT -- recreating in the override path the exact production
+    failure that had just been fixed in the computed path.
+    """
+    assert _budget(BIRCHER_DERIVE_TIMEOUT="5300") == NET_RUN_CEILING
+    assert _budget(BIRCHER_DERIVE_TIMEOUT="99999") == NET_RUN_CEILING
+    assert _budget(BIRCHER_DERIVE_TIMEOUT="abc") <= NET_RUN_CEILING
+    assert _budget(BIRCHER_DERIVE_TIMEOUT="0") <= NET_RUN_CEILING
+    # A usable value still passes through untouched.
+    assert _budget(BIRCHER_DERIVE_TIMEOUT="900") == 900
+
+
+def test_no_reachable_budget_value_collapses_to_the_net_run_default():
+    """The property behind both instances, stated once.
+
+    Any value `_derive_budget` can return must survive `_net_run`'s clamp
+    unchanged. If it does not, the effective bound is 300 seconds and every
+    caller silently gets a timeout far shorter than the one it asked for.
+    """
+    candidates = [{}, {"BIRCHER_DERIVE_TIMEOUT": "5300"},
+                  {"BIRCHER_DERIVE_TIMEOUT": "99999"},
+                  {"BIRCHER_DERIVE_TIMEOUT": "abc"},
+                  {"BIRCHER_CI_WAIT": "7200", "BIRCHER_CI_RERUN_MAX": "20",
+                   "BIRCHER_CI_RERUN_WAIT": "7200"}]
+    for env in candidates:
+        got = _budget(**env)
+        assert 1 <= got <= NET_RUN_CEILING, (
+            f"{env} yields {got}s, which _net_run would replace with its 300s "
+            "default")

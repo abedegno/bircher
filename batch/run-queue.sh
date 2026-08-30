@@ -1331,7 +1331,10 @@ _restamp_if_delta_unchanged() {
 # <reported_rows> `name|state` lines for the head.
 _classify_blocked() {
   local req="$1" rows="$2" name row_state saw_absent=0 saw_pending=0 saw_bad=0
-  [ "$req" = "?" ] && { printf 'defer'; return; }          # 1: unreadable -> fail closed
+  [ "$req" = "?" ] && { printf 'defer'; return; }          # 1: unreadable required set -> fail closed
+  # 1b: the ROWS could not be read. Unknown, not absent -- so wait, and do NOT
+  # spend the registration grace on an API outage.
+  [ "$rows" = "?" ] && { printf 'wait'; return; }
   [ -z "$req" ]    && { printf 'defer'; return; }          # 2: no required checks -> non-check blocker
   # ROWS ARE `name|status|conclusion`, three fields, and the pair must be read
   # the way `_checkrun_state` reads it. An earlier cut took field 2 alone --
@@ -1447,7 +1450,13 @@ _await_mergeable_state() {
       local req rows snap
       snap=$(_required_contexts_snapshot) || snap=""
       if [ "${snap%%$'\n'*}" = known ]; then req=$(_req_names "${snap#*$'\n'}"); else req="?"; fi
-      rows=$(_commit_ci_lines "$head" "$req") || rows=""
+      # `?` and not "": a FAILED lookup is not an empty result. Discarding the
+      # failure made every required context look ABSENT, started the
+      # registration grace on an API outage, and stranded the PR with "a
+      # required check never registered". The required-SET snapshot already
+      # preserved its uncertainty as `?`; the rows did not, and uncertainty
+      # must survive both reads or neither.
+      rows=$(_commit_ci_lines "$head" "$req") || rows="?"
       verdict=$(_classify_blocked "$req" "$rows")
       if [ "$verdict" = settling ]; then
         # Every required context is green and the PR is still BLOCKED. Bounded
@@ -2480,6 +2489,9 @@ _ci_policy() {
 
 _derive_budget() {
   local w r rw floor
+  # The largest cap `_net_run` will honour. Above it `_clamp_int` returns its
+  # 300s DEFAULT rather than truncating, so this is a cliff, not a ceiling.
+  local ceiling=3600
   read -r w r rw <<<"$(_ci_policy)"
   # +20s settle per rerun (coordinator.ci.rerun_and_wait), +120s slack for
   # process start, the review dispatch and the effect calls.
@@ -2493,17 +2505,21 @@ _derive_budget() {
   #
   # Say so when the configured budgets cannot fit: a bound that cannot cover
   # the work is a real limitation, and silently shrinking it is how this broke.
-  local ceiling=3600
   if [ "$floor" -gt "$ceiling" ]; then
     echo "[batch:derive] WARN the CI wait/rerun settings can spend ${floor}s but a single bounded call tops out at ${ceiling}s -> using ${ceiling}s; lower BIRCHER_CI_WAIT or BIRCHER_CI_RERUN_MAX to fit" >&2
     floor=$ceiling
   fi
   if [ -n "${BIRCHER_DERIVE_TIMEOUT:-}" ]; then
-    # An explicit operator value is honoured -- but say so when it cannot
-    # cover the budgets the other knobs already promise.
-    [ "$BIRCHER_DERIVE_TIMEOUT" -lt "$floor" ] 2>/dev/null \
-      && echo "[batch:derive] WARN BIRCHER_DERIVE_TIMEOUT=$BIRCHER_DERIVE_TIMEOUT is below the ${floor}s the CI wait/rerun settings can legitimately spend -> a healthy recovery may be cut short" >&2
-    printf '%s' "$BIRCHER_DERIVE_TIMEOUT"; return
+    # CLAMPED, not returned raw. Returning it raw recreated the very collapse
+    # this helper exists to prevent: BIRCHER_DERIVE_TIMEOUT=5300 reached
+    # `_net_run`, exceeded its 3600 ceiling, and `_clamp_int` handed back its
+    # 300s DEFAULT. The same defect, one branch over from where it was fixed.
+    local want; want=$(_clamp_int "$BIRCHER_DERIVE_TIMEOUT" "$floor" 1 "$ceiling")
+    [ "$want" != "$BIRCHER_DERIVE_TIMEOUT" ] \
+      && echo "[batch:derive] WARN BIRCHER_DERIVE_TIMEOUT=$BIRCHER_DERIVE_TIMEOUT is not usable (1-${ceiling}s) -> using ${want}s" >&2
+    [ "$want" -lt "$floor" ] 2>/dev/null \
+      && echo "[batch:derive] WARN the derive timeout ${want}s is below the ${floor}s the CI wait/rerun settings can legitimately spend -> a healthy recovery may be cut short" >&2
+    printf '%s' "$want"; return
   fi
   printf '%s' "$floor"
 }
