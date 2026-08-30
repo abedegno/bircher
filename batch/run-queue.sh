@@ -2288,7 +2288,9 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
     echo "[batch:recover-pr] $code: recovery produced NO tuple -> it failed; PR left untouched for a human" >&2
     return 1
   fi
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ <<EOF
+  # Eight fields; the last three are unused here. Named explicitly rather than
+  # left to a trailing `_` to absorb, so a width change is a visible edit.
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ _ <<EOF
 $rec
 EOF
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
@@ -3923,12 +3925,32 @@ ${prompt}"
     # wearing a verdict's clothes.
     if [ -z "${obs//[[:space:]]/}" ]; then
       echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown|"
+      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||"
     fi
-    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions <<EOF
+    # EIGHT fields. The last is the PR the DERIVATION settled on, which is not
+    # always the one passed in: it discards an abandoned PR, discovers one by
+    # code or issue linkage, and adopts a CI-green sibling. Reading seven
+    # absorbed the eighth into `resubmissions` silently -- `read` does not
+    # error on a short variable list, it concatenates the remainder into the
+    # last name.
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr <<EOF
 $obs
 EOF
     : "${outcome:=timeout}" "${ci_first:=unknown}"
+    # ADOPT IT BEFORE THE MERGE AUTHORIZATION, not after. `$pr` feeds the
+    # kernel merge command, the merge itself and the scorecard line, so a
+    # stale value authorizes one PR and reports another. On muesli #723 the
+    #
+    # (The kernel command is not named literally here on purpose:
+    # `test_the_merge_request_redispatches_as_implementer` slices this
+    # function between the FIRST occurrence of two identifiers, so naming one
+    # in a comment above the real call gives it an empty slice to search.)
+    # derivation reviewed #738, posted its cross-review there, and the caller
+    # then tried to merge #737 -- which the implementer had already closed.
+    if [ -n "${_settled_pr:-}" ] && [ "${_settled_pr}" != "${pr:-}" ]; then
+      echo "[batch] $item: derivation settled on PR #$_settled_pr (was ${pr:-none}) -> adopting" >&2
+      pr="$_settled_pr"
+    fi
 
     # The kernel lifecycle, unchanged in order and in roles. Its INPUTS are now
     # observations; the sequence is the one the marker branch used to drive.
@@ -4573,7 +4595,7 @@ SH
   # for the branch lookup, so they are `unknown` and empty -- which is the
   # correct answer to "no history was visible", and is pinned here so a change
   # that starts inventing `false|0` on a failed lookup is caught.
-  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7" ] \
     || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -4592,7 +4614,7 @@ SH
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown|" ] \
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||" ] \
     || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "observe_outcome OK"
@@ -4630,7 +4652,11 @@ SH
   local rec_disc
   rec_disc=$(PATH="$ddir:$PATH" WORKDIR="$ddir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex observe_outcome i300 i300 "")
-  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  # The eighth field is 300: this case passes an EMPTY pr and the derivation
+  # DISCOVERS it, so the field carrying it back is exactly what this asserts.
+  # Before the field existed the discovery was used internally and the caller
+  # never learned of it.
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -4695,7 +4721,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown|" ] \
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"

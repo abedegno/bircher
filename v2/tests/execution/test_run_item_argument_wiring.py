@@ -227,9 +227,9 @@ def _heredoc_to_herestring(run_item_src):
     pairs = [
         (
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            "resubmissions <<EOF\n$obs\nEOF",
+            "resubmissions _settled_pr <<EOF\n$obs\nEOF",
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            'resubmissions <<< "$obs"',
+            'resubmissions _settled_pr <<< "$obs"',
         ),
     ]
     for old, new in pairs:

@@ -74,16 +74,32 @@ class Derived:
     ci: str
     ci_first: str
     resubmissions: object
+    #: THE PR THIS DERIVATION ACTUALLY SETTLED ON, which is not always the one
+    #: the caller passed in. `_settle_pr` discards an abandoned PR, discovers
+    #: one by code or issue linkage, and adopts a CI-green sibling. All three
+    #: were used internally -- the review, the status and the comment all went
+    #: to the right PR -- and none of it reached the caller, which went on to
+    #: authorize and merge the number it started with. muesli #723: the
+    #: derivation reviewed #738 and the caller tried to merge closed #737.
+    pr: str = ""
 
     def as_tuple(self):
         return (self.outcome, self.review, self.note, self.sha, self.ci,
-                self.ci_first, self.resubmissions)
+                self.ci_first, self.resubmissions, self.pr)
+
+    #: Field count, so a consumer can assert it rather than assume it. The
+    #: absorption hazard below is silent, and silence is what made the missing
+    #: `pr` field survive a live run that looked like it worked.
+    FIELDS = 8
 
     def as_line(self) -> str:
-        """The seven-field form the shell parses. A caller reading six absorbs
-        the last into its neighbour, silently."""
+        """The EIGHT-field form the shell parses. A caller reading seven
+        absorbs the last into its neighbour, silently -- `read -r a b c` puts
+        every remaining field into `c`, so a short reader does not error, it
+        corrupts one value."""
         r = "" if self.resubmissions is None else self.resubmissions
-        return f"{self.outcome}|{self.review}|{self.note}|{self.sha}|{self.ci}|{self.ci_first}|{r}"
+        return (f"{self.outcome}|{self.review}|{self.note}|{self.sha}|"
+                f"{self.ci}|{self.ci_first}|{r}|{self.pr}")
 
 
 def _settle_pr(item, code, pr, issue, d: Deps) -> str:
@@ -140,7 +156,7 @@ def _settle_ci(item, pr, d: Deps, rerun_max: int) -> str:
 
 def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
            rerun_max: int = 4) -> Derived:
-    """The whole derivation. Returns the seven fields."""
+    """The whole derivation. Returns the eight fields."""
     d = deps
     pr = _settle_pr(item, code, pr, issue, d)
 
@@ -210,4 +226,4 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
     # evidence, and a failed or escalated derivation must never carry one.
     sha_out = reviewed_sha if o.outcome == "ready" else ""
     return Derived(o.outcome, o.review, o.note, sha_out, o.ci,
-                   ci_first, resubmissions)
+                   ci_first, resubmissions, str(pr or ""))

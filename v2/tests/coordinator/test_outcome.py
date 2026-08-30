@@ -5,7 +5,7 @@ rather than a rearrangement of it.
 """
 import pytest
 
-from coordinator.outcome import Deps, derive
+from coordinator.outcome import Deps, Derived, derive
 
 
 def _deps(**over):
@@ -22,12 +22,15 @@ def _deps(**over):
     return d
 
 
-def test_the_tuple_has_seven_fields_in_order():
+def test_the_tuple_has_eight_fields_in_order():
+    """Eight since the settled PR joined it. The width is asserted against
+    `Derived.FIELDS` as well as the literal, because the shell's reader is
+    checked against that constant and two numbers that can disagree will."""
     r = derive("i1", "i1", "7", "", deps=_deps())
-    assert len(r.as_tuple()) == 7
+    assert len(r.as_tuple()) == 8 == Derived.FIELDS
     assert r.outcome == "ready"
-    assert r.as_tuple()[5:] == ("true", 0)
-    assert len(r.as_line().split("|")) == 7
+    assert r.as_tuple()[5:] == ("true", 0, "7")
+    assert len(r.as_line().split("|")) == Derived.FIELDS
 
 
 def test_a_red_pr_never_reaches_the_reviewer():
@@ -170,7 +173,10 @@ def test_an_unknown_history_leaves_the_resubmission_field_empty():
     d = _deps(branch_of=lambda pr: "")
     r = derive("i1", "i1", "7", "", deps=d)
     assert (r.ci_first, r.resubmissions) == ("unknown", None)
-    assert r.as_line().endswith("|unknown|")
+    # The empty resubmissions field is now followed by the settled PR, so the
+    # assertion names the pair rather than the line's end -- otherwise adding
+    # any field silently stops this from checking what it claims to.
+    assert "|unknown||" in r.as_line(), r.as_line()
 
 
 def test_the_reviewers_findings_are_kept_in_the_comment():
@@ -352,3 +358,32 @@ def test_the_comment_is_addressed_to_the_repository_under_management():
     assert "--repo" in argv, "the comment effect must name its repository"
     assert argv[argv.index("--repo") + 1] == "owner/target", (
         f"the comment was addressed to the wrong repository: {argv}")
+
+
+def test_derive_returns_the_pr_it_settled_on_not_the_one_passed_in():
+    """End to end through `derive`, which is where the loss happened.
+
+    The unit tests for `_settle_pr` already proved it picks the right PR. None
+    of them proved the answer LEFT the function -- and it did not.
+    """
+    d = _deps(pr_state=lambda pr: ("CLOSED", None),
+              discover_by_code=lambda code: ["738"],
+              reconcile=lambda code, pr: pr)
+    r = derive("i723", "i723", "737", "", deps=d)
+    assert r.pr == "738", (
+        "derive discarded the abandoned #737 and discovered #738, but returned "
+        f"{r.pr!r} to the caller that has to merge it")
+    assert r.as_line().split("|")[-1] == "738"
+
+
+def test_derive_returns_a_reconciled_sibling():
+    """The muesli #723 shape exactly: a CI-green sibling is adopted."""
+    d = _deps(reconcile=lambda code, pr: "738")
+    r = derive("i723", "i723", "737", "", deps=d)
+    assert r.pr == "738"
+
+
+def test_derive_returns_the_original_pr_when_nothing_changed():
+    """The common case must round-trip, or the caller adopts a wrong value."""
+    r = derive("i1", "i1", "7", "", deps=_deps())
+    assert r.pr == "7"
