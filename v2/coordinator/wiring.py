@@ -136,8 +136,14 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         discover_by_issue=lambda issue: discovery.by_issue(repo, issue),
         reconcile=lambda code, pr: discovery.reconcile(
             repo, code, pr, ci_of=ci_of, close=close_sibling),
+        # `gh=_gh` is NOT optional here: `poll` is the one ci_mod entry point
+        # whose `gh` has no default, and omitting it raised TypeError on the
+        # exact branch this dep exists for -- a PENDING CI. Every unit test
+        # injects its own `wait_ci`, so nothing exercised the wired one, and
+        # the live acceptance happened to run against a PR whose CI had
+        # already settled.
         wait_ci=lambda pr: ci_mod.poll(
-            pr, required(), sleep=time.sleep,
+            pr, required(), gh=_gh, sleep=time.sleep,
             timeout=_int("BIRCHER_CI_WAIT", 1500), interval=interval,
             ignore=ignore),
         required=required(),

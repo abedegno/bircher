@@ -226,12 +226,57 @@ def test_the_comment_key_is_stable_for_the_same_body():
 
     key1 = d1.posted[0][1]
     key2 = d2.posted[0][1]
-    assert key1 == key2, "identical bodies must produce identical effect keys"
+    # NOTE: this equality DOES NOT BIND the defect. `hash()` is stable WITHIN
+    # a process, so both derives agree even with the bug present -- confirmed
+    # by mutation: restoring `abs(hash(body))` left this assertion passing and
+    # only the digest assertion below went red. It is kept as documentation of
+    # the property, not as the guard.
+    assert key1 == key2
 
-    # Bound to the ACTUAL digest, not merely to equality: two calls to a
-    # broken-but-deterministic function would also be equal.
+    # THIS is the binding assertion: the key must equal a specific,
+    # process-independent digest, which `hash()` cannot produce.
     body = d1.posted[0][2][-1]
     assert key1 == f"pr-comment:7:{hashlib.sha256(body.encode()).hexdigest()[:16]}"
+
+
+def test_the_comment_key_survives_a_different_hash_seed():
+    """The real property, across PROCESSES -- which is where it broke.
+
+    Python randomises string hashing per interpreter, so the same comment body
+    produced a different idempotency key on every run and a retry could never
+    match a previous attempt. Two subprocesses with deliberately different
+    PYTHONHASHSEED values must agree.
+    """
+    import subprocess
+    import sys
+
+    prog = (
+        "import hashlib,sys;"
+        "body='outcome=ready ci=green';"
+        "print(f'pr-comment:7:{hashlib.sha256(body.encode()).hexdigest()[:16]}')"
+    )
+    outs = []
+    for seed in ("0", "12345"):
+        r = subprocess.run([sys.executable, "-c", prog], capture_output=True,
+                           text=True, env={"PYTHONHASHSEED": seed,
+                                           "PATH": "/usr/bin:/bin"})
+        assert r.returncode == 0, r.stderr
+        outs.append(r.stdout.strip())
+    assert outs[0] == outs[1], (
+        "the key formula must not depend on the interpreter's hash seed")
+
+    # And prove the OLD formula would have failed this very test.
+    old = ("body='outcome=ready ci=green';"
+           "print(f'{abs(hash(body)) % (16 ** 16):016x}')")
+    olds = []
+    for seed in ("0", "12345"):
+        r = subprocess.run([sys.executable, "-c", old], capture_output=True,
+                           text=True, env={"PYTHONHASHSEED": seed,
+                                           "PATH": "/usr/bin:/bin"})
+        olds.append(r.stdout.strip())
+    assert olds[0] != olds[1], (
+        "if this ever passes, `hash()` stopped being seed-dependent and this "
+        "test no longer demonstrates what it claims")
 
 
 def test_a_failing_comment_effect_does_not_abort_the_derivation():

@@ -650,3 +650,67 @@ def test_the_default_runner_merges_stderr_into_stdout():
     src = inspect.getsource(mod.dispatch)
     assert "stderr=subprocess.STDOUT" in src
     assert "capture_output=True" not in src
+
+
+# --- BIRCHER_CI_IGNORE_CHECKS reaches the CONSUMERS, not just the reader -----
+# Mutation evidence (2026-08-30): discarding the operator override in
+# `live_deps` was caught only INCIDENTALLY, by the boundary contract noticing
+# the variable stopped being read. Nothing bound that the value threaded
+# through to `poll`, `failure_kind` and `rerun_and_wait` -- the
+# bound-at-the-producer-not-the-consumer shape. These bind the consumers.
+
+def test_poll_honours_a_custom_ignore_pattern():
+    """A check named in the override must not hold the poll open."""
+    from coordinator import ci as ci_mod
+    lines = "build|pass\nflaky-lint|pending"
+    gh = lambda argv: lines
+    # Default ignore list: `flaky-lint` is required and pending, so poll waits
+    # out its whole budget and reports pending.
+    assert ci_mod.poll("7", "build\nflaky-lint", gh=gh, sleep=lambda _: None,
+                       timeout=60, interval=30) == "pending"
+    # With the override, the only blocking row left is green.
+    assert ci_mod.poll("7", "build\nflaky-lint", gh=gh, sleep=lambda _: None,
+                       timeout=60, interval=30,
+                       ignore="Dependabot|review-gate|flaky-lint") == "green"
+
+
+def test_failure_kind_honours_a_custom_ignore_pattern():
+    """The second consumer: an ignored check's run must not be inspected."""
+    from coordinator import ci as ci_mod
+    seen = []
+    def gh(argv):
+        seen.append(argv)
+        if argv[1] == "checks":
+            return "flaky-lint|https://github.com/o/r/actions/runs/999/job/1"
+        return '{"jobs": []}'
+    ci_mod.failure_kind("7", gh=gh, ignore="Dependabot|review-gate|flaky-lint")
+    assert not any(a[:2] == ["run", "view"] for a in seen), (
+        "an ignored check's run was inspected anyway -- the pattern did not "
+        "reach run_ids_from_links")
+
+
+def test_live_deps_threads_the_override_all_the_way_to_the_verdict(monkeypatch):
+    """End of the chain: the operator's env var must change what the WIRED
+    reader reports, not merely be read into a local variable.
+
+    Mutation evidence: discarding the override in `live_deps` was caught only
+    incidentally, by the boundary contract noticing the variable stopped being
+    read. Nothing bound that the value reached its consumers.
+    """
+    import coordinator.wiring as w
+
+    monkeypatch.setattr(w, "_gh", lambda argv: "build|pass\nflaky-lint|fail")
+    monkeypatch.setattr(w.ci_mod, "required_contexts",
+                        lambda repo, **kw: "build\nflaky-lint")
+
+    monkeypatch.delenv("BIRCHER_CI_IGNORE_CHECKS", raising=False)
+    plain = w.live_deps("i", repo="o/r", reviewer="c", server="s",
+                        bundle_dir=".", poll_interval=0)
+    assert plain.wait_ci("7") == "red", "a failing required check must read red"
+
+    monkeypatch.setenv("BIRCHER_CI_IGNORE_CHECKS",
+                       "Dependabot|review-gate|flaky-lint")
+    overridden = w.live_deps("i", repo="o/r", reviewer="c", server="s",
+                             bundle_dir=".", poll_interval=0)
+    assert overridden.wait_ci("7") == "green", (
+        "BIRCHER_CI_IGNORE_CHECKS did not reach the wired CI reader")
