@@ -11,12 +11,46 @@ produce the text stay with their callers for now.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 
 #: Checks that never block a merge. `review-gate` MUST stay excluded or the
 #: derivation DEADLOCKS: it stays pending until a cross-vendor review is posted,
 #: and the caller is the thing about to post one. Each waits for the other.
 #: Seen on muesli PR #549, which hung with every other check green.
+class GhError(Exception):
+    """`gh` failed. Distinct from "gh succeeded and returned nothing"."""
+
+
+#: The repo `_gh` adds to subcommands that accept it. Set by `cli derive`
+#: from its own `--repo` argument -- NOT read from `REPO`, which run-queue.sh
+#: never exports.
+#:
+#: Subcommands that take `--repo`. `gh api` does NOT: it carries the repo in
+#: the URL and REJECTS the flag outright.
+#:
+#: Appending `--repo` unconditionally made every `gh api` call fail, so
+#: `head_of` returned an empty sha, no merge could be pinned, and a green PR
+#: escalated instead of merging. The self-test's shim ignored unknown
+#: arguments, so it passed; the live run on the smoke repo did not. A stub more
+#: permissive than the real tool hides exactly this.
+_TAKES_REPO = ("pr", "issue", "run", "release", "workflow", "cache")
+
+
+def _gh(args: list[str]) -> str:
+    """The default runner. Injected in tests so none of this needs network."""
+    repo = os.environ.get("BIRCHER_GH_REPO") or ""
+    takes_repo = bool(args) and args[0] in _TAKES_REPO
+    cmd = ["gh", *args] + (["--repo", repo]
+                           if repo and takes_repo and "--repo" not in args else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise GhError(r.stderr.strip()[:200])
+    return r.stdout
+
+
 DEFAULT_IGNORED = "Dependabot|review-gate"
 
 
@@ -116,7 +150,7 @@ def run_ids_from_links(lines: str, ignore: str = DEFAULT_IGNORED) -> list[str]:
 
 
 def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
-         interval: int = 30) -> str:
+         interval: int = 30, ignore: str = DEFAULT_IGNORED) -> str:
     """Watch until CI settles, or `pending` if it never does.
 
     `sleep` and `gh` are injected so a test can drive many iterations without
@@ -139,9 +173,115 @@ def poll(pr: str, required: str, *, gh, sleep, timeout: int = 900,
     while waited < timeout:
         buckets = gh(["pr", "checks", str(pr), "--json", "name,bucket",
                       "-q", r'.[] | "\(.name)|\(.bucket)"'])
-        settled = normalize(keep_blocking(buckets, required))
+        settled = normalize(keep_blocking(buckets, required, ignore))
         if settled != "pending":
             return settled
         sleep(interval)
         waited += interval
     return "pending"
+
+
+def required_contexts(repo: str, *, gh=_gh, cache=None) -> str:
+    """The contexts branch protection requires, newline separated.
+
+    UNIONS BOTH SHAPES. Protection reports required checks under `contexts`
+    (legacy) and `checks[].context` (current), and a repo may use either;
+    reading one would leave the other's checks non-blocking.
+
+    EMPTY on any failure, which downstream means "everything blocks" -- the
+    conservative reading. Inventing a list would silently make real checks
+    non-blocking, and that failure cannot be noticed from the outside.
+    """
+    if cache is not None and "v" in cache:
+        return cache["v"]
+    try:
+        branch = os.environ.get("MAIN_BRANCH") or "main"
+        d = json.loads(gh(["api", f"repos/{repo}/branches/{branch}/protection"]))
+        rsc = (d or {}).get("required_status_checks") or {}
+        names = set(rsc.get("contexts") or [])
+        names |= {c.get("context") for c in (rsc.get("checks") or [])
+                  if isinstance(c, dict) and c.get("context")}
+        out = "\n".join(sorted(n for n in names if n))
+    except (GhError, ValueError, AttributeError, TypeError):
+        out = ""
+    if cache is not None:
+        cache["v"] = out
+    return out
+
+
+def failure_kind(pr: str, *, gh=_gh, ignore: str = DEFAULT_IGNORED) -> str:
+    """`genuine` | `infra` for a RED pr, by counting failed STEPS.
+
+    Fails toward `genuine`: `infra` triggers a re-run that costs CI minutes, so
+    an unreadable run must not spend them on a guess.
+    """
+    try:
+        links = gh(["pr", "checks", str(pr), "--json", "name,link",
+                    "-q", r'.[] | "\(.name)|\(.link)"'])
+    except GhError:
+        return "genuine"
+    ids = run_ids_from_links(links, ignore)
+    if not ids:
+        return "genuine"
+    total = 0
+    for rid in ids:
+        try:
+            jobs = json.loads(gh(["run", "view", rid, "--json", "jobs"])).get("jobs") or []
+        except (GhError, ValueError, AttributeError):
+            return "genuine"
+        for job in jobs:
+            if job.get("conclusion") in ("failure", "cancelled"):
+                total += sum(1 for st in (job.get("steps") or [])
+                             if st.get("conclusion") == "failure")
+    return classify_failure(total)
+
+
+#: States that mean a run can usefully be re-run. A SUCCESSFUL run must never
+#: be: `gh run rerun` on a green run burns CI for no reason and can turn a
+#: green PR amber while it repeats.
+_RERUNNABLE = ("failure", "cancelled", "timed_out", "startup_failure")
+
+
+def rerun_and_wait(pr: str, required: str, *, gh=_gh, sleep, settle: int = 20,
+                   timeout: int = 900, interval: int = 30,
+                   ignore: str = DEFAULT_IGNORED) -> str:
+    """Re-run the failed runs on a PR, then wait for CI to settle again.
+
+    `red` if nothing could be re-run: with no run to retry there is no reason
+    to wait, and reporting anything else would claim an outcome the retry never
+    produced.
+    """
+    try:
+        links = gh(["pr", "checks", str(pr), "--json", "name,link",
+                    "-q", r'.[] | "\(.name)|\(.link)"'])
+    except GhError:
+        return "red"
+    ids = run_ids_from_links(links, ignore)
+    if not ids:
+        return "red"
+
+    did = False
+    for rid in ids:
+        try:
+            conc = (json.loads(gh(["run", "view", rid, "--json", "conclusion"]))
+                    or {}).get("conclusion")
+        except (GhError, ValueError, AttributeError):
+            continue
+        if conc not in _RERUNNABLE:
+            continue
+        try:
+            gh(["run", "rerun", rid, "--failed"])
+        except GhError:
+            try:
+                gh(["run", "rerun", rid])
+            except GhError:
+                continue
+        did = True
+
+    if not did:
+        return "red"
+    # A moment before polling: the re-run takes a beat to register, and asking
+    # immediately reads the OLD conclusion and calls it settled.
+    sleep(settle)
+    return poll(pr, required, gh=gh, sleep=sleep, timeout=timeout, ignore=ignore,
+                interval=interval)

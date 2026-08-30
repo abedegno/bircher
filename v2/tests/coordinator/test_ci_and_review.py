@@ -5,12 +5,14 @@ it disagrees with the code it replaces on an input nobody thought of. So the
 property tests below are paired with tests that run the ORIGINAL bash and the
 new Python on the same inputs and require identical answers.
 """
+import json
 import pathlib
 import subprocess
 
 import pytest
 
-from coordinator.ci import classify_failure, drop_ignored, keep_blocking, normalize
+from coordinator.ci import (GhError, classify_failure, drop_ignored,
+                            keep_blocking, normalize)
 from coordinator.review import extract_verdict
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -375,3 +377,340 @@ def test_poll_applies_the_required_contexts_filter():
     """Otherwise a non-required flaky check would hold every PR pending."""
     gh = _gh_returning("build|pass\nflaky|pending")
     assert poll("1", "build", gh=gh, sleep=lambda _s: None) == "green"
+
+
+# --- required contexts and failure kind (plan task 1) ------------------------
+
+from coordinator.ci import failure_kind, required_contexts
+
+
+def test_required_contexts_unions_both_shapes():
+    """Branch protection reports required checks under TWO keys, and a repo can
+    use either. Reading one would leave the other's checks non-blocking."""
+    payload = {"required_status_checks": {
+        "contexts": ["build"],
+        "checks": [{"context": "test"}, {"context": "build"}]}}
+    gh = lambda args: json.dumps(payload)
+    assert sorted(required_contexts("o/r", gh=gh).split()) == ["build", "test"]
+
+
+def test_required_contexts_is_EMPTY_when_the_lookup_fails():
+    """Empty means "everything blocks" downstream, which is conservative.
+    Inventing a context list would make real checks non-blocking."""
+    def boom(args):
+        raise GhError("404")
+    assert required_contexts("o/r", gh=boom) == ""
+
+
+def test_required_contexts_is_fetched_once():
+    calls = []
+
+    def gh(args):
+        calls.append(args)
+        return json.dumps({"required_status_checks": {"contexts": ["build"]}})
+
+    cache = {}
+    required_contexts("o/r", gh=gh, cache=cache)
+    required_contexts("o/r", gh=gh, cache=cache)
+    assert len(calls) == 1, "branch protection is fetched once per run"
+
+
+def test_a_red_run_with_failed_steps_is_genuine():
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        return json.dumps({"jobs": [{"conclusion": "failure",
+                                     "steps": [{"conclusion": "failure"}]}]})
+    assert failure_kind("7", gh=gh) == "genuine"
+
+
+def test_a_red_run_with_NO_failed_step_is_infrastructure():
+    """B-5: a runner never acquired, or a cancelled job, fails with zero failed
+    steps. Burying those as `failed` buried three green PRs in one incident."""
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        return json.dumps({"jobs": [{"conclusion": "cancelled", "steps": []}]})
+    assert failure_kind("7", gh=gh) == "infra"
+
+
+def test_an_unreadable_run_is_GENUINE_not_infra():
+    """Fails toward NOT re-running. `infra` triggers a re-run that costs CI
+    minutes; if we cannot see why a run failed, spending them is a guess."""
+    def gh(args):
+        if args[0] == "pr":
+            return "build|https://github.com/o/r/actions/runs/1"
+        raise GhError("boom")
+    assert failure_kind("7", gh=gh) == "genuine"
+
+
+def test_a_pr_with_no_workflow_runs_is_genuine():
+    assert failure_kind("7", gh=lambda a: "external|https://example.com/x") == "genuine"
+
+
+# --- the review prompt and dispatch (plan task 5 prerequisite) ---------------
+
+from coordinator.review import dispatch, review_prompt
+
+
+def test_the_rendered_prompt_is_byte_identical_to_the_bash():
+    """Prose carrying scars (#705, #666, #66). A paraphrase would drop one
+    silently, so both are rendered and compared rather than eyeballed."""
+    src = RUN_QUEUE.read_text().splitlines()
+    i = next(k for k, l in enumerate(src)
+             if l.startswith("_recovery_review_prompt() {"))
+    end = next(k for k in range(i + 1, len(src)) if src[k] == "}")
+    fn = "\n".join(src[i:end + 1])
+    script = (f'set -uo pipefail\nREPO="$REPO_IN"\n{fn}\n'
+              '_recovery_review_prompt "$PR_IN" "$SHA_IN"')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "REPO_IN": "o/r",
+                            "PR_IN": "7", "SHA_IN": "abc123"})
+    assert r.stdout.rstrip("\n") == review_prompt("7", "o/r", "abc123").rstrip("\n")
+
+
+def test_an_absent_sha_falls_back_to_FETCH_HEAD():
+    assert "FETCH_HEAD" in review_prompt("7", "o/r", "")
+    assert "FETCH_HEAD" not in review_prompt("7", "o/r", "a" * 40)
+
+
+class _R:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+
+
+def test_dispatch_reads_the_verdict(tmp_path):
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(0, "findings\nVERDICT: PASS"))
+    assert v == "PASS"
+
+
+def test_a_dead_reviewer_returns_NO_verdict_without_reading_its_output(tmp_path):
+    """Mining a crashed reviewer's stdout would let one that echoed its own
+    prompt authorise a merge."""
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(1, "VERDICT: PASS"))
+    assert v is None
+
+
+def test_the_prompt_and_reviewer_reach_the_runner(tmp_path):
+    seen = {}
+
+    def run(argv, cwd):
+        seen["argv"], seen["cwd"] = argv, cwd
+        return _R(0, "VERDICT: PASS")
+
+    dispatch("7", "o/r", "dead", reviewer="claude_code", bundle_dir="/b",
+             server="http://s", log_path=str(tmp_path / "l"), run=run)
+    assert seen["cwd"] == "/b"
+    assert "agents/claude_code" in seen["argv"]
+    assert any("dead" in a for a in seen["argv"]), "the sha must reach the prompt"
+
+
+# --- re-running an infrastructure failure ------------------------------------
+
+from coordinator.ci import rerun_and_wait
+
+
+def _gh_script(responses):
+    """Answer by command shape rather than call order."""
+    seen = []
+
+    def gh(args):
+        seen.append(args)
+        for key, val in responses.items():
+            if all(k in " ".join(args) for k in key.split()):
+                if isinstance(val, Exception):
+                    raise val
+                return val
+        return ""
+    gh.seen = seen
+    return gh
+
+
+def test_a_failed_run_is_re_run_then_polled():
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "failure"}),
+        "run rerun": "",
+    })
+    out = rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None)
+    assert any("rerun" in " ".join(a) for a in gh.seen)
+    assert out in ("green", "red", "pending")
+
+
+def test_a_SUCCESSFUL_run_is_never_re_run():
+    """`gh run rerun` on a green run burns CI for no reason and can turn a
+    green PR amber while it repeats."""
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "success"}),
+    })
+    assert rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None) == "red"
+    assert not any("rerun" in " ".join(a) for a in gh.seen)
+
+
+def test_nothing_to_re_run_is_red_without_waiting():
+    """With no run to retry there is no reason to wait, and reporting anything
+    else would claim an outcome the retry never produced."""
+    slept = []
+    gh = _gh_script({"pr checks": "external|https://example.com/x"})
+    assert rerun_and_wait("7", "", gh=gh, sleep=slept.append) == "red"
+    assert slept == []
+
+
+def test_an_unreadable_checks_call_is_red():
+    gh = _gh_script({"pr checks": GhError("boom")})
+    assert rerun_and_wait("7", "", gh=gh, sleep=lambda _s: None) == "red"
+
+
+def test_it_settles_before_polling():
+    """The re-run takes a beat to register; asking immediately reads the OLD
+    conclusion and calls it settled."""
+    slept = []
+    gh = _gh_script({
+        "pr checks": "build|https://github.com/o/r/actions/runs/1",
+        "run view": json.dumps({"conclusion": "failure"}),
+        "run rerun": "",
+    })
+    rerun_and_wait("7", "", gh=gh, sleep=slept.append, settle=20)
+    assert slept and slept[0] == 20
+
+
+# --- the runner's own argument handling --------------------------------------
+
+def _capture(monkeypatch, seen):
+    """Record the argv and return a successful result.
+
+    NOT a `setdefault(...) or ...` lambda: setdefault returns the list, which is
+    truthy, so the `or` short-circuits and the caller gets a list where it
+    expects a CompletedProcess.
+    """
+    import coordinator.ci as mod
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake(cmd, **kw):
+        seen["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    return mod
+
+
+def test_gh_api_is_never_given_a_repo_flag(monkeypatch):
+    """`gh api` carries the repo in its URL and REJECTS `--repo`.
+
+    Appending it unconditionally made every api call fail, so `head_of`
+    returned an empty sha, no merge could be pinned, and a green PR escalated
+    instead of merging. Caught by a LIVE RUN, not by the suite: the self-test's
+    shim ignored unknown arguments, so it passed. A stub more permissive than
+    the real tool hides exactly this.
+    """
+    seen = {}
+    monkeypatch.setenv("BIRCHER_GH_REPO", "o/r")
+    mod = _capture(monkeypatch, seen)
+    mod._gh(["api", "repos/o/r/pulls/1", "--jq", ".head.sha"])
+    assert "--repo" not in seen["cmd"], seen["cmd"]
+
+
+def test_pr_subcommands_still_get_the_repo_flag(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("BIRCHER_GH_REPO", "o/r")
+    mod = _capture(monkeypatch, seen)
+    mod._gh(["pr", "checks", "1"])
+    assert "--repo" in seen["cmd"] and "o/r" in seen["cmd"]
+
+
+def test_trailing_progress_output_does_not_defeat_the_verdict(tmp_path):
+    """omnigent writes progress to stderr. Captured SEPARATELY and joined, that
+    noise lands after the reviewer's last line, and `extract_verdict` -- which
+    reads the last non-blank line -- sees "Launching your agent..." instead of
+    the verdict. Every review escalated. The runner now merges the streams as
+    the bash's `2>&1` did, so a runner returning one interleaved stream is what
+    this asserts."""
+    merged = ("omnigent: Connecting...\n"
+              "## Review\nfindings here\n"
+              "VERDICT: PASS")
+    v, _out = dispatch("7", "o/r", "abc", reviewer="codex", bundle_dir=".",
+                       server="http://x", log_path=str(tmp_path / "l"),
+                       run=lambda a, c: _R(0, merged))
+    assert v == "PASS"
+
+
+def test_the_default_runner_merges_stderr_into_stdout():
+    """Pinned because the separation is invisible until something writes to
+    stderr, and by then every review has escalated."""
+    import inspect
+
+    import coordinator.review as mod
+    src = inspect.getsource(mod.dispatch)
+    assert "stderr=subprocess.STDOUT" in src
+    assert "capture_output=True" not in src
+
+
+# --- BIRCHER_CI_IGNORE_CHECKS reaches the CONSUMERS, not just the reader -----
+# Mutation evidence (2026-08-30): discarding the operator override in
+# `live_deps` was caught only INCIDENTALLY, by the boundary contract noticing
+# the variable stopped being read. Nothing bound that the value threaded
+# through to `poll`, `failure_kind` and `rerun_and_wait` -- the
+# bound-at-the-producer-not-the-consumer shape. These bind the consumers.
+
+def test_poll_honours_a_custom_ignore_pattern():
+    """A check named in the override must not hold the poll open."""
+    from coordinator import ci as ci_mod
+    lines = "build|pass\nflaky-lint|pending"
+    gh = lambda argv: lines
+    # Default ignore list: `flaky-lint` is required and pending, so poll waits
+    # out its whole budget and reports pending.
+    assert ci_mod.poll("7", "build\nflaky-lint", gh=gh, sleep=lambda _: None,
+                       timeout=60, interval=30) == "pending"
+    # With the override, the only blocking row left is green.
+    assert ci_mod.poll("7", "build\nflaky-lint", gh=gh, sleep=lambda _: None,
+                       timeout=60, interval=30,
+                       ignore="Dependabot|review-gate|flaky-lint") == "green"
+
+
+def test_failure_kind_honours_a_custom_ignore_pattern():
+    """The second consumer: an ignored check's run must not be inspected."""
+    from coordinator import ci as ci_mod
+    seen = []
+    def gh(argv):
+        seen.append(argv)
+        if argv[1] == "checks":
+            return "flaky-lint|https://github.com/o/r/actions/runs/999/job/1"
+        return '{"jobs": []}'
+    ci_mod.failure_kind("7", gh=gh, ignore="Dependabot|review-gate|flaky-lint")
+    assert not any(a[:2] == ["run", "view"] for a in seen), (
+        "an ignored check's run was inspected anyway -- the pattern did not "
+        "reach run_ids_from_links")
+
+
+def test_live_deps_threads_the_override_all_the_way_to_the_verdict(monkeypatch):
+    """End of the chain: the operator's env var must change what the WIRED
+    reader reports, not merely be read into a local variable.
+
+    Mutation evidence: discarding the override in `live_deps` was caught only
+    incidentally, by the boundary contract noticing the variable stopped being
+    read. Nothing bound that the value reached its consumers.
+    """
+    import coordinator.wiring as w
+
+    monkeypatch.setattr(w, "_gh", lambda argv: "build|pass\nflaky-lint|fail")
+    monkeypatch.setattr(w.ci_mod, "required_contexts",
+                        lambda repo, **kw: "build\nflaky-lint")
+
+    monkeypatch.delenv("BIRCHER_CI_IGNORE_CHECKS", raising=False)
+    plain = w.live_deps("i", repo="o/r", reviewer="c", server="s",
+                        bundle_dir=".", poll_interval=0)
+    assert plain.wait_ci("7") == "red", "a failing required check must read red"
+
+    monkeypatch.setenv("BIRCHER_CI_IGNORE_CHECKS",
+                       "Dependabot|review-gate|flaky-lint")
+    overridden = w.live_deps("i", repo="o/r", reviewer="c", server="s",
+                             bundle_dir=".", poll_interval=0)
+    assert overridden.wait_ci("7") == "green", (
+        "BIRCHER_CI_IGNORE_CHECKS did not reach the wired CI reader")

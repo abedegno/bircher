@@ -323,9 +323,10 @@ _EFFECT_SITE_CONTEXT = {
     "_ensure_issue_closed": "REACHED",
     # Renamed from `recover_from_ground_truth` in Phase 2: it is no longer a
     # recovery path, it is the ONLY path, and run_item calls it for every item.
-    # Still performs an effect -- its comment -- but through
-    # `_coordinator effect`, the Python entry point, since 2026-08-29.
-    "observe_outcome": "REACHED",
+    # `observe_outcome` is GONE from this table since 2026-08-29: it is Python
+    # now, and its effects are performed by coordinator/effects.py -- which the
+    # kernel journals identically, but which this shell-source scanner cannot
+    # and should not see.
     "_reconcile_item_pr": "REACHED",
     # Only caller is merge_ready_pr's revert path, which is itself REACHED.
     "_reopen_reverted_issues": "REACHED",

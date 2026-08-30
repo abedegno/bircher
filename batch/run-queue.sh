@@ -338,29 +338,6 @@ _ci_run_ids() {
   _run_ids_from_check_links "$lines"
 }
 
-# _ci_failure_kind <pr> -> infra|genuine (best-effort; defaults genuine on any
-# lookup failure so a real red is never mistaken for infra).
-#
-# Sums failed steps across EVERY CI run on the PR, because a repo may legitimately
-# split CI over several workflows; assuming exactly one was the #41 defect.
-_ci_failure_kind() {
-  local pr="$1" ids rid fsc total=0
-  ids=$(_ci_run_ids "$pr") || { echo genuine; return; }
-  [ -n "$ids" ] || { echo genuine; return; }
-  while IFS= read -r rid; do
-    [ -n "$rid" ] || continue
-    fsc=$(gh run view "$rid" --repo "$REPO" --json jobs \
-      -q '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .steps[]? | select(.conclusion=="failure")] | length' 2>/dev/null)
-    # A lookup that failed tells us nothing -> fail closed on `genuine` rather than
-    # letting a missing answer read as "no failed steps" (which would mean infra).
-    [ -n "$fsc" ] || { echo genuine; return; }
-    total=$((total + fsc))
-  done <<EOF
-$ids
-EOF
-  _classify_ci_failure "$total"
-}
-
 # _arm_ci_deadline -> sets MAIN_CI_DEADLINE_AT to an absolute epoch instant.
 #
 # #62: the initial watch and each re-run poll have their own budgets, and each lives in
@@ -761,41 +738,6 @@ _poll_ci() {
     sleep "$_iv"; w=$((w + _iv))
   done
   echo pending
-}
-
-# _wait_ci <pr> -> settle CI (B-5 part 2). Used when a coordinator DIED while CI
-# was still running: run-queue survives the wait, so wait for CI to finish
-# (queue delays pushed CI to ~12min+ this window) rather than escalating on
-# 'pending'. Bounded by BIRCHER_CI_WAIT (default 1500s).
-_wait_ci() { _poll_ci "$1" "${BIRCHER_CI_WAIT:-1500}"; }
-
-# _rerun_and_wait_ci <pr> -> final ci state after re-running the failed jobs and
-# polling until CI settles (B-5 part 1; bounded by BIRCHER_CI_RERUN_WAIT).
-_rerun_and_wait_ci() {
-  local pr="$1" ids rid conc did=0
-  ids=$(_ci_run_ids "$pr") || { echo red; return; }
-  [ -n "$ids" ] || { echo red; return; }
-  while IFS= read -r rid; do
-    [ -n "$rid" ] || continue
-    # Only re-run runs that actually ended badly. #41 re-ran whatever run it had
-    # picked, green ones included; a bare `gh run rerun` on a green run burns CI
-    # minutes and republishes passing checks for no reason.
-    conc=$(gh run view "$rid" --repo "$REPO" --json conclusion -q .conclusion 2>/dev/null)
-    case "$conc" in
-      failure|cancelled|timed_out|startup_failure) : ;;
-      *) continue ;;
-    esac
-    gh run rerun "$rid" --repo "$REPO" --failed >/dev/null 2>&1 \
-      || gh run rerun "$rid" --repo "$REPO" >/dev/null 2>&1
-    did=1
-  done <<EOF
-$ids
-EOF
-  # Nothing re-run means nothing will change; report red rather than sleeping and
-  # re-polling an unchanged state until the caller's attempt budget is gone.
-  [ "$did" = 1 ] || { echo red; return; }
-  sleep 20
-  _poll_ci "$pr" "${BIRCHER_CI_RERUN_WAIT:-900}"
 }
 
 # _send_retry_decision <fails_so_far> <max> -> retry|give-up   (PURE, self-tested)
@@ -2280,197 +2222,86 @@ _reconcile_item_pr() {
 # marker to the PR and prints "outcome|review|note" for the scorecard row.
 # `issue` (optional) enables the issue-linkage PR fallback when both signal and
 # branch-code discovery miss (run #24 a06-vs-i230); standalone --recover-pr omits it.
-observe_outcome() {
-  local item="$1" code="$2" pr="$3" issue="${4:-}"
-  local ci="na" verdict="" reviewer_out="" reviewed_sha=""
-  # A tracked PR that was CLOSED without merging can never satisfy this item --
-  # drop it and let the discovery below find the real one. See _pr_is_abandoned
-  # for the i506 scratch-PR case this exists for.
-  if [ -n "$pr" ]; then
-    local _st _mg
-    _st=$(gh pr view "$pr" --repo "$REPO" --json state,mergedAt \
-      -q '(.state // "") + "|" + (.mergedAt // "")' 2>/dev/null)
-    _mg="${_st#*|}"; _st="${_st%%|*}"
-    if [ -n "$_st" ] && _pr_is_abandoned "$_st" "$_mg"; then
-      echo "[batch:recover] $item: tracked PR #$pr is CLOSED and unmerged -> discarding and re-discovering" >&2
-      pr=""
-    fi
-  fi
-  # If discovery missed the PR (coordinator opened it, then died before run-queue
-  # saw it -- overnight i230 opened #250 but was recorded "no PR"), re-scan for an
-  # open PR whose head branch carries the item code before concluding "no PR".
-  if [ -z "$pr" ] && [ -n "$code" ]; then
-    local _disc
-    _disc=$(gh pr list --repo "$REPO" --state open --json number,headRefName \
-      -q "$(_branch_code_filter "$code") | (.[0].number // empty)" 2>/dev/null)
-    if [ -n "$_disc" ]; then
-      echo "[batch:recover] $item: discovery had no PR; found open PR #$_disc by code -> adopting" >&2
-      pr="$_disc"
-    fi
-  fi
-  # Branch-code discovery ALSO missed it -> fall back to issue linkage (`Closes
-  # #N` in the PR body). Only a SINGLE unambiguous match auto-adopts; 2+ matches
-  # are left for a human (recovery has no live escalation channel like the poll
-  # loop). Recovers the run #24 a06-vs-i230 class where branch AND signal used
-  # the wrong code but the body write-back was still correct.
-  if [ -z "$pr" ] && [ -n "$issue" ]; then
-    local _im _ic
-    _im=$(_discover_pr_by_issue "$issue")
-    _ic=$(printf '%s\n' "$_im" | grep -c .)
-    if [ "${_ic:-0}" -eq 1 ]; then
-      pr="$_im"
-      echo "[batch:recover] $item: no PR by code; found #$pr via issue #$issue linkage -> adopting" >&2
-    elif [ "${_ic:-0}" -gt 1 ]; then
-      echo "[batch:recover] $item: multiple PRs link issue #$issue ($_im) -- leaving for a human (ambiguous)" >&2
-    fi
-  fi
-  # Reconcile a CI-red-retry that opened a second branch/PR before the
-  # coordinator died (run #20 #141): adopt the CI-green sibling if there is one.
-  if [ -n "$pr" ]; then
-    local _rp; _rp=$(_reconcile_item_pr "$code" "$pr")
-    if [ -n "$_rp" ] && [ "$_rp" != "$pr" ]; then
-      echo "[batch:recover] $item: adopted CI-green sibling PR #$_rp (was tracking #$pr)" >&2
-      pr="$_rp"
-    fi
-  fi
-  # THE CI HISTORY. What the repository shows about how this branch got here,
-  # replacing the marker's `ci_first` (asserted) and `rounds` (asserted, and
-  # about a quantity nothing observed -- see Decision 2 in the Phase 2 plan).
-  local ci_first="unknown" resubmissions=""
-  if [ -n "$pr" ]; then
-    local _br; _br=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.ref' 2>/dev/null) || _br=""
-    if [ -n "$_br" ]; then
-      local _hist; _hist=$(observe_ci_history "$_br")
-      ci_first="${_hist%%|*}"; resubmissions="${_hist#*|}"
-    fi
-  fi
+# _derive_budget -> seconds the Python derivation may take.
+#
+# DERIVED, not a constant. A fixed 1800 was SHORTER THAN THE WORK IT BOUNDED:
+# the derivation may wait BIRCHER_CI_WAIT (1500) for CI, then re-run up to
+# BIRCHER_CI_RERUN_MAX (4) times, each waiting BIRCHER_CI_RERUN_WAIT (900) plus
+# a settle -- 5180s of legitimate work inside a 1800s cap. A healthy infra
+# recovery was killed mid-rerun and reported as a crashed derivation, and the
+# three knobs above accepted values that could never be spent.
+#
+# The bash this replaced had NO whole-derivation cap at all, so a budget that
+# cannot cut a legitimate run short is also the faithful behaviour.
+# _ci_policy -> "<wait> <rerun_max> <rerun_wait>", validated ONCE.
+#
+# One resolution point, because two of them disagree. `_derive_budget` clamped
+# these while the Python CLI re-parsed the RAW environment with a bare `int()`:
+# `BIRCHER_CI_RERUN_MAX=abc` gave bash a budget computed from 4 and gave Python
+# a ValueError, which `observe_outcome` reads as an empty tuple -- so a single
+# malformed operator setting escalated EVERY item while the shell believed it
+# had defaulted safely. A value above 20 diverged the other way: Python would
+# attempt more reruns than the budget bounding it allowed.
+#
+# The clamped values are passed to the coordinator explicitly, so there is no
+# second interpretation to drift.
+_ci_policy() {
+  printf '%s %s %s' \
+    "$(_clamp_int "${BIRCHER_CI_WAIT:-1500}" 1500 1 7200)" \
+    "$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-4}" 4 0 20)" \
+    "$(_clamp_int "${BIRCHER_CI_RERUN_WAIT:-900}" 900 1 7200)"
+}
 
-  if [ -n "$pr" ]; then
-    local buckets
-    # Fetch NAME too, so non-CI checks are filtered before deciding.
-    # `review-gate` MUST be excluded or this DEADLOCKS: it stays pending until a
-    # cross-vendor review is posted, and the caller of this function is the thing
-    # about to perform that review. Each waits for the other. Seen 2026-08-07 on
-    # muesli PR #549, which hung with every other check green. (Normal waves do
-    # not hit it — the coordinator reviews without waiting on review-gate.)
-    #
-    # Not CI's business regardless: this answers "is the code green?", while
-    # "has it been reviewed" is a separate question that branch protection still
-    # enforces at merge time.
-    buckets=$(gh pr checks "$pr" --repo "$REPO" --json name,bucket \
-                -q '.[] | "\(.name)|\(.bucket)"' 2>/dev/null)
-        buckets=$(_keep_blocking_checks "$buckets" "$(_required_contexts)")
-    ci=$(_normalize_ci "$buckets")
-    # B-5 part 2: the coordinator often DIES (runner_error) while CI is still
-    # running -- CI queue delays (degraded GitHub runner capacity) pushed CI to
-    # ~12min+ and the coordinator can't survive that wait. run-queue CAN, so wait
-    # for CI to settle instead of escalating on 'pending' (that "pending at
-    # timeout" was a coordinator death, not a real timeout).
-    if [ "$ci" = pending ]; then
-      echo "[batch:recover] $item: PR #$pr CI still running at coordinator death -> waiting for CI to settle" >&2
-      ci=$(_wait_ci "$pr")
-    fi
-    # B-5 part 1: a red CI may be a transient GitHub infra failure (runner not
-    # acquired / cancelled with no real failed step) rather than a real test
-    # failure. Classify and re-run rather than burying a green PR as failed.
-    # 2026-07-14: an overnight GitHub-infra flake outlasted 2 reruns and buried 3
-    # green PRs as failed -> default raised to 4 (each rerun already waits for CI).
-    local _rr=0 _rrmax="${BIRCHER_CI_RERUN_MAX:-4}"
-    while [ "$ci" = red ] && [ "$_rr" -lt "$_rrmax" ] && [ "$(_ci_failure_kind "$pr")" = infra ]; do
-      _rr=$((_rr + 1))
-      echo "[batch:recover] $item: PR #$pr CI red but INFRA (no failed step) -> re-running CI (attempt $_rr/$_rrmax)" >&2
-      ci=$(_rerun_and_wait_ci "$pr")
-    done
-    if [ "$ci" = green ]; then
-      # #66: capture the commit the reviewer is about to read OURSELVES, before
-      # dispatching. The normal path gets this from the reviewer's marker `head=`
-      # (#24); recovery had no equivalent, so an out-of-band PASS could bless a
-      # PR with no same-head guarantee at all.
-      #
-      # Deliberately NOT asked of the reviewer: that would make a merge-critical
-      # value another model-reported field (#67). And deliberately NOT read from
-      # `headRefOid` AFTER the review -- the normal path's comments explain why
-      # that blesses a concurrent push. Observed at dispatch time, from the ref
-      # we hand the reviewer, is the only version that is evidence.
-      reviewed_sha=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.sha' 2>/dev/null)
-      case "$reviewed_sha" in
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
-        *) echo "[batch:recover] $item: could not capture a full 40-hex head for PR #$pr (got '${reviewed_sha:-<empty>}') -> cannot pin a recovery merge" >&2
-           reviewed_sha="" ;;
-      esac
-      echo "[batch:recover] $item: PR #$pr CI green, no marker -> $RECOVERY_REVIEWER recovery review at ${reviewed_sha:0:7}" >&2
-      local _rv
-      _rv=$(BIRCHER_REVIEW_LOG="/tmp/recover-$item.log" \
-              observe_review "$pr" "$reviewed_sha")
-      verdict="${_rv%%|*}"
-      reviewer_out=$(cat "${_rv#*|}" 2>/dev/null)
-      # `classify_recovery`'s `*)` arm already routes an absent verdict to
-      # `escalated`; NONE is spelled empty here so that mapping is untouched.
-      [ "$verdict" = NONE ] && verdict=""
-    fi
+_derive_budget() {
+  local w r rw floor
+  read -r w r rw <<<"$(_ci_policy)"
+  # +20s settle per rerun (coordinator.ci.rerun_and_wait), +120s slack for
+  # process start, the review dispatch and the effect calls.
+  floor=$(( w + r * (rw + 20) + 120 ))
+  if [ -n "${BIRCHER_DERIVE_TIMEOUT:-}" ]; then
+    # An explicit operator value is honoured -- but say so when it cannot
+    # cover the budgets the other knobs already promise.
+    [ "$BIRCHER_DERIVE_TIMEOUT" -lt "$floor" ] 2>/dev/null \
+      && echo "[batch:derive] WARN BIRCHER_DERIVE_TIMEOUT=$BIRCHER_DERIVE_TIMEOUT is below the ${floor}s the CI wait/rerun settings can legitimately spend -> a healthy recovery may be cut short" >&2
+    printf '%s' "$BIRCHER_DERIVE_TIMEOUT"; return
   fi
+  printf '%s' "$floor"
+}
 
-  # #66: the reviewed SHA is EVIDENCE attached to the result, not an input to
-  # classification -- classify_recovery stays the pure ground-truth-to-outcome
-  # mapping it documents and self-tests. It rides in the marker (`head=`) and in
-  # this function's 4th return field instead.
-  local tuple r_outcome r_review r_ci r_note
-  tuple=$(classify_recovery "$pr" "$ci" "$verdict")
-  IFS='|' read -r r_outcome r_review r_ci r_note <<EOF
-$tuple
-EOF
-
-  # Post a self-describing marker to the PR (reviewer findings above it, if any).
-  if [ -n "$pr" ]; then
-    local body
-    # head= only on a ready/PASS outcome: it is the merge-authorising evidence,
-    # and a failed or escalated derivation must never carry one.
-    local _head_field=""
-    [ "$r_outcome" = "ready" ] && [ -n "$reviewed_sha" ] && _head_field=" head=$reviewed_sha"
-    # DECISION 3 OF PHASE 2. The findings stay -- they are the most useful
-    # thing on the PR for a human. The `bircher-status:` prefix goes, because
-    # it was a machine channel and nothing reads it any more. This text is
-    # documentation now; `test_marker_is_gone` keeps it that way.
-    if [ -n "$reviewer_out" ]; then
-      body="Cross-vendor review (outcome derived from the repository, not reported):
-
-$reviewer_out
-
-outcome=$r_outcome ci=$r_ci review=$r_review${_head_field}
-note: $r_note"
-    else
-      body="Outcome derived from the repository: outcome=$r_outcome ci=$r_ci${_head_field}
-note: $r_note"
-    fi
-    # THE FIRST EFFECT PERFORMED THROUGH THE PYTHON PATH. Identical journal --
-    # same class, key, run and generation, same `perform()` -- so this run's
-    # facts are indistinguishable from one where bash performed it. It is wired
-    # here, on the one effect the design allows to move, so the path is proven
-    # in production before `observe_outcome` itself depends on it.
-    #
-    # `_effect`'s exit codes are preserved by the CLI (87 = refused), so the
-    # caller's check is unchanged.
-    _coordinator effect --class comment \
-      --key "pr-marker:$pr:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" \
-      -- gh pr comment "$pr" --repo "$REPO" --body "$body" >/dev/null 2>&1 \
-      || echo "[batch:recover] WARN $item: failed to post the derived comment to PR #$pr" >&2
-  fi
-
-  # 4th field (#66): the orchestrator-captured reviewed SHA, empty unless this is
-  # a ready outcome with a validated 40-hex head. Callers MUST pin the merge and
-  # the cross-review status to it; an empty value means "cannot pin", which now
-  # means "cannot auto-merge".
-  local _sha_out=""
-  [ "$r_outcome" = "ready" ] && _sha_out="$reviewed_sha"
-  # $ci is returned as a FIFTH field so the caller can record a real CI
-  # OBSERVATION rather than inferring one from the outcome. "ready implies
-  # green" happens to be true today, and a ledger built on an inference is a
-  # claim with nothing behind it -- which is the one thing the kernel exists to
-  # refuse. Both callers parse five fields; a four-field read would silently
-  # absorb this into the sha.
-  # SEVEN fields since Phase 2. A caller reading five absorbs the CI-history
-  # pair into `ci`, silently. Both callers were updated with this change.
-  echo "$r_outcome|$r_review|$r_note|$_sha_out|$ci|$ci_first|$resubmissions"
+observe_outcome() {  # <item> <code> <pr> [issue]
+  # THE DERIVATION, in Python since 2026-08-29. What was 192 lines here is now
+  # v2/coordinator/outcome.py with eighteen tests driving it directly, plus its
+  # dependencies -- discovery, reconciliation, CI classification, the review
+  # dispatch -- each ported with a differential test against the bash it
+  # replaced.
+  #
+  # NOT via `_coordinator`: that wraps every call in `_net_run` at
+  # BIRCHER_KERNEL_TIMEOUT (5s), and this legitimately runs as long as CI does.
+  # Bounded by its own budget instead, which defaults to half an hour.
+  #
+  # Emits the same SEVEN fields it always did:
+  #   outcome|review|note|head|ci|ci_first|resubmissions
+  local out="" _budget _rc=0 _pw _pr _prw
+  _budget=$(_derive_budget)
+  # The SAME validated numbers the budget was computed from.
+  read -r _pw _pr _prw <<<"$(_ci_policy)"
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" \
+         _net_run "$_budget" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli derive \
+           --item "$1" --code "${2:-}" --pr "${3:-}" --issue "${4:-}" \
+           --reviewer "$RECOVERY_REVIEWER" --repo "$REPO" \
+           --server "$SERVER" --bundle-dir "$BUNDLE_DIR" \
+           --poll-interval "$MAIN_CI_POLL_INTERVAL" \
+           --ci-wait "$_pw" --rerun-max "$_pr" --rerun-wait "$_prw"
+  ) || { _rc=$?; out=""; }
+  # A TIMEOUT AND A CRASH BOTH YIELD AN EMPTY TUPLE, and the caller correctly
+  # escalates either way -- but a human reading the log cannot tell them apart,
+  # and they call for opposite responses (raise the budget vs fix the code).
+  # `timeout` reports 124.
+  [ "$_rc" = 124 ] && echo "[batch:derive] $1: derivation exceeded its ${_budget}s budget -> escalating (this is a BUDGET failure, not a crash)" >&2
+  # An EMPTY tuple is a CRASH, not a verdict -- the caller checks for it and
+  # escalates rather than reading outcome="" as "NOT ready".
+  printf '%s' "$out"
 }
 
 # _is_blank <text> -> rc 0 if text is empty or whitespace-only.
@@ -4513,14 +4344,22 @@ SH
   local ddir; ddir=$(mktemp -d)
   cat >"$ddir/gh" <<'SH'
 #!/usr/bin/env bash
-# fake gh: an open PR #300 for the item; CI green; record the marker comment.
-# #66: also answer the reviewed-head lookup so a ready recovery can be pinned.
+# fake gh: an open PR #300 for the item; CI green; record the comment.
+# #66: also answer the reviewed-head lookup so a ready outcome can be pinned.
+#
+# `list` returns JSON, not a bare number: the derivation asks for
+# `--json number,headRefName` and does the boundary-anchored code match in
+# Python (which also ESCAPES the code, so `i.3` is not a pattern). The old shim
+# answered gh's `-q` form and is why this failed first.
 if [ "$1" = "api" ]; then
-  case "$*" in *"/pulls/"*) printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}" ;; esac
+  case "$*" in
+    *".head.ref"*) printf 'i300-work' ;;
+    *"/pulls/"*)   printf '%s' "${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}" ;;
+  esac
   exit 0
 fi
 case "$2" in
-  list)    printf '%s\n' '300' ;;
+  list)    printf '%s' '[{"number":300,"headRefName":"i300-work"}]' ;;
   checks)  printf 'pass\npass\n' ;;
   comment) echo "https://github.com/demo/demo/pull/300#issuecomment-1" ;;
 esac

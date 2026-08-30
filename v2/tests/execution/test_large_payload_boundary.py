@@ -86,3 +86,39 @@ def test_a_normal_sized_payload_still_works_as_an_argument():
     r = _cli(["ci-normalize", "--buckets", "pass\npending"], "")
     assert r.returncode == 0, r.stderr
     assert r.stdout == "pending"
+
+
+# --- the operator's ignore policy must survive the CLI boundary too ---------
+
+def test_ci_keep_blocking_honours_the_operator_ignore_policy():
+    """Found by the third cross-review round.
+
+    `_keep_blocking_checks` used to apply `${BIRCHER_CI_IGNORE_CHECKS:-...}`
+    with its own grep. Once it delegated to this CLI mode, the handler called
+    `keep_blocking` with no `ignore` argument, silently reinstating the library
+    default -- so on every shell path a custom-ignored FAILING check went back
+    to blocking, producing false reds, needless reruns and halted recoveries.
+
+    A port that moves a filter must move the filter's CONFIGURATION with it.
+    """
+    lines = "build|pass\nflaky-lint|fail"
+    env = {"PYTHONPATH": str(V2), "PATH": "/usr/bin:/bin",
+           "BIRCHER_CI_IGNORE_CHECKS": "Dependabot|review-gate|flaky-lint"}
+    r = subprocess.run(
+        [sys.executable, "-m", "coordinator.cli", "ci-keep-blocking",
+         "--lines", "-", "--required", "build\nflaky-lint"],
+        input=lines, capture_output=True, text=True, cwd=V2, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "fail" not in r.stdout, (
+        "the operator's ignore policy did not cross the CLI boundary; "
+        f"got {r.stdout!r}")
+
+    # Control: without the override the same input keeps the failing row.
+    env.pop("BIRCHER_CI_IGNORE_CHECKS")
+    r2 = subprocess.run(
+        [sys.executable, "-m", "coordinator.cli", "ci-keep-blocking",
+         "--lines", "-", "--required", "build\nflaky-lint"],
+        input=lines, capture_output=True, text=True, cwd=V2, env=env)
+    assert "fail" in r2.stdout, (
+        "without the override the failing check must still block, or this "
+        "test would pass for the wrong reason")
