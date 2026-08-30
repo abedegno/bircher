@@ -1217,3 +1217,90 @@ dependencies can see any of them.
 
 **That is the argument for the plan having ended in a live run**, and against
 ever treating a green suite as sufficient for a port of an I/O-bound path.
+
+---
+
+## v2 merges a real muesli item — 2026-08-30
+
+**The binding goal was "v2 working to supersede v1". v2 has now taken a real
+issue on `abedegno/muesli` to a merged pull request with main CI green, every
+externally visible mutation kernel-authorised and journalled.**
+
+muesli #726 (`parseChatError` cannot read a status from a real bridge error)
+→ PR #735, merged as `eb49d394`, issue closed, labels cleared. Implementer
+codex, reviewer claude_code, effect mode `kernel`, kernel mode `enforce`.
+
+### The defect the smoke run found first, which would have hit muesli
+
+Before touching muesli the smoke item was re-run with the day's nine fixes
+deployed. It passed — merged, CI green. Then the effects were checked for WHERE
+they landed rather than whether they happened:
+
+**The derivation's review comments were being posted to the wrong repository.**
+`gh pr comment` carried no `--repo`, so `gh` resolved the target from the
+coordinator's own working directory — the bircher checkout. The comments for
+smoke runs s13 and s14 landed on `abedegno/bircher` issues #17 and #18.
+
+The kernel journalled `effect_intended` AND `effect_confirmed` for both, and
+was right to: the command succeeded. **The journal recorded a true fact about a
+command and a false impression about the world.** 940 tests, five cross-review
+rounds and two green live runs all missed it, because every one of them checked
+that the effect was PERFORMED, never where it LANDED.
+
+Second instance of the shape — `publish_cmd` ran `git push` in the
+coordinator's cwd where `origin` resolved to bircher. That instance was fixed
+and the class was not closed. It is closed now: an enumeration requires every
+`gh` effect argv to name its repo (`gh api` exempted, the repo is in its URL),
+plus a test binding the VALUE rather than the flag's presence.
+
+### What the live run proved, including by failing
+
+The first merge attempt FAILED, and the failure is the most valuable part.
+
+muesli requires `review-gate`, not `bircher/cross-review`. They chain: bircher
+posts cross-review, a workflow reacts to that status event and posts the
+required check. Measured timings:
+
+    13:29:11  bircher/cross-review = success   (bircher posts)
+    13:29:18  review-gate          = success   (the workflow reacts, +7s)
+
+The merge was attempted inside that seven-second window and GitHub refused:
+`base branch policy prohibits the merge`. The kernel recorded
+`effect_uncertain`, **halted the run pending reconciliation**, and then
+REJECTED `record_merge_outcome` and `record_run_outcome` with
+`reason: halted`. The sweep's retry could not proceed either.
+
+Nothing was forced, nothing was guessed, and no outcome was recorded for a run
+whose effect state was unresolved. That is criterion 2 doing exactly its job
+against a real-world race, and it is the first time the halt path has fired on
+a live repository.
+
+Resolution was by observation, not assumption: PR #735 was read back as `OPEN`
+with `mergedAt=null` and no merge commit, so the merge definitively had not
+happened. `kernel.cli reconcile` under expected-version CAS (7 → 8) recorded
+that resolution, and `--recover-pr` re-drove the merge at **generation 5** — a
+new generation, so a genuinely new attempt rather than a replay of a spent key.
+`merge:735:c9f51fb…:g5` is `effect_confirmed` in the journal.
+
+**The gap this exposes, not yet fixed:** a merge refused for a DEFINITIVE
+reason ("base branch policy prohibits") is not an uncertain outcome — it is a
+clean refusal, and it is known that the merge did not happen. Treating it as
+uncertain halts the run and blocks the automatic retry that would have
+succeeded seconds later. Distinguishing a definitive refusal from a genuinely
+uncertain one (timeout, transport death) would let this class self-heal. That
+is a design change and is deliberately not made here.
+
+### Criterion 1 on a real item: still PARTIAL, and now measured on muesli
+
+The implementer wrote a `bircher-status:` marker into its own PR comment.
+Nothing read it — the outcome was derived from the repository — but the
+criterion says no marker anywhere. On the smoke items the marker was absent
+only because the hand-written item text forbade it by name; a muesli item's
+text comes from the ISSUE, which does not. **Prompt wording is the only thing
+discouraging it, and prompt wording is not a mechanism.**
+
+### What is now true
+
+- v1 remains deployed at `/workspaces/bircher` (218 commits behind); v2 runs
+  from `/workspaces/bircher-v2` on current main. Both exist side by side.
+- The cutover is NOT done: nothing schedules a wave, and v1 is untouched.
