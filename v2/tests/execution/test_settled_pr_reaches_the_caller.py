@@ -72,3 +72,56 @@ def test_an_unchanged_pr_is_not_announced():
     guard = src[i - 400:i]
     assert '!= "${pr:-}"' in guard, (
         "adoption must be conditional on the PR actually differing")
+
+
+# --- the boundary must fail closed, not fall back to the old behaviour -------
+
+def _width_ok(line: str) -> bool:
+    import subprocess
+    src = RUN_QUEUE.read_text()
+    m = re.search(r"^_derived_width_ok\(\) \{.*?^\}", src, re.S | re.M)
+    assert m, "_derived_width_ok not found"
+    r = subprocess.run(["bash", "-c", m.group(0) + '\n_derived_width_ok "$1"\n', "_", line],
+                       capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
+    return r.returncode == 0
+
+
+def test_a_short_tuple_is_rejected_rather_than_silently_accepted():
+    """Found by cross-review, and it would have undone the whole fix.
+
+    A seven-field result leaves `_settled_pr` EMPTY, which the adoption guard
+    reads as "nothing to adopt" -- indistinguishable from a derivation that
+    legitimately settled on no PR. So version skew against an older
+    coordinator, or a truncated write, would silently restore the stale-PR
+    behaviour this change exists to remove.
+    """
+    assert _width_ok("a|b|c|d|e|f|g|h")
+    assert not _width_ok("a|b|c|d|e|f|g")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i")
+    assert not _width_ok("")
+
+
+def test_an_embedded_newline_is_rejected():
+    """`read` consumes only the FIRST line, so a multi-line result would be
+    parsed as its first line with the rest discarded silently."""
+    assert not _width_ok("a|b|c|d|e|f|g|h\nx|y")
+
+
+def test_a_real_tuple_is_accepted():
+    """The guard must not reject what production emits -- an earlier cut used
+    `"$(printf '\\n')"` for the newline test, which command substitution
+    reduces to the EMPTY STRING, so the pattern matched everything and the
+    check rejected every valid tuple."""
+    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738")
+    assert _width_ok("escalated|na|no PR||na|unknown||")
+
+
+def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
+    """recover_pr_cmd runs the SAME `_settle_pr`, so discarding the eighth
+    field left it able to reproduce the exact defect: review and comment a
+    sibling, then authorize and merge the stale PR it was invoked with."""
+    src = RUN_QUEUE.read_text()
+    assert "r_settled_pr <<EOF" in src, "recovery must parse the settled PR"
+    i = src.index('pr="$r_settled_pr"')
+    j = src.index("merge_ready_pr \"$item\" \"$pr\"", i)
+    assert i < j, "recovery must adopt the settled PR before it merges"

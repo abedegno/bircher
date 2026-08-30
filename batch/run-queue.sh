@@ -2274,7 +2274,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   fi
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
-  local rec r_outcome r_review r_note r_sha r_ci
+  local rec r_outcome r_review r_note r_sha r_ci r_settled_pr
   # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
   # reaching that line -- and `rec=$(...)` swallows the death into an empty
@@ -2288,11 +2288,22 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
     echo "[batch:recover-pr] $code: recovery produced NO tuple -> it failed; PR left untouched for a human" >&2
     return 1
   fi
-  # Eight fields; the last three are unused here. Named explicitly rather than
-  # left to a trailing `_` to absorb, so a width change is a visible edit.
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ _ <<EOF
+  if ! _derived_width_ok "$rec"; then
+    echo "[batch:recover-pr] $code: recovery returned a malformed tuple -> PR left untouched for a human" >&2
+    return 1
+  fi
+  # THE EIGHTH FIELD IS USED HERE TOO. An earlier cut named it and threw it
+  # away, which left recovery able to reproduce the exact defect the field was
+  # added to fix: `observe_outcome` runs the same `_settle_pr`, so recovery can
+  # review and comment a sibling PR and then authorize and merge the stale one
+  # it was invoked with.
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr <<EOF
 $rec
 EOF
+  if [ -n "${r_settled_pr:-}" ] && [ "$r_settled_pr" != "$pr" ]; then
+    echo "[batch:recover-pr] $code: derivation settled on PR #$r_settled_pr (was #$pr) -> adopting" >&2
+    pr="$r_settled_pr"
+  fi
   echo "[batch:recover-pr] $code: review -> outcome=$r_outcome review=$r_review note=$r_note head=${r_sha:0:7}" >&2
 
   # Only drive the lifecycle from a state that can still accept it. A run
@@ -2524,6 +2535,27 @@ _derive_budget() {
     printf '%s' "$want"; return
   fi
   printf '%s' "$floor"
+}
+
+# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of eight fields.
+#
+# FAIL CLOSED. The old reader could not tell a seven-field tuple from an
+# eight-field one: `read -r a..h` simply leaves `h` empty, so a short result --
+# version skew against an older coordinator, a truncated write, a partial
+# failure -- silently restored the very behaviour the eighth field was added to
+# remove, and the caller went on to authorize and merge a stale PR.
+#
+# Also rejects embedded newlines: `read` consumes only the FIRST line, so a
+# multi-line result would be parsed as its first line and the rest discarded
+# without a word.
+_derived_width_ok() {
+  local line="$1" n
+  # `$'\n'` and NOT `"$(printf '\n')"`: command substitution strips trailing
+  # newlines, so the latter is the EMPTY STRING and the pattern `*""*` matches
+  # every input -- the check rejected everything, including valid tuples.
+  case $line in *$'\n'*) return 1 ;; esac
+  n=$(printf '%s' "$line" | awk -F'|' '{print NF}')
+  [ "$n" = 8 ]
 }
 
 observe_outcome() {  # <item> <code> <pr> [issue]
@@ -3933,6 +3965,13 @@ ${prompt}"
     # absorbed the eighth into `resubmissions` silently -- `read` does not
     # error on a short variable list, it concatenates the remainder into the
     # last name.
+    # WIDTH CHECKED BEFORE PARSING. A short tuple leaves `_settled_pr` empty,
+    # which used to mean "keep the PR I started with" -- indistinguishable from
+    # a derivation that legitimately settled on nothing.
+    if ! _derived_width_ok "$obs"; then
+      echo "[batch] $item: derivation returned a malformed tuple (not eight fields on one line) -> escalating rather than guessing which field is which" >&2
+      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||"
+    fi
     IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr <<EOF
 $obs
 EOF

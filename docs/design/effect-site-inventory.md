@@ -44,7 +44,7 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | 2982 | `gh issue edit --add-label` | `issue_or_label` |
 | 3122 | `gh issue close` | `issue_or_label` |
 | 3159 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
-| 1195 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
+| 1010 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
 | 1214 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
 
 **1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
@@ -89,7 +89,7 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 3167 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
-| 3165 | `gh run rerun` | *(none)* | Same site class as line 3165 above. |
+| 3197 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
+| 3199 | `gh run rerun` | *(none)* | Same site class as line 3197 above. |
 
 | 1010 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed, but that is NOT what blocks routing — corrected 2026-08-29.** The recorded reason was that routing needs the intent contract to carry a response. It does not: `perform` already returns the executor's stdout as the external object id, and `_create_session` was routed on exactly that basis, capturing the response and parsing it afterwards. The ACTUAL blocker is `-w`. The upload uses `-w '\n%{http_code}'` to capture the status alongside the body, and `-w` is deliberately absent from the `session_control` contract because its value supports `%output{path}` — an arbitrary filesystem write from a class that exists to control a session. Checked directly: the contract refuses this argv, reading the `-w` value as the URL. **The route out is `--fail-with-body`** (curl 8.14.1 on the runner supports it), which yields the body AND a non-zero exit on an HTTP error, making `-w` unnecessary. Not done here because it changes what the caller receives on failure, on the coordinator's hot path where every run begins. |

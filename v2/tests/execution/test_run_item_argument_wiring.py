@@ -138,6 +138,13 @@ _NEEDED_REAL_FUNCTIONS = [
     "_pr_signal", "_session_died", "_item_issue",
     "_local_host_id", "_json_get", "_host_ids_match", "_writeback_plan",
     "_issue_writeback", "_ensure_issue_closed", "_record_deferred_ready",
+    # The derived tuple's width check. REAL, not stubbed: it decides whether
+    # run_item parses the tuple or escalates, so a stub that always said yes
+    # would make every test here pass over a boundary that is not being
+    # exercised. Omitting it entirely left run_item calling an undefined
+    # function, which killed the drive before any kernel call and surfaced as
+    # an IndexError on an empty call sequence.
+    "_derived_width_ok",
 ]
 
 
@@ -264,7 +271,7 @@ _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
-  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1'
+  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}'
 }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
@@ -355,6 +362,10 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
         callseq=callseq, calldir=calldir, gencounter=gencounter,
         observed_review=observed_review, head_sha=HEAD_SHA,
         reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH,
+        # The EIGHTH field: the PR the derivation settled on. Emitting the same
+        # PR the item already has keeps these tests about argument wiring; the
+        # settle-and-adopt behaviour has its own file.
+        pr=PR,
     )
     if not merge_ok:
         stub = stub.replace(
