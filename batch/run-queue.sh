@@ -2483,6 +2483,22 @@ _reconcile_item_pr() {
 # cannot cut a legitimate run short is also the faithful behaviour.
 # _ci_policy -> "<wait> <rerun_max> <rerun_wait>", validated ONCE.
 #
+# RERUN_MAX DEFAULTS TO 2, NOT 4, BECAUSE A DEFAULT MUST BE DELIVERABLE.
+# With 4 the advertised budget is 1500 + 4*920 + 120 = 5300s, and a single
+# bounded call tops out at 3600s (`_net_run` clamps, and `_clamp_int` returns
+# its 300s DEFAULT above the ceiling rather than truncating). So the third and
+# fourth reruns could never complete: the enclosing process was killed and the
+# item escalated, while the knob said four were available.
+#
+# 2 gives 1500 + 2*920 + 120 = 3460s, which fits. An operator may still set 4
+# or more -- the range is 0-20 and the warning below fires when the choice
+# cannot fit, which is the honest treatment of an EXPLICIT decision as opposed
+# to a shipped default nobody chose.
+#
+# Not evidence that 3-4 reruns are useless: 26 scorecard rows contain exactly
+# one rerun, which is too few to conclude anything about a rare failure mode.
+# The argument is only that a default must be one the runner can honour.
+#
 # One resolution point, because two of them disagree. `_derive_budget` clamped
 # these while the Python CLI re-parsed the RAW environment with a bare `int()`:
 # `BIRCHER_CI_RERUN_MAX=abc` gave bash a budget computed from 4 and gave Python
@@ -2496,7 +2512,7 @@ _reconcile_item_pr() {
 _ci_policy() {
   printf '%s %s %s' \
     "$(_clamp_int "${BIRCHER_CI_WAIT:-1500}" 1500 1 7200)" \
-    "$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-4}" 4 0 20)" \
+    "$(_clamp_int "${BIRCHER_CI_RERUN_MAX:-2}" 2 0 20)" \
     "$(_clamp_int "${BIRCHER_CI_RERUN_WAIT:-900}" 900 1 7200)"
 }
 
