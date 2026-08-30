@@ -289,8 +289,14 @@ with different powers, and resolving it is a question of ownership (§8).
 Bircher runs on the NAS, not on a workstation: `omnigent:8000` does not resolve
 elsewhere and `/workspaces/*` does not exist elsewhere.
 
-    ~/homelab/omnigent.sh exec '<cmd>'        # via the Portainer API, no SSH
-    OMNIGENT_RUNNER=omnigent-runner-bircher   # target the bircher runner
+    OMNIGENT_RUNNER=omnigent-runner-bircher ~/homelab/omnigent.sh exec '<cmd>'
+
+**The variable must be on the same command.** `omnigent.sh` defaults to
+`RUNNER_NAME="${OMNIGENT_RUNNER:-omnigent-runner}"` — the GENERAL runner, which
+runs other workloads. An earlier version of this document put the assignment on
+its own line BELOW the command, which in shell cannot affect it: following that
+would have launched an autonomous, merge-capable process against the wrong
+container.
 
 | path | what |
 |---|---|
@@ -333,11 +339,32 @@ set, so a PR whose base has moved becomes `BEHIND` and is refused.
 
 ## 7. Where the boundaries are
 
-- **The runner decides. The kernel permits.** Policy never moves into the
-  kernel; the kernel only ever answers "is this allowed" and "what happened".
-- **Every gh/git mutation carries `--repo`.** `gh` resolves an omitted repo
-  from the working directory, which is the runner's own checkout. Enforced by
-  `test_effect_argv_names_its_repo.py`.
+- **Two kinds of policy, in two places.** The runner/coordinator owns WORKFLOW
+  policy: which item, which vendor, when to wait, when to merge, when to give
+  up. The kernel owns SAFETY policy and enforces it — `authz.py` raises
+  `NotAuthorized` in 30 places, covering legal state transitions, the dispatch
+  role a command may come from, reviewer independence from the implementer,
+  the accepted verdict vocabulary, that a review binds an artifact the kernel
+  actually holds, and that a `merged` outcome is backed by a confirmed merge
+  effect rather than an actor's claim.
+
+  An earlier version of this document said "the kernel never decides policy",
+  which is wrong and would misdirect the migration: moving a decision into the
+  coordinator can collide with a rule the kernel already enforces.
+- **Routed `gh` effects in the coordinator name their repository explicitly.**
+  `gh` resolves an omitted `--repo` from the working directory — the runner's
+  own checkout — so an omission acts on the WRONG repository and still
+  succeeds. That happened: review comments landed on `abedegno/bircher` instead
+  of the smoke repo while the kernel journalled them confirmed.
+
+  Scope of the guarantee, precisely: `test_effect_argv_names_its_repo.py`
+  AST-enumerates literal `gh` argv lists inside effect calls in
+  `v2/coordinator/*.py` only. `gh api` is exempt because the repository is in
+  its URL path. **It does not cover the runner's own `gh` calls, and it cannot
+  cover `git` at all** — git has no `--repo`; a routed `git push` is bound by
+  the worktree it runs in and that worktree's `origin`, which is why
+  `publish_cmd` uses a subshell `cd`. Treating this as a global invariant would
+  recreate exactly the failure the test was written for.
 - **An unreadable observation is never evidence.** A failed lookup is `UNKNOWN`,
   never `CLEAN`, never "absent", and never spends a grace period.
 - **A model's claim is not an observation.** Outcomes are derived; the
