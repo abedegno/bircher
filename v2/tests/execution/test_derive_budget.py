@@ -34,12 +34,18 @@ def _budget(**env) -> int:
     return int(r.stdout.strip())
 
 
+#: `_net_run` puts every bounded call through `_clamp_int "$cap" 300 1 3600`,
+#: and `_clamp_int` returns its DEFAULT for an out-of-range value. So a budget
+#: above 3600 does not merely get truncated -- it collapses to 300 SECONDS.
+NET_RUN_CEILING = 3600
+
+
 def _floor(wait: int, rmax: int, rwait: int) -> int:
-    return wait + rmax * (rwait + 20) + 120
+    return min(wait + rmax * (rwait + 20) + 120, NET_RUN_CEILING)
 
 
 def test_the_default_budget_covers_the_default_inner_budgets():
-    assert _budget() == _floor(1500, 4, 900) == 5300
+    assert _budget() == _floor(1500, 4, 900) == NET_RUN_CEILING
 
 
 def test_the_budget_follows_the_ci_wait():
@@ -56,8 +62,14 @@ def test_the_budget_follows_the_rerun_wait():
     assert _budget(BIRCHER_CI_RERUN_WAIT="1800") == _floor(1500, 4, 1800)
 
 
-def test_the_budget_is_never_below_what_the_knobs_can_spend():
-    """The property, stated directly, across the range each knob allows."""
+def test_the_budget_covers_the_knobs_unless_the_ceiling_forbids_it():
+    """The honest property, in two halves.
+
+    Below the ceiling the budget must cover everything the knobs can spend.
+    ABOVE it, it cannot -- a single bounded call tops out at
+    `NET_RUN_CEILING` -- so the budget equals the ceiling and the helper warns.
+    Claiming the first half unconditionally is what produced a 300s bound.
+    """
     for wait in (1, 600, 1500, 7200):
         for rmax in (0, 1, 4, 20):
             for rwait in (1, 900, 7200):
@@ -65,9 +77,13 @@ def test_the_budget_is_never_below_what_the_knobs_can_spend():
                               BIRCHER_CI_RERUN_MAX=str(rmax),
                               BIRCHER_CI_RERUN_WAIT=str(rwait))
                 spendable = wait + rmax * (rwait + 20)
-                assert got >= spendable, (
-                    f"budget {got}s cannot cover {spendable}s of legitimate "
-                    f"work (wait={wait} rmax={rmax} rwait={rwait})")
+                if spendable + 120 <= NET_RUN_CEILING:
+                    assert got >= spendable, (
+                        f"budget {got}s cannot cover {spendable}s of legitimate "
+                        f"work (wait={wait} rmax={rmax} rwait={rwait})")
+                else:
+                    assert got == NET_RUN_CEILING, (
+                        f"over the ceiling the budget must BE the ceiling, got {got}")
 
 
 def test_an_explicit_operator_value_is_honoured_but_warned_about():
@@ -80,7 +96,7 @@ def test_an_explicit_operator_value_is_honoured_but_warned_about():
                        capture_output=True, text=True,
                        env={"PATH": "/usr/bin:/bin", "BIRCHER_DERIVE_TIMEOUT": "1800"})
     assert r.stdout.strip() == "1800", "an explicit value must be honoured"
-    assert "below the 5300s" in r.stderr, (
+    assert "below the 3600s" in r.stderr, (
         "a value that cannot cover the other knobs must warn: "
         f"stderr was {r.stderr!r}")
 
@@ -138,3 +154,39 @@ def test_the_budget_is_computed_from_the_very_same_numbers():
         wait, rmax, rwait = _policy(**env)
         assert _budget(**env) == _floor(wait, rmax, rwait), (
             f"budget and policy disagree for {env}")
+
+
+# --- the budget must be a bound the runner will actually honour --------------
+
+def test_the_budget_never_exceeds_what_a_bounded_call_accepts():
+    """The defect this file did not catch the first time.
+
+    `_net_run` clamps its cap with `_clamp_int "$cap" 300 1 3600`, and
+    `_clamp_int` returns its DEFAULT when the value is out of range. Handing it
+    5300 therefore produced a 300-SECOND bound -- six times SHORTER than the
+    1800s it replaced -- and a live muesli item escalated on it while the log
+    reported the 5300s that had been asked for.
+
+    A budget above the ceiling is not a long timeout. It is a very short one.
+    """
+    for env in ({}, {"BIRCHER_CI_WAIT": "7200"},
+                {"BIRCHER_CI_RERUN_MAX": "20"},
+                {"BIRCHER_CI_RERUN_WAIT": "7200"},
+                {"BIRCHER_CI_WAIT": "7200", "BIRCHER_CI_RERUN_MAX": "20",
+                 "BIRCHER_CI_RERUN_WAIT": "7200"}):
+        got = _budget(**env)
+        assert got <= NET_RUN_CEILING, (
+            f"budget {got}s exceeds the {NET_RUN_CEILING}s ceiling for {env}; "
+            "_net_run would silently collapse it to its 300s default")
+        assert got >= 1, got
+
+
+def test_the_ceiling_matches_what_net_run_actually_clamps_to():
+    """Read from the SOURCE, not copied. If `_net_run`'s clamp changes, this
+    fails rather than leaving a stale constant that reads as verified."""
+    src = RUN_QUEUE.read_text()
+    m = re.search(r'cap=\$\(_clamp_int "\$cap" (\d+) (\d+) (\d+)\)', src)
+    assert m, "could not find _net_run's clamp; the guard below is unanchored"
+    assert int(m.group(3)) == NET_RUN_CEILING, (
+        f"_net_run now clamps to {m.group(3)}s but this file assumes "
+        f"{NET_RUN_CEILING}s")

@@ -2484,6 +2484,20 @@ _derive_budget() {
   # +20s settle per rerun (coordinator.ci.rerun_and_wait), +120s slack for
   # process start, the review dispatch and the effect calls.
   floor=$(( w + r * (rw + 20) + 120 ))
+  # CLAMPED TO WHAT `_net_run` WILL ACTUALLY HONOUR. Its cap goes through
+  # `_clamp_int "$cap" 300 1 3600`, and `_clamp_int` returns its DEFAULT for an
+  # out-of-range value -- so handing it 5300 silently produced a 300-SECOND
+  # bound, six times shorter than the 1800s this replaced. A live muesli run
+  # escalated on it while the log reported the 5300s that was asked for rather
+  # than the 300s that applied.
+  #
+  # Say so when the configured budgets cannot fit: a bound that cannot cover
+  # the work is a real limitation, and silently shrinking it is how this broke.
+  local ceiling=3600
+  if [ "$floor" -gt "$ceiling" ]; then
+    echo "[batch:derive] WARN the CI wait/rerun settings can spend ${floor}s but a single bounded call tops out at ${ceiling}s -> using ${ceiling}s; lower BIRCHER_CI_WAIT or BIRCHER_CI_RERUN_MAX to fit" >&2
+    floor=$ceiling
+  fi
   if [ -n "${BIRCHER_DERIVE_TIMEOUT:-}" ]; then
     # An explicit operator value is honoured -- but say so when it cannot
     # cover the budgets the other knobs already promise.
