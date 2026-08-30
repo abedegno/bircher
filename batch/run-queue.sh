@@ -178,7 +178,10 @@ _normalize_ci() {
   # EMPTY IS PENDING, not green: no checks reported yet is the absence of a
   # verdict, and reading it as success merges a PR whose CI never started.
   local out=""
-  out=$(_coordinator ci-normalize --buckets "$1") || out=""
+  # PIPED, not passed: a CI list has no upper bound and an oversized argv
+  # element fails `execve` with "Argument list too long" -- which this
+  # function would then read as `pending`, and `_wait_ci` loops on pending.
+  out=$(printf '%s' "$1" | _coordinator ci-normalize --buckets -) || out=""
   # A failed call must not read as green. `pending` keeps the caller waiting,
   # which is the survivable answer -- but note `_wait_ci` loops on pending, so
   # a PERMANENTLY failing call hangs rather than errors. That trade is why the
@@ -2710,7 +2713,10 @@ _keep_blocking_checks() {
   # delimiter passes through whole, because `cut` does and real `gh pr checks`
   # output arrives that way. All three rules, and their tests, are in
   # v2/coordinator/ci.py.
-  _coordinator ci-keep-blocking --lines "$1" --required "${2:-}" || printf '%s' "$1"
+  # PIPED for the same reason as `_normalize_ci`: the check list is unbounded
+  # and an oversized argv element fails execve rather than returning an answer.
+  printf '%s' "$1" | _coordinator ci-keep-blocking --lines - --required "${2:-}" \
+    || printf '%s' "$1"
 }
 
 # _drop_non_ci_checkruns <lines> -> the same lines minus non-CI ones, name stripped.

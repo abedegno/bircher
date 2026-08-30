@@ -1,0 +1,74 @@
+name: CI
+
+# bircher had NO CI at all until 2026-08-30. Its own pull requests got zero
+# automated verification while it gated another repository's merges, and five
+# defects in one migration slice were found only by live runs after a green
+# local suite. A second observer is the point of this file.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A superseded push should not keep burning a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: python suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Pinned rather than floating: a pytest release that changes collection
+      # semantics must be an explicit bump, not a Tuesday.
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check 'pytest==8.3.4' 'pyyaml==6.0.2'
+
+      # `cd v2` matters: there is no pyproject.toml, so the package roots
+      # (kernel/, coordinator/, tools/, tests/) are found via rootdir, exactly
+      # as the local invocation does it.
+      - name: Run the suite
+        working-directory: v2
+        run: python -m pytest -q
+
+  self-test:
+    name: run-queue self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check 'pyyaml==6.0.2'
+
+      # The self-test drives throwaway git worktrees; git refuses to commit
+      # without an identity, and the failure is opaque when it happens deep in
+      # a subshell.
+      - name: Give git an identity
+        run: |
+          git config --global user.email "ci@bircher.invalid"
+          git config --global user.name "bircher CI"
+
+      # ~360s locally. That is the baseline, not a regression -- it has caught
+      # four defects pytest could not, including a `cut` semantics divergence
+      # that hung a live run.
+      #
+      # No GH_TOKEN is provided ON PURPOSE. The self-test is meant to be
+      # hermetic, driving fake `gh` shims it puts on PATH. If it ever needs a
+      # real token, that is a finding about the self-test, not a missing secret.
+      - name: Run --self-test
+        run: bash batch/run-queue.sh --self-test

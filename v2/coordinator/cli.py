@@ -30,6 +30,18 @@ RC_LOOKUP_FAILED = 3
 RC_EFFECT_DENIED = 87
 
 
+def _maybe_stdin(value: str) -> str:
+    """`-` means the payload is on stdin.
+
+    Any other value is returned unchanged, so every existing caller and test
+    keeps working. Only the two CI-list commands use it, and only because
+    their input has no upper bound.
+    """
+    if value != "-":
+        return value
+    return sys.stdin.read()
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="bircher-coordinator")
     subs = p.add_subparsers(dest="mode", required=True)
@@ -50,6 +62,13 @@ def main(argv=None) -> int:
     st.add_argument("--server", required=True)
     st.add_argument("--id", required=True, dest="conv_id")
 
+    # `-` means READ FROM STDIN. These carry CI check lists, which are
+    # unbounded: passed as an argv element they hit the kernel's per-argument
+    # ceiling (128KB on Linux, MAX_ARG_STRLEN) and `timeout` fails with
+    # "Argument list too long". The shell then reads the empty result as
+    # `pending`, and `_wait_ci` loops on pending -- so an oversized input HANGS
+    # rather than erroring. Found by bircher's first CI run, on Linux; macOS
+    # allows a larger argument and never reproduced it.
     cn = subs.add_parser("ci-normalize")
     cn.add_argument("--buckets", required=True)
 
@@ -125,11 +144,11 @@ def main(argv=None) -> int:
         return RC_OK
 
     if a.mode == "ci-normalize":
-        print(normalize(a.buckets), end="")
+        print(normalize(_maybe_stdin(a.buckets)), end="")
         return RC_OK
 
     if a.mode == "ci-keep-blocking":
-        print(keep_blocking(a.lines, a.required), end="")
+        print(keep_blocking(_maybe_stdin(a.lines), a.required), end="")
         return RC_OK
 
     if a.mode == "verdict":
