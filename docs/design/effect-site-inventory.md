@@ -27,22 +27,22 @@ grep -nE "git .*push" batch/run-queue.sh
 grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 ```
 
-## Mutations — 19 routed sites
+## Mutations — 18 routed sites
 
 | Line | Call | Effect class |
 |---|---|---|
-| 378 | `gh issue reopen` | `issue_or_label` |
-| 1291 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
+| 291 | `gh issue reopen` | `issue_or_label` |
+| 4260 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
 | 1519 | `gh pr merge --squash --delete-branch` | `merge` |
-| 1723 | `git push origin HEAD:main` | `ref_update` |
+| 1602 | `git push origin HEAD:main` | `ref_update` |
 | 1816 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
 | 1899 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
-| 1979 | `gh pr close` | `pull_request` |
-| 2138 | `gh pr comment` | `comment` |
-| 2980 | `gh issue comment` | `comment` |
+| 2212 | `gh pr close` | `pull_request` |
+| 4272 | `gh pr comment` | `comment` |
+| 3104 | `gh issue comment` | `comment` |
 | 2981 | `gh issue edit --remove-label` | `issue_or_label` |
 | 2982 | `gh issue edit --add-label` | `issue_or_label` |
-| 2998 | `gh issue close` | `issue_or_label` |
+| 3122 | `gh issue close` | `issue_or_label` |
 | 3159 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 | 1195 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
 | 1214 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
@@ -64,12 +64,12 @@ suppression nobody wrote down is a suppression nobody re-reads.
 
 | Line | Text | Why it is not a call |
 |---|---|---|
-| 1546 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
+| 1425 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
 | 5115 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
 | 5185 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
 | 5914 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
 | 5915 | `echo "FAIL #62: the recovery git push must be bounded"` | failure message |
-| 5938 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 6196 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
@@ -89,7 +89,7 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 788 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
-| 3076 | `gh run rerun` | *(none)* | Same site class as line 788 above. |
-| 3078 | `gh run rerun` | *(none)* | Same site class as line 788 above. |
-| 1057 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed, but that is NOT what blocks routing — corrected 2026-08-29.** The recorded reason was that routing needs the intent contract to carry a response. It does not: `perform` already returns the executor's stdout as the external object id, and `_create_session` was routed on exactly that basis, capturing the response and parsing it afterwards. The ACTUAL blocker is `-w`. The upload uses `-w '\n%{http_code}'` to capture the status alongside the body, and `-w` is deliberately absent from the `session_control` contract because its value supports `%output{path}` — an arbitrary filesystem write from a class that exists to control a session. Checked directly: the contract refuses this argv, reading the `-w` value as the URL. **The route out is `--fail-with-body`** (curl 8.14.1 on the runner supports it), which yields the body AND a non-zero exit on an HTTP error, making `-w` unnecessary. Not done here because it changes what the caller receives on failure, on the coordinator's hot path where every run begins. |
+| 2887 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
+| 2889 | `gh run rerun` | *(none)* | Same site class as line 2887 above. |
+
+| 999 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed, but that is NOT what blocks routing — corrected 2026-08-29.** The recorded reason was that routing needs the intent contract to carry a response. It does not: `perform` already returns the executor's stdout as the external object id, and `_create_session` was routed on exactly that basis, capturing the response and parsing it afterwards. The ACTUAL blocker is `-w`. The upload uses `-w '\n%{http_code}'` to capture the status alongside the body, and `-w` is deliberately absent from the `session_control` contract because its value supports `%output{path}` — an arbitrary filesystem write from a class that exists to control a session. Checked directly: the contract refuses this argv, reading the `-w` value as the URL. **The route out is `--fail-with-body`** (curl 8.14.1 on the runner supports it), which yields the body AND a non-zero exit on an HTTP error, making `-w` unnecessary. Not done here because it changes what the caller receives on failure, on the coordinator's hot path where every run begins. |
