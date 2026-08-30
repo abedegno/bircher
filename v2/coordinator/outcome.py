@@ -15,6 +15,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from coordinator.ci import DEFAULT_IGNORED as _DEFAULT_IGNORED
 from coordinator.observe import classify
 
 #: A head we can pin a merge to. Anything else is "cannot pin", which the
@@ -43,6 +44,16 @@ class Deps:
     wait_ci: callable = lambda pr: "pending"
     required: str = ""
     reviewer: str = "codex"
+    #: The operator's BIRCHER_CI_IGNORE_CHECKS, or the library default.
+    #: ON Deps, not imported at the point of use: `_settle_ci` used to
+    #: reconstruct the filtering with `keep_blocking`'s default, so the
+    #: override reached `poll`, `failure_kind` and `rerun` but NOT the FIRST
+    #: read -- and the first read is the one that decides whether the others
+    #: are ever called. A custom-ignored check that was already failing made
+    #: the derivation return red without ever consulting the policy that said
+    #: to ignore it. Threading it here means there is one policy rather than
+    #: one per call site.
+    ignore: str = _DEFAULT_IGNORED
 
 
 @dataclass(frozen=True)
@@ -104,7 +115,7 @@ def _settle_ci(item, pr, d: Deps, rerun_max: int) -> str:
     """Wait out a pending CI, and re-run an INFRASTRUCTURE red."""
     from coordinator.ci import keep_blocking, normalize
 
-    ci = normalize(keep_blocking(d.checks(pr), d.required))
+    ci = normalize(keep_blocking(d.checks(pr), d.required, d.ignore))
     if ci == "pending":
         d.log(f"{item}: PR #{pr} CI still running -> waiting for CI to settle")
         ci = d.wait_ci(pr)

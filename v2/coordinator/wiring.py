@@ -148,6 +148,7 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
             ignore=ignore),
         required=required(),
         reviewer=reviewer,
+        ignore=ignore,
     )
 
 

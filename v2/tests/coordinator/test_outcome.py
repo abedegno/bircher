@@ -300,3 +300,37 @@ def test_a_failing_comment_effect_does_not_abort_the_derivation():
     assert r.as_tuple()[3] == "a" * 40, "the merge-authorising head must survive"
     assert any("failed to post" in m for m in logged), \
         "the failure must be visible in the log, not swallowed"
+
+
+def test_a_custom_ignored_check_does_not_decide_the_first_read():
+    """The gap the second cross-review round found.
+
+    `_settle_ci` classified the FIRST read with `keep_blocking`'s default
+    ignore list rather than the configured one. That read decides everything:
+    a custom-ignored check that was already FAILING made the derivation return
+    red immediately, so `wait_ci`, `failure_kind` and `rerun` -- all of which
+    had been correctly threaded -- were never reached. The override was bound
+    at three consumers and missed at the only one that gates them.
+
+    Drives the whole of `derive`, deliberately. The earlier tests bound
+    `poll`, `failure_kind` and `live_deps.wait_ci` individually and every one
+    of them passed with this defect present.
+    """
+    checks = "build|pass\nflaky-lint|fail"
+
+    # Default policy: the failing check is required and blocking -> red.
+    plain = derive("i1", "i1", "7", "",
+                   deps=_deps(checks=lambda pr: checks,
+                              required="build\nflaky-lint"))
+    assert plain.ci == "red"
+    assert plain.outcome != "ready"
+
+    # Operator policy ignores it -> the same repository state is green.
+    ignored = derive("i1", "i1", "7", "",
+                     deps=_deps(checks=lambda pr: checks,
+                                required="build\nflaky-lint",
+                                ignore="Dependabot|review-gate|flaky-lint"))
+    assert ignored.ci == "green", (
+        "BIRCHER_CI_IGNORE_CHECKS did not reach the first classification, "
+        "which is the one that decides whether the others run")
+    assert ignored.outcome == "ready"
