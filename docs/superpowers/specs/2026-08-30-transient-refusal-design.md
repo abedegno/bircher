@@ -183,6 +183,22 @@ So an absent required context is presumed to be arriving, bounded:
 - When grace expires, re-read the PR state and contexts as close together as
   the API allows, and defer only if the context is still absent.
 
+### WHERE the gate runs, which the code decides
+
+`merge_ready_pr` already waits for `mergeable`, and only THEN posts
+`bircher/cross-review`. That ordering matters and was not obvious from the
+design alone: `review-gate` reacts to the cross-review status, so a gate
+waiting for `CLEAN` placed BEFORE the status post would wait for a state that
+cannot arrive until we act. It would block forever on its own inaction.
+
+So there are two waits, with different jobs:
+
+1. The existing `mergeable` wait stays where it is — it catches `CONFLICTING`
+   before the cost of posting a status.
+2. The new `mergeStateStatus` gate runs AFTER `_post_cross_review_status` and
+   immediately before the merge loop, which is the only point at which `CLEAN`
+   is reachable.
+
 ### Backoff
 
 Exponential, 2s doubling to a 30s ceiling, and every sleep capped by
