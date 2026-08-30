@@ -13,7 +13,7 @@ import argparse
 import os
 import sys
 
-from coordinator.ci import keep_blocking, normalize
+from coordinator.ci import DEFAULT_IGNORED, keep_blocking, normalize
 from coordinator.effects import EffectDenied, NotDispatched, perform_effect
 from coordinator.observe import ci_history, classify
 from coordinator.outcome import derive
@@ -148,7 +148,21 @@ def main(argv=None) -> int:
         return RC_OK
 
     if a.mode == "ci-keep-blocking":
-        print(keep_blocking(_maybe_stdin(a.lines), a.required), end="")
+        # The operator's policy, resolved HERE at the boundary. The shell used
+        # to apply `${BIRCHER_CI_IGNORE_CHECKS:-...}` with its own grep; once
+        # `_keep_blocking_checks` delegated to this mode, calling
+        # `keep_blocking` with no `ignore` silently reinstated the library
+        # default and discarded the override -- so a custom-ignored FAILING
+        # check went back to being treated as blocking on the shell paths.
+        #
+        # Read from the environment rather than added as a flag: run-queue.sh
+        # never ASSIGNS this name, every use is `${BIRCHER_CI_IGNORE_CHECKS:-}`
+        # against the operator's own environment, so both languages already see
+        # the same value. That is the contract test_env_boundary_contract.py
+        # calls `operator`.
+        print(keep_blocking(_maybe_stdin(a.lines), a.required,
+                            os.environ.get("BIRCHER_CI_IGNORE_CHECKS")
+                            or DEFAULT_IGNORED), end="")
         return RC_OK
 
     if a.mode == "verdict":
