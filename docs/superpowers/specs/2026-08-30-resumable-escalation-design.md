@@ -47,87 +47,123 @@ manufacturing the missing stages is this defect with better manners.
 
 ## The design
 
-**An escalation is not an ending, and the fix is to stop recording it as one.**
+**An escalation is not an ending, and a resumed run re-earns everything that
+can go stale.**
 
 An escalated run has a REAL partial history — a spec, a plan, an
-implementation, often CI and a review. Resumption is legitimate precisely
-because that history exists and can be re-checked. Nothing is synthesized.
+implementation, a pull request. Resumption is legitimate because that history
+exists. What it must NOT inherit is any judgement about the current world.
 
-### A distinct state, and the stage it came from
+### Resumption returns the run to `implementing`, and no further
 
-`record_run_outcome` gains a distinction it does not make today:
+A first draft returned the run to whatever stage it escalated from, so a run
+that gave up at `merge_requested` would resume holding its `merge_authorized`
+fact and re-run the merge effect. **That is unsafe, and the reason is not
+obvious.**
 
-| outcome | state | meaning |
+`revalidate_merge` re-derives every input from kernel state, which sounds like
+it would catch a stale approval. It does not catch this one. Its base check
+compares `binding.base_sha` against `store.run_base_sha(run_id)` — **the run's
+own recorded base against itself** — so it is tautological on exactly this
+path, a fact `kernel-client.sh` already states in a comment about adoption.
+And `--match-head-commit` pins the PR HEAD, not the base: main moving
+underneath an unchanged head is invisible to both. A run escalated at
+`merge_requested` on Monday could merge on Friday against a main it was never
+tested with.
+
+So resumption lands at `implementing`. The spec and the plan survive — they are
+history, not judgement. The review, the CI observation and the merge
+authorization do not: they are claims about a world that has moved, and the
+run re-earns them against the world as it is now.
+
+This also removes the need to record which stage a run escalated from. There
+is one destination, so there is nothing to record, nothing written mid-failure
+to be trusted later, and no crash window between recording the outcome and
+recording the stage. The first draft needed `escalated_from` and a rule making
+it kernel-derived inside the CAS transaction; the simpler destination deletes
+the requirement instead of satisfying it.
+
+### The outcome vocabulary, from the code rather than from memory
+
+`_RUN_OUTCOMES` in `v2/kernel/authz.py` is
+`{merged, ready, escalated, noop, skipped, failed, timeout}`. A first draft of
+this table invented `closed` and omitted `ready` and `noop` — the whole set is
+classified here, and a test generated FROM `_RUN_OUTCOMES` fails the build if
+an outcome is ever added without a decision:
+
+| outcome | state | why |
 |---|---|---|
-| `merged`, `closed`, `skipped` | `ended` | terminal, as now |
-| `escalated`, `failed`, `timeout` | `escalated` | work stopped, history intact |
+| `merged` | `ended` | terminal, and already checked against a confirmed merge effect |
+| `noop` | `ended` | there was nothing to do |
+| `skipped` | `ended` | deliberately not done |
+| `escalated` | `escalated` | a judgement was handed to a human; the work survives |
+| `failed` | `escalated` | the mechanism broke; the work survives |
+| `timeout` | `escalated` | a budget expired; the work survives |
+| `ready` | `escalated` | **the case that stranded PR #736** — the work is complete and the merge did not happen, which is precisely a resumable state, not an ending |
 
-`ended` keeps its exact current meaning and remains unreachable-from. Only the
-escalation outcomes land in the new state, and the fact records
-`escalated_from: <the state the run was in>` so resumption has somewhere to
-return to rather than a guess.
+`ended` keeps its exact current meaning and stays unreachable-from.
 
 ### `resume_run`, an audited command under CAS
 
     resume_run --run-id R --expected-version N
 
-- Legal ONLY from `escalated`. Never from `ended`, `cancelled` or a live state.
-- Returns the run to its recorded `escalated_from` state — the stage it
-  genuinely reached, not a stage chosen by the caller.
-- Appends a `run_resumed` fact carrying the from/to states and the resume
-  count.
-- Re-fences: a resumed run takes a NEW generation, so a stale actor from the
-  previous attempt cannot act, and every idempotency key that embeds the
-  generation becomes a genuinely new attempt rather than a replay.
-- Refused if the run has unresolved uncertain effects. A halt is reconciled
-  first, exactly as today; resumption never clears one.
-- Bounded by `BIRCHER_MAX_RESUMES` (default 3) per run, recorded in the fact.
-  Without a bound a permanently-failing item resumes for ever, and the count
-  belongs in the journal so the limit is auditable rather than ambient.
+- Legal ONLY from `escalated`; never from `ended`, `cancelled`, or a live
+  state.
+- Moves the run to `implementing` and appends a `run_resumed` fact carrying the
+  resume count.
+- Re-fences: a new generation, so a stale actor cannot act and every
+  idempotency key embedding the generation becomes a genuinely new attempt.
+- **Refused while any effect is uncertain.** A halt is reconciled first,
+  exactly as today; resumption never clears one.
+- Bounded by `BIRCHER_MAX_RESUMES` (default 3) per run, counted from the
+  journal so the limit is auditable rather than ambient.
 
-**No gate is skipped.** A run resumed to `implementing` still needs its review
-and its merge authorization. A run resumed to `merge_requested` — #714's case
-— already HAS a recorded, accepted review and a `merge_authorized` fact; those
-are real, and the merge effect they authorize is the one that failed to
-execute. Resumption re-runs the effect, not the approval.
+### Why resumption may be automatic here, having not been safe before
 
-### Adoption selects a live or resumable run, never a terminal one
+Adoption gains one branch: the newest LIVE run is adopted as now; failing that
+the newest `escalated` run is adopted and resumed; failing that a fresh run is
+minted, with today's deliberate refusals intact.
 
-`_kernel_adopt_run` currently takes `runs[-1]` regardless of state. It becomes:
+Automatic resumption was rejected in review while resumption could replay an
+authorization — and rightly, because a retry would then re-enable a mutation
+nobody had re-approved. Landing at `implementing` removes that: a resumed run
+holds no authorization and can reach a merge only by earning a fresh review
+against the current head and base. The bound stops an item looping, and every
+resume is journalled.
 
-1. the newest run in a LIVE state → adopt, as now;
-2. else the newest run in `escalated` → adopt AND `resume_run` it;
-3. else (only `ended`/`cancelled` runs, or none) → mint, with today's
-   deliberate refusals intact.
-
-Rule 3 is unchanged behaviour and keeps the fabrication scar closed: a genuinely
-new run still presents an empty history and is still refused.
+The residual risk is honest and worth stating: an item that escalated for a
+reason a human should have looked at will be retried up to three times before
+it stops. It will not merge anything unearned while doing so, and each attempt
+is visible in the journal.
 
 ### What this does NOT do
 
 **It does not resurrect the two PRs already stranded.** #736 and #737 recorded
-`ended` before this exists, and no migration invents an `escalated_from` that
-was never observed. They need a human, and that is the honest cost of shipping
-the escalation state late.
+`ended` before this exists, and no migration invents a state that was never
+observed. They need a human, which is the honest cost of shipping the
+escalation state late.
 
-**It does not make escalation cheap.** A resumed run is still an item a human
-was asked about. The resume bound and the journalled count keep that visible.
+**It does not touch `revalidate_merge`'s tautological base check.** That is a
+real weakness, now written down, and it belongs in its own piece of work: the
+fix is to bind an approval to an OBSERVED base rather than the run's recorded
+one, which changes what a review means.
 
 ## Acceptance
 
-1. Every escalation outcome lands in `escalated`; every terminal outcome still
-   lands in `ended`. Asserted per outcome, not by sampling one.
-2. `resume_run` is refused from `ended`, from `cancelled`, from a live state,
-   past the resume bound, and while an uncertain effect is unresolved. Each
-   refusal is its own test.
-3. A resumed run returns to its RECORDED stage — a test resumes runs escalated
-   from three different stages and asserts each lands where it left.
+1. Every outcome in `_RUN_OUTCOMES` is classified, with the test generated
+   from that frozenset so a new outcome fails the build rather than defaulting.
+2. `resume_run` is refused from `ended`, from `cancelled`, from every live
+   state, past the resume bound, and while an uncertain effect is unresolved.
+   Each refusal is its own test.
+3. A run escalated from `merge_requested` resumes to `implementing` and its
+   `merge_authorized` no longer authorizes anything — asserted by driving the
+   merge effect and requiring a refusal.
 4. A resumed run takes a new generation, and an actor holding the old one is
    refused.
-5. Adoption picks live over escalated over minting, with a test per branch, and
-   a test that a run in `ended` is never adopted.
+5. Adoption picks live over escalated over minting, a test per branch, plus a
+   test that a run in `ended` is never adopted.
 6. **The fabrication guard still holds:** a minted run still cannot reach
-   `merge_requested`, asserted directly, so this change cannot be read as
-   permission to seed history.
-7. A live muesli item that escalates is re-queued and completes without a
-   human touching the kernel.
+   `merge_requested`, asserted directly, so this cannot be read as permission
+   to seed history.
+7. A live muesli item that escalates is re-queued and completes, with the
+   journal showing a resume and a FRESH review rather than a replayed one.
