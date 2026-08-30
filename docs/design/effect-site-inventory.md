@@ -32,20 +32,21 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | Line | Call | Effect class |
 |---|---|---|
 | 291 | `gh issue reopen` | `issue_or_label` |
-| 4260 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
-| 1519 | `gh pr merge --squash --delete-branch` | `merge` |
-| 1602 | `git push origin HEAD:main` | `ref_update` |
-| 1816 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
-| 1899 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
-| 2212 | `gh pr close` | `pull_request` |
-| 4272 | `gh pr comment` | `comment` |
-| 3104 | `gh issue comment` | `comment` |
-| 2981 | `gh issue edit --remove-label` | `issue_or_label` |
-| 2982 | `gh issue edit --add-label` | `issue_or_label` |
-| 3122 | `gh issue close` | `issue_or_label` |
-| 3159 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
-| 1010 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
-| 1214 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
+| 4597 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
+| 1633 | `gh pr merge --squash --delete-branch` | `merge` |
+| 1837 | `git push origin HEAD:main` | `ref_update` |
+| 1984 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
+| 2460 | `gh pr close` | `pull_request` |
+| 4609 | `gh pr comment` | `comment` |
+| 3414 | `gh issue comment` | `comment` |
+| 3415 | `gh issue edit --remove-label` | `issue_or_label` |
+| 3416 | `gh issue edit --add-label` | `issue_or_label` |
+| 3432 | `gh issue close` | `issue_or_label` |
+| 3667 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 1066 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
+| 1092 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
+| 1052 | `curl -X POST $SERVER/v1/sessions` | `session_control` |
+| 1078 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
 
 **1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
 classified it as `pull_request`. M1-3 split `merge` into its own class
@@ -64,12 +65,11 @@ suppression nobody wrote down is a suppression nobody re-reads.
 
 | Line | Text | Why it is not a call |
 |---|---|---|
-| 1425 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 5115 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 5185 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 5914 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
-| 5915 | `echo "FAIL #62: the recovery git push must be bounded"` | failure message |
-| 6196 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 1660 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
+| 5793 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 6710 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
+| 6711 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 6734 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
