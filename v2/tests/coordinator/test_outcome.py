@@ -334,3 +334,21 @@ def test_a_custom_ignored_check_does_not_decide_the_first_read():
         "BIRCHER_CI_IGNORE_CHECKS did not reach the first classification, "
         "which is the one that decides whether the others run")
     assert ignored.outcome == "ready"
+
+
+def test_the_comment_is_addressed_to_the_repository_under_management():
+    """Not just that `--repo` is present -- that it carries the RIGHT value.
+
+    The flag's presence is a structural fact; the defect was about WHERE the
+    effect landed. `gh` resolves an omitted `--repo` from the coordinator's own
+    working directory, so s13's and s14's review comments went to
+    abedegno/bircher #17 and #18 instead of abedegno/bircher-smoke -- and the
+    kernel journalled effect_confirmed for both, because the command succeeded.
+    """
+    d = _deps(repo="owner/target")
+    derive("i1", "i1", "7", "", deps=d)
+
+    argv = d.posted[0][2]
+    assert "--repo" in argv, "the comment effect must name its repository"
+    assert argv[argv.index("--repo") + 1] == "owner/target", (
+        f"the comment was addressed to the wrong repository: {argv}")

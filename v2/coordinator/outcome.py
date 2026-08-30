@@ -54,6 +54,15 @@ class Deps:
     #: to ignore it. Threading it here means there is one policy rather than
     #: one per call site.
     ignore: str = _DEFAULT_IGNORED
+    #: The target repository, `owner/name`. EVERY effect argv must name it.
+    #: `gh` resolves an omitted `--repo` from the CURRENT WORKING DIRECTORY's
+    #: git remote -- which for the coordinator is the bircher checkout, not the
+    #: repository under management. The comment below went to abedegno/bircher
+    #: issues #17 and #18 instead of abedegno/bircher-smoke, and the kernel
+    #: journalled `effect_confirmed` for both, because the command SUCCEEDED --
+    #: against the wrong target. Second instance of this shape; `publish_cmd`
+    #: was the first.
+    repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -190,7 +199,8 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
         # a non-essential courtesy blocking a merge.
         try:
             d.effect("comment", key,
-                     ["gh", "pr", "comment", str(pr), "--body", body])
+                     ["gh", "pr", "comment", str(pr), "--repo", d.repo,
+                      "--body", body])
         except Exception as exc:                       # noqa: BLE001
             d.log(f"{item}: failed to post the derived comment to PR #{pr} "
                   f"({type(exc).__name__}: {exc}) -> continuing; the outcome "
