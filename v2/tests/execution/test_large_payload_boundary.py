@@ -60,11 +60,21 @@ def test_passing_the_same_payload_as_an_argument_is_what_fails():
     said out loud, because a silently-skipped control is not a control.
     """
     import pytest
-    r = subprocess.run(
-        [sys.executable, "-m", "coordinator.cli", "ci-normalize",
-         "--buckets", BIG],
-        capture_output=True, text=True, cwd=V2,
-        env={"PYTHONPATH": str(V2), "PATH": "/usr/bin:/bin"})
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "coordinator.cli", "ci-normalize",
+             "--buckets", BIG],
+            capture_output=True, text=True, cwd=V2,
+            env={"PYTHONPATH": str(V2), "PATH": "/usr/bin:/bin"})
+    except OSError as exc:
+        # THE LINUX PATH, and the one the defect actually took. `execve` refuses
+        # before the child exists, so the failure surfaces as E2BIG raised IN
+        # THE PARENT rather than as a child exit code. The first version of
+        # this test only checked `returncode` and therefore FAILED on the very
+        # platform it was written to describe -- caught by CI, which is the
+        # point of CI.
+        assert exc.errno == 7, f"expected E2BIG, got {exc!r}"
+        return
     if r.returncode == 0:
         pytest.skip("this platform accepts a >128KB argv element (macOS); the "
                     "ceiling this guards exists on Linux, where CI runs")
