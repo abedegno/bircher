@@ -130,6 +130,13 @@ only WHEN a merge is attempted. Updating a BEHIND branch requires re-reviewing
 the new head and issuing a fresh authorization; that is a lifecycle change and
 belongs in its own piece of work, not smuggled into a timing fix.
 
+**And it already exists.** `recover_pr_cmd` detects BEHIND before it reviews,
+performs the `update-branch` effect, reviews the NEW head and only then calls
+`merge_ready_pr` — the full lifecycle, in the one place that has a reviewer to
+re-run. The gate deferring on BEHIND is therefore not a capability gap: it
+keeps the mutation in the caller that can pay for it, rather than adding a
+second, reviewer-less one inside a timing gate.
+
 `UNKNOWN` has no separate poll count: the phase deadline already bounds it,
 and a second bound would be a knob nobody sets correctly.
 
@@ -173,8 +180,13 @@ So an absent required context is presumed to be arriving, bounded:
   sit BLOCKED for another reason first and only later expose a newly required
   or re-run context as absent; starting the clock at the first BLOCKED
   observation would defer immediately on a genuine registration race.
-- It is measured on a monotonic clock, so a wall-clock adjustment cannot end
-  it early or extend it indefinitely.
+- It is measured on the same WALL clock as `_arm_deadline`. Monotonic would
+  be better in isolation, but the deadline that bounds every wait here is
+  wall-clock, so a monotonic grace inside a wall-clock phase would not make
+  the pair safer — only the claim harder to check. If the clock cannot be read
+  at all the gate keeps WAITING rather than deferring, because deferring would
+  escalate on the transient condition this exists to tolerate; a poll cap
+  bounds the loop in that case.
 - It resets when the head changes: a new head is a new set of check runs.
 - If the required SET changes, contexts new to it start their own grace;
   contexts that leave it are forgotten.

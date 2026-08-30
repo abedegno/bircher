@@ -386,6 +386,17 @@ _arm_ci_deadline() {
 # a garbled value would abandon healthy work. The digits check must come first and be
 # SILENT: bash's `[ x -ge y ]` ERRORS rather than returning false on an oversized operand
 # (#61b), and a test asserting only "non-zero" cannot tell the guard from the error.
+# _now_s -> seconds since the epoch, or empty if the clock is unreadable.
+# Wall clock, matching `_arm_deadline`. A monotonic source would be better in
+# isolation, but the deadline that BOUNDS every wait here is wall-clock, so a
+# monotonic grace inside a wall-clock phase would not make the pair safer -- it
+# would only make the claim harder to check.
+_now_s() {
+  local n; n=$(date +%s 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
 _deadline_passed() {
   case "${1:-}" in
     ''|*[!0-9]*) return 1 ;;
@@ -1305,6 +1316,162 @@ _restamp_if_delta_unchanged() {
   return 0
 }
 
+# _classify_blocked <required_names> <reported_rows> -> wait | defer | absent
+#
+# ORDERED and EXHAUSTIVE. BLOCKED covers a check still running, a check that
+# failed, a check that has not REGISTERED yet, and conditions that are not
+# checks at all -- a missing approval matches none of the check-shaped rules
+# while still blocking forever, which is the case an obvious three-way split
+# misses entirely.
+#
+# <required_names> newline-separated context names; empty means the snapshot
+# said "no required contexts". The literal token `?` means the snapshot could
+# not be read, which is NOT evidence of absence and must not spend the
+# registration grace on an API outage.
+# <reported_rows> `name|state` lines for the head.
+_classify_blocked() {
+  local req="$1" rows="$2" name row_state saw_absent=0 saw_pending=0 saw_bad=0
+  [ "$req" = "?" ] && { printf 'defer'; return; }          # 1: unreadable -> fail closed
+  [ -z "$req" ]    && { printf 'defer'; return; }          # 2: no required checks -> non-check blocker
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    row_state=$(printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$1==n {print $2; exit}')
+    if [ -z "$row_state" ]; then saw_absent=1
+    elif [ "$row_state" = pending ]; then saw_pending=1
+    elif [ "$row_state" != success ]; then saw_bad=1
+    fi
+  done <<EOF
+$req
+EOF
+  [ "$saw_pending" = 1 ] && { printf 'wait'; return; }     # 3: something is running
+  [ "$saw_absent" = 1 ]  && { printf 'absent'; return; }   # 4: not registered YET -> grace
+  [ "$saw_bad" = 1 ]     && { printf 'defer'; return; }    # 5: reported, not success -> durable
+  printf 'defer'                                           # 6: all green, still BLOCKED -> approval etc.
+}
+
+# _classify_merge_state <state> <mergeable> <mergeStateStatus> <head> <expected>
+#   -> proceed | wait | defer
+#
+# Precedence, in order. FAILS CLOSED: an enum value neither table knows defers
+# rather than proceeding, because GitHub adding a state must never read as
+# "go". BLOCKED is resolved by _classify_blocked, whose `absent` answer the
+# caller converts to wait-or-defer using the registration grace.
+_classify_merge_state() {
+  local st="$1" mergeable="$2" mss="$3" head="$4" expected="$5"
+  [ "$st" != OPEN ] && { printf 'defer'; return; }                    # 1
+  # 2: never proceed on a head the reviewer did not see.
+  [ -n "$expected" ] && [ -n "$head" ] && [ "$head" != "$expected" ] \
+    && { printf 'defer'; return; }
+  [ "$mergeable" = CONFLICTING ] && { printf 'defer'; return; }       # 3
+  { [ -z "$mergeable" ] || [ "$mergeable" = UNKNOWN ] \
+    || [ -z "$mss" ] || [ "$mss" = UNKNOWN ]; } && { printf 'wait'; return; }  # 4
+  case "$mss" in                                                      # 6
+    CLEAN)    printf 'proceed' ;;
+    UNSTABLE) printf 'proceed' ;;   # a NON-required check; protection ignores it
+    BLOCKED)  printf 'blocked' ;;   # the caller resolves this one
+    BEHIND)   printf 'defer' ;;     # no mutation here: update-branch moves the
+                                    # head, which rule 2 then refuses forever
+    DIRTY)    printf 'defer' ;;
+    *)        printf 'defer' ;;     # 5: unknown future enum -> fail closed
+  esac
+}
+
+# _await_mergeable_state <item> <pr> <expected_sha> -> rc 0 proceed | rc 1 defer
+#
+# THE FIX FOR THE muesli #735 HALT. The old gate polled `.mergeable`, which
+# reports CONFLICT state only. Branch protection lives in `mergeStateStatus`,
+# so a PR whose required check had not yet posted read as MERGEABLE, the merge
+# was attempted, GitHub refused it, the effect became uncertain and the run
+# HALTED -- needing a human before it could merge at all. Measured on #735:
+# bircher posts bircher/cross-review at 13:29:11, the workflow reacts and posts
+# review-gate at 13:29:18, and the merge landed in that seven-second window.
+#
+# Runs AFTER the cross-review status is posted, deliberately: review-gate reacts
+# to that status, so a gate placed before it would wait for a state that cannot
+# arrive until we act.
+#
+# Sets MERGE_GATE_NOTE on deferral. Never merges, never mutates.
+MERGE_GATE_NOTE=""
+_await_mergeable_state() {
+  local item="$1" pr="$2" expected="$3"
+  MERGE_GATE_NOTE=""
+  local sleep_s=2 absent_since="" absent_key="" j st mergeable mss head verdict
+  # A BACKSTOP, not the budget. If the clock is unreadable `_arm_deadline`
+  # leaves the deadline empty and `_deadline_passed` never fires, so without
+  # this the loop would poll for ever on the one failure that disables its
+  # bound. The phase deadline remains the real limit whenever it is armed.
+  local polls=0 max_polls=200
+  local grace; grace=$(_clamp_int "${BIRCHER_CHECK_REGISTRATION_GRACE:-120}" 120 0 3600)
+  while ! _deadline_passed "$PREMERGE_DEADLINE_AT" && [ "$polls" -lt "$max_polls" ]; do
+    polls=$((polls + 1))
+    # ONE response: two calls could disagree with each other.
+    j=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "$PREMERGE_DEADLINE_AT")" \
+        gh pr view "$pr" --repo "$REPO" \
+        --json state,mergeable,mergeStateStatus,headRefOid 2>/dev/null) || j=""
+    # `_json_get <key>` reads the document from STDIN, not from $1.
+    st=$(printf '%s' "$j" | _json_get state)
+    mergeable=$(printf '%s' "$j" | _json_get mergeable)
+    mss=$(printf '%s' "$j" | _json_get mergeStateStatus)
+    head=$(printf '%s' "$j" | _json_get headRefOid)
+    # A failed lookup is UNKNOWN, never CLEAN.
+    [ -z "$j" ] && { st=OPEN; mergeable=UNKNOWN; mss=UNKNOWN; head="$expected"; }
+    verdict=$(_classify_merge_state "$st" "$mergeable" "$mss" "$head" "$expected")
+
+    if [ "$verdict" = blocked ]; then
+      local req rows snap
+      snap=$(_required_contexts_snapshot) || snap=""
+      if [ "${snap%%$'\n'*}" = known ]; then req=$(_req_names "${snap#*$'\n'}"); else req="?"; fi
+      rows=$(_commit_ci_lines "$head" "$req") || rows=""
+      verdict=$(_classify_blocked "$req" "$rows")
+      if [ "$verdict" = absent ]; then
+        # Grace is keyed by (head, the required set) and starts when a context
+        # is FIRST observed absent -- not at the first BLOCKED observation. A PR
+        # can sit BLOCKED for another reason first and only later expose a
+        # newly required or re-run context as absent; starting the clock earlier
+        # would defer on a genuine registration race.
+        local key="$head:$req" now; now=$(_now_s) || now=""
+        [ "$key" = "$absent_key" ] || { absent_key="$key"; absent_since="$now"; }
+        # An unreadable clock cannot time the grace. Keep WAITING rather than
+        # deferring: deferring would escalate to a human on the transient
+        # condition this exists to tolerate, and `max_polls` still bounds it.
+        if [ -z "$now" ] || [ -z "$absent_since" ] \
+           || [ "$(( now - absent_since ))" -lt "$grace" ]; then
+          verdict=wait
+        else
+          MERGE_GATE_NOTE="merge deferred: a required check never registered within ${grace}s"
+          echo "[batch:merge] $item: PR #$pr BLOCKED and a required check never registered (${grace}s) -> left open for the human" >&2
+          return 1
+        fi
+      elif [ "$verdict" = defer ]; then
+        MERGE_GATE_NOTE="merge deferred: blocked by branch protection (not a pending check)"
+        echo "[batch:merge] $item: PR #$pr BLOCKED durably (no required check pending) -> left open for the human" >&2
+        return 1
+      fi
+    fi
+
+    case "$verdict" in
+      proceed) return 0 ;;
+      defer)
+        if [ -n "$expected" ] && [ -n "$head" ] && [ "$head" != "$expected" ]; then
+          # SPECIFIC, because it is the most dangerous refusal to misread: the
+          # PR moved off the head a reviewer signed off on.
+          MERGE_GATE_NOTE="merge refused: PR head ${head:0:7} is not the reviewed head ${expected:0:7}"
+        else
+          MERGE_GATE_NOTE="merge deferred: mergeStateStatus=${mss:-unknown} mergeable=${mergeable:-unknown}"
+        fi
+        echo "[batch:merge] $item: PR #$pr not ready to merge (state=${mss:-unknown}) -> left open for the human" >&2
+        return 1 ;;
+    esac
+    # Exponential, and CAPPED: a deadline check followed by an uncapped sleep
+    # crosses the deadline it just tested (#71).
+    [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep "$(_cap_to "$sleep_s" "$PREMERGE_DEADLINE_AT")"
+    sleep_s=$(( sleep_s * 2 )); [ "$sleep_s" -gt 30 ] && sleep_s=30
+  done
+  MERGE_GATE_NOTE="merge deferred: the pre-merge budget expired before the PR became mergeable"
+  echo "[batch:merge] $item: PR #$pr still not mergeable when the pre-merge budget expired -> left open for the human" >&2
+  return 1
+}
+
 # merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
 # deferral) | rc 2 (HALT the run: main went red and the merge was reverted, or
 # main CI never resolved). B-1 in-run merge: merging each ready PR before the
@@ -1366,13 +1533,32 @@ merge_ready_pr() {
   # #10: satisfy a required-check branch protection (bircher/cross-review) so a
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
+  local _status_confirmed=1
   if ! _post_cross_review_status "$item" "$pr" "$expected_sha"; then
+    _status_confirmed=0
     # Best-effort: attempt the merge anyway. On a repo that REQUIRES the check the
     # merge below is BLOCKED and defers (retry-eligible); on a repo that does NOT
     # require it the merge still succeeds. Let branch protection decide rather than
     # pre-empting an otherwise-mergeable PR.
     MERGE_RETRY_ELIGIBLE=1
     echo "[batch:merge] $item: PR #$pr cross-review status unconfirmed -> attempting merge anyway (branch protection decides)" >&2
+  fi
+  # WAIT FOR THE STATE THAT ACTUALLY BLOCKS THE MERGE, now that the status this
+  # repo's gate reacts to has been posted. Before this the loop below was the
+  # only thing standing between a BLOCKED PR and a refused merge -- and on
+  # muesli #735 the refusal made the effect uncertain, halted the run, and the
+  # halt then blocked the very retries meant to absorb the lag.
+  # SKIPPED when the status could not be confirmed, deliberately. The gate waits
+  # for a CLEAN that OUR OWN status post produces; if that post failed, CLEAN
+  # can never arrive and waiting for it would strand the PR for the whole phase.
+  # The pre-existing best-effort behaviour is also explicit that an unconfirmed
+  # status should still attempt the merge and "let branch protection decide
+  # rather than pre-empting an otherwise-mergeable PR" -- on a repo that does
+  # not require the check, the merge simply succeeds.
+  if [ "$_status_confirmed" = 1 ] && ! _await_mergeable_state "$item" "$pr" "$expected_sha"; then
+    MERGE_NOTE="$MERGE_GATE_NOTE"
+    MERGE_RETRY_ELIGIBLE=1
+    return 0
   fi
   # Merge, retrying briefly: the status just posted needs a moment to propagate to
   # the protected-branch merge gate (a single early attempt can still see BLOCKED).
@@ -4952,7 +5138,31 @@ SH
 #!/usr/bin/env bash
 # fake gh for _post_cross_review_status. CNT counts statuses POSTs; the posted
 # context only "lands" (becomes visible to the read-back) from POST attempt >= $LAND_AT.
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "headsha1234567"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
+  echo "headsha1234567"; exit 0
+fi
 if [ "$1" = "api" ]; then
   if printf '%s\n' "$@" | grep -q '/statuses/'; then
     n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CNT"
@@ -5007,6 +5217,43 @@ SH
 #!/usr/bin/env bash
 # fake gh for merge_ready_pr: $FAKE_MERGEABLE controls mergeability; FAKE_GH_LOG records status posts.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
+  # The pre-merge GATE asks for all four fields in one response, because two
+  # calls could disagree. FAKE_MERGE_STATE defaults to CLEAN so every test
+  # written before the gate existed still reaches the merge it is exercising.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    # FAKE_GATE_* and NOT FAKE_PR_STATE: those model two different MOMENTS.
+    # FAKE_PR_STATE is what GitHub says AFTER a failed merge attempt (the #71
+    # reconciliation probe); the gate looks BEFORE the merge. Reusing one
+    # variable for both made the gate see MERGED and defer, so the
+    # unreviewed-merge test never reached the merge it exists to exercise.
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
   if printf '%s\n' "$@" | grep -q 'state,headRefOid'; then
     # #71 reconciliation probe. FAKE_PR_STATE / FAKE_PR_HEAD model what GitHub says the
     # PR actually looks like after a merge attempt whose client call failed.
@@ -5353,6 +5600,28 @@ SH
 #!/usr/bin/env bash
 # cross-review status NEVER verifies (read-back empty); `pr merge` exits $FAKE_MERGE_RC.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo "headsha1234567"; exit 0; }
   # A real sha: an empty one now HALTS (rc 2, main unwatched). These tests set
   # MAIN_CI_TIMEOUT low, so entering the watch costs a second or two.
@@ -5404,6 +5673,28 @@ SH
 #!/usr/bin/env bash
 # every mergeable lookup returns EMPTY (simulated transient gh failure).
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
   printf '%s\n' "$@" | grep -q 'headRefOid' && { echo "headsha1234567"; exit 0; }
   echo ""; exit 0
 fi
@@ -5421,6 +5712,28 @@ SH
 #!/usr/bin/env bash
 # current head is headsha1234567; a --match-head-commit != that -> merge refused.
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
   printf '%s\n' "$@" | grep -q 'headRefOid'  && { echo headsha1234567; exit 0; }
   # A real sha: an empty one now HALTS (rc 2, main unwatched). These tests set
   # MAIN_CI_TIMEOUT low, so entering the watch costs a second or two.
@@ -5456,8 +5769,13 @@ SH
   chmod +x "$mhdir/gh"; : > "$mhdir/pmlog"; : > "$mhdir/store"
   ( PATH="$mhdir:$PATH" REPO=demo/demo BIRCHER_STATUS_BACKOFF=0 PMLOG="$mhdir/pmlog" STORE="$mhdir/store" \
       merge_ready_pr demo 7 OTHERSHA000 >/dev/null 2>&1
-    rc=$?; [ $rc -eq 0 ] && [ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ] ) \
-    || { echo "FAIL merge_ready_pr: stale pinned head not refused"; rm -rf "$mhdir"; exit 1; }
+    # The NOTE changed when the pre-merge gate landed, and it had to: the gate
+    # refuses a moved head WITHOUT calling gh, so "gh pr merge failed" would be
+    # a false statement about what happened. The property this test exists for
+    # -- a stale pinned head is never merged -- is asserted below and now holds
+    # more strongly, because no merge is attempted at all.
+    rc=$?; [ $rc -eq 0 ] && printf '%s' "$MERGE_NOTE" | grep -qE 'merge (deferred|refused)' ) \
+    || { echo "FAIL merge_ready_pr: stale pinned head not refused (note=$MERGE_NOTE)"; rm -rf "$mhdir"; exit 1; }
   [ ! -s "$mhdir/pmlog" ] || { echo "FAIL merge_ready_pr: merged despite stale pinned head"; cat "$mhdir/pmlog"; rm -rf "$mhdir"; exit 1; }
   rm -rf "$mhdir"; echo "merge_ready_pr pinned-head-mismatch OK (atomic refuse)"
   # #66: an automatic merge with NO reviewed head must be refused outright. This
@@ -5506,6 +5824,20 @@ SH
 # compare JSON for that ref (absent = a compare GitHub could not answer).
 _pr(){ for a in "$@"; do case "$a" in [0-9]*) printf '%s' "$a"; return;; esac; done; }
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The gate asks for all four fields in ONE response. This fake is STATEFUL,
+  # so it must answer from its OWN dirs -- handing back defaults would give the
+  # gate a PR state contradicting the one the test seeded, and PR #8 (MERGED)
+  # would sail through a gate that is supposed to refuse it.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    _p=$(_pr "$@")
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "$(cat "$STATEDIR/$_p" 2>/dev/null || echo OPEN)" \
+      "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "$(if grep -q success "$STORE" 2>/dev/null; then echo CLEAN
+          else cat "$MSSDIR/$_p" 2>/dev/null || echo CLEAN; fi)" \
+      "$(cat "$HEADDIR/$_p" 2>/dev/null || echo headsha1234567)"
+    exit 0
+  fi
   p=$(_pr "$@")
   printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { cat "$MSSDIR/$p" 2>/dev/null || echo CLEAN; exit 0; }   # contains 'state' -> match FIRST
   printf '%s\n' "$@" | grep -q 'baseRefName' && { echo main; exit 0; }
@@ -5546,6 +5878,10 @@ if [ "$1" = "api" ]; then
   if [ -n "$cref" ]; then cat "$CMPDIR/$cref" 2>/dev/null || exit 1; exit 0; fi
   tref=$(printf '%s' "$*" | sed -n 's#.*/git/trees/\([A-Za-z0-9._-]*\).*#\1#p')
   if [ -n "$tref" ]; then cat "$TREEDIR/$tref" 2>/dev/null || exit 1; exit 0; fi
+  # Posting the required status CLEARS the block, exactly as GitHub does: the
+  # sweep's BLOCKED is "missing our status", so a fixture where it never clears
+  # models a repository that could never merge at all. Without this the gate
+  # correctly waits for a CLEAN the fake would never produce.
   printf '%s\n' "$@" | grep -q '/statuses/' && { printf 'success\n' >> "$STORE"; exit 0; }
   printf '%s\n' "$@" | grep -q '/status'    && { if printf '%s\n' "$@" | grep -q -- '-q'; then :; else printf '[{"statuses":[]}]'; exit 0; fi; cat "$STORE" 2>/dev/null; exit 0; }
   # _commit_ci_lines fetches this with --slurp and parses it as JSON, so the
@@ -5742,6 +6078,29 @@ J
 #!/usr/bin/env bash
 # fake gh for recover_pr_cmd end-to-end (recovery review + merge_ready_pr).
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "$(if grep -q update-branch "${PR_LOG:-/dev/null}" 2>/dev/null; then echo CLEAN
+          else echo "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}"; fi)" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA-a502a88e20f959c908d00871ee7f25572512dd6d}}"
+    exit 0
+  fi
   printf '%s\n' "$@" | grep -q 'mergeStateStatus' && { echo "${FAKE_MSS:-CLEAN}"; exit 0; }
   printf '%s\n' "$@" | grep -q 'headRefOid'       && { echo "headsha1234567"; exit 0; }
   # A real sha: an empty one now HALTS (rc 2, main unwatched), so this shim would fail
@@ -5889,7 +6248,31 @@ SH
 #!/usr/bin/env bash
 if [ "$1" = "issue" ] && [ "$2" = "comment" ]; then
   while [ $# -gt 0 ]; do [ "$1" = "--body" ] && { echo "$2" >> "${WB_LOG:-/dev/null}"; break; }; shift; done; exit 0; fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo "${FAKE_PR_STATE:-MERGED}"; exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # The pre-merge gate asks for all four fields in ONE response. Every fake a
+  # merge path drives must answer it, or the gate reads a failed lookup
+  # (correctly: never CLEAN) and polls until its budget expires.
+  #
+  # Matched on the EXACT field list, not on 'mergeStateStatus' alone: the sweep
+  # already queries that field by itself, and a looser match shadowed it --
+  # handing its bare-value comparison a whole JSON document, which it then
+  # reported as a state unsafe to auto-merge.
+  #
+  # The defaults CHAIN into each fake's own variables (FAKE_MSS, FAKE_HEAD_SHA)
+  # so a fixture stays self-consistent. Returning a constant head here made the
+  # recovery fixture contradict itself -- it captures its reviewed head from
+  # FAKE_HEAD_SHA -- and the gate correctly refused a PR whose head did not
+  # match the head that was reviewed. The old code never noticed because it
+  # never compared the two.
+  if printf '%s\n' "$@" | grep -q 'state,mergeable,mergeStateStatus,headRefOid'; then
+    printf '{"state":"%s","mergeable":"%s","mergeStateStatus":"%s","headRefOid":"%s"}\n' \
+      "${FAKE_GATE_STATE:-OPEN}" "${FAKE_MERGEABLE:-MERGEABLE}" \
+      "${FAKE_MERGE_STATE:-${FAKE_MSS:-CLEAN}}" \
+      "${FAKE_GATE_HEAD:-${FAKE_HEAD_SHA:-headsha1234567}}"
+    exit 0
+  fi
+  echo "${FAKE_PR_STATE:-MERGED}"; exit 0
+fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then echo "${FAKE_ISSUE_STATE:-OPEN}"; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "close" ]; then echo "CLOSED $3" >> "${WB_CLOSE_LOG:-/dev/null}"; exit 0; fi
 exit 0
