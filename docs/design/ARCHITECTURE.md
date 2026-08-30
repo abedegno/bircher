@@ -136,15 +136,39 @@ It returns an eight-field pipe-delimited tuple:
 Authorises and records. Never decides what *should* happen — only whether a
 request is permitted and what actually occurred.
 
-**Run states and the commands that move them:**
+**Run states and the commands that move them.** Two commands have
+destinations that depend on their PAYLOAD, which is where the retry and
+revision loops live:
 
     queued --submit_spec--> specified --submit_plan--> planned
-      --start_implementation--> implementing --record_review(accept)--> reviewing
-      --request_merge--> merge_requested --record_run_outcome--> ended
+      --start_implementation--> implementing
+      --record_review--> (by verdict)
+      --request_merge--> merge_requested
+      --record_merge_outcome--> (by outcome)
+      --record_run_outcome--> ended
 
-Non-transitioning commands: `record_implementation_output`,
-`record_ci_observation`, `record_merge_outcome`. `cancel_run` is legal from any
-live state. `ended` is terminal and unreachable-from.
+`record_review` (`_VERDICTS`):
+
+| verdict | lands in |
+|---|---|
+| `accept` | `reviewing` |
+| `reject` | `reviewing` |
+| `request_revision` | **`planned`** — the revision loop: back to planning |
+
+`record_merge_outcome` (`_MERGE_OUTCOMES`), legal only from `merge_requested`:
+
+| outcome | lands in |
+|---|---|
+| `merged` | **`merged`** |
+| `failed` | **`reviewing`** — a failed merge is retryable after re-review |
+
+So the successful path is
+`implementing → reviewing → merge_requested → merged → ended`.
+
+Genuinely non-transitioning: `record_implementation_output`,
+`record_ci_observation`. `cancel_run` is legal from any live state.
+`record_run_outcome` is legal from every state except `ended`. `ended` is
+terminal and unreachable-from.
 
 **Effect classes:** `merge`, `comment`, `status_check`, `pull_request`,
 `issue_or_label`, `ref_update`, `session_control`.
@@ -203,33 +227,40 @@ path.**
 
 ## 4. One item, end to end
 
-1. **Queue.** The runner reads `bircher:queued` issues, writes `queue/*.md`,
-   labels the issue `bircher:running` (a routed `issue_or_label` effect).
+1. **Queue.** The runner reads `bircher:queued` issues and writes `queue/*.md`.
 2. **Run start.** `run_item` mints a run id `<item>-<epoch>` and records the
    work repo's HEAD as the run's `base_sha`.
-3. **Dispatch.** The kernel issues a generation (a monotonic fence). The runner
-   creates the lead session (`session_control` effect) and sends the item plus
-   a vendor directive naming implementer and opposite reviewer.
-4. **Implementation.** The lead session dispatches a coding sub-agent, opens a
+3. **Dispatch, THEN label.** The kernel issues a generation (a monotonic
+   fence) *before* the session exists. Only then is `bircher:running` applied,
+   because it is a routed effect and every routed effect needs a generation.
+   **This order is load-bearing and was arrived at by a bug:** labelling
+   earlier meant the effect was either silently dropped (`${BIRCHER_GENERATION:?}`
+   aborts in kernel mode, and its `|| true` swallowed the failure) or — worse,
+   on the second item of a run — attributed to the PREVIOUS item's stale
+   exported generation.
+4. **Session.** The runner creates the lead session (`session_control` effect)
+   and sends the item plus a vendor directive naming implementer and opposite
+   reviewer.
+5. **Implementation.** The lead session dispatches a coding sub-agent, opens a
    branch and a PR, dispatches its own reviewer, may run fix rounds, posts a
    summary, and stops.
-5. **Settle detection.** The runner polls: session idle AND item count stable
+6. **Settle detection.** The runner polls: session idle AND item count stable
    AND a PR open, held for N polls. Then it cancels the session.
-6. **Derivation.** The runner invokes the coordinator, which selects the PR,
+7. **Derivation.** The runner invokes the coordinator, which selects the PR,
    waits out CI, dispatches an INDEPENDENT reviewer, and returns the tuple.
-7. **Lifecycle recording.** The runner replays the derived facts into the
+8. **Lifecycle recording.** The runner replays the derived facts into the
    kernel: output, CI observation, review verdict, then `request_merge`.
-8. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
+9. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
    `mergeStateStatus == CLEAN`, merges pinned to the reviewed head, watches
    main CI, and reverts on a confirmed red.
-9. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
+10. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
 
-> **GAP — steps 4 and 6 both review.** Step 5 exists only because the
+> **GAP — steps 5 and 7 both review.** Step 6 exists only because the
 > orchestrator is a separate process from the session: it has to *detect* that
-> the model stopped rather than being told. Steps 7's replay-into-the-kernel
+> the model stopped rather than being told. Step 8's replay-into-the-kernel
 > exists only because the derivation happened out-of-process.
 >
-> **TARGET —** steps 4–7 collapse. The coordinator dispatches the implementer,
+> **TARGET —** steps 5–8 collapse. The coordinator dispatches the implementer,
 > observes it directly, reviews once, repairs if needed, and records as it goes
 > rather than replaying afterwards.
 
@@ -276,8 +307,21 @@ elsewhere and `/workspaces/*` does not exist elsewhere.
       BIRCHER_KERNEL_DB=/workspaces/bircher-v2/.run/kernel-muesli.db \
       bash batch/launch.sh --source issues --log .run/<name>.log
 
-All three variables are required — `BIRCHER_KERNEL_DB` has a `:?` guard and
-nothing defaults it. Defaults are already `BIRCHER_EFFECT_MODE=kernel` and
+**None of those three is required.** All are deployment overrides of shipped
+defaults, and an earlier version of this document said otherwise:
+
+| variable | shipped default | why override it |
+|---|---|---|
+| `BIRCHER_REPO` | `abedegno/muesli` | targeting a different repo (e.g. `bircher-smoke`) |
+| `WORKDIR` | `/workspaces/muesli` | the matching work checkout |
+| `BIRCHER_KERNEL_DB` | `$BUNDLE_DIR/.run/kernel.db` (set in `run_item`) | keeping a repo's journal separate |
+
+`BIRCHER_KERNEL_DB` does carry a `:?` guard, but in `effect-adapter.sh` — which
+runs long after `run_item` has already defaulted it, so it never fires in
+practice. Passing it explicitly is a good habit for keeping muesli's journal
+apart from smoke runs; it is not a requirement.
+
+Mode defaults are already `BIRCHER_EFFECT_MODE=kernel` and
 `BIRCHER_KERNEL_MODE=enforce`. `--source queue` drains `queue/*.md` instead.
 
 **The merge gate on muesli:** branch protection requires `review-gate`, NOT
@@ -315,12 +359,28 @@ driving items directly against omnigent, with the kernel unchanged beneath it.
 
 Two consequences worth stating, because they change what to build:
 
-1. **The review/repair split resolves itself.** The coordinator cannot repair
-   today only because it is a one-shot subprocess. As the orchestrator it is
-   present throughout, so it can re-dispatch a fix and re-review. The lead
-   session's review, its fix loop and its `bircher-status:` marker are then all
-   removable from `muesli-loop` — they exist because the session was the only
-   thing that could review and report.
+1. **The review/repair split becomes SOLVABLE — it does not solve itself.**
+   An earlier draft claimed longevity alone fixes it. That is wrong:
+   being long-lived supplies *availability*, not repair authority or a
+   protocol. The coordinator's review today is read-only and one-shot, and
+   nothing anywhere defines how a FAIL becomes a fix task.
+
+   A target repair protocol must specify, and none of this exists yet:
+
+   - which session receives the fix task — the original implementer session
+     (still alive? it is cancelled today) or a fresh one
+   - how the kernel transition works: `record_review(request_revision)` already
+     returns a run to `planned`, so the revision loop exists in the kernel and
+     is unused by this path
+   - how generations and roles advance across a repair round, and what fences
+     the retry
+   - how the reviewed artifact and head are invalidated and rebound after a fix
+   - when CI and review repeat, and the bound on rounds
+   - how a repair resumes idempotently if the coordinator itself dies mid-round
+   - what terminal escalation looks like when the bound is reached
+
+   Until that is designed, gap 1 is NOT "closed by migration" — the migration
+   is a precondition, not the fix.
 2. **New mechanism belongs in Python.** Anything added to `run-queue.sh` from
    here is written to be moved.
 
@@ -338,8 +398,8 @@ of the runner/coordinator split and should NOT be patched in place.
 
 | # | gap | severity | closed by | blocked on |
 |---|---|---|---|---|
-| 1 | a repairable finding dies when the two reviews disagree (§5) | **high** | migration | `run_item` in Python |
-| 2 | duplicate cross-vendor review | medium | migration | same — deleting either one first loses repair or loses independence |
+| 1 | a repairable finding dies when the two reviews disagree (§5) | **high** | a repair protocol, THEN migration | the protocol in §8 is undesigned — migration is a precondition, not the fix |
+| 2 | duplicate cross-vendor review | medium | gap 1 | deleting either one first loses repair or loses independence |
 | 3 | `bircher-status:` marker still emitted | medium | `muesli-loop` edit | deciding what reports `rounds=<n>` |
 | 4 | runner is 8,559 lines and still growing | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
 | 5 | review base binding is tautological | moderate, config-dependent | own design | not urgent while muesli sets `strict: true` — see `base-binding-weakness.md` |
@@ -349,6 +409,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 9 | `_derive_budget` warns every run | low | config or ceiling change | knobs promise 5,300s, a bounded call tops at 3,600s |
 | 10 | kernel availability is unmonitored in `kernel` effect mode | low | operational | — |
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
+| 13 | the kernel's revision loop (`record_review(request_revision) -> planned`) is never used by any path | medium | gap 1 | it is the mechanism a repair protocol would build on |
 | 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
 
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
