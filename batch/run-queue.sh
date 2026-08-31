@@ -1039,16 +1039,28 @@ _create_session() {
   # pattern required a literal verb. Creating a model session is exactly the
   # kind of externally visible act the journal exists to record.
   #
-  # Keyed on the RUN, not the workspace: a replay must return the session this
-  # run already created rather than start a second one, and `perform` returns
-  # the recorded external id without re-executing.
+  # Keyed on the RUN **AND THE GENERATION**. Keyed on the run alone -- which it
+  # was until 2026-08-31 -- the key says "this run's session", and that was true
+  # only while a run had exactly one.
+  #
+  # The repair loop gave a run two. `_repair_round` called this after the
+  # original session had been cancelled, the kernel correctly saw the same
+  # idempotency key, treated the create as a REPLAY, and returned the recorded
+  # external id without executing anything. So the repair was prompted into the
+  # session the runner had just killed. Observed on muesli #711 round 1: the
+  # repair "ran", settled quietly, and the head never moved.
+  #
+  # The generation is exactly the right discriminator: `_kernel_dispatch` mints
+  # a new one per dispatch, so a RETRY at the same generation still replays --
+  # which is the property the original key was protecting -- while a new attempt
+  # gets its own session.
   local body
   body=$(python3 -c 'import json,sys; print(json.dumps({"agent_id":sys.argv[1],"host_id":sys.argv[2],"workspace":sys.argv[3]}))' "$1" "$2" "$3" 2>/dev/null) || return 1
   # CAPTURED, then parsed -- not piped straight out of `_effect`. A pipeline
   # masks the effect's exit status behind `_json_get`'s, so a refused or failed
   # create would look like a successful call that happened to return no id.
   local resp
-  resp=$(_effect session_control "sess-create:${BIRCHER_RUN_ID:-$3}" 30 \
+  resp=$(_effect session_control "sess-create:${BIRCHER_RUN_ID:-$3}:${BIRCHER_GENERATION:-0}" 30 \
     curl -sf --max-time 30 -X POST "$SERVER/v1/sessions" \
     -H 'content-type: application/json' -d "$body") || return 1
   printf '%s' "$resp" | _json_get id
@@ -1059,10 +1071,20 @@ _create_session() {
 # before the host-launched runner settles WAITS for the launch - on a cold
 # start that exceeded 30s and logged a false "send_prompt failed" (run #13
 # EMB02) even though the server delivered the message.
+#
+# THE KEY CARRIES THE PROMPT, not just the session. Keyed on the conversation
+# alone, a second prompt to one session is a REPLAY: the kernel returns the
+# first prompt's recorded result and posts nothing. That is right for a retry of
+# the same message and wrong for a different one, and the repair loop sends a
+# different one -- so on muesli #711 the repair brief was dropped silently,
+# behind the replayed create that had already put it in the wrong session.
+#
+# Hashing the body is what `pr-comment` already does, and for the same reason.
 _send_prompt() {
-  local body
+  local body key
   body=$(python3 -c 'import json,sys; print(json.dumps({"type":"message","data":{"role":"user","content":[{"type":"input_text","text":sys.argv[1]}]}}))' "$2" 2>/dev/null) || return 1
-  _effect session_control "sess-prompt:$1" 120 \
+  key="sess-prompt:$1:$(printf '%s' "$2" | shasum -a 256 | cut -c1-16)"
+  _effect session_control "$key" 120 \
     curl -sf --max-time 120 -X POST "$SERVER/v1/sessions/$1/events" \
     -H 'content-type: application/json' -d "$body" >/dev/null 2>&1
 }
@@ -5397,6 +5419,46 @@ SH
     || { echo "FAIL _repair_round: prompted a session that was never created"; exit 1; }
   rm -rf "$rrdir"
   echo "_repair_round executes OK"
+
+  # --- one run, two sessions: the keys must not collide -----------------------
+  #
+  # THE DEFECT THE FIRST FULL LIVE ROUND FOUND (muesli #711, 2026-08-31). Both
+  # session_control keys identified the RUN or the CONVERSATION and not the
+  # ATTEMPT, so the repair round's create and prompt were both replays: the
+  # kernel returned the first session's id without creating anything, and posted
+  # nothing. The repair was prompted into the session the runner had just
+  # cancelled. It settled quietly and the head never moved -- a repair that
+  # looks, at every observable point, exactly like one that ran.
+  local kdir; kdir=$(mktemp -d)
+  (
+    _effect() { echo "$2" >> "$kdir/keys"; printf '{"id":"conv-%s"}' "$RANDOM"; }
+    _json_get() { cat >/dev/null; printf 'conv-x'; }
+    SERVER=http://x
+    BIRCHER_RUN_ID=run-1 BIRCHER_GENERATION=1 _create_session ag h /w >/dev/null
+    BIRCHER_RUN_ID=run-1 BIRCHER_GENERATION=4 _create_session ag h /w >/dev/null
+    BIRCHER_RUN_ID=run-1 BIRCHER_GENERATION=4 _create_session ag h /w >/dev/null
+    _send_prompt conv-1 "implement the thing" >/dev/null
+    _send_prompt conv-1 "repair it: the retry drops b" >/dev/null
+    _send_prompt conv-1 "implement the thing" >/dev/null
+  )
+  # Two DIFFERENT generations -> two different keys, so the second attempt
+  # actually creates a session.
+  [ "$(sort -u "$kdir/keys" | grep -c '^sess-create:')" = 2 ] \
+    || { echo "FAIL session keys: two generations must yield two create keys: $(grep '^sess-create:' "$kdir/keys")"; exit 1; }
+  # The SAME generation repeats -> one key, so a retry still replays. That is
+  # the property the original run-scoped key was protecting and it must survive.
+  [ "$(grep -c '^sess-create:run-1:4' "$kdir/keys")" = 2 ] \
+    && [ "$(sort -u "$kdir/keys" | grep -c '^sess-create:run-1:4')" = 1 ] \
+    || { echo "FAIL session keys: a retry at the same generation must replay"; exit 1; }
+  # Two DIFFERENT prompts to one session -> two keys, so the repair brief is
+  # actually delivered.
+  [ "$(sort -u "$kdir/keys" | grep -c '^sess-prompt:conv-1')" = 2 ] \
+    || { echo "FAIL session keys: a different prompt to the same session must not replay: $(grep '^sess-prompt:' "$kdir/keys")"; exit 1; }
+  # The SAME prompt repeated -> one key, so a genuine retry still dedupes.
+  [ "$(grep -c '^sess-prompt:conv-1' "$kdir/keys")" = 3 ] \
+    || { echo "FAIL session keys: expected three prompt calls"; exit 1; }
+  rm -rf "$kdir"
+  echo "session_control keys are per-attempt OK"
   rm -rf "$rdir"
   echo "repair loop OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
