@@ -441,8 +441,21 @@ def test_the_run_id_is_still_minted_in_exactly_one_place():
     so every other _effect site either inherits it or adopts one.
     """
     src = RUN_QUEUE.read_text()
+    # A SITE THAT SETS THE RUN, not every line that mentions the variable. The
+    # discriminator is `export`: run_item and the sweep both assign and export,
+    # because every downstream effect and every `python3 -m kernel.cli` call
+    # reads it from the environment. An `ENV=value <command>` prefix -- which is
+    # how the self-test drives `_repair_round` in a subshell -- sets it for one
+    # command and exports nothing, so it cannot be a site that establishes a
+    # run.
+    #
+    # Tightened after a self-test fixture tripped this on its env prefixes. The
+    # narrowing is toward what the test is ABOUT: a bare assignment with no
+    # export would fail here too, and that is correct -- it would be a run id
+    # nothing downstream could see.
     assigns = [l.strip() for l in src.splitlines()
-               if "BIRCHER_RUN_ID=" in l and not l.strip().startswith("#")]
+               if "BIRCHER_RUN_ID=" in l and "export BIRCHER_RUN_ID" in l
+               and not l.strip().startswith("#")]
     # TWO now, and the second is deliberate: the sweep restores the run id
     # RECORDED with a deferred row rather than guessing by item code. It mints
     # nothing -- it reuses an id the kernel already holds -- so the
