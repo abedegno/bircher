@@ -2311,6 +2311,13 @@ EOF
   # verdict, and re-driving them earns four refusals that are individually
   # correct and collectively noise -- they sit in the shadow report next to
   # refusals that mean something, which is how a report stops being read.
+  # WHAT THE HISTORY SAYS, before what the state name says. The gate below is
+  # a state-name check, and the recovery table exists because that is not
+  # enough -- most of all for the merge rows, where the state name cannot tell
+  # "authorised and never attempted" from "already merged".
+  local _rp_act
+  _rp_act=$(_recovery_action "${BIRCHER_RUN_ID:-}" "${BIRCHER_RUN_BASE:-$_rec_base}" "")
+  [ -n "$_rp_act" ] && echo "[batch:recover-pr] $code: journal says ${_rp_act%%|*} -- ${_rp_act#*|}" >&2
   local _rp_state="" _rp_raw
   _rp_raw=$(_kernel_pending "${BIRCHER_RUN_ID:-}")
   [ -n "${_rp_raw//[[:space:]]/}" ] && _rp_state=$(printf '%s' "$_rp_raw" \
@@ -2368,6 +2375,13 @@ EOF
       "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
   fi
 
+  if [ "$r_outcome" = "ready" ] && _recovery_forbids_merge "$_rp_act"; then
+    # The derivation says the PR is ready, and the JOURNAL says a merge has
+    # already happened or may have. The derivation cannot know that: it reads
+    # the repository, and a PR whose merge is uncertain still reads as open.
+    echo "[batch:recover-pr] $code: derivation says ready, but the journal says ${_rp_act%%|*} -> NOT merging (${_rp_act#*|})" >&2
+    return 0
+  fi
   if [ "$r_outcome" = "ready" ]; then
     # #66: this was the one production caller that merged UNPINNED. A recovery
     # PASS with no captured head cannot be merged automatically -- the same
@@ -2646,6 +2660,44 @@ $1"
 # gets dispatched against a run the kernel never revised.
 _revision_is_recorded() {  # <used|left|confirmed>
   case "${1:-}" in *"|yes") return 0 ;; esac
+  return 1
+}
+
+# _recovery_action <run_id> <base_sha> <context_hash> -> `do|why`, or empty.
+#
+# Asks the JOURNAL what to do with an interrupted run. The existing gate below
+# asks the STATE NAME, and the state name cannot answer it: `reviewing` is
+# reached from an accept, from a reject AND from a failed merge.
+_recovery_action() {  # <run_id> <base_sha> <context_hash>
+  [ -n "${1:-}" ] || return 0
+  _coordinator recover --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" \
+    --base-sha "${2:-}" --context-hash "${3:-}" 2>/dev/null || true
+}
+
+# _recovery_forbids_merge <action> -> rc 0 if this recovery action means the
+# caller must NOT merge.
+#
+# THE WORST OUTCOME THIS PROGRAMME CAN PRODUCE is merging something twice, or
+# merging something a reviewer never saw. Three of the recovery table's rows say
+# "do not merge here" and each says it for a different reason:
+#
+#   done                 the outcome is already recorded; there is nothing left
+#   record_merge_outcome the merge HAPPENED; record it, never re-execute it
+#   halt_and_reconcile   the merge MAY have happened; only an observation of the
+#                        forge can settle it
+#
+# UNKNOWN IS NOT PERMISSION. An empty action -- an unreachable kernel, a failed
+# lookup, a bounded call that timed out -- returns rc 1 here, meaning "does not
+# forbid", because refusing every merge whenever the kernel is unreachable would
+# stop the pipeline dead on a transient. That is a deliberate trade and it is
+# only safe because the merge path has its own gates behind this one: the kernel
+# authorization, the reviewed-head pin, and `gh --match-head-commit`. This check
+# is an early, cheap refusal, NOT the last line of defence, and treating it as
+# the last line is how a fail-open default gets written.
+_recovery_forbids_merge() {  # <action>
+  case "${1%%|*}" in
+    done|record_merge_outcome|halt_and_reconcile) return 0 ;;
+  esac
   return 1
 }
 
@@ -5207,6 +5259,32 @@ SH
     || { chmod 700 "$rdir/ro"; echo "FAIL rollback: a disabled loop still names a path in an unwritable directory"; exit 1; }
   chmod 700 "$rdir/ro"
   echo "_findings_path rollback OK"
+
+  # The three recovery rows that must never reach a merge, and the reasons they
+  # are three rather than one.
+  _recovery_forbids_merge "done|the merge outcome is recorded" \
+    || { echo "FAIL _recovery_forbids_merge: a recorded merge was not forbidden"; exit 1; }
+  _recovery_forbids_merge "record_merge_outcome|the merge HAPPENED" \
+    || { echo "FAIL _recovery_forbids_merge: a confirmed-but-unrecorded merge was not forbidden"; exit 1; }
+  _recovery_forbids_merge "halt_and_reconcile|a merge effect is uncertain" \
+    || { echo "FAIL _recovery_forbids_merge: an uncertain merge was not forbidden"; exit 1; }
+  # And the rows that must still be allowed through, or recovery merges nothing
+  # ever again -- an assertion that only forbade would pass every test above.
+  ! _recovery_forbids_merge "merge|an acceptance binds the current output" \
+    || { echo "FAIL _recovery_forbids_merge: a clean merge was forbidden"; exit 1; }
+  ! _recovery_forbids_merge "perform_merge|authorised and never attempted" \
+    || { echo "FAIL _recovery_forbids_merge: an authorised merge was forbidden"; exit 1; }
+  ! _recovery_forbids_merge "retry_merge|the merge failed, not the review" \
+    || { echo "FAIL _recovery_forbids_merge: a failed merge could not be retried"; exit 1; }
+  # UNKNOWN IS NOT PERMISSION, but it is also not a refusal: see the function's
+  # own comment for why, and for what stands behind it.
+  ! _recovery_forbids_merge "" \
+    || { echo "FAIL _recovery_forbids_merge: an unreadable journal stopped every merge"; exit 1; }
+  # Matched on the ACTION, not the whole line: a `why` mentioning the word
+  # must not decide anything.
+  ! _recovery_forbids_merge "merge|do not confuse this with halt_and_reconcile" \
+    || { echo "FAIL _recovery_forbids_merge: matched the reason text, not the action"; exit 1; }
+  echo "_recovery_forbids_merge OK"
   rm -rf "$rdir"
   echo "repair loop OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------

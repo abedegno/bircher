@@ -6,10 +6,18 @@ read what line N used to be, find that text in the file now. A line whose old
 text is absent or ambiguous is reported, never guessed -- repointing a row onto
 a different site is precisely the false claim these tests check for.
 """
-import pathlib, re, subprocess, sys
+import pathlib
+import re
+import subprocess
+import sys
 
 ROOT = pathlib.Path("/Users/jonw/bircher")
-BASE = "HEAD"  # the docs at HEAD are consistent with the source at HEAD
+# THE BASELINE IS AN ARGUMENT, and it is the last commit where the citation
+# tests PASSED -- not HEAD. Defaulting it to HEAD is wrong the moment the source
+# change is committed before the docs are repointed: HEAD's source already has
+# the new lines, so the remap is a no-op and the stale citations survive while
+# the tool reports success. That happened; hence the argument.
+BASE = (sys.argv[1] if len(sys.argv) > 1 else "HEAD")
 
 
 def old_lines(path):
