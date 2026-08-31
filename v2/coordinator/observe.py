@@ -92,7 +92,41 @@ class Outcome:
     note: str
 
 
-def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str) -> Outcome:
+def revisions_used(facts) -> int:
+    """How many revisions this run has already had, from the JOURNAL.
+
+    Counts `REVIEW_VERDICT` facts whose verdict is `request_revision`. NOT
+    `transition_performed`, which records `{"to": ..., "via": "record_review"}`
+    and no verdict at all -- every accepted review looks identical there, so
+    counting those cannot tell a revision from an acceptance.
+
+    `REVIEW_VERDICT` is written by the kernel AFTER validation and carries the
+    verdict explicitly; it is the same fact `authz.py` reads when deciding
+    whether a binding was approved.
+
+    From the journal and not a variable, so a coordinator that dies and is
+    re-driven gets no fresh allowance.
+
+    NOTE WHAT THIS DOES NOT PROVE. `commands.py` validates a review, THEN bumps
+    the version under CAS, THEN appends this fact -- so a review can validate
+    and lose the CAS, leaving no fact. This counts what was ACCEPTED, which is
+    the right basis for an allowance, but the caller must separately confirm
+    its own revision was recorded before acting on it.
+    """
+    n = 0
+    for f in facts or ():
+        kind = getattr(f, "kind", None)
+        kind = getattr(kind, "value", kind)
+        if kind != "review_verdict":
+            continue
+        payload = getattr(f, "payload", None) or {}
+        if payload.get("verdict") == "request_revision":
+            n += 1
+    return n
+
+
+def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str,
+             revisions_left: int = 0) -> Outcome:
     """Ground truth to outcome. PURE -- no I/O, no globals.
 
     The reviewed sha is deliberately NOT an input: it is evidence attached to
@@ -112,6 +146,18 @@ def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str) -> 
         return Outcome("ready", f"{reviewer}:pass", "green",
                        "out-of-band review PASS")
     if verdict == "FAIL":
+        # A FAIL WITH ROUNDS LEFT IS A REVISION, NOT AN ENDING. Eight of
+        # eighteen muesli item-runs stopped here, every one on a specific
+        # actionable finding; routing them back by hand merged two of three.
+        #
+        # `revise` is the coordinator's vocabulary only -- the runner acts on
+        # it and never records it, so the scorecard still ends `ready` or
+        # `failed`. With `revisions_left <= 0` this is byte-identical to the
+        # behaviour before the loop existed, which is what makes
+        # BIRCHER_MAX_REVISIONS=0 a real rollback.
+        if revisions_left > 0:
+            return Outcome("revise", f"{reviewer}:fail", "green",
+                           "out-of-band review FAIL; revising")
         return Outcome("failed", f"{reviewer}:fail", "green",
                        "out-of-band review FAIL")
     # NONE, empty, or anything unrecognised. A reviewer that crashed, timed out
