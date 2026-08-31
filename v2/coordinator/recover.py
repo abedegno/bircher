@@ -132,6 +132,22 @@ def decide(facts, *, current_binding_hash=None, merge_effect=None) -> Action:
             return Action("halt_and_reconcile",
                           "a merge effect is intended or uncertain; observe "
                           "the PR and reconcile, never re-execute")
+        if state == "reconciled":
+            # A RESOLUTION IS FREE TEXT, and it can say either thing. The
+            # kernel's own reconcile tests resolve merges as "PR was not
+            # merged" and "not landed", so mapping `reconciled` onto "the merge
+            # HAPPENED" asserts an outcome the mechanism cannot read. Fails
+            # closed today -- `_recovery_forbids_merge` refuses it -- but it
+            # refuses while giving the wrong reason, and a merge that SHOULD
+            # happen becomes unreachable through recovery with no hint why.
+            #
+            # So: name the resolution and refuse to decide. A human already
+            # ruled on this effect; the ruling is the evidence and it is not
+            # machine-readable.
+            return Action("reconciled_ruling_needed",
+                          "a merge effect was reconciled by a human and the "
+                          "resolution is free text; read it before deciding "
+                          "whether the merge still needs to happen")
         return Action("record_merge_outcome",
                       "the merge HAPPENED and its outcome was never recorded; "
                       "record it from the observed merge commit")

@@ -421,19 +421,41 @@ def main(argv=None) -> int:
 def _merge_effect_from_table(store, run_id, facts):
     """The effect TABLE's answer for this run's merge, or None.
 
-    THE TABLE IS AUTHORITATIVE and the facts only say which key to ask about.
-    `mark_effect` moves an effect to `uncertain` in the table; that is the state
-    `is_halted` trusts, so reading it here means recovery agrees with the halt
-    rather than reconstructing it.
+    THE TABLE IS AUTHORITATIVE, and it is also where the ENUMERATION comes
+    from. An earlier version walked `effect_intended` FACTS to find which keys
+    were merges and then read the table per key -- which is authoritative about
+    the state and not about the existence.
 
-    The key comes from `causal_command_id`, NOT from the payload. The payload
-    carries `effect_id`, a different identifier, and `effect_state` is keyed by
-    the idempotency key -- so looking there returns None for every effect and
-    the halt row silently never fires. That is what the first version did, and
-    no end-to-end test could catch it: `recover.merge_effect_state` answers the
-    same way from the facts, so the fallback covered for the bug.
+    `perform` calls `journal_intent` (table) and then `append_fact`. A process
+    death between those two statements leaves a table row with NO fact, and
+    that is exactly the crash the `intended` halt row exists for --
+    `Store.uncertain_effects` says so in its own comment: "a real process death
+    after journalling never runs the handler that marks it uncertain". A
+    fact-driven enumeration is blind to it, returns None, and `decide` falls
+    through to `merge_authorized` and answers `perform_merge` -- re-executing a
+    merge that may already have landed, which is the one thing this gate exists
+    to prevent. Found by cross-review, not by a test: the test that builds this
+    state passed `merge_effect` by hand.
+
+    `uncertain_effects` reads the table, is already class-tagged, and covers
+    both `intended` and `uncertain`. The facts remain a fallback for a caller
+    with no store.
     """
     worst = None
+    for e in store.uncertain_effects(run_id):
+        if e.get("effect_class") != "merge":
+            continue
+        # The WORST unresolved state wins: one uncertain merge among several
+        # confirmed ones still means the forge may hold a merge nobody recorded.
+        st = store.effect_state(e["idempotency_key"], run_id=run_id)
+        if st in ("intended", "uncertain"):
+            return st
+        worst = worst or st
+    if worst:
+        return worst
+    # Nothing unresolved. Ask the facts which keys were merges at all, so a
+    # CONFIRMED or RECONCILED merge is still reported rather than read as "no
+    # merge was ever attempted".
     for f in facts:
         k = getattr(f, "kind", None)
         k = getattr(k, "value", k)
@@ -441,14 +463,8 @@ def _merge_effect_from_table(store, run_id, facts):
         if k != "effect_intended" or payload.get("effect_class") != "merge":
             continue
         key = getattr(f, "causal_command_id", None)
-        if not key:
-            continue
-        st = store.effect_state(key, run_id=run_id)
-        # The WORST unresolved state wins: one uncertain merge among several
-        # confirmed ones still means the forge may hold a merge nobody recorded.
-        if st in ("intended", "uncertain"):
-            return st
-        worst = worst or st
+        if key:
+            worst = worst or store.effect_state(key, run_id=run_id)
     return worst
 
 

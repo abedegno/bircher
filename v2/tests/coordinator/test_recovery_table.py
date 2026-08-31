@@ -396,3 +396,47 @@ def test_a_MISSING_database_is_a_lookup_failure_not_an_empty_history(tmp_path):
     import os
     assert not os.path.exists(missing), (
         "the lookup created the database it was meant to refuse")
+
+
+def test_a_table_only_intent_halts_the_CLI_too(reviewing):
+    """Finding 1 of the second-vendor review, and it is the double-merge case.
+
+    `perform` calls `journal_intent` (table) then `append_fact`. A process
+    death between them leaves a table row with NO fact -- exactly the crash the
+    `intended` halt row exists for. The CLI helper used to ENUMERATE from the
+    facts, so it found no key, returned None, and `decide` fell through to
+    `merge_authorized` and answered `perform_merge`: re-executing a merge that
+    may already have landed.
+
+    The earlier test built this state and passed `merge_effect="intended"` by
+    hand, so it proved `decide` and not the lookup.
+    """
+    from coordinator.cli import _merge_effect_from_table
+    s, art = reviewing
+    _authorize(s, art)
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    s.journal_intent("mk-tbl", "r", gen, EffectClass.MERGE, "mk-tbl", MERGE_ARGV)
+    facts = s.facts_for("r")
+    assert not [f for f in facts if f.kind == "effect_intended"], (
+        "journal_intent appended a fact; this test no longer builds the state "
+        "it names")
+
+    assert _merge_effect_from_table(s, "r", facts) == "intended"
+    assert decide(facts, merge_effect=_merge_effect_from_table(s, "r", facts)
+                  ).do == "halt_and_reconcile"
+
+
+def test_a_RECONCILED_merge_does_not_assert_that_it_happened(reviewing):
+    """Finding 2. A resolution is free text and the kernel's own tests resolve
+    merges as "PR was not merged". Mapping `reconciled` onto "the merge
+    HAPPENED" asserts an outcome the mechanism cannot read."""
+    s, art = reviewing
+    _authorize(s, art)
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    perform(s, "r", gen, EffectClass.MERGE, "mk", MERGE_ARGV, lambda *a: "sha")
+    facts = s.facts_for("r")
+    a = decide(facts, merge_effect="reconciled")
+    assert a.do == "reconciled_ruling_needed", a
+    assert "free text" in a.why
+    # It still fails closed at the runner's gate.
+    assert decide(facts, merge_effect="confirmed").do == "record_merge_outcome"

@@ -2722,6 +2722,10 @@ _recovery_action() {  # <run_id> <base_sha> <context_hash>
 #   record_merge_outcome the merge HAPPENED; record it, never re-execute it
 #   halt_and_reconcile   the merge MAY have happened; only an observation of the
 #                        forge can settle it
+#   reconciled_ruling_needed  a human already reconciled the effect, and the
+#                        resolution is free text -- "merged" and "PR was not
+#                        merged" are both things it says. The mechanism cannot
+#                        read it, so it must not act on it either way.
 #
 # UNKNOWN IS NOT PERMISSION. An empty action -- an unreachable kernel, a failed
 # lookup, a bounded call that timed out -- returns rc 1 here, meaning "does not
@@ -2733,7 +2737,7 @@ _recovery_action() {  # <run_id> <base_sha> <context_hash>
 # the last line is how a fail-open default gets written.
 _recovery_forbids_merge() {  # <action>
   case "${1%%|*}" in
-    done|record_merge_outcome|halt_and_reconcile) return 0 ;;
+    done|record_merge_outcome|halt_and_reconcile|reconciled_ruling_needed) return 0 ;;
   esac
   return 1
 }
@@ -3691,7 +3695,8 @@ _writeback_plan() {
   esac
 }
 
-# _issue_writeback <issue> <outcome> <pr> <review> <rounds>: comment the scorecard
+# _issue_writeback <issue> <outcome> <pr> <review> <resubmissions> <ci_first>
+#                  [rounds]: comment the scorecard
 # line on the issue and set/clear status labels. No-op if issue empty or writeback off.
 _issue_writeback() {
   # THE FIFTH ARGUMENT IS RESUBMISSIONS, and it was labelled `rounds=` in the
@@ -3821,9 +3826,19 @@ preflight_dispatch() {
   [ "$ok" = 1 ] || { echo "[batch] preflight FAILED at dispatch -> refusing to start the queue (every item would die at launch)" >&2; return 1; }
 }
 
-# json_row item pr outcome ci_first review rounds wall note bound [implementer]
+# json_row item pr outcome ci_first review resubmissions wall note bound
+#          [implementer] [repair_rounds]
+#
+# POSITION 6 IS RESUBMISSIONS -- distinct commits CI ran on, minus one. It was
+# named `rounds` here and in the parameter list for the whole of Phase 2 while
+# being emitted as `resubmissions`, and that is what let the issue writeback
+# label one as the other on the channel a human reads.
+#
 # #4: implementer is optional (last arg) so pre-launch call sites can omit it;
 # recording it makes the cross-vendor pairing (implementer vs review) auditable.
+# repair_rounds is optional for the same reason and is emitted as `rounds` --
+# null when absent, which means "no repair happened", never "the loop ran and
+# found nothing to repair".
 json_row() {
   python3 - "$@" <<'PY'
 import json,sys,datetime
@@ -5245,6 +5260,8 @@ SH
   esac
   # The durability gate. Criterion 7: an accepted REVIEW_VERDICT carrying the
   # submitted command's causal id, or no repair work is dispatched.
+  _recovery_forbids_merge "reconciled_ruling_needed|resolution is free text" \
+    || { echo "FAIL _recovery_forbids_merge: a human-reconciled merge was not forbidden"; exit 1; }
   _revision_is_recorded "1|1|yes" \
     || { echo "FAIL _revision_is_recorded: a confirmed revision was rejected"; exit 1; }
   ! _revision_is_recorded "1|1|no" \

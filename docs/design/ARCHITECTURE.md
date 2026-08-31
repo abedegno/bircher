@@ -500,6 +500,15 @@ free: it would change what a FAIL records under `BIRCHER_MAX_REVISIONS=0`, which
 is the configuration that has to stay byte-identical. So it needs its own design
 pass rather than a patch. Found by second-vendor review.
 
+**`--recover-pr` consumes only the FORBID bit.** The recovery action is computed
+and logged, and the only thing acted on is "must not merge here".
+`record_merge_outcome`, `halt_and_reconcile`, `reconciled_ruling_needed` and
+`retry_merge` are named in the log and never performed, so a run in one of those
+states says the same sentence forever until a human acts. That is a merge
+SAFEGUARD, not recovery, and calling it "recovery is wired" overstates it.
+Performing those actions is the next step and each one is an effect that needs
+its own authorization path. Named by second-vendor review.
+
 STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
 `--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and
 gap 2 stands, because the lead session's own fix loop is untouched.
