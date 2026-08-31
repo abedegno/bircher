@@ -1525,3 +1525,59 @@ the earlier review logs, which match that glob.** So this audit is indirect.
 
 That leaves no known contaminated conclusion, but the argument rests on quoted
 excerpts rather than on the logs, because I destroyed them.
+
+
+---
+
+## The bounded repair loop, run to a disposition — 2026-08-31
+
+The previous section was correctly rejected for stopping after one round and
+calling it the pre-registered test. This is the loop actually run to a
+disposition, bound 3, the same bound `muesli-loop` uses.
+
+### #727 — CONVERGED at round 2, merged
+
+| round | routed finding | result |
+|---|---|---|
+| 0 | — | escalated: guarded write preceded the storage delete, so a failed delete stranded a note as permanently non-retranscribable |
+| 1 | that ordering | fixed it (`SetRetentionStateDiscardedIfCurrent` spans the delete under a notes-row lock, six tests) → NEW finding: `DeleteNoteSummariesIfCurrent` not atomic against transcript replacement |
+| 2 | that atomicity | fixed it → **PR #750 MERGED**, issue closed |
+
+Worth noting what happened inside round 2: the lead session opened #750 with
+`server (go)` FAILING and spent ~90 minutes fixing its own CI before the runner
+ever saw it settle. That is `muesli-loop`'s fix-task loop working, and it is
+invisible in the scorecard.
+
+### #722 — did NOT converge; three distinct findings in three reviews
+
+| round | routed finding | result |
+|---|---|---|
+| 0 | — | escalated: `t0` anchored to the utterance start after the decode window was bounded |
+| 1 | that anchor | fixed it exactly (`max(segment_start_frame, end_frame - partial_frames)` + a `t0`-asserting test) → NEW: sub-threshold VAD pauses break the same computation, because `_utterance` holds only speech frames |
+| 2 | those pauses | → NEW: `finish()` treats a sub-frame residual as speech and moves `_last_speech_frame_end` |
+
+Still open, still escalated, three findings deep in the same file.
+
+### What this now supports
+
+**A bounded repair loop converges sometimes.** One of two items merged inside
+the bound; the other produced a distinct finding at every round. Each
+implementer fixed precisely what was routed, every time — the failure is not
+that repair is ignored, it is that the reviewer keeps finding more.
+
+That is directly relevant to the architecture decision. A repair loop is worth
+building: it turned an escalation into a merge without a human. It is not
+sufficient on its own: half the items here would still have exhausted the bound
+and escalated anyway.
+
+### What it still does not settle
+
+Two items. And the alternative hypothesis is undisturbed: #722's findings may
+be genuinely deeper each round, or the reviewer may simply find something on
+any sufficiently complex diff. The evidence is consistent with both. Settling
+it needs the churn baseline named earlier — repeated blinded reviews of an
+UNCHANGED diff — which has not been run.
+
+One asymmetry is suggestive but not conclusive: #727's rounds moved through
+DIFFERENT functions toward a merge, while #722's stayed in one file and one
+computation, which is what a diff-complexity effect would look like.
