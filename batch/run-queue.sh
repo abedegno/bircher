@@ -5330,6 +5330,73 @@ SH
   printf '%s' "$_jr" | grep -q '"rounds": null' \
     || { echo "FAIL json_row: an absent round count is not null: $_jr"; exit 1; }
   echo "json_row rounds OK"
+
+  # --- _repair_round actually EXECUTES ----------------------------------------
+  #
+  # Until this, nothing in either suite had ever run it. Every other repair-loop
+  # test drives the pieces around it -- the classification, the findings
+  # transport, the durability gate -- and the function that performs the repair
+  # was defended only by reading it. "Does ANY test drive the happy path to
+  # completion" had the answer NO, which is the shape that let a whole
+  # coordinator arm ship with a corrupted module name and 494 green tests.
+  #
+  # Driven by redefining its collaborators in a SUBSHELL, so the overrides
+  # cannot leak into the tests after it.
+  local rrdir; rrdir=$(mktemp -d)
+  (
+    _kernel_dispatch() { echo 7; }
+    _kernel_start_implementation() { echo "start_implementation $1 $2" >> "$rrdir/kernel"; }
+    _local_host_id() { echo host-1; }
+    _create_session() { echo "created $*" >> "$rrdir/calls"; echo conv-42; }
+    _send_prompt() { printf '%s' "$2" > "$rrdir/prompt"; echo "prompted $1" >> "$rrdir/calls"; }
+    _stop_session() { echo "stopped $1" >> "$rrdir/calls"; }
+    _session_state() { echo "failed|runner_error"; }   # dies -> the loop ends
+    _coordinator() { return 1; }                        # no settle answer
+    POLL=0 ITEM_TIMEOUT=5 AGENT_ID=ag WORKDIR=/w SERVER=http://x REPO=demo/demo \
+      BIRCHER_RUN_ID=r1 BIRCHER_KERNEL_DB=/dev/null \
+      _repair_round "the task" c1 7 i711-branch "BLOCKING: the retry drops b" 1 claude_code \
+      > "$rrdir/out" 2>&1
+    echo "$?" > "$rrdir/rc"
+  )
+  [ "$(cat "$rrdir/rc")" = 0 ] \
+    || { echo "FAIL _repair_round: rc=$(cat "$rrdir/rc")"; cat "$rrdir/out"; exit 1; }
+  # It MINTED A GENERATION AND RECORDED start_implementation. Without that the
+  # run is still at `planned` and every later command in the round is refused.
+  grep -q 'start_implementation r1 7' "$rrdir/kernel" \
+    || { echo "FAIL _repair_round: did not record start_implementation at the new generation"; cat "$rrdir/kernel" 2>/dev/null; exit 1; }
+  # It CREATED, PROMPTED and STOPPED, in that order. Stopping matters most: a
+  # quiet session is idle, not finished, and a live repair session races the
+  # review the next derivation is about to dispatch.
+  [ "$(tr '\n' ' ' < "$rrdir/calls" | sed 's/created [^p]*/created /')" = "created prompted conv-42 stopped conv-42 " ] \
+    || { echo "FAIL _repair_round: wrong call sequence: $(cat "$rrdir/calls")"; exit 1; }
+  # The BRIEF reached the session -- verbatim, with the branch and the PR.
+  grep -q 'BLOCKING: the retry drops b' "$rrdir/prompt" \
+    || { echo "FAIL _repair_round: the findings did not reach the prompt"; cat "$rrdir/prompt"; exit 1; }
+  grep -q 'i711-branch' "$rrdir/prompt" \
+    || { echo "FAIL _repair_round: the branch did not reach the prompt"; exit 1; }
+  grep -q 'Do NOT open a new pull request' "$rrdir/prompt" \
+    || { echo "FAIL _repair_round: the prohibition did not reach the prompt"; exit 1; }
+  # A session that cannot be created is rc 1 and NO prompt -- the caller
+  # escalates rather than looping on a round that never started.
+  : > "$rrdir/calls"
+  (
+    _kernel_dispatch() { echo 7; }
+    _kernel_start_implementation() { :; }
+    _local_host_id() { echo host-1; }
+    _create_session() { echo ""; }
+    _send_prompt() { echo "prompted" >> "$rrdir/calls"; }
+    _stop_session() { :; }
+    POLL=0 ITEM_TIMEOUT=5 AGENT_ID=ag WORKDIR=/w SERVER=http://x REPO=demo/demo \
+      BIRCHER_RUN_ID=r1 BIRCHER_KERNEL_DB=/dev/null \
+      _repair_round t c1 7 br "f" 1 claude_code >/dev/null 2>&1
+    echo "$?" > "$rrdir/rc2"
+  )
+  [ "$(cat "$rrdir/rc2")" = 1 ] \
+    || { echo "FAIL _repair_round: a failed session create must return rc 1, got $(cat "$rrdir/rc2")"; exit 1; }
+  [ ! -s "$rrdir/calls" ] \
+    || { echo "FAIL _repair_round: prompted a session that was never created"; exit 1; }
+  rm -rf "$rrdir"
+  echo "_repair_round executes OK"
   rm -rf "$rdir"
   echo "repair loop OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
