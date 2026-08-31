@@ -2679,6 +2679,22 @@ The original task, for context:
 $1"
 }
 
+# _terminal_review_flag <outcome> -> `terminal` when this review failure ENDS
+# the item, empty otherwise.
+#
+# A FUNCTION so a test can reach it. The call site is inside run_item and
+# nothing can drive that, and the distinction it draws is not obvious enough to
+# leave to a grep: `failed` is reached from exactly one place -- a reviewer FAIL
+# with no repair rounds left -- so it means "the bound is spent, record a
+# rejection". Every other escalation keeps `request_revision`, because a
+# revision genuinely IS owed there and nothing performed it; telling a resume
+# to dispatch an implementer is the right answer in those cases and the wrong
+# one here.
+_terminal_review_flag() {  # <outcome>
+  [ "${1:-}" = failed ] && printf 'terminal'
+  return 0
+}
+
 # _revision_is_recorded <revisions-tuple> -> rc 0 only if the kernel journalled
 # the revision we submitted. The tuple is `used|left|confirmed` from
 # `coordinator.cli revisions --confirm-command <key>`.
@@ -4274,6 +4290,7 @@ ${prompt}"
   # moved them once for the same test and satisfied only half of what it says.
   local _rev_key=""
   local _rev_round=0
+  local _rev_terminal=""
   if [ "${_blind:-0}" = 1 ]; then
     # Unchanged from the marker era, and still correct: the cancel was never
     # confirmed, so the coordinator may still be running. Deriving an outcome
@@ -4395,8 +4412,14 @@ EOF
       _rev_key=""
       [ "$outcome" = revise ] && \
         _rev_key="revise:${BIRCHER_RUN_ID}:${_rev_round}:${BIRCHER_GENERATION}"
+      # TERMINAL only when the bound is spent. `failed` is reached from exactly
+      # one place -- a reviewer FAIL with no rounds left -- so it is the signal
+      # for "record a rejection, not a revision request". The mechanism
+      # escalations below set `escalated` and keep `request_revision`, because a
+      # revision genuinely is owed there and nothing performed it.
+      _rev_terminal=$(_terminal_review_flag "$outcome")
       _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-        "$_out_hash" "$_base_sha" "$_spec_hash" "$_rev_key"
+        "$_out_hash" "$_base_sha" "$_spec_hash" "$_rev_key" "$_rev_terminal"
       BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
       export BIRCHER_GENERATION
     fi
@@ -5280,6 +5303,19 @@ SH
   # merely contain the word must not pass.
   ! _revision_is_recorded "yes|1|no" \
     || { echo "FAIL _revision_is_recorded: matched 'yes' outside the confirmed field"; exit 1; }
+  # The bound-exhausted review is the ONLY one that records a rejection.
+  [ "$(_terminal_review_flag failed)" = terminal ] \
+    || { echo "FAIL _terminal_review_flag: a spent allowance must record a rejection"; exit 1; }
+  for o in revise ready escalated timeout noop skipped ""; do
+    [ -z "$(_terminal_review_flag "$o")" ] \
+      || { echo "FAIL _terminal_review_flag: '$o' must not record a rejection"; exit 1; }
+  done
+  # `escalated` in particular: the revision-not-journalled and no-findings paths
+  # end there, and a revision IS owed on both -- `dispatch_implementer` is the
+  # right answer for a resume, so they must keep request_revision.
+  [ -z "$(_terminal_review_flag escalated)" ] \
+    || { echo "FAIL _terminal_review_flag: a mechanism escalation is not a rejection"; exit 1; }
+  echo "_terminal_review_flag OK"
   echo "_revision_is_recorded OK"
 
   # THE ROLLBACK, asserted as a property of the call and not of the loop.

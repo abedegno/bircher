@@ -537,10 +537,27 @@ _KERNEL_POLICY_VERSION=1
 # and in the ledger. `na` included: "a review was attempted and its verdict was
 # not one the kernel accepts" is a fact worth holding, and it is the truth
 # about a run nobody reviewed. Skipping is what looks like success.
+# The optional SECOND argument marks a TERMINAL review failure -- the repair
+# allowance is spent and the runner is about to escalate. Without it every
+# `*:fail` recorded `request_revision`, which returns the run to `planned`: the
+# kernel then said "an implementer should start" for a run that had no rounds
+# left, and `coordinator.recover` read that state and answered
+# `dispatch_implementer`. The runner and the kernel disagreed about whether the
+# item was over.
+#
+# ONLY the bound-exhausted case. The other escalation paths -- the revision was
+# not journalled, no findings were written -- leave `request_revision` standing,
+# and that is correct: a revision IS owed there, nothing did it, and
+# `dispatch_implementer` is the right thing for a human or a resume to do.
+#
+# The CALLER PASSES A FLAG, never a kernel word. `review=` was model-authored
+# once and passing an unmapped word through unchanged was an authorization
+# bypass; the mapping stays in here so that cannot come back through a new
+# argument.
 _kernel_verdict() {
   case "$1" in
     *:pass) printf 'accept' ;;
-    *:fail) printf 'request_revision' ;;
+    *:fail) if [ "${2:-}" = terminal ]; then printf 'reject'; else printf 'request_revision'; fi ;;
     # PREFIXED, and stripped to a safe charset. Passing an unmapped word
     # through UNCHANGED -- the previous version -- was an authorization bypass:
     # `review=` is model-authored, and `accept` is the kernel's own vocabulary,
@@ -630,10 +647,10 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # the fact carries the key as its causal id. Deriving that key on the shell side
 # instead would rebuild `kernel.cli`'s default-key format in a second language,
 # and two subsystems that rebuild the same string eventually disagree about it.
-_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key]
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
-  local key="${7:-}"
-  local verdict; verdict=$(_kernel_verdict "$raw")
+  local key="${7:-}" terminal="${8:-}"
+  local verdict; verdict=$(_kernel_verdict "$raw" "$terminal")
   # No early return: every input now maps to something submittable -- a mapped
   # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
   # used to skip an empty verdict became unreachable when the fallback stopped

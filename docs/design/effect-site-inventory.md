@@ -32,17 +32,17 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | Line | Call | Effect class |
 |---|---|---|
 | 291 | `gh issue reopen` | `issue_or_label` |
-| 5024 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
+| 5047 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
 | 1655 | `gh pr merge --squash --delete-branch` | `merge` |
 | 1859 | `git push origin HEAD:main` | `ref_update` |
 | 2006 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
 | 2511 | `gh pr close` | `pull_request` |
-| 5036 | `gh pr comment` | `comment` |
-| 3691 | `gh issue comment` | `comment` |
-| 3692 | `gh issue edit --remove-label` | `issue_or_label` |
-| 3693 | `gh issue edit --add-label` | `issue_or_label` |
-| 3710 | `gh issue close` | `issue_or_label` |
-| 3955 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 5059 | `gh pr comment` | `comment` |
+| 3707 | `gh issue comment` | `comment` |
+| 3708 | `gh issue edit --remove-label` | `issue_or_label` |
+| 3709 | `gh issue edit --add-label` | `issue_or_label` |
+| 3726 | `gh issue close` | `issue_or_label` |
+| 3971 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 | 1088 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
 | 1114 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
 | 1064 | `curl -X POST $SERVER/v1/sessions` | `session_control` |
@@ -66,10 +66,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1682 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 6560 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 7477 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
-| 7478 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 7501 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 6596 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 7513 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
+| 7514 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 7537 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
@@ -89,7 +89,7 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 3498 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
-| 3500 | `gh run rerun` | *(none)* | Same site class as the other `gh run rerun` row above — see it for the reasoning. **Named, not numbered**, because the repointing tool remaps the Line column and cannot follow a line number written in prose: this reference had been stale since the row moved to 3457. |
+| 3514 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
+| 3516 | `gh run rerun` | *(none)* | Same site class as the other `gh run rerun` row above — see it for the reasoning. **Named, not numbered**, because the repointing tool remaps the Line column and cannot follow a line number written in prose: this reference had been stale since the row moved to 3457. |
 
 | 1010 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed, but that is NOT what blocks routing — corrected 2026-08-29.** The recorded reason was that routing needs the intent contract to carry a response. It does not: `perform` already returns the executor's stdout as the external object id, and `_create_session` was routed on exactly that basis, capturing the response and parsing it afterwards. The ACTUAL blocker is `-w`. The upload uses `-w '\n%{http_code}'` to capture the status alongside the body, and `-w` is deliberately absent from the `session_control` contract because its value supports `%output{path}` — an arbitrary filesystem write from a class that exists to control a session. Checked directly: the contract refuses this argv, reading the `-w` value as the URL. **The route out is `--fail-with-body`** (curl 8.14.1 on the runner supports it), which yields the body AND a non-zero exit on an HTTP error, making `-w` unnecessary. Not done here because it changes what the caller receives on failure, on the coordinator's hot path where every run begins. |

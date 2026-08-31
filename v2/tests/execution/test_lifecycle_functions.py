@@ -587,7 +587,7 @@ def test_a_bogus_outcome_is_refused_rather_than_recorded(tmp_path):
 # untrusted and the guard that decides whether it approves a merge was
 # unbound.
 
-def _reviewed_run(db, run_id, verdict):
+def _reviewed_run(db, run_id, verdict, terminal=""):
     """Drive a run to `implementing`, then record a review with *verdict*."""
     _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
     r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
@@ -606,7 +606,7 @@ def _reviewed_run(db, run_id, verdict):
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     rgen = r.stdout.strip().strip("[]")
     _run(f"_kernel_record_review {run_id} {rgen} {verdict!r} "
-         f"{out_hash} {BASE_SHA} {spec}", env=_db_env(db))
+         f"{out_hash} {BASE_SHA} {spec} '' {terminal!r}", env=_db_env(db))
     return Store.open(db)
 
 
@@ -623,6 +623,45 @@ def test_a_fail_verdict_sends_the_run_back_rather_than_forward(tmp_path):
     with nowhere to go, and `accept` would let failed work merge."""
     s = _reviewed_run(tmp_path / "k.db", "r-fail", "codex:fail")
     assert s.run_state("r-fail") == "planned", s.run_state("r-fail")
+
+
+def test_a_TERMINAL_fail_records_a_rejection_not_a_revision_request(tmp_path):
+    """Gap 14. Every `*:fail` recorded `request_revision`, which returns the run
+    to `planned` -- so the kernel said "an implementer should start" for a run
+    whose repair allowance was spent and which the runner was about to
+    escalate. `coordinator.recover` read that state and answered
+    `dispatch_implementer`. The runner and the kernel disagreed about whether
+    the item was over.
+
+    `reject` leaves the run in `reviewing`, which the recovery table maps to
+    `terminal`."""
+    s = _reviewed_run(str(tmp_path / "k.db"), "r-term", "codex:fail",
+                      terminal="terminal")
+    assert s.run_state("r-term") == "reviewing", s.run_state("r-term")
+    verdicts = [f.payload.get("verdict") for f in s.facts_for("r-term")
+                if f.kind == "review_verdict"]
+    assert verdicts == ["reject"], verdicts
+
+
+def test_recovery_calls_a_terminal_run_terminal(tmp_path):
+    """The consequence, asserted where it actually bites: `decide` must not
+    tell a resume to dispatch an implementer for a run that has no rounds
+    left."""
+    from coordinator.recover import decide
+    s = _reviewed_run(str(tmp_path / "k.db"), "r-term2", "codex:fail",
+                      terminal="terminal")
+    assert decide(s.facts_for("r-term2")).do == "terminal"
+
+
+def test_a_NON_terminal_fail_still_asks_for_a_revision(tmp_path):
+    """The other escalation paths -- the revision was not journalled, no
+    findings were written -- must keep `request_revision`. A revision genuinely
+    is owed there and nothing performed it, so `dispatch_implementer` is the
+    right answer for a human or a resume."""
+    from coordinator.recover import decide
+    s = _reviewed_run(str(tmp_path / "k.db"), "r-rev", "codex:fail")
+    assert s.run_state("r-rev") == "planned"
+    assert decide(s.facts_for("r-rev")).do == "dispatch_implementer"
 
 
 @pytest.mark.parametrize("verdict", [

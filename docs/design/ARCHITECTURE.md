@@ -440,7 +440,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
 | 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running |
-| 14 | an exhausted allowance records `request_revision`, so the kernel sits at `planned` while the runner escalates | low | its own design pass | recording `reject` changes what `BIRCHER_MAX_REVISIONS=0` records, and that must stay byte-identical |
+| 14 | ~~an exhausted allowance records `request_revision`~~ | **CLOSED** | a bound-exhausted failure records `reject`, so the run ends in `reviewing` and `recover` calls it terminal | — |
 | 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
 
 ### The repair loop, as of 2026-08-31
@@ -506,6 +506,35 @@ reading as comfortable: a bound of 2 was chosen from #740 converging in 1 and
 #750 in 2, and #722 used both. One more finding and it would have escalated
 correctly. The bound is doing real work, and this run is evidence for the loop,
 not evidence that 2 is the right number.
+
+**A bound-exhausted failure records `reject`** (gap 14, closed). Every `*:fail`
+used to record `request_revision`, returning the run to `planned` -- so the
+kernel said "an implementer should start" for a run whose allowance was spent
+and which the runner was about to escalate, and `recover` read that and answered
+`dispatch_implementer`. Runner and kernel disagreed about whether the item was
+over, and the disagreement only surfaced once recovery started reading the
+journal for its answer.
+
+ONLY that case. The mechanism escalations -- the revision was not journalled, no
+findings were written -- keep `request_revision`, because a revision genuinely IS
+owed there and nothing performed it. `_terminal_review_flag` draws the line, and
+is a function rather than an inline test so something can drive it.
+
+**The implementer is being killed before it finishes, and that may be part of
+what the loop is repairing** (gap 15, open). Four `runner_error` reaps across the
+run logs, with omnigent's own message:
+
+> `turn exceeded the 480s harness idle watchdog (run_turn emitted no events for
+> 480s; likely a wedged LLM or tool call)`
+
+`omnigent-runner-bircher` sets `HARNESS_TURN_TIMEOUT_S: 480`; the general runner
+on the same image uses 600. An implementer running a long build or test suite
+emits nothing for minutes and gets reaped. The runner handles it correctly -- it
+observes the death and derives from the repository -- so nothing is lost or
+corrupted. What it changes is the reading of a reviewer FAIL: some fraction are
+truncated work rather than wrong work, and a loop repairing truncation is doing
+a different job from one repairing defects. Worth measuring before drawing
+conclusions about convergence, and probably the largest single lever on them.
 
 STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
 `--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and
