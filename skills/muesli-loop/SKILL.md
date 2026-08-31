@@ -161,27 +161,22 @@ an independent different-vendor reviewer. Work in /workspaces/muesli.
   cross-vendor pass), or leaves them for the human when merging is disabled
   or deferred.
 
-- After the PR is ready (or you are escalating/failing), post a PR comment whose
-  LAST line is exactly this machine-readable marker (the batch runner parses it):
+- After the PR is ready (or you are escalating/failing), post NOTHING
+  machine-readable. There is no marker, and there is nothing you need to report
+  for the runner to act.
 
-  `bircher-status: outcome=<ready|escalated|failed> ci=<green|red|na> ci_first=<true|false> review=<vendor>:<pass|fail|na> rounds=<n> head=<sha> note="<short>"`
+  This block used to specify a `bircher-status:` line and require you to fill in
+  `outcome`, `ci`, `ci_first`, `review`, `rounds` and `head`. Every one of those
+  is now OBSERVED by the runner from the repository -- the outcome from the PR
+  and its checks, the reviewed head from the reviewer that read it, the round
+  count from the repairs the runner itself dispatched. A value you assert about
+  your own work is not evidence; the point of deriving them is that nobody has
+  to trust the thing being measured to report on itself.
 
-  - `head=<sha>` is the FULL 40-hex commit the reviewer actually reviewed — take it
-    from the review worktree (`git -C <worktree> rev-parse HEAD`), NOT from a fresh
-    `gh pr view` after the fact. The runner uses this to refuse a merge if the head
-    moved after the review, so a re-derived value would defeat the check it feeds.
-    REQUIRED whenever `outcome=ready`: without it the runner cannot prove which
-    commit was reviewed and will decline to auto-merge, leaving the PR for a human.
-    Omit it (or leave it empty) for `escalated`/`failed`, where nothing merges.
-  - `outcome=ready` when CI is green AND cross-review passed.
-  - `outcome=escalated` when the confidence gate fired or review did not converge
-    in the bounded rounds (leave the PR/draft for the human; reason in `note`).
-  - `outcome=failed` when you could not produce a mergeable PR (reason in `note`).
-    Keep `note` under ~100 chars and free of double quotes.
-  - POST IT SO THE MARKER IS ITS OWN PHYSICAL LINE. A `--body "...\nbircher-status:
-..."` does NOT work: bash leaves `\n` as a literal backslash-n, so the marker
-    ends up mid-line and the runner cannot parse it (the item then polls to
-    timeout). Instead write the body to a file and post that -- e.g.
-    `printf '%s\n\n%s\n' "<prose>" 'bircher-status: ...' > /tmp/<code>.md && gh pr
-comment <pr> --body-file /tmp/<code>.md` -- or use `$'...\n...'` so the newline
-    is real. (The runner now also tolerates a mislaid marker, but post it cleanly.)
+  So: do not write a `bircher-status:` line, in a PR comment, a PR body, an
+  issue comment or anywhere else. Nothing reads it, and one written now is a
+  status line a future digest may show a later session as though it meant
+  something.
+
+  Do post a normal, human-readable summary of what you did if it is useful to a
+  reader. Prose is welcome; a machine channel is not.

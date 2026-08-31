@@ -66,7 +66,7 @@ Everything below is written against this. Nothing here is finished.
 | review | twice — lead session AND coordinator | once, coordinator-owned |
 | repair loop | lead session (3 rounds) AND the coordinator (2, default) | coordinator-owned only |
 | lead session | implements, reviews, repairs, reports a marker | implements only |
-| reporting | `bircher-status:` marker + derived tuple | derived only |
+| reporting | derived only — the marker is retired in code AND in the instructions | done |
 | kernel | authorises and journals | unchanged — this part is done |
 
 The kernel is the only component at its target. Everything else is in motion.
@@ -429,7 +429,7 @@ of the runner/coordinator split and should NOT be patched in place.
 |---|---|---|---|---|
 | 1 | a repairable finding dies when the two reviews disagree (§5) | ~~high~~ **BUILT, not yet proven live** | the repair loop (`2026-08-31-repair-loop-design.md`) | one live muesli item repaired and merged with no human routing the finding |
 | 2 | duplicate cross-vendor review | medium | gap 1 | deleting either one first loses repair or loses independence |
-| 3 | `bircher-status:` marker still emitted | medium | `muesli-loop` edit | deciding what reports `rounds=<n>` |
+| 3 | ~~`bircher-status:` marker still emitted~~ | **CLOSED** | the skill no longer mandates it, and the enumerating guard now scans instruction files (`.md` under `skills/`, `agents/`) as code | — |
 | 4 | runner is 8,559 lines and still growing | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
 | 5 | review base binding is tautological | moderate, config-dependent | own design | not urgent while muesli sets `strict: true` — see `base-binding-weakness.md` |
 | 6 | why two reviews of the same commit disagreed is unexplained | moderate | investigation | recovering the lead session's child transcript |

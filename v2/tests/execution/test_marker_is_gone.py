@@ -15,12 +15,28 @@ _PROSE_ROOTS = {"docs", "README.md", ".superpowers"}
 
 _CODE_SUFFIXES = {".sh", ".py", ".yaml", ".yml"}
 
+#: INSTRUCTIONS TO A MODEL ARE EXECUTABLE, so they are scanned like code.
+#:
+#: The hole this closes: `.md` was not a scanned suffix, so while no shipped
+#: code wrote or read the marker, `skills/muesli-loop/SKILL.md` still TOLD the
+#: lead session to post one -- and it did, on muesli #735. The channel was
+#: retired everywhere except the one place that caused it to be written.
+#:
+#: Only `skills/` and `agents/`. `docs/` stays prose: records and specs describe
+#: the history, and erasing the name from them would make the scar record
+#: unreadable.
+_INSTRUCTION_ROOTS = {"skills", "agents"}
+
 
 def _shipped_files():
     for p in sorted(REPO_ROOT.rglob("*")):
-        if not p.is_file() or p.suffix not in _CODE_SUFFIXES:
+        if not p.is_file():
             continue
         rel = p.relative_to(REPO_ROOT)
+        instruction = (rel.parts and rel.parts[0] in _INSTRUCTION_ROOTS
+                       and p.suffix == ".md")
+        if p.suffix not in _CODE_SUFFIXES and not instruction:
+            continue
         if rel.parts[0] == ".git" or rel.parts[0] in _PROSE_ROOTS:
             continue
         # This file exists to NAME the marker -- its allowlist, its scanning
@@ -39,6 +55,10 @@ def test_the_guard_can_actually_see_the_files_it_claims_to_check():
     files = {str(rel) for rel, _ in _shipped_files()}
     assert "batch/run-queue.sh" in files, files
     assert "batch/lib/observe.sh" in files, files
+    # The instruction files, which were invisible until 2026-08-31: `.md` was
+    # not a scanned suffix, so the marker survived in the one place that caused
+    # it to be written.
+    assert "skills/muesli-loop/SKILL.md" in files, files
     assert len(files) > 20, files
 
 
@@ -65,6 +85,10 @@ _ALLOWED_LINES = {
         "bundle freezer has to hash an issue as it actually exists, and a "
         "fixture that pretended otherwise would test a shape that does not "
         "occur.",
+    'This block used to specify a `bircher-status:` line and require you to fill in':
+        "EXPLAINS THE RETIREMENT, in the same instruction file. Kept because a block that simply vanished would leave a session wondering what to report instead; this says nothing, and why.",
+    'So: do not write a `bircher-status:` line, in a PR comment, a PR body, an':
+        "FORBIDS IT BY NAME, in the instruction file that used to mandate it. The prohibition has to name the thing to be effective for a model reader -- the smoke items that avoided the marker did so only because their text forbade it by name, while issue-derived text did not and #735 carried one. Prompt wording is not the mechanism (this scan is); it is what stops the model writing one before the scan ever runs.",
 }
 
 
