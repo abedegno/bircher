@@ -439,6 +439,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 10 | kernel availability is unmonitored in `kernel` effect mode | low | operational | — |
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
+| 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running |
 | 14 | an exhausted allowance records `request_revision`, so the kernel sits at `planned` while the runner escalates | low | its own design pass | recording `reject` changes what `BIRCHER_MAX_REVISIONS=0` records, and that must stay byte-identical |
 | 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
 
@@ -487,6 +488,22 @@ human, and merging. That is acceptance criterion 9 and it is the reason gap 1
 above says "not yet proven live" rather than closed. #722 is the standing
 counter-example — three reviews, three distinct findings — and if it exhausts
 the bound that is the correct outcome, not a failure of the loop.
+
+**The implementer is being killed before it finishes, and that may be what the
+loop is repairing.** Four `runner_error` reaps across the run logs, with
+omnigent's own message:
+
+> `turn exceeded the 480s harness idle watchdog (run_turn emitted no events for
+> 480s; likely a wedged LLM or tool call)`
+
+`omnigent-runner-bircher` sets `HARNESS_TURN_TIMEOUT_S: 480`; the general runner
+on the same image uses 600. An implementer running a long build or test suite
+emits nothing for minutes and gets reaped. The runner handles it correctly --
+it observes the death and derives the outcome from the repository -- so nothing
+is lost or corrupted. But it reframes what a reviewer FAIL means: some fraction
+of them are truncated work rather than wrong work, and a repair loop that fixes
+truncation is doing a different job from one that fixes defects. Worth measuring
+before drawing conclusions about convergence rates.
 
 **An exhausted allowance still records `request_revision`.** `_kernel_verdict`
 maps every `*:fail` to `request_revision`, including the terminal failure when
