@@ -97,10 +97,16 @@ That field exists and has never had an observation behind it.
 derivation runs; reviving it is not available and would not be desirable —
 resuming a cancelled session inherits whatever state it stopped in.
 
-The coordinator dispatches a new implementer with `_kernel_dispatch(vendor,
-implementer)`, which mints a new generation. The prompt carries the item, the
-PR, and the reviewer's blocking findings verbatim — the same shape that worked
-by hand for #740 and #750.
+**The RUNNER dispatches it** — a previous draft said the coordinator did, in
+this section, while the ownership section above said the opposite. The
+coordinator only judges.
+
+The coordinator returns `revise` plus the data the runner needs, in the tuple:
+the reviewer's blocking findings verbatim, and the round number. The runner
+then records the revision, calls `_kernel_dispatch(vendor, implementer)` to
+mint a generation, creates and prompts a session with the item, the PR and
+those findings — the same shape that worked by hand for #740 and #750 — settles
+it, and calls `derive` again.
 
 **Vendor rotation stays.** The repair is implemented by the vendor whose turn
 it is and reviewed by the opposite one, as now. In the hand-run test the
@@ -152,6 +158,18 @@ after validation, carries the verdict explicitly, and is the same fact
 From the journal and not a variable, so a coordinator that dies and is
 re-driven gets no fresh allowance.
 
+**But the count proves only what was ACCEPTED, and that is not the same as what
+was requested.** `commands.py` validates a review, then bumps the version under
+CAS, then appends `REVIEW_VERDICT` — in that order. A review can validate and
+then lose the CAS as stale, producing no fact at all. The shell kernel adapter
+is advisory besides, so a caller can see success after a refusal.
+
+Therefore: **the runner must observe an accepted `REVIEW_VERDICT` carrying the
+submitted command's causal id before it dispatches any repair work.** Not the
+adapter's exit code, and not the absence of an error. If the fact is not there,
+the revision did not happen and the run must re-derive rather than proceed on
+the assumption that it did.
+
 Default 2 and not 3 because the evidence supports it: #740 converged in 1,
 #750 in 2, #722 had produced a new finding at every round and would have
 exhausted any bound. A third round costs a full implement-plus-CI-plus-review
@@ -178,7 +196,12 @@ Recovery therefore reads HISTORY, not the state name:
 | latest `REVIEW_VERDICT` is `accept` AND binds the run's CURRENT output | proceed to merge |
 | latest `REVIEW_VERDICT` is `accept` but binds a SUPERSEDED output | re-review; the approval is stale, which `validate_review` already refuses |
 | latest `REVIEW_VERDICT` is `reject` | terminal, as today |
-| latest fact is `record_merge_outcome(failed)` | the merge failed, not the review; retry the merge, do NOT consume a revision |
+| a `record_review` command was REJECTED (stale CAS) and no matching `REVIEW_VERDICT` exists | the revision was NOT recorded; re-derive. Do not treat an older `accept` as current |
+| run is `reviewing` with a current accept, no `MERGE_AUTHORIZED` | authorise, then merge |
+| `MERGE_AUTHORIZED` present, no confirmed `merge` effect | the merge was authorised and never executed; perform it. Do NOT re-issue `request_merge` — illegal from `merge_requested` |
+| confirmed `merge` effect present, no `record_merge_outcome` | **the merge HAPPENED.** Record the outcome from the observed merge commit; never re-execute the effect |
+| `record_merge_outcome(merged)` recorded | done; close out |
+| `record_merge_outcome(failed)` recorded | the merge failed, not the review; retry the merge, do NOT consume a revision |
 | no `REVIEW_VERDICT` at all | derive from scratch |
 
 **The external review result is not durable until its kernel command is
@@ -222,12 +245,19 @@ and settling; only the judgement moves. See "Who owns the loop".
 5. `BIRCHER_MAX_REVISIONS=0` is byte-identical to today, so the switch is a
    real rollback.
 6. Re-entry at every row of the recovery table, driven from journal history
-   rather than a state name — including the crash-after-FAIL-before-
-   request_revision window, an accept binding a superseded output, and a
-   failed merge that must NOT consume a revision.
-7. Mutation: making a FAIL record `reject` instead of `request_revision` must
+   rather than a state name. The rows that must each have their own test,
+   because each was missing from a draft and each does something different:
+   crash after the external FAIL but before `request_revision`; a
+   `record_review` that validated and then lost the CAS; an accept binding a
+   superseded output; `MERGE_AUTHORIZED` with no confirmed effect; a confirmed
+   merge effect with no recorded outcome (**must not re-execute**); and a
+   failed merge that must not consume a revision.
+7. The runner refuses to dispatch repair work unless an accepted
+   `REVIEW_VERDICT` for the submitted command exists — asserted by driving a
+   revision whose kernel command was refused and requiring no dispatch.
+8. Mutation: making a FAIL record `reject` instead of `request_revision` must
    fail a named test; the run would sit in `reviewing` and never revise.
-8. **A live muesli item that fails review is repaired and merged with no human
+9. **A live muesli item that fails review is repaired and merged with no human
    routing the finding.** That is what this is for, and #722 is the standing
    counter-example: if it still exhausts the bound, that is the correct outcome
    and not a failure of the loop.
