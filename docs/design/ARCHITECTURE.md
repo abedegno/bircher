@@ -64,7 +64,7 @@ Everything below is written against this. Nothing here is finished.
 | queue loop | `main()` in bash | replaced, driving omnigent directly |
 | derivation | coordinator as a one-shot subprocess | coordinator in-process, long-lived |
 | review | twice — lead session AND coordinator | once, coordinator-owned |
-| repair loop | lead session only (3 rounds) | coordinator-owned |
+| repair loop | lead session (3 rounds) AND the coordinator (2, default) | coordinator-owned only |
 | lead session | implements, reviews, repairs, reports a marker | implements only |
 | reporting | `bircher-status:` marker + derived tuple | derived only |
 | kernel | authorises and journals | unchanged — this part is done |
@@ -427,19 +427,51 @@ of the runner/coordinator split and should NOT be patched in place.
 
 | # | gap | severity | closed by | blocked on |
 |---|---|---|---|---|
-| 1 | a repairable finding dies when the two reviews disagree (§5) | **high** | a repair protocol, THEN migration | the protocol in §8 is undesigned — migration is a precondition, not the fix |
+| 1 | a repairable finding dies when the two reviews disagree (§5) | ~~high~~ **BUILT, not yet proven live** | the repair loop (`2026-08-31-repair-loop-design.md`) | one live muesli item repaired and merged with no human routing the finding |
 | 2 | duplicate cross-vendor review | medium | gap 1 | deleting either one first loses repair or loses independence |
 | 3 | `bircher-status:` marker still emitted | medium | `muesli-loop` edit | deciding what reports `rounds=<n>` |
 | 4 | runner is 8,559 lines and still growing | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
 | 5 | review base binding is tautological | moderate, config-dependent | own design | not urgent while muesli sets `strict: true` — see `base-binding-weakness.md` |
 | 6 | why two reviews of the same commit disagreed is unexplained | moderate | investigation | recovering the lead session's child transcript |
-| 7 | 12 stale citations in the effect-site inventory | low | hand-fixing | per-row judgement; some describe deleted code |
+| 7 | ~~12 stale citations in the effect-site inventory~~ | **CLOSED** | `tools/repoint-citations.py` — repoints by the cited line's own TEXT at a named baseline, reports ambiguity rather than guessing | — |
 | 8 | citation binding test cannot land | low | gap 7 | — |
 | 9 | `_derive_budget` warns every run | low | config or ceiling change | knobs promise 5,300s, a bounded call tops at 3,600s |
 | 10 | kernel availability is unmonitored in `kernel` effect mode | low | operational | — |
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
-| 13 | the kernel's revision loop (`record_review(request_revision) -> planned`) is never used by any path | medium | gap 1 | it is the mechanism a repair protocol would build on |
+| 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
 | 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
+
+### The repair loop, as of 2026-08-31
+
+Built and merged; `BIRCHER_MAX_REVISIONS` (default 2, range 0–5, 0 disables).
+A reviewer FAIL with rounds remaining is a `revise`, not an ending: the runner
+records `request_revision`, confirms the kernel journalled it, dispatches a
+repair session briefed on the reviewer's verbatim findings, and derives again.
+
+Judgement is the coordinator's; dispatch, settle and re-derive stay the
+runner's until `run_item` migrates. That split is honest rather than ideal —
+`v2/coordinator/session.py` is read-only and cannot start a session — and it
+moves with the rest of `run_item`.
+
+WHAT IS PROVEN, and by what:
+
+| claim | evidence |
+|---|---|
+| a FAIL with rounds left revises; with none it fails exactly as before | `tests/coordinator/test_repair_loop.py`, and the shell→Python path in `--self-test` |
+| the revision is not acted on until the kernel journals it | `test_revision_durability.py`, driven through real commands including a lost CAS |
+| no approval survives a round | `test_revision_durability.py` — one test per guard (artifact, CI head, state), each killed by exactly one mutation |
+| re-entry is decided from history, not the state name | `test_recovery_table.py`, every row against a real journal |
+| recovery will not merge what may already be merged | `_recovery_forbids_merge`, wired into `--recover-pr` |
+
+WHAT IS NOT PROVEN: a live muesli item failing review, being repaired without a
+human, and merging. That is acceptance criterion 9 and it is the reason gap 1
+above says "not yet proven live" rather than closed. #722 is the standing
+counter-example — three reviews, three distinct findings — and if it exhausts
+the bound that is the correct outcome, not a failure of the loop.
+
+STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
+`--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and
+gap 2 stands, because the lead session's own fix loop is untouched.
 
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
 state machine, effect classes, fact vocabulary and mode switches; the derived
