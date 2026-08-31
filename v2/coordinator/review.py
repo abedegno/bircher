@@ -17,6 +17,12 @@ _EDGE = "*`_"
 def extract_verdict(text: str) -> str | None:
     """`PASS`, `FAIL`, or None from a reviewer's output.
 
+    `VERDICT: BLOCKED` maps to None -- the reviewer says it formed no opinion,
+    which is exactly the "approved nothing" case, NOT a rejection. Before this
+    existed the prompt offered only PASS and FAIL, so a reviewer whose checkout
+    failed had to pick one; it picked FAIL, and the run recorded
+    `review=codex:fail` for a pull request nobody had read.
+
     Reads the LAST non-blank line and requires it to be a BARE verdict. A
     verdict mentioned mid-report is not a verdict -- a reviewer writing "if the
     tests passed I would say VERDICT: PASS" must not merge anything.
@@ -60,23 +66,39 @@ def extract_verdict(text: str) -> str | None:
 #: `test_the_rendered_prompt_is_byte_identical_to_the_bash` renders both and
 #: compares.
 _PROMPT = r"""Review PR #{pr} in {repo} as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree add --detach /tmp/review-{pr} {co}; cd /tmp/review-{pr}.
+First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
 You are reviewing EXACTLY commit {co}. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:$PATH &&' (e.g. 'export PATH=/root/bin:$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (`gh pr checks {pr}` to find the run, then `gh run view <run-id> --log`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (`|| true`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
 If the change acquires a resource that must be released -- a capture device, stream, handle, lock or subscription -- verify its FAILURE paths are tested, not just the happy path; a missing release-on-error test is a blocking finding. (muesli #666 left a microphone recording when a capture start failed.) Keep that scope narrow: do not treat every state change as in scope.
-Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL'. Put findings BEFORE the verdict so the verdict is the last line even if output is long."""
+Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS', 'VERDICT: FAIL', or 'VERDICT: BLOCKED'.
+Use BLOCKED, and ONLY BLOCKED, when you could not review at all -- the checkout failed, the tooling was unavailable, the commit was unreachable. BLOCKED means "I formed no opinion"; FAIL means "I reviewed this and it must not merge". They are routed differently and confusing them is expensive: a reviewer that could not check out its worktree once emitted FAIL, and the run recorded a code rejection for a PR nobody had read.
+Put findings BEFORE the verdict so the verdict is the last line even if output is long."""
 
 
-def review_prompt(pr: str, repo: str, sha: str = "") -> str:
+def review_prompt(pr: str, repo: str, sha: str = "", nonce: str = "") -> str:
     """The prompt handed to the reviewer.
 
     #66: the worktree is created at the EXACT captured commit, not FETCH_HEAD.
     `pull/N/head` is a MOVING ref -- a push between capture and the reviewer's
     fetch would have it read one commit while the merge pinned another.
     """
-    return _PROMPT.format(pr=pr, repo=repo, co=(sha or "FETCH_HEAD"))
+    # A UNIQUE WORKTREE PER REVIEWER, and the `-oob` suffix is the part that
+    # does the work. A sha-derived nonce alone is NOT enough: the two reviewers
+    # review the SAME commit, so they would compute the same nonce and collide
+    # exactly as before. The suffix names WHICH reviewer this is -- the
+    # out-of-band one the coordinator dispatches, as opposed to the one the
+    # lead session arranges from `skills/cross-review`.
+    #
+    # Both reviewers in this system used
+    # `/tmp/review-<PR>`: `skills/cross-review/SKILL.md` for the lead session's
+    # and this prompt for the coordinator's. On muesli PR #745 the first
+    # created the directory and the second died on
+    # `fatal: '/tmp/review-745' already exists`. Nothing cleans these up
+    # either -- the runner still holds worktrees from smoke PRs #11-#16.
+    return _PROMPT.format(pr=pr, repo=repo, co=(sha or "FETCH_HEAD"),
+                          nonce=(nonce or (sha or "head")[:8]))
 
 
 def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,

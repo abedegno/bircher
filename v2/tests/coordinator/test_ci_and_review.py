@@ -714,3 +714,64 @@ def test_live_deps_threads_the_override_all_the_way_to_the_verdict(monkeypatch):
                              bundle_dir=".", poll_interval=0)
     assert overridden.wait_ci("7") == "green", (
         "BIRCHER_CI_IGNORE_CHECKS did not reach the wired CI reader")
+
+
+# --- an infrastructure failure is not a rejection ----------------------------
+# muesli PR #745, 2026-08-31. Both reviewers in this system wrote their
+# worktree to `/tmp/review-<PR>`: skills/cross-review/SKILL.md for the lead
+# session's, review.py's _PROMPT for the coordinator's. The first created it,
+# the second died on `fatal: '/tmp/review-745' already exists`, stopped without
+# reading a line -- and, because the prompt offered only PASS or FAIL, emitted
+# FAIL. The run recorded `review=codex:fail` for a PR nobody had reviewed, and
+# the item escalated as though a reviewer had judged the code.
+
+def test_a_blocked_verdict_is_not_a_rejection():
+    """BLOCKED means "I formed no opinion", which is None -- the same routing
+    as a crashed reviewer. A FAIL would mean "I read this and it must not
+    merge", and the difference is the whole point."""
+    from coordinator.review import extract_verdict
+    assert extract_verdict("VERDICT: BLOCKED") is None
+    assert extract_verdict("**VERDICT: BLOCKED**") is None
+    assert extract_verdict("VERDICT: FAIL") == "FAIL"
+    assert extract_verdict("VERDICT: PASS") == "PASS"
+
+
+def test_the_prompt_offers_a_third_verdict_for_not_being_able_to_review():
+    """A prompt that offers only PASS and FAIL forces a reviewer whose checkout
+    failed to claim one of them. It picked FAIL."""
+    from coordinator.review import review_prompt
+    p = review_prompt("745", "o/r", "a" * 40)
+    assert "VERDICT: BLOCKED" in p
+    assert "could not review at all" in p
+
+
+def test_each_review_gets_its_own_worktree_path():
+    """Two reviewers sharing `/tmp/review-<PR>` collide, and the loser reports
+    a verdict it never formed."""
+    from coordinator.review import review_prompt
+    a = review_prompt("745", "o/r", "a" * 40)
+    b = review_prompt("745", "o/r", "b" * 40)
+    import re
+    pa = re.search(r"/tmp/review-\S+?[;\s]", a).group(0).rstrip("; ")
+    pb = re.search(r"/tmp/review-\S+?[;\s]", b).group(0).rstrip("; ")
+    assert pa != pb, f"two reviews of PR 745 share a worktree: {pa}"
+    assert "745" in pa, "the PR number should still be identifiable in the path"
+    # THE PART THAT ACTUALLY PREVENTS THE COLLISION. A sha-derived nonce alone
+    # is not enough: the lead session's reviewer and the coordinator's review
+    # the SAME commit, so they would compute the same nonce. The suffix names
+    # which reviewer this is.
+    assert pa.endswith("-oob"), (
+        "the coordinator's worktree must be distinguishable from the lead "
+        f"session's reviewer, which reviews the same commit: {pa}")
+
+
+def test_the_lead_sessions_skill_uses_a_unique_path_too():
+    """Fixing only the coordinator's side leaves the collision in place: it
+    takes two to collide, and the lead session's reviewer runs first."""
+    import pathlib
+    skill = (pathlib.Path(__file__).resolve().parents[3]
+             / "skills" / "cross-review" / "SKILL.md").read_text()
+    assert "/tmp/review-<PR>-<short-sha>" in skill
+    assert "/tmp/review-<PR>." not in skill, (
+        "a bare /tmp/review-<PR> remains in the skill; it will collide with "
+        "the coordinator's reviewer")

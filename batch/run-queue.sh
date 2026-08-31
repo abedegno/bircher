@@ -2419,15 +2419,23 @@ _recovery_review_prompt() {
   # ref, the checkout fails and so does the review -- which is the correct
   # outcome, not a regression.
   local _co="FETCH_HEAD"; [ -n "$sha" ] && _co="$sha"
+  # A UNIQUE worktree per REVIEWER. The `-oob` suffix does the work: both
+  # reviewers review the same commit, so a sha-derived nonce alone would still
+  # collide. Both wrote `/tmp/review-<PR>`;
+  # on muesli #745 the second died on "already exists" and, with only PASS
+  # and FAIL on offer, reported FAIL for a PR it had not read.
+  local _nonce="${_co:0:8}"; [ -n "$_nonce" ] || _nonce=head
   cat <<EOF
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr $_co; cd /tmp/review-$pr.
+First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree add --detach /tmp/review-$pr-$_nonce-oob $_co; cd /tmp/review-$pr-$_nonce-oob.
 You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
 If the change acquires a resource that must be released -- a capture device, stream, handle, lock or subscription -- verify its FAILURE paths are tested, not just the happy path; a missing release-on-error test is a blocking finding. (muesli #666 left a microphone recording when a capture start failed.) Keep that scope narrow: do not treat every state change as in scope.
-Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS' or 'VERDICT: FAIL'. Put findings BEFORE the verdict so the verdict is the last line even if output is long.
+Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS', 'VERDICT: FAIL', or 'VERDICT: BLOCKED'.
+Use BLOCKED, and ONLY BLOCKED, when you could not review at all -- the checkout failed, the tooling was unavailable, the commit was unreachable. BLOCKED means "I formed no opinion"; FAIL means "I reviewed this and it must not merge". They are routed differently and confusing them is expensive: a reviewer that could not check out its worktree once emitted FAIL, and the run recorded a code rejection for a PR nobody had read.
+Put findings BEFORE the verdict so the verdict is the last line even if output is long.
 EOF
 }
 
@@ -6324,7 +6332,10 @@ SH
   local _pp
   _pp=$(REPO=demo/demo _recovery_review_prompt 9 a502a88e20f959c908d00871ee7f25572512dd6d)
   case "$_pp" in
-    *"worktree add --detach /tmp/review-9 a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    # The path now carries a per-review nonce so two reviewers cannot collide
+    # on it (muesli #745). The PROPERTY is unchanged and is what this asserts:
+    # the CAPTURED sha, not the moving pull/N/head, is what gets checked out.
+    *"worktree add --detach /tmp/review-9-a502a88e-oob a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
     *) echo "FAIL _recovery_review_prompt: checkout not pinned to the captured sha"; exit 1 ;;
   esac
   case "$_pp" in
@@ -6335,7 +6346,9 @@ SH
   # empty checkout target.
   _pp=$(REPO=demo/demo _recovery_review_prompt 9)
   case "$_pp" in
-    *"worktree add --detach /tmp/review-9 FETCH_HEAD"*) : ;;
+    # With no sha the nonce falls back to `head`, and the checkout target is
+    # still FETCH_HEAD -- which is what this asserts.
+    *"worktree add --detach /tmp/review-9-FETCH_HE-oob FETCH_HEAD"*) : ;;
     *) echo "FAIL _recovery_review_prompt: no-sha fallback broken"; exit 1 ;;
   esac
   echo "_recovery_review_prompt pins the reviewed commit OK (#66)"

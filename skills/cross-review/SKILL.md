@@ -33,8 +33,8 @@ anyone needs to read through.
    the raw vendor name. The reviewer reads the REAL code (not a diff excerpt):
    its `input` instructs it to
    `export PATH=/root/bin:$PATH`, then
-   `git fetch origin pull/<PR>/head && git worktree add --detach /tmp/review-<PR> FETCH_HEAD`,
-   `cd /tmp/review-<PR>`, read the changed files AND their surrounding context,
+   `git fetch origin pull/<PR>/head && git worktree add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD`,
+   `cd /tmp/review-<PR>-<short-sha>`, read the changed files AND their surrounding context,
    run the gates it can — prefixing EACH gate command with
    `export PATH=/root/bin:$PATH &&` in the same shell call, since the reviewer's
    shell may not persist env between calls (`export PATH=/root/bin:$PATH && go
@@ -58,8 +58,8 @@ build ./...`, `... && go vet ./...`, client `... && npm run typecheck` / `...
    `sys_session_send(agent="claude_code"|"codex", title="review-<task_slug>",
 args={purpose: "review", input: "Review PR #<PR> against this contract:
 <contract>. First: export PATH=/root/bin:$PATH; git fetch origin
-pull/<PR>/head; git worktree add --detach /tmp/review-<PR> FETCH_HEAD; cd
-/tmp/review-<PR>. READ the changed files and enough surrounding code to
+pull/<PR>/head; git worktree add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD; cd
+/tmp/review-<PR>-<short-sha>. READ the changed files and enough surrounding code to
 verify each contract point — do NOT judge from the diff alone. Run the gates
 you can, each as ONE command prefixed with `export PATH=/root/bin:$PATH &&`
 (e.g. `export PATH=/root/bin:$PATH && go build ./...`) since your shell may not
