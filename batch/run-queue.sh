@@ -4128,6 +4128,18 @@ ${prompt}"
   fi
 
   local outcome ci_first review rounds note resubmissions observed_head _obs_ci
+  # AT RUN_ITEM SCOPE, indent 2, not inside the branch that assigns them.
+  #
+  # `_rev_key` feeds a kernel binding and `_rev_round` is read below at the
+  # scorecard, which every path reaches -- including the `_blind` path that
+  # never enters the derivation branch. Declared inside that branch they would
+  # be unbound there, and `set -u` kills run_item AFTER the implementer has
+  # already opened its PR. That is not hypothetical: it is what `_out_hash`
+  # did, and `test_binding_variables_are_declared_at_run_item_scope` exists
+  # because of it -- it caught this one too, by indent, after I had already
+  # moved them once for the same test and satisfied only half of what it says.
+  local _rev_key=""
+  local _rev_round=0
   if [ "${_blind:-0}" = 1 ]; then
     # Unchanged from the marker era, and still correct: the cancel was never
     # confirmed, so the coordinator may still be running. Deriving an outcome
@@ -4148,8 +4160,18 @@ ${prompt}"
     # variable, so a coordinator that dies and is re-driven gets no fresh
     # rounds. `_max_revisions` of 0 makes `revise` unreachable and this loop
     # runs exactly once -- the pre-loop behaviour, byte for byte.
-    local obs _rev_round=0 _rev_left=0 _rev_key="" _rev_state=""
-    local _findings="" _last_finding=""
+    # ONE `local` PER NAME, deliberately. `test_binding_variables_are_declared
+    # _at_run_item_scope` matches `local <var>`, so a name riding second on a
+    # shared `local` line reads to it as undeclared -- and it caught exactly
+    # that here. The check exists because `_out_hash` was once declared inside
+    # the branch that assigned it and killed run_item on `set -u` AFTER the
+    # implementer had opened its PR, so satisfying it by splitting the line is
+    # the honest fix and loosening its regex would not be.
+    local obs
+    local _rev_left=0
+    local _rev_state=""
+    local _findings=""
+    local _last_finding=""
     local _ffile="${NOOP_DIR}/${code}.findings"
     mkdir -p "$NOOP_DIR"
     while :; do
@@ -4321,7 +4343,7 @@ EOF
   # Empty, not 0, when the loop is disabled: a 0 would claim the loop ran and
   # found nothing to repair, which is not what BIRCHER_MAX_REVISIONS=0 means.
   rounds=""
-  [ "${_rev_round:-0}" != 0 ] && rounds="$_rev_round"
+  [ "$_rev_round" != 0 ] && rounds="$_rev_round"
 
   # B-1 in-run merge: merge a ready PR now so the NEXT item builds on it
   # (eliminates the merge-order conflict class). Deferral appends to the note;
