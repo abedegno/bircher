@@ -198,7 +198,8 @@ Recovery therefore reads HISTORY, not the state name:
 | latest `REVIEW_VERDICT` is `reject` | terminal, as today |
 | a `record_review` command was REJECTED (stale CAS) and no matching `REVIEW_VERDICT` exists | the revision was NOT recorded; re-derive. Do not treat an older `accept` as current |
 | run is `reviewing` with a current accept, no `MERGE_AUTHORIZED` | authorise, then merge |
-| `MERGE_AUTHORIZED` present, no confirmed `merge` effect | the merge was authorised and never executed; perform it. Do NOT re-issue `request_merge` — illegal from `merge_requested` |
+| `MERGE_AUTHORIZED` present, NO merge effect journalled at all | authorised and never attempted; perform it. Do NOT re-issue `request_merge` — illegal from `merge_requested` |
+| `merge` effect `intended` or `uncertain` | **the merge may ALREADY have happened at GitHub.** Halt and reconcile against the observed PR state; never re-execute. This is the halt path muesli #726 took on the first live run |
 | confirmed `merge` effect present, no `record_merge_outcome` | **the merge HAPPENED.** Record the outcome from the observed merge commit; never re-execute the effect |
 | `record_merge_outcome(merged)` recorded | done; close out |
 | `record_merge_outcome(failed)` recorded | the merge failed, not the review; retry the merge, do NOT consume a revision |
@@ -250,8 +251,10 @@ and settling; only the judgement moves. See "Who owns the loop".
    crash after the external FAIL but before `request_revision`; a
    `record_review` that validated and then lost the CAS; an accept binding a
    superseded output; `MERGE_AUTHORIZED` with no confirmed effect; a confirmed
-   merge effect with no recorded outcome (**must not re-execute**); and a
-   failed merge that must not consume a revision.
+   merge effect with no recorded outcome (**must not re-execute**); an
+   INTENDED or UNCERTAIN merge effect (**must halt and reconcile, never
+   re-execute** — GitHub may already have merged it); and a failed merge that
+   must not consume a revision.
 7. The runner refuses to dispatch repair work unless an accepted
    `REVIEW_VERDICT` for the submitted command exists — asserted by driving a
    revision whose kernel command was refused and requiring no dispatch.
