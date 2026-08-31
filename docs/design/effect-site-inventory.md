@@ -32,17 +32,17 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | Line | Call | Effect class |
 |---|---|---|
 | 291 | `gh issue reopen` | `issue_or_label` |
-| 5047 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
+| 5093 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
 | 1655 | `gh pr merge --squash --delete-branch` | `merge` |
 | 1859 | `git push origin HEAD:main` | `ref_update` |
 | 2006 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` | `ref_update` |
 | 2511 | `gh pr close` | `pull_request` |
-| 5059 | `gh pr comment` | `comment` |
+| 5105 | `gh pr comment` | `comment` |
 | 3707 | `gh issue comment` | `comment` |
 | 3708 | `gh issue edit --remove-label` | `issue_or_label` |
 | 3709 | `gh issue edit --add-label` | `issue_or_label` |
 | 3726 | `gh issue close` | `issue_or_label` |
-| 3971 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 4017 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 | 1088 | `curl -X POST $SERVER/v1/sessions/$1/events` | `session_control` |
 | 1114 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
 | 1064 | `curl -X POST $SERVER/v1/sessions` | `session_control` |
@@ -66,10 +66,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1682 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 6596 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 7513 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
-| 7514 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 7537 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 6675 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 7592 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
+| 7593 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 7616 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 

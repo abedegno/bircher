@@ -3802,6 +3802,52 @@ preflight_auth() {
 # DEPLOYMENT PIN directive in config.yaml -- change both together.
 BIRCHER_CODEX_MODEL="${BIRCHER_CODEX_MODEL:-gpt-5.6-sol}"
 
+# preflight_kernel -> rc 0 if the kernel is USABLE, rc 1 if it is not.
+#
+# Gap 10. In `kernel` effect mode the kernel is a HARD dependency, not a
+# ledger: `_effect` routes every externally visible mutation through it, so a
+# kernel that cannot be reached loses the EFFECT and not merely the record. And
+# it loses it quietly -- the adapter is advisory, the failure is a warning, and
+# the run carries on performing nothing.
+#
+# That is not hypothetical. The adapter once invoked `python3 -m kernel.cli`
+# with no PYTHONPATH, every effect died `No module named kernel`, and 494 tests
+# passed with the module name corrupted. Nothing checked before a run started,
+# and nothing checks during one.
+#
+# PROBED THE WAY THE ADAPTER CALLS IT -- same interpreter, same PYTHONPATH, same
+# database -- because that is the whole point. A probe that imports the module
+# some other way answers a different question, which is how the last one of
+# these read as coverage while proving nothing.
+#
+# ONLY IN KERNEL MODE. Under `legacy` or `deny` the kernel is not on the effect
+# path and an unusable one is not a reason to refuse a run.
+preflight_kernel() {
+  local mode="${BIRCHER_EFFECT_MODE:-kernel}"
+  if [ "$mode" != kernel ]; then
+    echo "[batch] preflight: effect mode is '$mode' -> kernel not on the effect path, skipping its probe"
+    return 0
+  fi
+  local db="${BIRCHER_KERNEL_DB:-}"
+  if [ -z "$db" ]; then
+    echo "[batch] preflight: !!! BIRCHER_KERNEL_DB is unset and the effect mode is kernel -- every effect would abort on its \${VAR:?} guard and be swallowed" >&2
+    return 1
+  fi
+  local out rc=0
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" \
+         _net_run 30 "${BIRCHER_PY:-python3}" -c \
+         'import sys
+from kernel.store import Store
+Store.open(sys.argv[1]).facts_for("preflight-probe")
+print("kernel-ok")' "$db" 2>&1 ) || rc=$?
+  case "$out" in
+    *kernel-ok*) echo "[batch] preflight: kernel OK (module importable, $db writable)"; return 0 ;;
+  esac
+  echo "[batch] preflight: !!! KERNEL UNUSABLE (rc=$rc) -- in kernel effect mode this loses every effect, not just its record:" >&2
+  printf '%s\n' "$out" | tail -n 4 >&2
+  return 1
+}
+
 # preflight_dispatch: prove a worker can actually LAUNCH THROUGH THE HARNESS.
 #
 # preflight_auth probes the CLIs directly (`claude -p`, `codex exec`), which is a
@@ -5316,6 +5362,39 @@ SH
   [ -z "$(_terminal_review_flag escalated)" ] \
     || { echo "FAIL _terminal_review_flag: a mechanism escalation is not a rejection"; exit 1; }
   echo "_terminal_review_flag OK"
+
+  # --- preflight_kernel, driven for real (gap 10) -----------------------------
+  #
+  # IN THE SELF-TEST and not a standalone harness, deliberately. The first probe
+  # of this sourced the function on its own and reported the healthy case as
+  # broken -- `_net_run` needs `_clamp_int` and `_timeout_bin`, which the
+  # harness had not supplied. A reproduction missing what the real path provides
+  # answers a different question; here the whole file is loaded, as in
+  # production.
+  local pkdir; pkdir=$(mktemp -d)
+  BIRCHER_EFFECT_MODE=kernel BIRCHER_KERNEL_DB="$pkdir/k.db" preflight_kernel >/dev/null 2>&1 \
+    || { echo "FAIL preflight_kernel: a healthy kernel was reported unusable"; \
+         BIRCHER_EFFECT_MODE=kernel BIRCHER_KERNEL_DB="$pkdir/k.db" preflight_kernel; exit 1; }
+  # A MISSING MODULE is the failure this exists for: the adapter once ran
+  # `python3 -m kernel.cli` with no PYTHONPATH, every effect died `No module
+  # named kernel`, and nothing noticed.
+  if BIRCHER_EFFECT_MODE=kernel BIRCHER_KERNEL_DB="$pkdir/k.db" \
+     BIRCHER_V2_DIR=/nonexistent-kernel-path preflight_kernel >/dev/null 2>&1; then
+    echo "FAIL preflight_kernel: an unimportable kernel passed the probe"; exit 1
+  fi
+  # NO DATABASE in kernel mode: every effect aborts on its guard and is
+  # swallowed, so the run must not start.
+  if BIRCHER_EFFECT_MODE=kernel BIRCHER_KERNEL_DB= preflight_kernel >/dev/null 2>&1; then
+    echo "FAIL preflight_kernel: kernel mode with no database passed the probe"; exit 1
+  fi
+  # NOT IN KERNEL MODE it must not block a run: the kernel is not on the effect
+  # path, so an unusable one is not a reason to refuse.
+  for m in legacy deny; do
+    BIRCHER_EFFECT_MODE="$m" BIRCHER_KERNEL_DB= preflight_kernel >/dev/null 2>&1 \
+      || { echo "FAIL preflight_kernel: mode '$m' was blocked by a kernel probe that does not apply to it"; exit 1; }
+  done
+  rm -rf "$pkdir"
+  echo "preflight_kernel OK"
   echo "_revision_is_recorded OK"
 
   # THE ROLLBACK, asserted as a property of the call and not of the loop.
@@ -8391,7 +8470,7 @@ __HELP__
   [ "${1:-}" = "--self-test" ] && { self_test; exit 0; }
   # Standalone health check (no queue run): verify both providers can auth AND
   # can actually be dispatched through the harness, then exit.
-  [ "${1:-}" = "--preflight" ] && { preflight_auth && preflight_dispatch; exit $?; }
+  [ "${1:-}" = "--preflight" ] && { preflight_kernel && preflight_auth && preflight_dispatch; exit $?; }
   # Standalone usage readout (no queue run): print both providers' live signals
   # and the vendor _pick_implementer would choose right now, then exit. Operator
   # sanity check for the B-2/B-3 gate (5h_pct|5h_reset|7d_pct|7d_reset).
@@ -8439,6 +8518,10 @@ __HELP__
   fi
 
   # Item 2: fail fast if either provider's auth is dead/stale before we launch.
+  # BEFORE the provider probes: a run with an unusable kernel performs no
+  # effects at all, so there is no point spending two model calls to learn the
+  # providers are healthy first.
+  preflight_kernel || exit 2
   preflight_auth || exit 2
   # ...and that the HARNESS can actually launch a worker for each vendor. Runs
   # ONCE here, deliberately not from preflight_auth: the per-item quota gate below

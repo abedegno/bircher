@@ -436,7 +436,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 7 | ~~12 stale citations in the effect-site inventory~~ | **CLOSED** | `tools/repoint-citations.py` — repoints by the cited line's own TEXT at a named baseline, reports ambiguity rather than guessing | — |
 | 8 | citation binding test cannot land | low | gap 7 | — |
 | 9 | `_derive_budget` warns every run | low | config or ceiling change | knobs promise 5,300s, a bounded call tops at 3,600s |
-| 10 | kernel availability is unmonitored in `kernel` effect mode | low | operational | — |
+| 10 | ~~kernel availability is unmonitored in `kernel` effect mode~~ | **PARTIAL** | `preflight_kernel` refuses to start a run whose kernel is unusable; nothing watches it DURING a run | in-run monitoring needs a design — a mid-run kernel failure is still silent |
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
 | 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running |
