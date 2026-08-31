@@ -430,18 +430,18 @@ of the runner/coordinator split and should NOT be patched in place.
 | 1 | ~~a repairable finding dies when the two reviews disagree~~ | **CLOSED 2026-08-31** | the repair loop — muesli #722 failed review twice, was repaired twice and merged, with no human routing a finding | — |
 | 2 | duplicate cross-vendor review | medium | gap 1 | deleting either one first loses repair or loses independence |
 | 3 | ~~`bircher-status:` marker still emitted~~ | **CLOSED** | the skill no longer mandates it, and the enumerating guard now scans instruction files (`.md` under `skills/`, `agents/`) as code | — |
-| 4 | runner is 8,559 lines and still growing | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
+| 4 | runner is 8,665 lines and still growing (measured 2026-08-31) | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
 | 5 | review base binding is tautological | moderate, config-dependent | own design | not urgent while muesli sets `strict: true` — see `base-binding-weakness.md` |
 | 6 | why two reviews of the same commit disagreed is unexplained | moderate | investigation | recovering the lead session's child transcript |
 | 7 | ~~12 stale citations in the effect-site inventory~~ | **CLOSED** | `tools/repoint-citations.py` — repoints by the cited line's own TEXT at a named baseline, reports ambiguity rather than guessing | — |
 | 8 | citation binding test cannot land | low | gap 7 | — |
 | 9 | ~~`_derive_budget` warns every run~~ | **CLOSED, and it was already stale** | the rerun default moved 4 → 2, so the floor is 3460s under the 3600s cliff; now pinned by a test | — |
 | 10 | ~~kernel availability is unmonitored in `kernel` effect mode~~ | **PARTIAL** | `preflight_kernel` refuses to start a run whose kernel is unusable; nothing watches it DURING a run | in-run monitoring needs a design — a mid-run kernel failure is still silent |
-| 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
+| 11 | nothing schedules a wave | operational | a decision | ~~gap 1~~ — **unblocked**: repair works, so unattended waves no longer just multiply escalations. Blocked instead on a groomed backlog: every wave-sized muesli issue is closed |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
 | 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running |
 | 14 | ~~an exhausted allowance records `request_revision`~~ | **CLOSED** | a bound-exhausted failure records `reject`, so the run ends in `reviewing` and `recover` calls it terminal | — |
-| 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
+| 12 | v1 checkout 277 commits behind (measured 2026-08-31) — and **nothing schedules either version**, so there is no live v1 to cut over FROM | operational | a decision to start running v2 on a schedule | gap 11 is the same decision |
 
 ### The repair loop, as of 2026-08-31
 
@@ -539,6 +539,19 @@ conclusions about convergence, and probably the largest single lever on them.
 STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
 `--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and
 gap 2 stands, because the lead session's own fix loop is untouched.
+
+**Numbers in this table are DATED MEASUREMENTS, not live claims.** Gap 9 sat
+here asserting "warns every run" for long enough that the default it depended on
+had changed underneath it — the row was describing a configuration that no
+longer existed, in the document that is supposed to be the map. Gap 4's line
+count and gap 12's commit count were both stale when audited on 2026-08-31.
+
+So: date any figure, and prefer a claim that cannot rot to a number that can.
+Where a property is worth keeping true rather than merely recorded, bind it with
+a test instead — gap 9's is now `_derive_budget defaults fit` in `--self-test`,
+which fails if a default is raised past the cliff. A row nobody re-measures is
+prose, and prose asserting a property nothing verifies is the defect this whole
+programme exists to catch.
 
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
 state machine, effect classes, fact vocabulary and mode switches; the derived
