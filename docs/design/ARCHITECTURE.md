@@ -250,19 +250,54 @@ path.**
    AND a PR open, held for N polls. Then it cancels the session.
 7. **Derivation.** The runner invokes the coordinator, which selects the PR,
    waits out CI, dispatches an INDEPENDENT reviewer, and returns the tuple.
-8. **Lifecycle recording.** The runner replays the derived facts into the
+8. **Repair, if the reviewer blocked and rounds remain.** The runner records
+   `request_revision`, CONFIRMS the kernel journalled it by causal id, dispatches
+   a fresh implementer session briefed on the reviewer's verbatim findings,
+   settles it, and goes back to step 7. Bounded by `BIRCHER_MAX_REVISIONS`
+   (default 2); 0 disables it and restores the pre-loop behaviour exactly.
+9. **Lifecycle recording.** The runner replays the derived facts into the
    kernel: output, CI observation, review verdict, then `request_merge`.
-9. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
+10. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
    `mergeStateStatus == CLEAN`, merges pinned to the reviewed head, watches
    main CI, and reverts on a confirmed red.
-10. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
+11. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
+
+The same thing as a picture, because the repair step turns a line into a loop
+and that is hard to see in a numbered list:
+
+    bircher:queued issues ──▶ queue/*.md
+       │
+       ├─ 2. run start: mint run id, record the work repo's base_sha
+       ├─ 3. kernel mints a generation ──▶ THEN label bircher:running
+       │        (this order is load-bearing — see step 3 above)
+       ├─ 4. create the lead session, send the item + vendor directive
+       ├─ 5. lead session: sub-agent implements, opens a PR,
+       │        runs its OWN review + up to 3 fix rounds, stops
+       ├─ 6. settle detection: poll until idle AND item count stable AND a PR
+       │
+       ├─ 7. DERIVATION (coordinator): select the PR, wait out CI,
+       │        dispatch an INDEPENDENT reviewer, return the 8-field tuple
+       │             │
+       │             └─ blocked, with rounds left? ──▶ 8. REPAIR
+       │                   record request_revision → confirm it journalled
+       │                   → dispatch a repair session with the findings
+       │                   → settle ──────────────────┐
+       │                                              │
+       │             ┌────────────────────────────────┘
+       │             ▼  (back to 7, allowance re-read FROM THE JOURNAL)
+       │
+       ├─ 9. replay the derived facts into the kernel
+       ├─ 10. merge pinned to the reviewed head, watch main CI, revert on red
+       └─ 11. issue comment, labels, scorecard row, record_run_outcome
 
 > **GAP — steps 5 and 7 both review.** Step 6 exists only because the
 > orchestrator is a separate process from the session: it has to *detect* that
-> the model stopped rather than being told. Step 8's replay-into-the-kernel
-> exists only because the derivation happened out-of-process.
+> the model stopped rather than being told. Step 9's replay-into-the-kernel
+> exists only because the derivation happened out-of-process. Step 8 dispatches
+> a session from bash for the same reason — `v2/coordinator/session.py` is
+> read-only and cannot create one.
 >
-> **TARGET —** steps 5–8 collapse. The coordinator dispatches the implementer,
+> **TARGET —** steps 5–9 collapse. The coordinator dispatches the implementer,
 > observes it directly, reviews once, repairs if needed, and records as it goes
 > rather than replaying afterwards.
 
@@ -270,23 +305,85 @@ path.**
 
 ## 5. Two reviews, and why that matters
 
-Steps 4 and 6 each perform a cross-vendor review of the same PR.
+Steps 5 and 7 each perform a cross-vendor review of the same PR.
 
-| | who dispatches | when | can it repair? |
-|---|---|---|---|
-| lead session's review | the model, per `muesli-loop` | during the session | **yes** — 3 bounded fix rounds |
-| coordinator's review | Python, per `review.py` | after the session is cancelled | **no** — it can only classify |
+| | who dispatches | when | can it repair? | bound |
+|---|---|---|---|---|
+| lead session's review | the model, per `muesli-loop` | during the session | yes | 3 fix rounds |
+| coordinator's review | Python, per `review.py` | after the session is cancelled | **yes, since 2026-08-31** | `BIRCHER_MAX_REVISIONS`, default 2 |
 
-`observe.py` turns a reviewer FAIL into outcome `failed`, which is terminal. So
-**when the two disagree, the finding lands at the layer that cannot act on it**
-and a repairable defect kills the run. Observed on muesli PR #739.
+**This table said `no` for the second row until 2026-08-31, and that asymmetry
+was the reason for the repair loop.** `observe.py` turned a reviewer FAIL into
+outcome `failed`, which is terminal — so when the two reviews disagreed, the
+finding landed at the layer that could not act on it and a repairable defect
+killed the run. Observed on muesli PR #739; measured at 8 of 18 item-runs.
 
-This is not redundancy to be deleted. It is the same capability in two places
-with different powers, and resolving it is a question of ownership (§8).
+That is now closed (gap 1). A blocked review with rounds remaining becomes a
+`revise`: the runner records `request_revision`, confirms the kernel journalled
+it, dispatches a repair session with the reviewer's verbatim findings, and
+derives again. Proven live on muesli #722, which failed review twice, was
+repaired twice, and merged.
+
+**The duplication itself remains, and is now the sharper question.** Both layers
+can review and both can repair, so the second review no longer adds a power the
+first lacks — it adds INDEPENDENCE (a different vendor, after the session is
+cancelled, reading only what was pushed). Whether that independence is worth a
+full review seat per item is gap 2, and it is a question of ownership (§8) that
+should not be answered before gap 6: why two reviews of the same commit
+disagreed has never been explained, and deleting a reviewer whose disagreement
+nobody understood is how you find out the hard way.
 
 ---
 
 ## 6. Deployment
+
+### 6a. Where the operator sits, and why that is architecture
+
+Every component above runs on the NAS. **Nothing that decides to start a wave
+does.** A wave is launched by a person running `batch/launch.sh` through
+`omnigent.sh exec`, watched by that person reading `.run/*.log` and the kernel
+database, and diagnosed by that person over the same channel. There is no
+crontab entry and no scheduled task: the operator IS the scheduler, the monitor
+and the triage.
+
+That is not a gap in the sense the others are — nothing is broken by it — but it
+is a structural fact with consequences, and leaving it unwritten made two of
+them look like separate problems:
+
+- **Gap 11 ("nothing schedules a wave") is this.** It reads as a missing cron
+  entry; it is actually a missing *operator*, because scheduling is only one of
+  the three things the person does.
+- **Supervision happens by forensics.** The operator reads logs after the fact
+  rather than watching the run, which is the opposite of the stated preference
+  for keeping launched sessions attachable in the UI.
+- **The runner's `main()` is only half the outer loop.** It drains a queue; it
+  does not decide when to run, what to run, or what to do about what came back.
+  So the migration's last step (`main` → Python) is smaller than it looks, and
+  the other half has no home at all.
+
+**TARGET —** the operator role becomes an omnigent session of its own: it fires
+a wave, watches it settle, triages what escalated, and reports. `launch.sh`
+already detaches the wave with `setsid` precisely so it survives the session
+that started it, which is the right dependency direction — the supervisor
+observes the wave and can die and be replaced without touching it.
+
+Two omnigent capabilities exist for this and neither is used yet:
+`/v1/scheduled-tasks` (`{name, prompt, rrule, agent_id, timezone, workspace,
+host_id}`, plus `/run` and `/runs`) and `/v1/projects` (`{name, config}`, with
+sessions carrying a project summary). **They do not connect:**
+`CreateScheduledTaskRequest` carries no `project_id`, so a per-project schedule
+has to name its project in the prompt or the workspace path. Confirmed against
+the live OpenAPI on 2026-08-31, not assumed.
+
+This matters beyond muesli. Bircher is a development agent, not a muesli agent,
+and the mechanism is already close to project-agnostic: `BIRCHER_REPO` and
+`WORKDIR` are env-driven with muesli only as a DEFAULT. The genuinely
+muesli-bound surface is `skills/muesli-loop/`, the three agent bundles and
+`config.yaml`. (The muesli references inside `v2/coordinator/` and `v2/kernel/`
+are scar citations in comments — those stay, for the same reason the effect
+inventory keeps its history.)
+
+### 6b. Driving it today
 
 Bircher runs on the NAS, not on a workstation: `omnigent:8000` does not resolve
 elsewhere and `/workspaces/*` does not exist elsewhere.
