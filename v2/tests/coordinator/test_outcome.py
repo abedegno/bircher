@@ -149,12 +149,23 @@ def test_a_reconciled_sibling_replaces_the_tracked_pr():
     assert "6" in d.posted[0][2]
 
 
-def test_the_sha_rides_out_only_on_a_ready_outcome():
-    """It is the merge-authorising evidence; a failed derivation must not carry
-    one."""
+def test_a_TERMINAL_outcome_carries_no_sha():
+    """It is the merge-authorising evidence, so a failed or escalated
+    derivation must not carry one.
+
+    RENAMED from `..._only_on_a_ready_outcome`, which stopped being true when
+    the repair loop landed: `revise` carries the head too, because the runner
+    needs it to record the CI observation and bind the review that carries
+    `request_revision`. The old name asserted a property this test never
+    checked -- it only ever drove the FAIL path -- so it stayed green while its
+    name became false. See `test_a_revise_carries_the_reviewed_head`.
+    """
     d = _deps(review=lambda pr, sha: ("FAIL", ""))
     r = derive("i1", "i1", "7", "", deps=d)
     assert r.outcome == "failed" and r.sha == ""
+    esc = derive("i1", "i1", "7", "",
+                 deps=_deps(review=lambda pr, sha: (None, "")))
+    assert esc.outcome == "escalated" and esc.sha == ""
 
 
 def test_a_reviewer_with_no_verdict_escalates():

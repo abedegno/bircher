@@ -235,9 +235,29 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                   f"({type(exc).__name__}: {exc}) -> continuing; the outcome "
                   f"is derived from the repository and is unaffected")
 
-    # The sha rides out only on a READY outcome: it is the merge-authorising
-    # evidence, and a failed or escalated derivation must never carry one.
-    sha_out = reviewed_sha if o.outcome == "ready" else ""
+    # The sha rides out on READY and on REVISE, and on nothing else.
+    #
+    # `ready` because it is the merge-authorising evidence. `revise` because a
+    # revision is a CONTINUATION, not an ending: the runner needs the head to
+    # record `record_ci_observation` and to bind the `record_review` that
+    # carries `request_revision`. Those three commands ARE the repair loop's
+    # kernel half, and the runner performs them only inside `if [ -n
+    # "$observed_head" ]`.
+    #
+    # Withholding it here is what the FIRST LIVE RUN of the loop did (muesli
+    # #711, PR #751, 2026-08-31). The reviewer returned FAIL, the coordinator
+    # correctly derived `revise` -- and with an empty head the runner skipped
+    # the whole lifecycle block, so no REVIEW_VERDICT fact was ever written, the
+    # durability gate found nothing to confirm, and the item escalated with an
+    # empty causal id. The journal shows `implementing` going straight to
+    # `ended`: no output, no CI observation, no review.
+    #
+    # The original rule -- "a failed or escalated derivation must never carry a
+    # head" -- is unchanged and still enforced, because `revise` is neither. And
+    # it cannot authorise a merge by accident: the runner's merge gate is
+    # `[ "$outcome" = "ready" ]`, and `revise` never reaches the scorecard at
+    # all. The head here binds a review that the next round supersedes.
+    sha_out = reviewed_sha if o.outcome in ("ready", "revise") else ""
     # The findings ride out only on `revise`: on any other outcome the runner
     # has nothing to route them to, and a scorecard note is not the place for a
     # multi-paragraph review.

@@ -285,3 +285,59 @@ def test_no_findings_path_still_derives():
         history=lambda br: ("true", 0), branch_of=lambda pr: "feat-x",
         revisions_left=1))
     assert r.outcome == "revise" and r.findings == "x"
+
+
+# --- the head must ride out on a revise --------------------------------------
+#
+# Found by the FIRST LIVE RUN, not by any of the 1042 tests that were green when
+# it launched. The reviewer FAILed, `revise` was derived correctly, and the head
+# was withheld -- so the runner skipped the block that records the revision, the
+# durability gate found nothing, and the item escalated. Everything downstream
+# behaved correctly on a value that should never have been empty.
+
+def _deps(verdict, **over):
+    from coordinator.outcome import Deps
+    base = dict(checks=lambda pr: "build|pass", head_of=lambda pr: "a" * 40,
+                review=lambda pr, sha: (verdict, "blocking: the thing"),
+                effect=lambda c, k, a: "ok", history=lambda br: ("true", 0),
+                branch_of=lambda pr: "feat-x")
+    base.update(over)
+    return Deps(**base)
+
+
+def test_a_revise_carries_the_reviewed_head():
+    """Without it the runner records NO output, NO CI observation and NO
+    review -- so there is no revision for the durability gate to confirm and
+    the loop cannot start."""
+    from coordinator.outcome import derive
+    r = derive("i1", "i1", "7", "", deps=_deps("FAIL", revisions_left=2))
+    assert r.outcome == "revise"
+    assert r.sha == "a" * 40, (
+        "a revise with no head skips the runner's entire kernel lifecycle block")
+
+
+def test_a_terminal_failure_still_carries_NO_head():
+    """The original rule is unchanged: a failed or escalated derivation must
+    never carry merge-authorising evidence. `revise` is neither."""
+    from coordinator.outcome import derive
+    r = derive("i1", "i1", "7", "", deps=_deps("FAIL", revisions_left=0))
+    assert r.outcome == "failed"
+    assert r.sha == ""
+
+
+def test_the_head_a_revise_carries_is_the_one_the_reviewer_READ():
+    """Re-reading it after the verdict would bless a push that landed in
+    between -- the #66 rule, which applies to a revision exactly as it does to
+    an acceptance, because the review this head binds is what
+    `validate_review` checks against."""
+    from coordinator.outcome import derive
+    seen = []
+
+    def _review(pr, sha):
+        seen.append(sha)
+        return ("FAIL", "blocking: the thing")
+
+    r = derive("i1", "i1", "7", "",
+               deps=_deps("FAIL", review=_review, revisions_left=2))
+    assert seen == [r.sha], (
+        f"the head reported ({r.sha[:7]}) is not the one reviewed ({seen})")
