@@ -66,10 +66,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1682 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 6675 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 7592 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
-| 7593 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 7616 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 6708 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 7625 | `_contains "$_body" '_net_run … git push origin'` | selftest asserting the source contains it |
+| 7626 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 7649 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 

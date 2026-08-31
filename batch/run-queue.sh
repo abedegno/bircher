@@ -5395,6 +5395,39 @@ SH
   done
   rm -rf "$pkdir"
   echo "preflight_kernel OK"
+
+  # --- the DEFAULT settings must fit the bound (gap 9) ------------------------
+  #
+  # `_net_run`'s cap goes through `_clamp_int "$cap" 300 1 3600`, and
+  # `_clamp_int` returns its DEFAULT above the range rather than truncating --
+  # so 5300 silently became 300, six times shorter than what it replaced, and a
+  # live muesli run escalated on it. `_derive_budget` now clamps and WARNS.
+  #
+  # The warning fired on every run while the rerun default was 4
+  # (1500 + 4*920 + 120 = 5300). It is 2 now, so the floor is 3460 and the
+  # warning is silent -- confirmed against 23 run logs: the four that carry it
+  # are all from before the default changed.
+  #
+  # PINNED, because a warning nobody sees is one nobody will notice returning,
+  # and the next person to raise a default has no reason to know about the
+  # cliff. Asserts the DEFAULTS specifically: an operator who deliberately sets
+  # a bigger budget still gets the warning, which is the point of it.
+  local _dbud _dwarn
+  _dwarn=$( BIRCHER_CI_WAIT= BIRCHER_CI_RERUN_MAX= BIRCHER_CI_RERUN_WAIT= \
+            BIRCHER_DERIVE_TIMEOUT= _derive_budget 2>&1 >/dev/null )
+  [ -z "$_dwarn" ] \
+    || { echo "FAIL _derive_budget: the DEFAULT settings warn on every run -- lower a default or raise the ceiling: $_dwarn"; exit 1; }
+  _dbud=$( BIRCHER_CI_WAIT= BIRCHER_CI_RERUN_MAX= BIRCHER_CI_RERUN_WAIT= \
+           BIRCHER_DERIVE_TIMEOUT= _derive_budget 2>/dev/null )
+  [ "$_dbud" -le 3600 ] && [ "$_dbud" -ge 300 ] \
+    || { echo "FAIL _derive_budget: the default budget ${_dbud}s is outside what _net_run honours"; exit 1; }
+  # And an operator who ASKS for more than the cliff must still be told.
+  _dwarn=$( BIRCHER_CI_RERUN_MAX=6 BIRCHER_DERIVE_TIMEOUT= _derive_budget 2>&1 >/dev/null )
+  case "$_dwarn" in
+    *"tops out at 3600s"*) ;;
+    *) echo "FAIL _derive_budget: an over-budget setting was accepted silently -- that is the collapse this warning exists for"; exit 1 ;;
+  esac
+  echo "_derive_budget defaults fit OK"
   echo "_revision_is_recorded OK"
 
   # THE ROLLBACK, asserted as a property of the call and not of the loop.
