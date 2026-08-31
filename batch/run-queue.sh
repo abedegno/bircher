@@ -2649,6 +2649,24 @@ _revision_is_recorded() {  # <used|left|confirmed>
   return 1
 }
 
+# _findings_path <code> -> where this round's findings go, or EMPTY when the
+# repair loop is disabled.
+#
+# EMPTY IS THE POINT. `observe_outcome` omits `--findings-out` entirely for an
+# empty value, and the CLI's unlink-then-replace only runs when that flag is
+# present -- so BIRCHER_MAX_REVISIONS=0 performs no file operation at all, which
+# is what "restores the previous behaviour exactly" has to mean.
+#
+# It did not, in the first cut: the path was passed unconditionally, so a
+# disabled loop still made derivation depend on being able to unlink a file in
+# NOOP_DIR. An unwritable or misowned directory there turned a healthy item into
+# a nonzero exit, an empty tuple and an escalation -- a live item failing for
+# repair-loop storage it was configured never to use. Found by cross-review.
+_findings_path() {  # <code>
+  [ "$(_max_revisions)" = 0 ] && return 0
+  printf '%s' "${NOOP_DIR}/${1}.findings"
+}
+
 # _pr_branch <pr> -> the PR's head branch, or empty.
 #
 # READ, not derived from the code. The branch is not always `<code>-<slug>`:
@@ -4172,8 +4190,8 @@ ${prompt}"
     local _rev_state=""
     local _findings=""
     local _last_finding=""
-    local _ffile="${NOOP_DIR}/${code}.findings"
-    mkdir -p "$NOOP_DIR"
+    local _ffile; _ffile=$(_findings_path "$code")
+    [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
     while :; do
     # RESET EVERY ROUND, at the top, before anything can be read.
     #
@@ -4323,7 +4341,7 @@ EOF
       break
     fi
     done
-    rm -f "$_ffile" 2>/dev/null || true
+    [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
     # TERMINAL ESCALATION names what the last reviewer objected to, so a human
     # sees the finding instead of having to open N review logs to find it.
     if [ "$_rev_round" != 0 ]; then
@@ -5145,6 +5163,50 @@ SH
   ! _revision_is_recorded "yes|1|no" \
     || { echo "FAIL _revision_is_recorded: matched 'yes' outside the confirmed field"; exit 1; }
   echo "_revision_is_recorded OK"
+
+  # THE ROLLBACK, asserted as a property of the call and not of the loop.
+  # BIRCHER_MAX_REVISIONS=0 must leave derivation with no findings-file
+  # operation whatever, so a NOOP_DIR that cannot be written to -- unwritable,
+  # misowned, holding a protected stale file -- cannot fail an item that was
+  # configured never to repair.
+  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR=/nonexistent/nope _findings_path c1)" ] \
+    || { echo "FAIL _findings_path: a disabled loop still names a findings file"; exit 1; }
+  [ "$(BIRCHER_MAX_REVISIONS=2 NOOP_DIR=/tmp/nd _findings_path c1)" = "/tmp/nd/c1.findings" ] \
+    || { echo "FAIL _findings_path: an enabled loop must name one"; exit 1; }
+  # And an empty path must make observe_outcome behave as it did before the
+  # loop existed -- proven against a path it could not possibly write to.
+  local ro_out
+  ro_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+           RECOVERY_REVIEWER=codex \
+           observe_outcome demo demo 7 "" 0 "")
+  [ "$ro_out" = "$dflt_out" ] \
+    || { echo "FAIL rollback: an empty findings path did not reproduce the pre-loop tuple: '$ro_out' vs '$dflt_out'"; exit 1; }
+  # THE HAZARD ITSELF, reproduced. A path that merely does not exist is fine --
+  # the CLI tolerates ENOENT on the pre-derivation unlink, because "nothing to
+  # clear" is the normal case. The failure needs a stale file that CANNOT be
+  # removed, which is what an unwritable or misowned NOOP_DIR produces.
+  #
+  # An earlier version of this test used /nonexistent/... and passed while
+  # asserting the opposite of what happened -- the derivation succeeded, ENOENT
+  # having been swallowed exactly as designed. A reproduction that cannot
+  # produce the failure it names proves nothing about the fix.
+  mkdir -p "$rdir/ro"
+  : > "$rdir/ro/f.txt"
+  chmod 500 "$rdir/ro"
+  local rofail_out
+  rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+               RECOVERY_REVIEWER=codex \
+               observe_outcome demo demo 7 "" 0 "$rdir/ro/f.txt")
+  # This is the pre-fix behaviour, pinned so the hazard stays visible: passing
+  # an unusable path fails the derivation even with NO revisions allowed.
+  [ -z "$rofail_out" ] \
+    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: an unremovable stale findings file did not fail the derivation, so this test no longer reproduces the hazard: '$rofail_out'"; exit 1; }
+  # And the fix: with the loop disabled, run_item never passes the path at all,
+  # so the same unusable directory cannot reach the derivation.
+  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR="$rdir/ro" _findings_path demo)" ] \
+    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: a disabled loop still names a path in an unwritable directory"; exit 1; }
+  chmod 700 "$rdir/ro"
+  echo "_findings_path rollback OK"
   rm -rf "$rdir"
   echo "repair loop OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
