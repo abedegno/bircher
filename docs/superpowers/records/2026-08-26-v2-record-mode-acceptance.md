@@ -1459,24 +1459,69 @@ tests.
 - #748: `DeleteNoteSummariesIfCurrent` does not make its generation check and
   deletion atomic — the same class, a different function.
 
-### What this supports
+### What this supports — CORRECTED after review
 
-**Routing a finding back works.** Both implementers fixed precisely what they
-were told, including the missing test, without fixing the wrong thing or
-regressing elsewhere. That is direct evidence for a repair loop being useful,
-and it is stronger than wave 01's inference because the mechanism was exercised
-rather than assumed.
+An earlier version of this section called the experiment "that test" and said
+the repairs "converged". Both were wrong, and the correction matters.
 
-**A single fix round does not imply a merge.** Both items are still open after
-one round, each on a finding the previous review did not raise. Whether a
-bounded loop converges within 3 rounds is untested — this experiment ran one
-round for each item.
+**The pre-registered test was convergence within a BOUNDED LOOP, to a final
+disposition. This ran ONE round, and both items are still blocked.** Moving the
+endpoint from "merged or bound exhausted" to "the first requested change
+appeared" is exactly the kind of substitution this record exists to catch.
 
-### What it does not support
+What is actually supported: **routing a finding back caused a targeted patch
+change.** Both implementers produced the specific fix named, including the
+specific missing test named, and the diffs show it. That is real and it is
+narrower than "repair works".
 
-Two items, one round each, same domain, same reviewing vendor for both repairs.
-It does not establish a convergence rate, and it cannot distinguish "reviews
-find genuinely deeper issues each round" from "reviews find something on any
-sufficiently complex diff". The second reading would make a bounded loop
-terminate at its bound rather than at a merge, which is the outcome that
-matters and is not measured here.
+What is NOT supported:
+
+- **That the repairs WORK.** I verified the code EXISTS — the anchor
+  expression, the lock-spanning function, the new test names. I did not verify
+  either fix under the scenario it addresses: no failure injection for the
+  storage delete, no concurrency test, no run of the timestamp case. `13
+  passed` and a clean `ruff` do not speak to either.
+- **That nothing regressed.** Unspecified generic gate results cannot support
+  that claim.
+- **That a bounded loop terminates in a merge.** Untested. Both items sit
+  blocked after round one.
+
+### The new findings: class unestablished
+
+I described both as "the same class, narrower". For #747 that is defensible —
+sub-threshold VAD pauses are a residual of the same timestamp defect. For #748
+it is not: `DeleteNoteSummariesIfCurrent` is a DIFFERENT function, and the
+finding may be an independent defect rather than a refinement.
+
+"The previous review did not raise it" does not show it was newly exposed. It
+is equally consistent with reviewer sampling — that a review of any
+sufficiently large diff surfaces something. **That reading would mean a bounded
+loop terminates at its bound rather than at a merge**, which is the outcome
+that matters and which this experiment does not measure.
+
+Settling it needs a baseline: repeated blinded reviews of an UNCHANGED diff, to
+estimate how much a reviewer finds by churn alone, compared against bounded
+repair runs with fixed stopping criteria.
+
+### Contamination audit of earlier results
+
+The false-FAIL mode — an infrastructure failure reported as a code rejection —
+could have affected any earlier escalation, and the first version of this
+section quarantined only attempts 1 and 2.
+
+**The primary evidence is gone: my own `rm -rf /tmp/review-*` cleanup deleted
+the earlier review logs, which match that glob.** So this audit is indirect.
+
+- **The FAILs that conclusions were drawn from are backed by quoted
+  substantive findings** — #739, #741 and #743 are each recorded here with
+  file:line citations, hand-traced code, and `git show <sha>^` comparisons. A
+  collision produces a ~600-byte log saying "already exists" and nothing else.
+  Those reviews were real.
+- **A PASS cannot be a collision artefact.** The failure mode is: the reviewer
+  cannot check out, stops, and — offered only two verdicts — says FAIL. It
+  never yields PASS. So every merge recorded here is structurally immune to
+  this defect.
+- **Attempts 1 and 2 are void** and are marked as such.
+
+That leaves no known contaminated conclusion, but the argument rests on quoted
+excerpts rather than on the logs, because I destroyed them.
