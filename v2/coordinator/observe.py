@@ -125,6 +125,36 @@ def revisions_used(facts) -> int:
     return n
 
 
+def revision_confirmed(facts, key: str) -> bool:
+    """Did the revision we submitted actually land in the journal?
+
+    NOT "did the adapter exit 0". `commands.py` validates a review, bumps the
+    version under CAS, and appends REVIEW_VERDICT -- in that order -- so a
+    review can validate and then lose the CAS as stale, producing no fact at
+    all. The shell adapter is advisory besides, so a caller sees success after
+    a refusal. Both leave the run unrevised while every signal the runner has
+    says otherwise, and it would then dispatch a repair the kernel will refuse
+    to accept work from.
+
+    The fact must carry OUR command's causal id and OUR verdict. Matching on
+    the verdict alone would accept a revision from a previous round, which is
+    the same class of error as reading a stale findings file.
+    """
+    if not key:
+        return False
+    for f in facts or ():
+        kind = getattr(f, "kind", None)
+        kind = getattr(kind, "value", kind)
+        if kind != "review_verdict":
+            continue
+        if getattr(f, "causal_command_id", None) != key:
+            continue
+        payload = getattr(f, "payload", None) or {}
+        if payload.get("verdict") == "request_revision":
+            return True
+    return False
+
+
 def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str,
              revisions_left: int = 0) -> Outcome:
     """Ground truth to outcome. PURE -- no I/O, no globals.

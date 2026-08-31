@@ -138,6 +138,26 @@ def main(argv=None) -> int:
     dv.add_argument("--rerun-max", type=int, default=4, dest="rerun_max")
     dv.add_argument("--rerun-wait", type=int, default=900, dest="rerun_wait")
 
+    # `revisions` is the runner's window onto the journal, and it answers the
+    # two questions the repair loop asks of it:
+    #
+    #   how many rounds are left   -- before derivation, to set --revisions-left
+    #   did the revision land      -- after submitting record_review, before
+    #                                 any repair work is dispatched
+    #
+    # Both read the SAME journal, and neither is answerable from the runner:
+    # bash has no sqlite handle and the kernel adapter is advisory, so an exit
+    # code from it proves nothing about what was recorded.
+    rv = subs.add_parser("revisions")
+    rv.add_argument("--db", required=True)
+    rv.add_argument("--run-id", required=True)
+    rv.add_argument("--max", type=int, default=2, dest="max_revisions")
+    # The idempotency key of the record_review command whose fact we are
+    # looking for. Supplied by the caller and never derived here: deriving it
+    # would rebuild `kernel.cli`'s default-key format in a second place, and
+    # two subsystems that rebuild the same string eventually disagree about it.
+    rv.add_argument("--confirm-command", default="", dest="confirm_command")
+
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
     pa.add_argument("--merged", default="")
@@ -282,6 +302,25 @@ def main(argv=None) -> int:
                       file=sys.stderr)
                 return RC_FINDINGS_UNWRITABLE
         print(r.as_line(), end="")
+        return RC_OK
+
+    if a.mode == "revisions":
+        from kernel.store import Store
+
+        from coordinator.observe import revision_confirmed, revisions_used
+        try:
+            facts = Store.open(a.db).facts_for(a.run_id)
+        except Exception as exc:
+            # An unreadable journal is NOT "zero revisions used", which would
+            # hand the loop a full allowance every round and make the bound
+            # unenforceable. It is a lookup failure, and the runner escalates.
+            print(f"could not read the journal at {a.db}: {exc}",
+                  file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        used = revisions_used(facts)
+        left = max(0, a.max_revisions - used)
+        ok = revision_confirmed(facts, a.confirm_command)
+        print(f"{used}|{left}|{'yes' if ok else 'no'}", end="")
         return RC_OK
 
     if a.mode == "pr-abandoned":

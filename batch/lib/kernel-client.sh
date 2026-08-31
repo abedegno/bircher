@@ -622,8 +622,17 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # the prompt it sent. Deliberately not read back from the kernel: a binding the
 # caller fetches from the mechanism and hands straight back makes the
 # mechanism's check compare a value against itself.
-_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context>
+#
+# The OPTIONAL seventh argument is an idempotency key. Omitted -- which is every
+# caller except the repair loop -- `kernel.cli` supplies its own stable default
+# and nothing about this call changes. The repair loop supplies one because it
+# must later ASK whether this exact command produced a REVIEW_VERDICT fact, and
+# the fact carries the key as its causal id. Deriving that key on the shell side
+# instead would rebuild `kernel.cli`'s default-key format in a second language,
+# and two subsystems that rebuild the same string eventually disagree about it.
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
+  local key="${7:-}"
   local verdict; verdict=$(_kernel_verdict "$raw")
   # No early return: every input now maps to something submittable -- a mapped
   # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
@@ -632,6 +641,15 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
   # is still happening.
   if [ -z "$artifact" ] || [ -z "$base" ] || [ -z "$context" ]; then
     _kernel_warn "incomplete verdict binding (artifact='$artifact' base='$base' context='$context') -- not recording a review"
+    return 0
+  fi
+  # An empty key must not become `--idempotency-key ""`: the CLI would take the
+  # empty string as the key rather than falling back to its default, and every
+  # record_review in the run would collide on it.
+  if [ -n "$key" ]; then
+    _kernel command --run-id "$run_id" --generation "$generation" \
+      --name record_review --idempotency-key "$key" \
+      --payload-json "{\"verdict\":\"$verdict\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
     return 0
   fi
   _kernel command --run-id "$run_id" --generation "$generation" \
