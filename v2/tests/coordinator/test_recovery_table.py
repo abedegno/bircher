@@ -348,3 +348,51 @@ def test_the_table_lookup_sees_what_the_facts_alone_cannot(reviewing):
     assert decide(facts).do == "record_merge_outcome", (
         "the fact-only answer no longer differs, so this test cannot bind "
         "the table lookup any more")
+
+
+def test_the_recover_cli_runs_as_a_SUBPROCESS(tmp_path):
+    """THE test that was missing, and its absence let a dead guard ship.
+
+    Two helpers were appended BELOW `if __name__ == "__main__": sys.exit(main())`.
+    Running as `python3 -m coordinator.cli` -- the only way production ever
+    invokes this -- executes the module top to bottom, so `main()` ran before
+    those `def` statements and the recover branch raised `NameError` on every
+    real call. Every test above stayed green: they call `main()` in-process,
+    after the import has completed, where the definitions exist.
+
+    The shell then swallowed it. `_recovery_action` ends `2>/dev/null || true`,
+    and an empty action deliberately does NOT forbid a merge -- so the recovery
+    gate was inert and nothing anywhere said so.
+
+    So: run the real command line, in a real subprocess, and read stdout.
+    """
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    v2 = Path(__file__).resolve().parents[2]
+    db = tmp_path / "k.db"
+    st = Store.open(str(db), clock=Clock(start_us=1))
+    st.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+
+    r = subprocess.run(
+        [_sys.executable, "-m", "coordinator.cli", "recover",
+         "--db", str(db), "--run-id", "r"],
+        capture_output=True, text=True, cwd=str(v2),
+        env={"PYTHONPATH": str(v2), "PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
+    assert "Error" not in r.stderr and "Traceback" not in r.stderr, r.stderr
+    assert r.stdout.split("|")[0] == "derive", r.stdout
+
+
+def test_a_MISSING_database_is_a_lookup_failure_not_an_empty_history(tmp_path):
+    """`Store.open` is `sqlite3.connect`, which CREATES the file. So a
+    misspelled BIRCHER_KERNEL_DB would answer "no review verdict at all; derive
+    from scratch" -- and `_recovery_forbids_merge` does not forbid `derive`. A
+    typo in a path would quietly become permission to merge."""
+    from coordinator.cli import RC_LOOKUP_FAILED, main
+    missing = str(tmp_path / "nope.db")
+    assert main(["recover", "--db", missing, "--run-id", "r"]) == RC_LOOKUP_FAILED
+    import os
+    assert not os.path.exists(missing), (
+        "the lookup created the database it was meant to refuse")

@@ -106,7 +106,6 @@ def decide(facts, *, current_binding_hash=None, merge_effect=None) -> Action:
     facts = list(facts or ())
 
     # --- the merge is already under way, or over -----------------------------
-    outcome = _last(facts, "transition_performed")
     for f in reversed(_of(facts, "transition_performed")):
         p = _payload(f)
         if p.get("via") != "record_merge_outcome":

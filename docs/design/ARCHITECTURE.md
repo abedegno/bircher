@@ -439,6 +439,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 10 | kernel availability is unmonitored in `kernel` effect mode | low | operational | — |
 | 11 | nothing schedules a wave | operational | a decision | gap 1 — scheduling unattended waves before repair works just multiplies escalations |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
+| 14 | an exhausted allowance records `request_revision`, so the kernel sits at `planned` while the runner escalates | low | its own design pass | recording `reject` changes what `BIRCHER_MAX_REVISIONS=0` records, and that must stay byte-identical |
 | 12 | v1 deployed, 237 commits behind | operational | cutover | gaps 1 and 11 |
 
 ### The repair loop, as of 2026-08-31
@@ -468,6 +469,18 @@ human, and merging. That is acceptance criterion 9 and it is the reason gap 1
 above says "not yet proven live" rather than closed. #722 is the standing
 counter-example — three reviews, three distinct findings — and if it exhausts
 the bound that is the correct outcome, not a failure of the loop.
+
+**An exhausted allowance still records `request_revision`.** `_kernel_verdict`
+maps every `*:fail` to `request_revision`, including the terminal failure when
+the bound is reached — so the run returns to `planned` in the kernel while the
+runner escalates and stops, and a later `recover` would answer
+`dispatch_implementer` for a run that has no rounds left. Nothing ever records
+`reject`. Not a safety hole (the runner escalates; a human owns it from there,
+and no merge is authorised from `planned`), but the kernel's terminal state and
+the runner's disagree. Recording `reject` there is the obvious fix and it is NOT
+free: it would change what a FAIL records under `BIRCHER_MAX_REVISIONS=0`, which
+is the configuration that has to stay byte-identical. So it needs its own design
+pass rather than a patch. Found by second-vendor review.
 
 STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
 `--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and

@@ -343,6 +343,14 @@ def main(argv=None) -> int:
         from kernel.store import Store
 
         from coordinator.recover import decide
+        # A MISSING FILE IS A LOOKUP FAILURE, not an empty history. `Store.open`
+        # is `sqlite3.connect`, which CREATES the file -- so a misspelled
+        # BIRCHER_KERNEL_DB would answer "no review verdict at all; derive from
+        # scratch", and `_recovery_forbids_merge` does not forbid that. A typo
+        # in a path would quietly become permission to merge.
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
         try:
             store = Store.open(a.db)
             facts = store.facts_for(a.run_id)
@@ -410,10 +418,6 @@ def main(argv=None) -> int:
     return RC_OK
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 def _merge_effect_from_table(store, run_id, facts):
     """The effect TABLE's answer for this run's merge, or None.
 
@@ -452,3 +456,16 @@ def _recover_action(store, run_id, facts, binding, decide):
     act = decide(facts, current_binding_hash=binding,
                  merge_effect=_merge_effect_from_table(store, run_id, facts))
     return f"{act.do}|{act.why}"
+
+
+# LAST IN THE FILE, and it must stay last. Running as `python3 -m
+# coordinator.cli` -- which is how the runner invokes this, and the only way
+# production ever does -- executes the module top to bottom, so anything
+# defined BELOW this line does not exist when `main()` runs. Two helpers were
+# appended after it and the `recover` branch died with `NameError` on every
+# real call, while every test passed: the tests call `main()` in-process after
+# the import has completed, where the defs exist.
+#
+# `test_the_recover_cli_runs_as_a_SUBPROCESS` drives the real invocation.
+if __name__ == "__main__":
+    sys.exit(main())

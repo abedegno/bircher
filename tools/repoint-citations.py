@@ -11,7 +11,11 @@ import re
 import subprocess
 import sys
 
-ROOT = pathlib.Path("/Users/jonw/bircher")
+# The repo this is run from, not the one it was written in. A committed tool
+# hardcoding an absolute home directory only ever works on one machine.
+ROOT = pathlib.Path(subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"],
+    capture_output=True, text=True, check=True).stdout.strip())
 # THE BASELINE IS AN ARGUMENT, and it is the last commit where the citation
 # tests PASSED -- not HEAD. Defaulting it to HEAD is wrong the moment the source
 # change is committed before the docs are repointed: HEAD's source already has

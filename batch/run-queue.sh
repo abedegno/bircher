@@ -2315,6 +2315,21 @@ EOF
   # a state-name check, and the recovery table exists because that is not
   # enough -- most of all for the merge rows, where the state name cannot tell
   # "authorised and never attempted" from "already merged".
+  # NO CONTEXT HASH IS PASSED, deliberately, and the consequence is stated
+  # because it is not obvious: `decide` skips the staleness comparison when it
+  # has no binding, so the `re_review` row -- "the latest acceptance binds a
+  # superseded output" -- cannot fire from here. The context bundle hash is
+  # minted inside the drive branch below, after the PR the derivation settles
+  # on is known, so it does not exist yet at this point.
+  #
+  # That is a loss of LEGIBILITY, not of safety. A stale approval is refused by
+  # the kernel at `request_merge` -- "merge binds an artifact that is not this
+  # run's current output" -- which is proven by
+  # `test_round_ONES_artifact_cannot_merge_after_a_repair`. Feeding the binding
+  # here would move that refusal earlier and give it a better message; it would
+  # not change what merges. Wiring it means minting the context artifact before
+  # the derivation, which changes what the binding IS, so it is a design change
+  # rather than an omission to patch.
   local _rp_act
   _rp_act=$(_recovery_action "${BIRCHER_RUN_ID:-}" "${BIRCHER_RUN_BASE:-$_rec_base}" "")
   [ -n "$_rp_act" ] && echo "[batch:recover-pr] $code: journal says ${_rp_act%%|*} -- ${_rp_act#*|}" >&2
@@ -3657,7 +3672,12 @@ _writeback_plan() {
 # _issue_writeback <issue> <outcome> <pr> <review> <rounds>: comment the scorecard
 # line on the issue and set/clear status labels. No-op if issue empty or writeback off.
 _issue_writeback() {
-  local issue="$1" outcome="$2" pr="$3" review="$4" rounds="$5" ci_first="$6"
+  # THE FIFTH ARGUMENT IS RESUBMISSIONS, and it was labelled `rounds=` in the
+  # issue comment -- the exact conflation Phase 2 emptied the scorecard field to
+  # avoid, still live on the channel a human actually reads. Repair rounds are
+  # now their own seventh argument and their own label.
+  local issue="$1" outcome="$2" pr="$3" review="$4" resubmissions="$5" ci_first="$6"
+  local rounds="${7:-}"
   [ -n "$issue" ] || return 0
   [ "${BIRCHER_ISSUE_WRITEBACK:-1}" = "1" ] || return 0
   local plan add rm; plan=$(_writeback_plan "$outcome"); IFS='|' read -r add rm _ <<EOF
@@ -3669,6 +3689,7 @@ EOF
   local body="bircher: outcome=$outcome"
   [ -n "$ci_first" ] && body="$body ci_first=$ci_first"
   [ -n "$review" ]   && body="$body review=$review"
+  [ -n "$resubmissions" ] && body="$body resubmissions=$resubmissions"
   [ -n "$rounds" ]   && body="$body rounds=$rounds"
   [ -n "$pr" ]       && body="$body pr=#$pr"
   _effect comment "issue-outcome:$issue:$(printf '%s' "$body" | shasum -a 256 | cut -c1-16)" - gh issue comment "$issue" --repo "$REPO" --body "$body" >/dev/null 2>&1 || true
@@ -3785,19 +3806,25 @@ json_row() {
   python3 - "$@" <<'PY'
 import json,sys,datetime
 a=sys.argv[1:]
-item,pr,outcome,ci_first,review,rounds,wall,note,bound=a[:9]
+item,pr,outcome,ci_first,review,resubmissions,wall,note,bound=a[:9]
 implementer=a[9] if len(a)>9 else ""
+# The 11th field, and it is REPAIR ROUNDS -- not the 6th, which has been
+# `resubmissions` under a parameter misleadingly named `rounds` since Phase 2.
+repair_rounds=a[10] if len(a)>10 else ""
 print(json.dumps({
  "ts": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
  "item": item, "pr": int(pr) if pr.isdigit() else None, "outcome": outcome,
  "implementer": implementer or None, "review": review or None,
  "ci_pass_first_try": ci_first=="true",
- # DECISION 2 OF PHASE 2. `rounds` was the coordinator's own count of its fix
- # loop, asserted in a marker and observed by nothing. It is emitted null from
- # the first Phase 2 run onward rather than quietly redefined, so a reader
- # comparing an old row to a new one is not misled about what the number means.
- "rounds": None,
- "resubmissions": int(rounds) if rounds.isdigit() else None,
+ # `rounds` was the coordinator's own count of its fix loop, asserted in a
+ # marker and observed by nothing, so Phase 2 emitted it null rather than
+ # quietly redefining it. It now carries REPAIR ROUNDS -- how many times this
+ # runner dispatched a repair -- which is observed, because the runner
+ # performed each one. Still null when the loop is disabled or never engaged,
+ # so a reader comparing an old row to a new one is not misled: a number here
+ # always means "a repair happened", never "the loop ran and found nothing".
+ "rounds": int(repair_rounds) if repair_rounds.isdigit() else None,
+ "resubmissions": int(resubmissions) if resubmissions.isdigit() else None,
  "wall_seconds": int(wall) if wall.isdigit() else None, "cost": None,
  "bound": bound or None, "note": note}))
 PY
@@ -4482,8 +4509,8 @@ EOF
   # particular divergence has no route left. The two records can still
   # disagree for other reasons, which is why this note stays.
   _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" >> "$SCORECARD"
-  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}"
+  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" "${rounds:-}" >> "$SCORECARD"
+  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}" "${rounds:-}"
   # #3: guarantee the issue closes when its PR actually merged (backstops a
   # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
   [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
@@ -5285,6 +5312,24 @@ SH
   ! _recovery_forbids_merge "merge|do not confuse this with halt_and_reconcile" \
     || { echo "FAIL _recovery_forbids_merge: matched the reason text, not the action"; exit 1; }
   echo "_recovery_forbids_merge OK"
+
+  # `rounds` REACHES THE SCORECARD. It was computed, documented as "reports
+  # something again", and read by nothing: `json_row` hardcoded `"rounds": None`
+  # and mapped its sixth argument to `resubmissions`. The comment claimed a
+  # behaviour the code did not have, which is the same defect as an unbinding
+  # test in a different medium.
+  local _jr
+  _jr=$(json_row it 7 ready true cx:pass 3 12 note bound claude 2)
+  printf '%s' "$_jr" | grep -q '"rounds": 2' \
+    || { echo "FAIL json_row: repair rounds did not reach the scorecard: $_jr"; exit 1; }
+  printf '%s' "$_jr" | grep -q '"resubmissions": 3' \
+    || { echo "FAIL json_row: resubmissions moved or was overwritten: $_jr"; exit 1; }
+  # Absent -> null, NOT 0. A 0 would claim the loop ran and found nothing to
+  # repair, which is not what a disabled loop means.
+  _jr=$(json_row it 7 ready true cx:pass 3 12 note bound claude)
+  printf '%s' "$_jr" | grep -q '"rounds": null' \
+    || { echo "FAIL json_row: an absent round count is not null: $_jr"; exit 1; }
+  echo "json_row rounds OK"
   rm -rf "$rdir"
   echo "repair loop OK"
   # --- Fix 1b: recovery re-discovers the PR when it was recorded "no PR" -------
