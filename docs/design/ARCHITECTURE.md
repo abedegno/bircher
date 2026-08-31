@@ -427,7 +427,7 @@ of the runner/coordinator split and should NOT be patched in place.
 
 | # | gap | severity | closed by | blocked on |
 |---|---|---|---|---|
-| 1 | a repairable finding dies when the two reviews disagree (§5) | ~~high~~ **BUILT, not yet proven live** | the repair loop (`2026-08-31-repair-loop-design.md`) | one live muesli item repaired and merged with no human routing the finding |
+| 1 | ~~a repairable finding dies when the two reviews disagree~~ | **CLOSED 2026-08-31** | the repair loop — muesli #722 failed review twice, was repaired twice and merged, with no human routing a finding | — |
 | 2 | duplicate cross-vendor review | medium | gap 1 | deleting either one first loses repair or loses independence |
 | 3 | ~~`bircher-status:` marker still emitted~~ | **CLOSED** | the skill no longer mandates it, and the enumerating guard now scans instruction files (`.md` under `skills/`, `agents/`) as code | — |
 | 4 | runner is 8,559 lines and still growing | medium | migration | ordering: `merge_ready_pr` → `run_item` → `main` |
@@ -473,7 +473,7 @@ exactly one defect that 1045 passing tests did not:
 | 1 | derived `revise`, refused to repair | a `revise` carried no head, so the runner skipped the whole kernel lifecycle block and no revision was journalled |
 | 2 | **repair round 1 dispatched**, revision journalled, allowance 2→1 | `sess-create:<run_id>` made the repair's create a REPLAY — the prompt went to the session the runner had just cancelled |
 | 3 | **PR #751 MERGED**, main CI green | nothing; but the review PASSED first time, so the loop never engaged |
-| 4 | in flight on #722 | — |
+| 4 | **#722 MERGED after 2 repair rounds** | nothing — this is criterion 9 |
 
 All three are one shape: an identifier that named the run, the conversation or
 the commit, in a system that now does each of those more than once per item.
@@ -483,48 +483,29 @@ refused to fabricate a verdict for an unread diff. The guards turned three
 silent corruptions into three diagnosable escalations. They did not prevent
 the defects, and no test found them.
 
-WHAT IS NOT PROVEN: a live muesli item failing review, being repaired without a
-human, and merging. That is acceptance criterion 9 and it is the reason gap 1
-above says "not yet proven live" rather than closed. #722 is the standing
-counter-example — three reviews, three distinct findings — and if it exhausts
-the bound that is the correct outcome, not a failure of the loop.
+CRITERION 9 IS MET. muesli #722 -- the item this design named as its standing
+counter-example, escalated after three distinct findings in three reviews --
+failed review twice more, was repaired twice, and merged. PR #752, merge commit
+`9ec9e869`, main CI green, issue closed. No human routed a finding.
 
-**The implementer is being killed before it finishes, and that may be what the
-loop is repairing.** Four `runner_error` reaps across the run logs, with
-omnigent's own message:
+The journal is the evidence, not the log:
 
-> `turn exceeded the 480s harness idle watchdog (run_turn emitted no events for
-> 480s; likely a wedged LLM or tool call)`
+    seq 31  review_verdict    request_revision   causal id revise:i722-...
+    seq 56  review_verdict    request_revision   causal id revise:i722-...
+    seq 81  review_verdict    accept
+    seq 87  merge_authorized
+    seq 92  effect_confirmed  merge:752:6f615ac...
 
-`omnigent-runner-bircher` sets `HARNESS_TURN_TIMEOUT_S: 480`; the general runner
-on the same image uses 600. An implementer running a long build or test suite
-emits nothing for minutes and gets reaped. The runner handles it correctly --
-it observes the death and derives the outcome from the repository -- so nothing
-is lost or corrupted. But it reframes what a reviewer FAIL means: some fraction
-of them are truncated work rather than wrong work, and a repair loop that fixes
-truncation is doing a different job from one that fixes defects. Worth measuring
-before drawing conclusions about convergence rates.
+Three reviews of three DIFFERENT commits -- `48eaf46`, `7304400`, `6f615ac` --
+by three distinct repair sessions, each briefed on the previous reviewer's
+verbatim findings. The scorecard reports `rounds: 2`, a field that had been null
+since Phase 2 and now carries an observation.
 
-**An exhausted allowance still records `request_revision`.** `_kernel_verdict`
-maps every `*:fail` to `request_revision`, including the terminal failure when
-the bound is reached — so the run returns to `planned` in the kernel while the
-runner escalates and stops, and a later `recover` would answer
-`dispatch_implementer` for a run that has no rounds left. Nothing ever records
-`reject`. Not a safety hole (the runner escalates; a human owns it from there,
-and no merge is authorised from `planned`), but the kernel's terminal state and
-the runner's disagree. Recording `reject` there is the obvious fix and it is NOT
-free: it would change what a FAIL records under `BIRCHER_MAX_REVISIONS=0`, which
-is the configuration that has to stay byte-identical. So it needs its own design
-pass rather than a patch. Found by second-vendor review.
-
-**`--recover-pr` consumes only the FORBID bit.** The recovery action is computed
-and logged, and the only thing acted on is "must not merge here".
-`record_merge_outcome`, `halt_and_reconcile`, `reconciled_ruling_needed` and
-`retry_merge` are named in the log and never performed, so a run in one of those
-states says the same sentence forever until a human acts. That is a merge
-SAFEGUARD, not recovery, and calling it "recovery is wired" overstates it.
-Performing those actions is the next step and each one is an effect that needs
-its own authorization path. Named by second-vendor review.
+It converged on the LAST round it had. That is worth stating plainly rather than
+reading as comfortable: a bound of 2 was chosen from #740 converging in 1 and
+#750 in 2, and #722 used both. One more finding and it would have escalated
+correctly. The bound is doing real work, and this run is evidence for the loop,
+not evidence that 2 is the right number.
 
 STILL OPEN in the loop itself: `run_item` does not consult `recover` (only
 `--recover-pr` does), so a crash mid-loop re-derives rather than resuming; and

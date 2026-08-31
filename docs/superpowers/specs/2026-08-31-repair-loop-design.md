@@ -264,3 +264,14 @@ and settling; only the judgement moves. See "Who owns the loop".
    routing the finding.** That is what this is for, and #722 is the standing
    counter-example: if it still exhausts the bound, that is the correct outcome
    and not a failure of the loop.
+
+   **MET, 2026-08-31, by #722 itself.** It failed review at `48eaf46`, was
+   repaired to `7304400`, failed again, was repaired to `6f615ac`, and passed --
+   merged as `9ec9e869` with main CI green and the issue closed. Two
+   `request_revision` verdicts in the journal under the loop's own causal ids,
+   then an accept, then the merge authorised and confirmed.
+
+   It used BOTH rounds. The bound of 2 came from #740 converging in 1 and #750
+   in 2; #722 needed exactly 2 and one more finding would have escalated it
+   correctly. So this is evidence the loop works, and not evidence that 2 is the
+   right number -- that still needs more items.
