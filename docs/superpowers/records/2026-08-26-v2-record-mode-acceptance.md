@@ -1387,3 +1387,96 @@ Then, to separate the confounders: matched or randomised items through
 current and repair-enabled pipelines, merge/escalation criteria fixed in
 advance, reviewer vendor varied, comparing unattended completion rate AND
 new-defect rate.
+
+---
+
+## The repair experiment — 2026-08-31
+
+Cross-review of wave 01 said its conclusion was unsupported and named the
+cheapest discriminating test: **run the two escalated items through a repair
+round and see whether they converge.** This is that test. It took three
+attempts, and the first two were void for a reason worth more than the result.
+
+### Attempts 1 and 2 were void, and that is the finding
+
+Both items' findings were written onto their issues, the PRs closed, the issues
+re-queued. Both came back `review=codex:fail`. Neither had been reviewed:
+
+    fatal: '/tmp/review-745' already exists
+    Per your instruction, I stopped without reviewing anything.
+    VERDICT: FAIL
+
+Two defects, and the second matters more than the first.
+
+**Both reviewers wrote the same worktree path.** `skills/cross-review/SKILL.md`
+for the lead session's reviewer, `review.py::_PROMPT` for the coordinator's,
+each `/tmp/review-<PR>`. The first created it; the second died on it. Nothing
+cleaned them up either — the runner held **30** stale worktrees, back to smoke
+PRs #11–#16.
+
+A sha-derived nonce does not fix this, which was the first attempt at a fix:
+the two reviewers review the SAME commit, so they compute the same nonce. The
+coordinator's path now carries an explicit `-oob` suffix naming which reviewer
+it is.
+
+**The prompt offered only PASS and FAIL.** A reviewer that could not review had
+to claim one. It said FAIL — and the run recorded `review=codex:fail` and
+escalated the item as though a reviewer had judged the code. There is now a
+third verdict: `BLOCKED` means "I formed no opinion", `extract_verdict` maps it
+to None, and None already routes to escalated rather than to a rejection.
+
+**An infrastructure failure inside a reviewer was indistinguishable from a code
+rejection.** Two consecutive experimental results were fabricated by it, and I
+drew a conclusion from the first before checking.
+
+### Attempt 3, with both fixed
+
+Worktree paths confirmed unique (`/tmp/review-747-866a6187-oob`,
+`/tmp/review-748-c1c02737-oob`), reviews genuine — gates run and reconciled,
+`pytest -q: 13 passed`, `ruff check: All checks passed`.
+
+**Both repairs converged on exactly what was routed.**
+
+`#722` → PR #747. The routed finding was that `t0` stayed anchored to the
+utterance start after the decode window was bounded. The fix is
+`window_start_frame = max(self._segment_start_frame, end_frame - partial_frames)`
+— the suggested anchor — plus a new test,
+`test_partial_timestamps_bound_the_decoded_trailing_window`, docstringed
+"Regression test for the #741 review finding" and asserting on `t0` rather than
+on byte counts, which was the specific gap named.
+
+`#727` → PR #748. The routed finding was that the guarded write preceded the
+storage delete, so a failed delete stranded a note as permanently
+non-retranscribable. The fix introduces `SetRetentionStateDiscardedIfCurrent`,
+which "spans the storage delete itself under a notes-row lock", with six new
+tests.
+
+**And both drew a NEW, narrower finding in the same area.**
+
+- #747: partial timestamps are still wrong when an utterance contains
+  VAD-classified pauses shorter than `silence_threshold_ms` — a residual case
+  of the same class.
+- #748: `DeleteNoteSummariesIfCurrent` does not make its generation check and
+  deletion atomic — the same class, a different function.
+
+### What this supports
+
+**Routing a finding back works.** Both implementers fixed precisely what they
+were told, including the missing test, without fixing the wrong thing or
+regressing elsewhere. That is direct evidence for a repair loop being useful,
+and it is stronger than wave 01's inference because the mechanism was exercised
+rather than assumed.
+
+**A single fix round does not imply a merge.** Both items are still open after
+one round, each on a finding the previous review did not raise. Whether a
+bounded loop converges within 3 rounds is untested — this experiment ran one
+round for each item.
+
+### What it does not support
+
+Two items, one round each, same domain, same reviewing vendor for both repairs.
+It does not establish a convergence rate, and it cannot distinguish "reviews
+find genuinely deeper issues each round" from "reviews find something on any
+sufficiently complex diff". The second reading would make a bounded loop
+terminate at its bound rather than at a merge, which is the outcome that
+matters and is not measured here.
