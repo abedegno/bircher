@@ -94,3 +94,62 @@ def test_a_revision_keeps_the_reviewer_verdict_as_evidence():
     o = classify("7", "green", "FAIL", reviewer="claude_code", revisions_left=1)
     assert o.review == "claude_code:fail"
     assert "revising" in o.note
+
+
+# --- the findings must reach the runner, and not via the tuple ---------------
+
+def test_the_findings_never_enter_the_pipe_delimited_line():
+    """The reviewer's output is multi-paragraph text containing pipes and
+    newlines; the tuple is ONE pipe-delimited line whose width guard rejects
+    both. Putting the findings in it would corrupt every field after them."""
+    from coordinator.outcome import Derived
+    d = Derived("revise", "cx:fail", "n", "a" * 40, "green", "true", 0, "7",
+                findings="blocking:\n- one | two\n- three")
+    assert len(d.as_line().split("|")) == Derived.FIELDS == 8
+    assert "\n" not in d.as_line()
+    assert "blocking" not in d.as_line()
+
+
+def test_the_findings_ride_out_only_on_a_revise():
+    """On any other outcome the runner has nothing to route them to, and a
+    scorecard note is not a place for a multi-paragraph review."""
+    from coordinator.outcome import Deps, derive
+
+    def _d(**over):
+        base = dict(checks=lambda pr: "build|pass", head_of=lambda pr: "a" * 40,
+                    review=lambda pr, sha: ("FAIL", "blocking: the thing"),
+                    effect=lambda c, k, a: "ok", history=lambda br: ("true", 0),
+                    branch_of=lambda pr: "feat-x")
+        base.update(over)
+        return Deps(**base)
+
+    revising = derive("i1", "i1", "7", "", deps=_d(revisions_left=2))
+    assert revising.outcome == "revise"
+    assert "blocking: the thing" in revising.findings
+
+    terminal = derive("i1", "i1", "7", "", deps=_d(revisions_left=0))
+    assert terminal.outcome == "failed"
+    assert terminal.findings == "", (
+        "findings must not ride out when there is no round to spend them on")
+
+    passing = derive("i1", "i1", "7", "",
+                     deps=_d(review=lambda pr, sha: ("PASS", "looks fine"),
+                             revisions_left=2))
+    assert passing.outcome == "ready"
+    assert passing.findings == ""
+
+
+def test_the_findings_file_is_written_before_the_tuple_is_printed():
+    """A caller reads the tuple, sees `revise`, then reads the file. Printing
+    first would let it act on `revise` while the findings were unwritten."""
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[2]
+           / "coordinator" / "cli.py").read_text()
+    i = src.index("findings_out")
+    write = src.index("fh.write(r.findings)", i)
+    printed = src.index("print(r.as_line()", i)
+    assert write < printed, "the findings file must be written before the tuple"
+    assert re.search(r"could not write findings", src), (
+        "a failed write must be reported, or the runner dispatches a repair "
+        "with an empty brief and no way to know")

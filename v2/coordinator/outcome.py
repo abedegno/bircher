@@ -54,6 +54,11 @@ class Deps:
     #: to ignore it. Threading it here means there is one policy rather than
     #: one per call site.
     ignore: str = _DEFAULT_IGNORED
+    #: How many revision rounds this run may still have, from the journal.
+    #: 0 -- the default -- reproduces the behaviour before the repair loop, so
+    #: BIRCHER_MAX_REVISIONS=0 is a real rollback rather than a code path that
+    #: merely usually agrees.
+    revisions_left: int = 0
     #: The target repository, `owner/name`. EVERY effect argv must name it.
     #: `gh` resolves an omitted `--repo` from the CURRENT WORKING DIRECTORY's
     #: git remote -- which for the coordinator is the bircher checkout, not the
@@ -82,6 +87,13 @@ class Derived:
     #: authorize and merge the number it started with. muesli #723: the
     #: derivation reviewed #738 and the caller tried to merge closed #737.
     pr: str = ""
+    #: The reviewer's output, carried out ONLY on a `revise` outcome so the
+    #: runner can put the blocking findings in front of the next implementer.
+    #: That routing is what merged #740 and #750 when done by hand.
+    #:
+    #: LAST in the field order deliberately: `pr` is passed positionally by
+    #: `derive`, and inserting anything before it silently rebinds arguments.
+    findings: str = ""
 
     def as_tuple(self):
         return (self.outcome, self.review, self.note, self.sha, self.ci,
@@ -185,7 +197,8 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
             if verdict == "NONE":
                 verdict = None
 
-    o = classify(pr or None, ci, verdict, reviewer=d.reviewer)
+    o = classify(pr or None, ci, verdict, reviewer=d.reviewer,
+                 revisions_left=d.revisions_left)
 
     if pr:
         head_field = f" head={reviewed_sha}" if o.outcome == "ready" and reviewed_sha else ""
@@ -225,5 +238,9 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
     # The sha rides out only on a READY outcome: it is the merge-authorising
     # evidence, and a failed or escalated derivation must never carry one.
     sha_out = reviewed_sha if o.outcome == "ready" else ""
+    # The findings ride out only on `revise`: on any other outcome the runner
+    # has nothing to route them to, and a scorecard note is not the place for a
+    # multi-paragraph review.
     return Derived(o.outcome, o.review, o.note, sha_out, o.ci,
-                   ci_first, resubmissions, str(pr or ""))
+                   ci_first, resubmissions, str(pr or ""),
+                   findings=(reviewer_out if o.outcome == "revise" else ""))

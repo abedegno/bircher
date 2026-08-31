@@ -110,6 +110,19 @@ def main(argv=None) -> int:
     # differently: the shell clamped `BIRCHER_CI_RERUN_MAX=abc` to 4 and
     # computed a budget from it, while a bare `int()` here raised ValueError
     # and escalated every item. One malformed operator value, two answers.
+    # The repair loop's two arguments.
+    #
+    # `--revisions-left` is the allowance, computed by the caller from the
+    # journal (`observe.revisions_used`) rather than here, because the caller
+    # owns the kernel database handle. 0 -- the default -- reproduces the
+    # behaviour before the loop existed.
+    #
+    # `--findings-out` is a PATH and not a tuple field on purpose: the
+    # reviewer's blocking findings are multi-paragraph text containing pipes
+    # and newlines, and the tuple is one pipe-delimited line whose width guard
+    # rejects both. Writing them to a file keeps the transport intact.
+    dv.add_argument("--revisions-left", type=int, default=0, dest="revisions_left")
+    dv.add_argument("--findings-out", default="", dest="findings_out")
     dv.add_argument("--ci-wait", type=int, default=1500, dest="ci_wait")
     dv.add_argument("--rerun-max", type=int, default=4, dest="rerun_max")
     dv.add_argument("--rerun-wait", type=int, default=900, dest="rerun_wait")
@@ -213,8 +226,23 @@ def main(argv=None) -> int:
                    deps=live_deps(a.item, repo=a.repo, reviewer=a.reviewer,
                                   server=a.server, bundle_dir=a.bundle_dir,
                                   poll_interval=a.poll_interval,
-                                  ci_wait=a.ci_wait, rerun_wait=a.rerun_wait),
+                                  ci_wait=a.ci_wait, rerun_wait=a.rerun_wait,
+                                  revisions_left=a.revisions_left),
                    rerun_max=a.rerun_max)
+        # Written BEFORE the tuple is printed: the caller reads the tuple,
+        # sees `revise`, and then reads this file. Printing first would let a
+        # caller act on `revise` while the findings were still unwritten.
+        if a.findings_out and r.findings:
+            try:
+                with open(a.findings_out, "w") as fh:
+                    fh.write(r.findings)
+            except OSError as exc:
+                # NOT fatal, and NOT silent. Without the findings the runner
+                # cannot route anything useful to the next implementer, so it
+                # must be able to see that and escalate rather than dispatch a
+                # repair with an empty brief.
+                print(f"could not write findings to {a.findings_out}: {exc}",
+                      file=sys.stderr)
         print(r.as_line(), end="")
         return RC_OK
 
