@@ -49,6 +49,15 @@ CONTRACT = {
     "BIRCHER_REVIEW_LOG": "operator",
     "MAIN_BRANCH": "operator",
     "BIRCHER_GH_REPO": "self",
+    # RUNNER-SET, read by the reviewer to name its worktree per ATTEMPT rather
+    # than per commit. The runner exports it at every `_kernel_dispatch`, so
+    # two repair rounds reviewing the same sha get different worktrees --
+    # muesli #711 round 2 died BLOCKED on round 1's leftover directory.
+    #
+    # Read with a fallback and never required: the prompt clears the path
+    # before creating it, so an absent generation degrades to a less
+    # informative name and not to a collision.
+    "BIRCHER_GENERATION": "runner",
 }
 
 _READ = re.compile(

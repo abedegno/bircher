@@ -775,3 +775,48 @@ def test_the_lead_sessions_skill_uses_a_unique_path_too():
     assert "/tmp/review-<PR>." not in skill, (
         "a bare /tmp/review-<PR> remains in the skill; it will collide with "
         "the coordinator's reviewer")
+
+
+# --- the review worktree must not collide across repair rounds ---------------
+
+def test_the_worktree_path_clears_itself_before_creating():
+    """muesli #711 round 2: the reviewer found round 1's worktree still there
+    and answered BLOCKED -- correctly, since it could not check out the commit
+    it was told to review. The round produced `codex:na` and the item escalated
+    with a working PR and two rounds of findings nobody acted on.
+
+    The prompt now removes the path first. That also clears the leftovers no
+    nonce can predict: crashed runs, killed sessions, and the worktrees this
+    runner has accumulated since smoke PR #11 with nothing to remove them.
+    """
+    from coordinator.review import review_prompt
+    p = review_prompt("751", "o/r", "9" * 40)
+    path = "/tmp/review-751-99999999-oob"
+    assert f"git worktree remove --force {path}" in p
+    assert f"rm -rf {path}" in p
+    assert p.index("rm -rf " + path) < p.index("worktree add --detach " + path), (
+        "the path must be cleared BEFORE it is created")
+
+
+def test_two_rounds_at_the_SAME_commit_get_different_worktrees(monkeypatch):
+    """The nonce identified the COMMIT. A repair round that pushes nothing --
+    which is how round 1 of #711 ended -- leaves the next review pointed at the
+    same sha, so the same path. The generation is re-minted per dispatch and
+    names the attempt instead."""
+    from coordinator import review as rv
+    seen = []
+
+    def _fake_run(argv, cwd):
+        seen.append(" ".join(argv))
+        import types
+        return types.SimpleNamespace(returncode=0, stdout="VERDICT: PASS")
+
+    for gen in ("2", "5"):
+        monkeypatch.setenv("BIRCHER_GENERATION", gen)
+        rv.dispatch("751", "o/r", "9" * 40, reviewer="codex",
+                    bundle_dir="/b", server="http://x",
+                    log_path="/tmp/x.log", run=_fake_run)
+    paths = {ln.split("/tmp/review-")[1].split()[0].rstrip(";")
+             for ln in seen if "/tmp/review-" in ln}
+    assert len(paths) == 2, f"two attempts shared a worktree: {paths}"
+    assert all(p.startswith("751-99999999-g") for p in paths), paths

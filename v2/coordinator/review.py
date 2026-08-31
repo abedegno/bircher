@@ -66,7 +66,7 @@ def extract_verdict(text: str) -> str | None:
 #: `test_the_rendered_prompt_is_byte_identical_to_the_bash` renders both and
 #: compares.
 _PROMPT = r"""Review PR #{pr} in {repo} as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
+First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; rm -rf /tmp/review-{pr}-{nonce}-oob; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
 You are reviewing EXACTLY commit {co}. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:$PATH &&' (e.g. 'export PATH=/root/bin:$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
@@ -91,6 +91,18 @@ def review_prompt(pr: str, repo: str, sha: str = "", nonce: str = "") -> str:
     # out-of-band one the coordinator dispatches, as opposed to the one the
     # lead session arranges from `skills/cross-review`.
     #
+    # AND THE PATH IS CLEARED BEFORE IT IS CREATED, because the nonce identifies
+    # the COMMIT and the repair loop reviews one commit more than once. muesli
+    # #711 round 2: the reviewer found `/tmp/review-751-934bda3d-oob` left by
+    # round 1 and answered, correctly, "Exact checkout failed because it already
+    # exists. Per instruction, no review was performed. VERDICT: BLOCKED" -- so
+    # the round produced `codex:na` and the item escalated with a working PR.
+    #
+    # Clearing beats a better nonce here, and both are done. A nonce fixes the
+    # collisions we predict; clearing also fixes the leftovers we do not --
+    # crashed runs, killed sessions, and the worktrees this runner has been
+    # accumulating since smoke PR #11 with nothing to remove them.
+    #
     # Both reviewers in this system used
     # `/tmp/review-<PR>`: `skills/cross-review/SKILL.md` for the lead session's
     # and this prompt for the coordinator's. On muesli PR #745 the first
@@ -113,6 +125,7 @@ def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
     stdout is not evidence, and mining it would let a crash that echoed its own
     prompt authorise a merge.
     """
+    import os
     import subprocess
 
     # `stderr=STDOUT`, exactly like the bash's `2>&1` -- ONE stream, interleaved
@@ -128,7 +141,17 @@ def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
     runner = run or (lambda argv, cwd: subprocess.run(
         argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True))
-    prompt = review_prompt(pr, repo, sha)
+    # THE NONCE NAMES THE ATTEMPT, not the commit. `BIRCHER_GENERATION` is
+    # re-minted by `_kernel_dispatch` for every dispatch, so two rounds of the
+    # repair loop get different worktrees even when they review the SAME sha --
+    # which is exactly what happens when a repair round pushes nothing.
+    #
+    # Falls back to the sha when the variable is absent, which is what every
+    # caller outside the runner does; the prompt clears a stale path either way,
+    # so the fallback degrades to "slightly less informative", not "collides".
+    gen = os.environ.get("BIRCHER_GENERATION", "").strip()
+    nonce = f"{(sha or 'head')[:8]}-g{gen}" if gen.isdigit() else ""
+    prompt = review_prompt(pr, repo, sha, nonce=nonce)
     r = runner(["omnigent", "run", f"agents/{reviewer}", "--server", server,
                 "-p", prompt], bundle_dir)
     out = r.stdout or ""
