@@ -28,6 +28,11 @@ RC_LOOKUP_FAILED = 3
 #: The adapter's `_EFFECT_RC_DENIED`. Kept identical so the two entry points
 #: are interchangeable to a caller that checks the code.
 RC_EFFECT_DENIED = 87
+# The findings could not be committed to disk. Deliberately NOT RC_OK: the
+# runner escalates on a non-zero rc, which is the right response, because
+# the alternative is dispatching a repair against findings that are stale,
+# truncated, or absent -- and all three read as a normal repair.
+RC_FINDINGS_UNWRITABLE = 88
 
 
 def _maybe_stdin(value: str) -> str:
@@ -121,6 +126,12 @@ def main(argv=None) -> int:
     # reviewer's blocking findings are multi-paragraph text containing pipes
     # and newlines, and the tuple is one pipe-delimited line whose width guard
     # rejects both. Writing them to a file keeps the transport intact.
+    #
+    # The path is REMOVED before derivation and REPLACED atomically after, so
+    # the file existing means this derivation wrote it. Without that, a round
+    # that leaves an old file behind pairs a fresh `revise` with a previous
+    # round's findings -- and a repair briefed on the wrong review looks
+    # exactly like a repair briefed on the right one.
     dv.add_argument("--revisions-left", type=int, default=0, dest="revisions_left")
     dv.add_argument("--findings-out", default="", dest="findings_out")
     dv.add_argument("--ci-wait", type=int, default=1500, dest="ci_wait")
@@ -222,6 +233,21 @@ def main(argv=None) -> int:
         from coordinator.wiring import live_deps
         # `_gh` reads the repo from here rather than from an unexported global.
         os.environ["BIRCHER_GH_REPO"] = a.repo
+        # FIRST, before anything can succeed: clear any file a previous round
+        # left at this path. Derivation runs for as long as CI does and can be
+        # killed by its timeout at any point in that window; if it dies with an
+        # old file still there, the next reader finds findings that look
+        # current and are not. Removing it up front means the file's existence
+        # is evidence, not an assumption.
+        if a.findings_out:
+            try:
+                os.unlink(a.findings_out)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"could not clear stale findings at {a.findings_out}: "
+                      f"{exc}", file=sys.stderr)
+                return RC_FINDINGS_UNWRITABLE
         r = derive(a.item, a.code, a.pr, a.issue,
                    deps=live_deps(a.item, repo=a.repo, reviewer=a.reviewer,
                                   server=a.server, bundle_dir=a.bundle_dir,
@@ -229,20 +255,32 @@ def main(argv=None) -> int:
                                   ci_wait=a.ci_wait, rerun_wait=a.rerun_wait,
                                   revisions_left=a.revisions_left),
                    rerun_max=a.rerun_max)
-        # Written BEFORE the tuple is printed: the caller reads the tuple,
-        # sees `revise`, and then reads this file. Printing first would let a
-        # caller act on `revise` while the findings were still unwritten.
+        # Written BEFORE the tuple is printed, and ATOMICALLY: the caller reads
+        # the tuple, sees `revise`, and then reads this file. Printing first
+        # would let a caller act on `revise` while the findings were unwritten;
+        # writing in place would let a crash mid-write leave a truncated brief
+        # that reads as a complete one. Temp file in the SAME directory (so the
+        # replace is a rename within one filesystem), fsync, then replace.
         if a.findings_out and r.findings:
+            tmp = f"{a.findings_out}.{os.getpid()}.tmp"
             try:
-                with open(a.findings_out, "w") as fh:
+                with open(tmp, "w") as fh:
                     fh.write(r.findings)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, a.findings_out)
             except OSError as exc:
-                # NOT fatal, and NOT silent. Without the findings the runner
-                # cannot route anything useful to the next implementer, so it
-                # must be able to see that and escalate rather than dispatch a
-                # repair with an empty brief.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                # FATAL, and the tuple is NOT printed. A `revise` the caller
+                # cannot brief is worse than no answer: it dispatches a repair
+                # with an empty brief and no way to know. A non-zero rc makes
+                # the runner escalate, which is the outcome we want.
                 print(f"could not write findings to {a.findings_out}: {exc}",
                       file=sys.stderr)
+                return RC_FINDINGS_UNWRITABLE
         print(r.as_line(), end="")
         return RC_OK
 
