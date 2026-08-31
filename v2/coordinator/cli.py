@@ -158,6 +158,22 @@ def main(argv=None) -> int:
     # two subsystems that rebuild the same string eventually disagree about it.
     rv.add_argument("--confirm-command", default="", dest="confirm_command")
 
+    # `recover` answers "this run was interrupted -- what now?" from the
+    # journal, because the STATE NAME cannot answer it: `reviewing` is reached
+    # from an accept, from a reject AND from a failed merge.
+    #
+    # base-sha and context-hash are the CALLER'S OWN values, as they are for
+    # record_review, and for the same reason: a binding fetched from the
+    # mechanism and handed back makes the mechanism compare a value against
+    # itself. The current artifact IS read from the store, because "what this
+    # run currently outputs" is the store's fact and not the caller's.
+    rc = subs.add_parser("recover")
+    rc.add_argument("--db", required=True)
+    rc.add_argument("--run-id", required=True)
+    rc.add_argument("--base-sha", default="")
+    rc.add_argument("--context-hash", default="")
+    rc.add_argument("--policy-version", type=int, default=1)
+
     pa = subs.add_parser("pr-abandoned")
     pa.add_argument("--state", default="")
     pa.add_argument("--merged", default="")
@@ -323,6 +339,40 @@ def main(argv=None) -> int:
         print(f"{used}|{left}|{'yes' if ok else 'no'}", end="")
         return RC_OK
 
+    if a.mode == "recover":
+        from kernel.store import Store
+
+        from coordinator.recover import decide
+        try:
+            store = Store.open(a.db)
+            facts = store.facts_for(a.run_id)
+        except Exception as exc:
+            print(f"could not read the journal at {a.db}: {exc}",
+                  file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        binding = None
+        if a.base_sha and a.context_hash:
+            art = store.current_artifact(a.run_id)
+            if art:
+                try:
+                    from kernel.artifacts import binding_hash
+                    from kernel.authz import _binding_from
+                    binding = binding_hash(_binding_from(dict(
+                        artifact_hash=art, base_sha=a.base_sha,
+                        context_bundle_hash=a.context_hash,
+                        policy_version=a.policy_version)))
+                except Exception as exc:
+                    # A binding we cannot build is NOT "the accept is current".
+                    # Leaving it None makes `decide` skip the staleness check
+                    # and answer `merge`, so say so rather than letting a
+                    # malformed base silently authorise the merge path.
+                    print(f"could not build the current binding: {exc}",
+                          file=sys.stderr)
+                    return RC_LOOKUP_FAILED
+        print(f"{_recover_action(store, a.run_id, facts, binding, decide)}",
+              end="")
+        return RC_OK
+
     if a.mode == "pr-abandoned":
         # EXIT CODE, not stdout: the shell calls this in an `if`, and a
         # printed word would have to be compared, which is one more place to
@@ -362,3 +412,43 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _merge_effect_from_table(store, run_id, facts):
+    """The effect TABLE's answer for this run's merge, or None.
+
+    THE TABLE IS AUTHORITATIVE and the facts only say which key to ask about.
+    `mark_effect` moves an effect to `uncertain` in the table; that is the state
+    `is_halted` trusts, so reading it here means recovery agrees with the halt
+    rather than reconstructing it.
+
+    The key comes from `causal_command_id`, NOT from the payload. The payload
+    carries `effect_id`, a different identifier, and `effect_state` is keyed by
+    the idempotency key -- so looking there returns None for every effect and
+    the halt row silently never fires. That is what the first version did, and
+    no end-to-end test could catch it: `recover.merge_effect_state` answers the
+    same way from the facts, so the fallback covered for the bug.
+    """
+    worst = None
+    for f in facts:
+        k = getattr(f, "kind", None)
+        k = getattr(k, "value", k)
+        payload = getattr(f, "payload", None) or {}
+        if k != "effect_intended" or payload.get("effect_class") != "merge":
+            continue
+        key = getattr(f, "causal_command_id", None)
+        if not key:
+            continue
+        st = store.effect_state(key, run_id=run_id)
+        # The WORST unresolved state wins: one uncertain merge among several
+        # confirmed ones still means the forge may hold a merge nobody recorded.
+        if st in ("intended", "uncertain"):
+            return st
+        worst = worst or st
+    return worst
+
+
+def _recover_action(store, run_id, facts, binding, decide):
+    act = decide(facts, current_binding_hash=binding,
+                 merge_effect=_merge_effect_from_table(store, run_id, facts))
+    return f"{act.do}|{act.why}"
