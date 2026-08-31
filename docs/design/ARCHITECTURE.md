@@ -464,6 +464,24 @@ WHAT IS PROVEN, and by what:
 | re-entry is decided from history, not the state name | `test_recovery_table.py`, every row against a real journal |
 | recovery will not merge what may already be merged | `_recovery_forbids_merge`, wired into `--recover-pr` |
 
+WHAT THE LIVE RUNS SHOWED, in order. Four runs on 2026-08-31, each finding
+exactly one defect that 1045 passing tests did not:
+
+| run | how far it got | what it found |
+|---|---|---|
+| 1 | derived `revise`, refused to repair | a `revise` carried no head, so the runner skipped the whole kernel lifecycle block and no revision was journalled |
+| 2 | **repair round 1 dispatched**, revision journalled, allowance 2→1 | `sess-create:<run_id>` made the repair's create a REPLAY — the prompt went to the session the runner had just cancelled |
+| 3 | **PR #751 MERGED**, main CI green | nothing; but the review PASSED first time, so the loop never engaged |
+| 4 | in flight on #722 | — |
+
+All three are one shape: an identifier that named the run, the conversation or
+the commit, in a system that now does each of those more than once per item.
+Each was found only by running it, and each was caught by a guard behaving
+correctly — the durability gate refused an unjournalled revision, BLOCKED
+refused to fabricate a verdict for an unread diff. The guards turned three
+silent corruptions into three diagnosable escalations. They did not prevent
+the defects, and no test found them.
+
 WHAT IS NOT PROVEN: a live muesli item failing review, being repaired without a
 human, and merging. That is acceptance criterion 9 and it is the reason gap 1
 above says "not yet proven live" rather than closed. #722 is the standing
