@@ -254,6 +254,8 @@ the plan's acceptance as if it were the code's. Each consumer filters on
 | | | `plan_accepted` | `planned` |
 | `grant_round` | `human_ruling` | `queued`, `specified`, `spec_submitted`, `plan_submitted` | no transition; raises the current phase's revision allowance and `max_seats` by one round. Refused from `*_accepted`: nothing there is stalled |
 | `record_human_direction(phase, text)` | `human_ruling` | `queued`, `specified` | no transition; the next author round's findings (§4) |
+| `issue_review_brief(phase, brief_hash, artifact_hash, context_bundle_hash, policy_version, base_sha[, spec_hash])` | — | `spec_submitted`, `plan_submitted` | no transition; records `review_brief_issued` under the calling generation, which must be a `reviewer` dispatch with no brief yet (§2 below the split) |
+| `record_author_empty(session)` | — | `queued`, `specified` | no transition; records `author_empty` — the cause of the one retry session after an author turn that produced nothing (§3, §7) |
 | `park(reason, …)` | — | every front-half state | no transition; records `parked` |
 | `revise_bundle(issue)` | — | every front-half state | `queued`; epoch + 1 |
 | `record_model_question` / `record_human_answer` | — | every front-half state | no transition |
@@ -291,6 +293,9 @@ observe the refusal; it may not pre-empt it.
 | `record_review(request_revision, review_ruling)` | this phase, this epoch, already carries `max_rounds` reviewer-driven revisions (plus any `grant_round`). Human rulings are never bounded |
 | `record_review(reject)` | from any front-half state. Bound exhaustion parks; it does not terminate |
 | `record_review` from `*_accepted` | unless its decision type is `human_ruling` — only the human moves a gated run |
+| `record_review` with a `review_ruling` | its generation carries no `review_brief_issued`, or the ruling's `phase`, `artifact_hash`, `context_bundle_hash`, `policy_version` or `base_sha` differs from that fact's. These are the dispatch checks of the split above; a `human_ruling` has no brief and passes none of them |
+| `issue_review_brief` | the calling generation is not a `reviewer` dispatch, or already carries a `review_brief_issued`; `phase` is not the phase of the current state; `artifact_hash` is not that phase's current artefact in the current epoch; `context_bundle_hash` is not the current epoch's bundle hash, `policy_version` not the version in `policy_frozen`, `base_sha` not the run's base; for a plan brief `spec_hash` is absent or not the run's current spec hash; or `brief_hash` names no object the store holds. The kernel holds every value on the right-hand side; the caller can only supply the right answer |
+| `record_author_empty` | the named session is not the one a `sess-create` of the current generation's actor delivered, or this phase and epoch already carry an `author_empty` newer than the last transition — the second empty turn is `RC_FAILED`, not a third session |
 | `approve_artifact` | the hash differs from the phase's current artefact in the current epoch. The kernel holds the hash; the caller can only supply the right answer. (From `*_submitted` it is refused by the transition table alone — legal only from `*_accepted` — and `authorize` checks that table before any guard, `authz.py:345`; a "no reviewer has accepted" guard would never be the first refusal, so there is none. The human is still told why, §4) |
 | any `author` or `reviewer` dispatch | the run's front-half dispatches already number `max_seats` (plus grants). Refused at `dispatch`, before a session exists, so the budget bounds sessions and not merely commands |
 | `create_run` | the `run_id` exists and the retry's inputs differ — a different issue snapshot hash, base sha, repository or Project config hash. `enqueue`'s replay recomputes its answer from the *retry's* arguments and reports `replayed` for whatever was passed, so a retry with different inputs is told it succeeded while the journal holds the first call's. Replay only an identical request; refuse the rest as `NotReplayable` |
@@ -340,20 +345,39 @@ generation, actor, role}` (`dispatch.py:61`, `schema.sql:82`) — so the
 kernel knows what the current bundle *is* and nothing about what the
 reviewer *saw*, and a coordinator that rendered a brief from the previous
 epoch's snapshot while reporting the current hash is believed. So the brief
-is journaled before the seat runs: the coordinator renders the review brief
-**from the store, by hash** — the artefact bytes, the bundle, the spec when
-reviewing a plan — PUTs the rendered brief, and records
+is journaled before the seat runs, by a command with a row in the table
+above: the coordinator takes the `reviewer` dispatch, renders the review
+brief **from the store, by hash** — the artefact bytes, the bundle, the spec
+when reviewing a plan — PUTs the rendered brief, and calls
+`issue_review_brief` under that generation through `execute`, which records
 `review_brief_issued {phase, epoch, brief_hash, artifact_hash,
-context_bundle_hash, policy_version, base_sha}` under the reviewer's
-dispatch generation. The dispatch checks then read: a `review_ruling` under
-a generation with no `review_brief_issued` is refused; one whose binding
-fields differ from that fact's is refused; and the fact's fields must equal
-the kernel's own — the current epoch's bundle hash, the version in
-`policy_frozen`, the run's base — or the brief fact itself is refused when
-recorded. What remains asserted is that the session was fed those bytes
-(§9); what is now observed is which bytes, so the §8 proof can open the
-stored brief and check that the hashes embedded in it are the ones the fact
-names, and that the verdict's `hash8` is the artefact's.
+context_bundle_hash, policy_version, base_sha, spec_hash?}`. It is a command
+and not a fact the coordinator appends the way `grill.py` appends its
+questions (`store.append_fact`) because a fact appended directly passes no
+check: the halt gate and the generation fence live in `submit`
+(`commands.py:165`, `:171`) and the `facts` table carries no generation of
+its own (`schema.sql:4-16`), so a brief written outside `execute` would be
+recorded under nobody's authority, from any state, as often as the
+coordinator liked. Through `execute` the kernel takes the generation from
+the dispatch record and refuses the brief unless that generation is a
+`reviewer` seat with no brief yet, unless the state is `*_submitted`, and
+unless every field equals what the kernel holds — the phase's current
+artefact, the current epoch's bundle hash, the version in `policy_frozen`,
+the run's base, for a plan brief the current spec hash — and `brief_hash`
+names an object in the store (the refusal rows below). The dispatch checks
+on the ruling then read against that fact: a `review_ruling` under a
+generation with no `review_brief_issued` is refused, and one whose binding
+fields differ from the fact's is refused. The order is fixed: `dispatch`,
+PUT, `issue_review_brief`, `omnigent run`, `record_review`; a crash after
+the brief and before the seat leaves a fact under a generation that will
+never rule, which costs the seat and nothing else, and a `revise_bundle`
+while the seat runs puts the run at `queued` in a new epoch, from which
+`record_review` is not legal at all (the table above) — the seat's verdict
+is refused by the state table before any check reads the stale brief. What
+remains asserted is that the session was fed those bytes (§9); what is now
+observed is which bytes, so the §8 proof can open the stored brief and check
+that the hashes embedded in it are the ones the fact names, and that the
+verdict's `hash8` is the artefact's.
 
 ### Grill facts
 
@@ -436,7 +460,9 @@ loop:
                                  FAIL, revisions left    → record_review(request_revision, findings)
                                  FAIL, none left         → park(bound_exhausted, findings, verdict, reviewer)
   spec_accepted | plan_accepted
-                              → park(gate)
+                              → gate_prompt(phase)                        (§4)
+                                 listing holds a human message → take it under the batch rules; no park
+                                 else                    → park(gate)
   planned                     → exit 0
 ```
 
@@ -497,39 +523,72 @@ prompt text per round. Out of scope here; noted so it is not rediscovered.)
 But "re-sent under a fresh key" is only right when the effect did *not*
 land, and today's reconciliation cannot say. `effects.reconcile` records
 `effect_reconciled` with a free-text `resolution` and nothing else
-(`effects.py:323`, `:380`), and clears the effect's `external_object_id`
-(`:329`) — so after a human has reconciled a `sess-create`, the journal
+(`effects.py:333`, `:376`), and clears the effect's `external_object_id`
+(`:367`) — so after a human has reconciled a `sess-create`, the journal
 holds neither whether a session exists nor which one, and the resumed pass
 would create a second; after a reconciled prompt it cannot tell a delivered
 prompt from a lost one. Two changes:
 
-- **Reconciliation is typed.** `reconcile` takes a result beside the text:
-  `delivered {external_object_id}` or `not_delivered`, journaled on the
-  `effect_reconciled` fact and stored on the effect row in place of the
-  cleared id. `_kernel_reconcile` grows `--delivered <id>` / `--not-delivered`
-  and refuses a call with neither; the reconciling human is the one person
-  who looked, and the journal records what they saw, not only that they
-  did. For a `sess-create` reconciled as delivered the id is the session
-  the coordinator adopts.
+- **Reconciliation is typed, per key.** `reconcile` and `reconcile_many`
+  (`effects.py:342`, `:291`) take a result for each key beside the text:
+  `delivered {external_object_id}` or `not_delivered`, journaled on that
+  key's `effect_reconciled` fact and stored on its effect row in place of
+  the cleared id. The batch shape is kept because it is right — one human
+  look, one CAS, every pending key of the run resolved in one transaction
+  (`_kernel_reconcile <run> <resolution> <version> <key>...`,
+  `kernel-client.sh:230`; `run-queue.sh:2259` passes every pending key) —
+  but a single result over the batch is not: a batch can hold a
+  `sess-create` and a `sess-prompt`, each with its own answer. So
+  `_kernel_reconcile` grows `--delivered <key>=<id>` and
+  `--not-delivered <key>`, every pending key of the run named exactly once,
+  and refuses a call that leaves a key unnamed or names one with neither
+  result; the reconciling human is the one person who looked, and the
+  journal records what they saw for each thing they looked at. For a
+  `sess-create` reconciled as delivered the id is the session the
+  coordinator adopts.
 - **Obligations are derived from intents, keys name attempts.** Every
   effect the coordinator performs carries an intent — for a session,
-  `{sess-create, run, epoch, agent}`; for a prompt, `{sess-prompt, session,
-  phase, epoch, cause, sha256}` where `cause` is the id of the fact the
-  prompt answers (the `human_answer` behind "Answered; continue.", the
-  accepting review behind a gate prompt, the `parked` reason and round
-  behind a stall prompt, the `artifact_submitted` behind a revision brief);
-  for a publication, `{publish, run, phase, hash}`. An obligation is
+  `{sess-create, run, epoch, agent, cause}`; for a prompt, `{sess-prompt,
+  session, phase, epoch, cause, sha256}`; for a publication, `{publish,
+  run, phase, hash}`. `cause` is the id of the fact the effect acts on, and
+  it is what makes two obligations in one epoch distinct: for a session,
+  the fact that called for it — `run_created` for the first author
+  session, the `review_verdict {request_revision}` for each revision
+  round's fresh session, the `human_ruling` or `human_direction` for the
+  fresh round a correction starts, the accepting verdict or the `parked`
+  fact for a session created only to carry a gate or stall prompt because
+  the author's is gone, the `author_empty` fact for the one retry after an
+  empty turn (§7); for a prompt, the fact it answers — the session's own
+  `cause` for the first prompt to a fresh session, the `human_answer`
+  behind "Answered; continue.", the accepting `review_verdict` behind a
+  gate prompt, the **`parked` fact** behind a stall prompt (never its
+  reason and round: two `no_verdict` parks in one round are two facts and
+  two prompts, and a cause that named the reason would send the second
+  never), the `review_verdict {request_revision}` behind a revision brief.
+  Without `cause` on the session intent, `{sess-create, run, epoch,
+  agent}` is the same obligation for round one and round two of a phase,
+  and the second fresh session — the one the revision mandates — reads
+  satisfied by the first and is never created. An obligation is
   **satisfied** when the journal holds an effect with that intent in state
   `confirmed` or reconciled `delivered`; **owed** otherwise; and every fresh
-  attempt is a fresh key, the generation being the part that moves. Before
-  sending anything the coordinator asks the journal whether the intent is
-  satisfied; a satisfied intent whose follow-up fact is missing —
-  `prompt_item` after a confirmed prompt, `parked` after a confirmed gate
-  prompt — is **completed** (list the session, find the item by hash,
-  record) and never re-sent. `publish_owed` (§3 Artefacts) is one instance
-  of this rule, not a special case, and "Answered; continue." is sent once
-  per human turn because its cause is a different fact each time, not
-  because its key carries a generation.
+  attempt is a fresh key, the generation being the part that moves. The
+  intent is stored where the kernel already puts it — `intent_json` on the
+  `effects` row, written in the transaction that journals the effect
+  (`store.py:308-317`, `effects.py:233-236`), so the obligation exists
+  before the attempt — but as its own `obligation` object beside `argv`,
+  and the satisfied-query matches on `obligation` alone: `argv` carries the
+  session id, the body and the max-time, which legitimately differ between
+  two attempts at one obligation, and a query over the whole intent would
+  find no prior attempt equal to the current one. Before sending anything
+  the coordinator asks the journal whether the obligation is satisfied; a
+  satisfied one whose follow-up fact is missing — `prompt_item` after a
+  confirmed prompt, `parked` after a confirmed gate prompt, the adopted
+  session after a confirmed `sess-create` — is **completed** (list the
+  session, find the item by hash, record) and never re-sent.
+  `publish_owed` (§3 Artefacts) is one instance of this rule, not a special
+  case, and "Answered; continue." is sent once per human turn because its
+  cause is a different fact each time, not because its key carries a
+  generation.
 Reviewer sessions stay on `omnigent run` as `review.py` does
 today: a reviewer has no push and no human in its session, so a lost reviewer
 session costs one seat and never correctness — stated as a cost residual, and
@@ -542,7 +601,7 @@ credential-proxy shape, no push allowance, a worktree at the run's base sha.
 There are **two** author bundles, not one, because the rotation below needs
 an author of each vendor and `v2_implementer` is one vendor's bundle:
 `harness: claude-sdk` with model egress to `api.anthropic.com` only
-(`agents/v2_implementer/config.yaml:8`, `:38`). `v2_author_claude` is that
+(`agents/v2_implementer/config.yaml:11`, `:67`). `v2_author_claude` is that
 bundle; `v2_author_codex` is the same confinement with `harness: codex` and
 only the codex harness's model hosts in `egress_rules`, established by probe
 the way the Anthropic host was. `agents/codex` is not a substitute: it runs
@@ -582,9 +641,9 @@ hash — read from the store and checked against it, so a reviewer cannot be
 handed something other than what will be approved — plus the issue snapshot
 and the spec (when reviewing a plan), every one of them read from the store
 by the hash the kernel currently holds. The rendered brief is PUT to the
-store and `review_brief_issued` recorded under the reviewer's generation
-before the session runs (§2); a seat whose brief fact is refused does not
-run. It returns `VERDICT: PASS|FAIL <hash8>` and findings through
+store and `issue_review_brief` taken under the reviewer's generation before
+the session runs (§2); a seat whose brief is refused does not run, and the
+seat is still counted at `dispatch`. It returns `VERDICT: PASS|FAIL <hash8>` and findings through
 `extract_verdict` extended to require the hash prefix in artefact mode — a
 verdict that names another hash, or none, is `None`; nonce `{hash8}-g{gen}`
 for the worktree path, as `review.py:153` does with the sha today; worktree
@@ -745,9 +804,12 @@ a residual, stated: it costs one ignored message, never a wrong transition.
 `created_by` is `None` on every item and cannot distinguish the human from the
 runner. A user-role item is therefore human-authored iff nothing but the UI
 and the coordinator can POST into that session. The coordinator excludes its
-own by item id, and by hash only in the crash window. The model is excluded by the `v2_author_*` bundles' default-deny
-egress — `v2_implementer` allows only `GET api.github.com/repos/…/**`, and
-the env-boundary tests pin the bundle. Any other process on the docker network
+own by item id, and by hash only in the crash window. The model is excluded
+by the `v2_author_*` bundles' default-deny egress — `v2_implementer`'s
+`egress_rules` (`config.yaml:42-67`) are the muesli fetch endpoints on
+`github.com`, `GET api.github.com/repos/abedegno/muesli/**` and the model
+host, none of which is the omnigent server — and the env-boundary tests pin
+both bundles. Any other process on the docker network
 is a **deployment residual, listed as asserted** in the provenance table.
 Enabling omnigent accounts mode would make `created_by` observed; it is a
 deployment change outside this spec.
@@ -807,13 +869,18 @@ The precedent for a run id reused across runner passes is narrower than it
 looks, and it does not do what the sweep believes: `run-queue.sh:1936-1946`
 re-fences a *recorded* run id — one whose `record_run_outcome` has already
 been taken — but the re-fence supplies a generation, not a state.
-`merge_ready_pr` returns `0` on a deferral as on a merge (`:1603`), so
-`:4584` records `record_merge_outcome(merged)` for a PR that is still open
-and `:4617` ends the run; the sweep's merge effect then reaches
-`revalidate_merge`, which requires `merge_requested` and refuses `ended`
-(`effects.py:107`, `authz.py:469`). In shadow mode the refusal is recorded
-and the merge proceeds against a journal that already said `merged`; in
-enforce mode the sweep can never merge. That is a live v1 defect — a false
+`merge_ready_pr` returns `0` on a deferral as on a merge (`:1602`), so
+`:4585-4586` record `record_merge_outcome(merged)` for a PR that is still
+open — legal, because `_kernel_request_merge` at `:4582` has just put the
+run at `merge_requested` (`authz.py:44`) — and `:4617` ends the run; the
+sweep's merge effect then reaches `revalidate_merge`, which requires
+`merge_requested` and refuses `ended` (`effects.py:107`, `authz.py:469`).
+That refusal is raised directly, not through `shadow_or_raise`
+(`mode.py:49-67`), so shadow mode records nothing for it; and `_effect` in
+kernel mode is the execution path, not an advisory one
+(`effect-adapter.sh:82`; `cli.py:246` turns `NotAuthorized` into
+`RC_REFUSED`), so in either mode the sweep can never merge, against a
+journal that already says `merged` then `ended`. That is a live v1 defect — a false
 `merged` fact on every transient deferral — that belongs in its own bircher
 issue and is out of scope here. Resumption re-fences an open run whose
 outcome has not been taken, and what it borrows from the sweep is only
@@ -906,14 +973,14 @@ the code gate. The mutation sweep is the first follow-up once this is live.
 | Reviewer's verdict line names a different `hash8` | as no verdict: the artefact-mode verdict must echo the hash it graded (§3 Review round); a mismatch parks `no_verdict` and is in the log. The review nonce today identifies the worktree, not the verdict |
 | Review bound exhausted (`max_rounds` in this phase and epoch) | park `bound_exhausted` carrying the final findings hash, verdict and reviewer. `retry` from the human = `grant_round` |
 | Seat budget exhausted (`max_seats`) | the kernel refuses the dispatch; park `budget_exhausted`. `retry` = `grant_round`, which raises both |
-| Author produced neither artefact nor questions | one retry with a fresh session (an attempt nonce joins the key, one seat each), then `RC_FAILED` |
+| Author produced neither artefact nor questions | the coordinator records `author_empty` (§2) and retries once with a fresh session whose `sess-create` cause is that fact — a distinct obligation, so the retry is not read as satisfied by the session that produced nothing (§3 Sessions are effects); one seat each. A second `author_empty` in the phase and epoch is refused by the kernel and the loop exits `RC_FAILED` |
 | `submit_*` refused as identical to a prior artefact in this phase and epoch | treated as a FAIL with findings "identical to the prior artefact"; one re-author, then park `identical_resubmission` |
 | `submit_plan` refused for shape (no `### Task` heading) | as identical: findings "plan has no tasks"; one re-author, then park `identical_resubmission` |
 | Crash after a review verdict was obtained, before `record_review` / `park` | nothing in the journal says a review happened; the next pass reviews again. Bounded by `max_seats`, which counts the lost seat because dispatch was journaled |
 | Crash after a `SESSION_CONTROL` effect was journaled, before its result | reconciliation as for every effect: the next pass sees the pending effect and halts the run for `_kernel_reconcile`, exactly as the runner does today. Halted, the run refuses everything but `cancel_run` — `park` included — so the runner skips it until the `effect_reconciled` fact exists (§5), then resumes under a fresh generation and reads the fact's typed result (the two rows below) to decide whether the effect is still owed — the fresh generation is what lets a `not_delivered` prompt be re-sent (§3). Reconciliation is a human touch: `effect_reconciled` and the halt both count against the claim (§1) |
-| Crash after a prompt was confirmed, before `prompt_item` / `parked` was recorded | the intent is satisfied and its follow-up is missing (§3 Sessions are effects): the next pass lists the session, finds the item by hash, records `prompt_item` and, for a gate or stall prompt, `parked`. Nothing is re-sent; a second identical prompt would wake the author a second time |
+| Crash after a prompt was confirmed, before `prompt_item` / `parked` was recorded | the obligation is satisfied and its follow-up is missing (§3 Sessions are effects): the next pass lists the session, finds the item by hash, records `prompt_item`, and discriminates the listing like any other (§4) — for a gate or stall prompt it records `parked` only if the listing holds no human message after the prompt; a message there is taken under the batch rules and no park is written. Nothing is re-sent; a second identical prompt would wake the author a second time |
 | Effect reconciled `delivered` | the obligation is satisfied; for a `sess-create` the delivered id is the session the next pass adopts. Nothing is re-sent |
-| Effect reconciled `not_delivered` | the obligation is owed again and the next pass performs it under the fresh generation's key. A reconciliation with neither result is refused by `_kernel_reconcile` |
+| Effect reconciled `not_delivered` | the obligation is owed again and the next pass performs it under the fresh generation's key. Results are per key: a `_kernel_reconcile` call that leaves a pending key of the run unnamed, or names one with neither result, is refused and reconciles nothing |
 | Session creation fails | `RC_FAILED`; `run_item` records `failed` as today |
 | Kernel refusal the loop did not expect | `RC_FAILED` with the refusal reason logged; never retried blind. The transient-refusal design's classes decide what is retryable |
 | `create_run` replayed with differing inputs | `NotReplayable`; `run_item` treats it as `failed` and the log names both input hashes. Never a silent second policy |
@@ -955,6 +1022,19 @@ refused:
 - `park` current-ness: a `parked` fact older than the latest transition, or
   than the latest human fact, is not current; a refused `approve` leaves it
   current.
+- `issue_review_brief` from an `author` generation refused, from a
+  `reviewer` generation at `spec_accepted` refused, a second under the same
+  generation refused; with `context_bundle_hash` one byte off the current
+  epoch's refused, and after `revise_bundle` the old epoch's hash refused
+  and the new accepted; a plan brief without `spec_hash`, or with the prior
+  spec's, refused; `brief_hash` of bytes never PUT refused. Then the
+  ruling: a `review_ruling` under a generation with no brief refused; with
+  a brief whose `artifact_hash` (and each other field in turn) differs
+  refused; the same ruling with a matching brief accepted; a `human_ruling`
+  with no brief accepted. Each with the guard deleted, as above.
+- `record_author_empty` naming a session no `sess-create` of that actor
+  delivered refused; a second in the phase and epoch refused; after a
+  transition, accepted again.
 
 Mutation discipline as before: commit before each mutation, a mutation that
 did not apply is not a result.
@@ -993,7 +1073,14 @@ merged run holds no `human_answer`, `human_ruling`, `parked` or
 absent from the journal); holds at least
 one `model_ruling`; holds `artifact_submitted` for spec and plan with
 different hashes; every `sess-create` intent for an `author` generation
-names the bundle of that generation's actor (§3 Author round); the issue is
+names the bundle of that generation's actor (§3 Author round); every
+`review_ruling` has a `review_brief_issued` under its generation, the
+brief that fact names is in the store, the hashes embedded in its rendered
+bytes are the fact's, and the ruling's `artifact_hash` and `hash8` are the
+brief's (§2) — the one place the proof opens what a reviewer was given; no
+two `sess-create` obligations of the run are equal, and every confirmed
+`sess-create` names a session the loop went on to prompt (§3, the two ways
+a session obligation goes wrong); the issue is
 in the pre-registered list and its body names no file, function or
 acceptance test. And, observed from the sessions rather than the journal:
 every author session named by a `sess-create` effect of the run is listed,
@@ -1004,8 +1091,16 @@ type into the run without parking it.
 **Runner.** Self-tests for the sidecar as projection (missing → rebuilt,
 disagreeing → overwritten), the `parked` row, the resume path's generation
 re-fence, resume refused without the flock, `_kernel_find_run` skipping an
-`ended` run, and that `run_item` no longer calls `_kernel_submit_spec` with
-the prompt.
+`ended` run, that `run_item` no longer calls `_kernel_submit_spec` with
+the prompt, and the §6 seam in order: with a fake `phases` that dispatches a
+reviewer and exits `0`, `start_implementation` is taken under a generation
+the runner dispatched as `implementer` *after* `phases` returned, the state
+read back is `implementing`, and `_create_session` is called after that
+read — asserted by the call log — while a `phases` that exits `0` with the
+run still at `plan_submitted` has its `start_implementation` refused and
+reaches `RC_FAILED` with no session created.
+`_kernel_reconcile` refused with a pending key unnamed, and with a key
+given both results.
 
 **Live, in order.**
 1. `abedegno/bircher-smoke` under `(human, {spec})`: the human is grilled in
@@ -1043,10 +1138,14 @@ New authorization inputs and how the kernel comes by them:
 ## §10 Where it lands
 
 - `v2/kernel/authz.py` — four states, the command and refusal tables,
-  `grant_round`, `park`, `revise_bundle`; `validate_review` split into
+  `grant_round`, `park`, `revise_bundle`, `issue_review_brief`,
+  `record_author_empty`; `validate_review` split into
   binding and dispatch checks, the dispatch checks comparing against
   `review_brief_issued` and kernel-held values rather than parsing and
-  discarding (`:133-143`). `v2/kernel/policy.py` (new) —
+  discarding (`:133-143`). `v2/kernel/effects.py` — `reconcile` and
+  `reconcile_many` take a per-key typed result; the `obligation` object
+  beside `argv` in the stored intent and the satisfied-query over it.
+  `v2/kernel/policy.py` (new) —
   derivation from labels and Project config, the `policy_frozen` fact, the
   epoch- and phase-scoped counters. `v2/kernel/grill.py` — many-question
   answers, `model_ruling`. `v2/kernel/enqueue.py` — `create_run(run_id,
