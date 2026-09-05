@@ -27,7 +27,7 @@ immutable facts, the human path reachable only from the operator's side),
 `bundle.py` (the frozen issue snapshot) and `enqueue.py` (the single
 transaction). None of it has a production caller. Two rules block using it:
 `record_review` is legal only from `{implementing, reviewing}`
-(`v2/kernel/authz.py:37`), and `request_revision` always lands in `planned`
+(`v2/kernel/authz.py:39`), and `request_revision` always lands in `planned`
 (`authz.py:78`). The runner walks through `specified` and `planned` by
 submitting the queue prompt as both spec and plan (`batch/run-queue.sh:4083`).
 
@@ -52,9 +52,15 @@ observable, or it is not a claim:
   body names no file, no function and no acceptance test. That is a reading,
   recorded ahead of time so it cannot be chosen after the fact.
 - *zero human touches*: the run's journal holds no `human_answer`, no fact
-  of decision type `human_ruling` and no `parked` fact. Every human path — the session, the
-  CLI fallback, a retry after a lost verdict — writes one of those, so a
-  touch that left no fact is a defect in this design, not a clean run.
+  of decision type `human_ruling`, no `parked` fact, no `effect_reconciled`
+  fact and no `reconciliation_required` halt. Every human path — the
+  session, the CLI fallback, a retry after a lost verdict, and the
+  reconciliation of an uncertain effect, which `effects.reconcile` records
+  with `actor="human"` because that is what it is — writes one of those, so
+  a touch that left no fact is a defect in this design, not a clean run. The
+  last two are the ones the first draft forgot: a run that halted on an
+  uncertain session prompt, was reconciled in the morning and then merged
+  satisfied every other assertion and still needed a person.
 - *merged*: the PR's merge is recorded under this run id, not a re-enqueue.
 - and the journal holds at least one `model_ruling`: an author that found
   nothing to decide on a vague issue did not grill it. This is a proof
@@ -210,8 +216,13 @@ under that rule and is refused before the transition table is consulted. So:
 Every consumer of `review_verdict` names the phase it reads. Today they all
 assume implementation — `recover.py` takes `verdicts[-1]` as the latest code
 review; `observe.revisions_used` counts every `request_revision` on the run;
-`kernel/projection.py` collects every verdict into one list; `kernel-client.sh`'s
-`_kernel_verdict` reads the same facts for the runner (§10 lists them). Left
+`kernel/projection.py` collects every verdict into one list; the runner reads
+them through `coordinator.cli revisions`, whose `used|left|confirmed` tuple
+`_revision_is_recorded` (`run-queue.sh:2698`) checks before any repair is
+dispatched — that tuple comes from `observe.revisions_used`, so it is the
+same read. `kernel-client.sh`'s `_kernel_verdict` (`:557`) reads no facts: it
+is the string mapping from coordinator to kernel vocabulary, and the first
+draft listed it as a consumer by mistake (§10 has the corrected list). Left
 alone, two spec revisions would cost the implementation two
 of its repair rounds, and a recovery run before any code review would act on
 the plan's acceptance as if it were the code's. Each consumer filters on
@@ -283,13 +294,45 @@ observe the refusal; it may not pre-empt it.
 `grant_round` and the human form of
 `record_review` are operator-side entry points in the sense `grill.py` already
 establishes: a model session cannot reach the function, and there is no
-parameter it can pass to become the human.
+parameter it can pass to become the human. `grill.py` appends its facts to
+the store directly, which is enough for a fact with no transition; the ones
+above that move the run (`approve_artifact`, the human `record_review`) and
+the ones that change a bound (`grant_round`) must go through `execute`, so
+the transition table, the version CAS and the halt gate apply to them. That
+needs one thing `execute` does not have today: it reads the actor from the
+generation's dispatch record (`commands.py:119`), and a human has no
+dispatch. So `execute` gains a second entry, `execute_as_human(cmd)`, that
+fixes the actor to `human` and skips the generation fence — its concurrency
+control is `expected_version`, so two operators racing get one acceptance
+and one `StaleVersion` — and is reachable only from the operator-side
+functions. The recorded fact carries `actor="human"` and, for a verdict,
+`reviewer_identity="human"`.
+
+Which checks a human verdict passes is then a decision the code makes today
+and this design must make explicitly. `validate_review` (`authz.py:150`)
+binds the verdict to the current artefact and to observed `base_sha`,
+requires the generation to have been dispatched as `reviewer`
+(`authz.py:209`) and refuses a conflicted actor. Applied whole, it refuses
+every human verdict — there is no reviewer dispatch to satisfy; exempted
+whole, the most powerful verdict class in the system binds nothing. It
+splits: the **binding** checks — the verdict word is legal, `phase` is the
+phase of the current state, `artifact_hash` is that phase's current artefact
+in the current epoch — apply to every verdict, human or model, and a human
+correction that names a superseded hash is refused and told so in the session
+(§4). The **dispatch** checks — role, independence, `base_sha`,
+`context_bundle_hash`, `policy_version` — apply to `review_ruling` only:
+they bind a model's attempt to what the kernel handed it, and a human
+correction typed against the artefact on the screen has no such attempt to
+bind. A human `record_review` therefore carries `{phase, artifact_hash,
+verdict: request_revision, findings}` and nothing else.
 
 ### Grill facts
 
 `grill.py` changes from one answer per question to one answer per human
-message: `human_answer` carries `{epoch, question_ids: [...], answer: text}`,
-referencing every question open in the epoch when the message arrived. The
+message: `human_answer` carries `{epoch, question_ids: [...], answer: text,
+cursor_item_id}`, referencing every question open in the epoch when the
+message arrived and the newest session item in the listing it was read from
+(§4, the cursor). The
 `submit_spec` guard counts facts, not text, in the current epoch only.
 `model_question` under `grill=model` is still recorded — with the model's own
 ruling appended as `model_ruling {question_id, ruling, reasoning,
@@ -314,12 +357,21 @@ publishes each approved artefact as a comment. As written, the first park would 
 into a "relevant change" made by bircher itself, and the run would reset to
 `queued` on every pass, publishing another comment each time. So the snapshot
 canon goes to version 2, excluding labels with the `bircher:` prefix and
-comments the runner's `is_bircher_status` predicate already drops
-(`run-queue.sh:2949`, `bircher: …`, `bircher-status:`, and the two legacy
-prefixes). The predicate moves into `bundle.py` as the single definition; the
-bash copy stays for the digest and both are tested against one fixture file
-of bircher-authored comments, so neither can drift from the other unseen. The
-published artefact comment starts with a `bircher:` line for the same reason.
+comments the runner's `is_bircher_status` predicate drops. That predicate
+(`run-queue.sh:2949`) matches four exact prefixes — `bircher: outcome=`,
+`bircher-status:` and the two legacy sentences — and **not** the generic
+`bircher: `, deliberately: it is a prefix match so that a human discussing a
+marker still gets through (`:2933`). It therefore does not drop the
+published-artefact comment this design adds, and the first draft's claim
+that it "already" did was wrong; taken literally, the first park after an
+acceptance would resume into bircher's own publication, reset the run to
+`queued` and discard the artefact whose publication caused the reset. So the
+predicate gains a fifth exact prefix, `bircher: published `, in both copies —
+not `bircher: `, which would silence the human as well. The predicate moves
+into `bundle.py` as the single definition; the bash copy stays for the
+digest and both are tested against one fixture file of bircher-authored
+comments, so neither can drift from the other unseen. The published artefact
+comment starts with that exact line for the same reason.
 The test that binds this: every mutation bircher makes to an issue — the label
 flip, the outcome comment, the publication — applied to a fetched issue,
 leaves `is_relevant_change` false.
@@ -398,7 +450,21 @@ one session once per human turn, and under a key of session and hash the
 second send is a replay that posts nothing — the author never wakes. A crash
 after the effect is journaled and before the sidecar is written is then a
 reconciliation the journal already names, not an orphan session that a resume
-duplicates. Reviewer sessions stay on `omnigent run` as `review.py` does
+duplicates. The generation does a second job there: a reconciled key is
+*spent* — `perform` raises `NotReplayable` on it (`effects.py:201`), because
+the recorded outcome describes the attempt that was reconciled and not the
+next one — so a prompt reconciled as "not delivered" can only be re-sent
+under a key that has moved. Here it always has: reconciliation halts the run,
+a halted run refuses every command but `cancel_run` (`commands.py:165`), the
+coordinator exits on the halt, and the pass that resumes it fences a fresh
+generation (§5) before it sends anything. The coordinator never retries an
+effect inside the generation that journaled it; an implementer who adds such
+a retry gets `NotReplayable` on the first reconciled prompt, and that is the
+kernel being right. (The runner's own `sess-prompt:<session>:<hash16>` has
+no generation and carries this defect latently — a reconciled prompt whose
+text recurs is unsendable — masked today because the repair loop varies its
+prompt text per round. Out of scope here; noted so it is not rediscovered.)
+Reviewer sessions stay on `omnigent run` as `review.py` does
 today: a reviewer has no push and no human in its session, so a lost reviewer
 session costs one seat and never correctness — stated as a cost residual, and
 the seat is still counted at `dispatch`.
@@ -494,19 +560,30 @@ the `human_ruling` that consumes the park. At `no_verdict` that grant is
 slack the human chose to fund; the alternative — a retry that writes no fact
 — would leave the park current and the loop asking again.
 
-**The cursor is the coordinator's own prompt.** Every prompt the coordinator
-sends is a `SESSION_CONTROL` effect (§3); after the POST is accepted the
-coordinator lists the session's items, finds the user-role item whose content
-hash matches the prompt it just sent, and records `prompt_item {session_id,
-item_id, sha256}`. The cursor is the latest `prompt_item` for the session;
-the `parked` fact's `cursor_item_id` repeats it for the reader's convenience
-and the journal wins if they differ. On the next pass the coordinator lists
-items after the cursor and takes, in order,
+**The cursor is the newest item the coordinator has listed — never one it
+wrote afterwards.** Every prompt the coordinator sends is a
+`SESSION_CONTROL` effect (§3); after the POST is accepted the coordinator
+lists the session's items, finds the user-role item whose content hash
+matches the prompt it just sent, and records `prompt_item {session_id,
+item_id, sha256}`. That fact is the *exclusion list*, not the cursor. The
+first draft made it the cursor, and that loses a message: the pass that reads
+answer H1 records it, re-prompts the author, and records the re-prompt P2 —
+and a second answer H2 the human sent between the list and the re-prompt now
+sits *before* the cursor, unread forever, while the author resumes on H1
+alone. So the cursor is `cursor_item_id`, carried on every fact the
+coordinator records from a listing — `human_answer`, `human_ruling`,
+`record_human_direction`, `parked` — and set to the newest item id *in that
+listing*, whatever its role. The cursor is the `cursor_item_id` of the
+run's latest fact that carries one; the session's first item if none does.
+On the next pass the coordinator lists items after it and takes, in order,
 **every user-role item that is not one of its own prompts** — excluded by
 item id where a `prompt_item` fact exists, by content hash where the crash
 window left an effect journaled but no `prompt_item` (the hash is in the
-effect's intent). The discriminator reads the journal, not the memory of the
-process that parked.
+effect's intent). In the sequence above the next pass lists after H1, finds
+H2 and P2, drops P2 by id and reads H2. A pass that lists nothing human
+records nothing and does not move the cursor; re-listing the same handful of
+its own prompts is the price of never leapfrogging a person. The
+discriminator reads the journal, not the memory of the process that parked.
 
 - **grill:** the batch of human messages becomes one `human_answer {epoch,
   question_ids, answer}` fact, `answer` the messages concatenated in order,
@@ -537,7 +614,9 @@ process that parked.
   --text <file>`. The same commands, from the operator's shell.
 
 A message the human sends **between** the coordinator's list and its record
-is not lost: it is after the cursor and is read on the next pass. A human
+— or between its record and its re-prompt — is not lost: the cursor is the
+listing, so the message is after it whatever the coordinator posted since,
+and it is read on the next pass. A human
 answer to a question the author has since superseded is still recorded
 against the ids that were open when it was read; the author sees it as part
 of the answer text and rules on it. A human message whose text is
@@ -575,7 +654,16 @@ for the open run carrying this item code — `_kernel_find_run`
 regardless of state; it gains an `open` filter (not `ended`, not `cancelled`)
 — which is the truth; the sidecar is a hint that is rebuilt from the answer
 when missing and overwritten when it disagrees. It exports `BIRCHER_RUN_ID`,
-re-fences through `_kernel_dispatch` for a fresh generation, re-snapshots the
+re-fences through `_kernel_dispatch` for a fresh generation **in the
+`operator` role, actor `runner`** — `_kernel_dispatch` takes both
+(`kernel-client.sh:323`), and the role decides whether the fence is a seat:
+§1 counts `author` and `reviewer` dispatches, so a resumption fence, like the
+first pass's fence, is free, and a pass that reads the park and exits having
+done nothing spends nothing. Dispatched as `author` it would spend a seat per
+pass and the run's own scheduler could exhaust the bound it is waiting out.
+A run that is halted for reconciliation is not resumed: the runner sees
+`reconciliation_required` before fencing, logs it and moves on, until the
+human has reconciled (§7). The resumed pass re-snapshots the
 issue, submits `revise_bundle` if the change is relevant, and calls `phases`,
 which re-enters at the loop's `parked` branch (§3) and from there at §4. The
 runner's flock singleton (`run-queue.sh:8543`) is what keeps two passes from
@@ -615,6 +703,12 @@ as today. Three changes at the seam:
 
 - The implementer's brief is the spec and the plan, read from the store by the
   hashes the kernel holds, plus the issue snapshot — not the queue prompt.
+  The two directives the runner prepends today (`run-queue.sh:4028-4035`) —
+  the implementer-vendor directive and the work-repo directive that
+  overrides the bundle's literal `/workspaces/muesli` — are **still
+  prepended**: they are per-run deployment facts, not artefacts, and a brief
+  without them sends the implementer to the repository written in the
+  bundle.
 - The two ceremonial submits at `run-queue.sh:4083-4084` are deleted, and the
   "deliberate reuse" comment in `kernel-client.sh`'s `submit_plan` wrapper
   with them. Under §2 they would be refused.
@@ -650,7 +744,7 @@ the code gate. The mutation sweep is the first follow-up once this is live.
 | `submit_*` refused as identical to a prior artefact in this phase and epoch | treated as a FAIL with findings "identical to the prior artefact"; one re-author, then park `identical_resubmission` |
 | `submit_plan` refused for shape (no `### Task` heading) | as identical: findings "plan has no tasks"; one re-author, then park `identical_resubmission` |
 | Crash after a review verdict was obtained, before `record_review` / `park` | nothing in the journal says a review happened; the next pass reviews again. Bounded by `max_seats`, which counts the lost seat because dispatch was journaled |
-| Crash after a `SESSION_CONTROL` effect was journaled, before its result | reconciliation as for every effect: the next pass sees the pending effect and halts the run for `_kernel_reconcile`, exactly as the runner does today |
+| Crash after a `SESSION_CONTROL` effect was journaled, before its result | reconciliation as for every effect: the next pass sees the pending effect and halts the run for `_kernel_reconcile`, exactly as the runner does today. Halted, the run refuses everything but `cancel_run` — `park` included — so the runner skips it until the `effect_reconciled` fact exists (§5), then resumes under a fresh generation, which is what lets the reconciled prompt be re-sent (§3). Reconciliation is a human touch: `effect_reconciled` and the halt both count against the claim (§1) |
 | Session creation fails | `RC_FAILED`; `run_item` records `failed` as today |
 | Kernel refusal the loop did not expect | `RC_FAILED` with the refusal reason logged; never retried blind. The transient-refusal design's classes decide what is retryable |
 | `create_run` replayed with differing inputs | `NotReplayable`; `run_item` treats it as `failed` and the log names both input hashes. Never a silent second policy |
@@ -715,7 +809,9 @@ named in §2 gets a test with a spec-phase FAIL followed by an implementation
 PASS, asserting the consumer reads the implementation one.
 
 **Proof assertions** for the done criterion (§ The claim): the journal of the
-merged run holds no `human_answer`, `human_ruling` or `parked`; holds at least
+merged run holds no `human_answer`, `human_ruling`, `parked` or
+`effect_reconciled` fact and was never halted (`reconciliation_required`
+absent from the journal); holds at least
 one `model_ruling`; holds `artifact_submitted` for spec and plan with
 different hashes; the issue is in the pre-registered list and its body names
 no file, function or acceptance test.
@@ -773,12 +869,15 @@ New authorization inputs and how the kernel comes by them:
   `schema.sql` — per-phase current artefact, `parked`, `prompt_item`, epoch.
   `v2/kernel/events.py` — the new fact types. `v2/kernel/dispatch.py` — the
   `author` role.
-- Every `review_verdict` consumer filters on phase. Today there are four
-  outside the tests: `v2/coordinator/recover.py:164` (`verdicts[-1]`),
-  `v2/coordinator/observe.py` (`revisions_used`), `v2/kernel/projection.py:46`
-  (`RunState.verdicts`, which gains a per-phase view), and
-  `batch/lib/kernel-client.sh` (`_kernel_verdict`, `:557`). `outcome.py` takes
-  its verdict from the live review call, not the journal, and is unchanged.
+- Every `review_verdict` consumer filters on phase. Today there are three
+  outside the tests: `v2/coordinator/recover.py:165-176` (`verdicts[-1]`),
+  `v2/coordinator/observe.py` (`revisions_used`, which the runner reads as
+  `coordinator.cli revisions` → `_revision_is_recorded`, `run-queue.sh:2698`,
+  before dispatching any repair), and `v2/kernel/projection.py:46`
+  (`RunState.verdicts`, which gains a per-phase view).
+  `batch/lib/kernel-client.sh`'s `_kernel_verdict` (`:557`) is a vocabulary
+  mapping and reads no facts; `outcome.py` takes its verdict from the live
+  review call, not the journal. Both are unchanged.
 - `v2/coordinator/phases.py` (new) — the loop, `publish_owed`. `author.py`
   (new) — author dispatch through `perform_effect(SESSION_CONTROL)` and the
   artefact/questions contract. `human.py` (new) — the session reader,
