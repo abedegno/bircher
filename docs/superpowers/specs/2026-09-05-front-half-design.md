@@ -1612,7 +1612,13 @@ New authorization inputs and how the kernel comes by them:
   `revise_bundle` as a command that PUTs the new snapshot's bytes. `v2/kernel/commands.py`
   — `submit_spec`/`submit_plan` record `artifact_submitted` with the phase
   and author; `record_review` takes and checks `phase`. `v2/kernel/store.py`,
-  `schema.sql` — per-phase current artefact, `parked`, `prompt_item`, epoch.
+  `schema.sql` — per-phase current artefact, `parked`, `prompt_item`, epoch;
+  and a read of an artefact's bytes by hash, which the store does not have —
+  today it can insert (`put_blob`, `:386`), delete (`:197`) and test for
+  (`has_artifact`, `:251`) a blob, and nothing reads one back, so every
+  "read from the store by the hash" in this document — the brief render, the
+  coordinator reading the brief, the executor materialising `body.artifact` —
+  is this one function.
   `v2/kernel/events.py` — the new fact types. `v2/kernel/dispatch.py` — the
   `author` role.
 - Every `review_verdict` consumer filters on phase. Today there are three
