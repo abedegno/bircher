@@ -500,9 +500,12 @@ loop:
                                  nothing from the human   → exit RC_PARKED
   queued | specified          → out ← author_round(phase)
                                  questions               → record them; park(grill)   # the park lists; a message there is an answer (§4)
-                                 artefact                → list the session; discriminate (§4)
-                                   human direction       → taken; nothing submitted; next iteration
+                                 artefact                → list the session; discriminate (§4); read the journal
+                                   human direction       → in the session, taken; or already recorded
+                                                            (`kernel direct`, §4): nothing submitted; next iteration
                                    else                  → submit(phase, put_artifact(artefact))
+                                                            refused for a newer `human_direction` (§2)
+                                                            → nothing submitted; next iteration
   spec_submitted | plan_submitted
                               → verdict, findings ← review_round(phase, hash)
                                  None                    → stall(no_verdict)
@@ -524,7 +527,11 @@ stall(reason, …):                                                          (§
 where `phase` is `spec` for `queued` and `spec_*`, `plan` for `specified` and
 `plan_*`. A run already at or beyond `planned` exits `0` at once. Any
 `author`/`reviewer` dispatch the kernel refuses for `max_seats` goes through
-`stall(budget_exhausted)`; a `submit_*` refused as identical or for shape
+`stall(budget_exhausted)`; a `submit_*` refused for a newer
+`human_direction` (§2 Refusals) is one typed at the operator's shell
+between the loop's journal read and its submit, and goes to the next
+iteration as a direction read from the session does — the loop expects
+these refusals and no other (§7); a `submit_*` refused as identical or for shape
 re-authors once — and when the refused bytes came from a session whose own
 `sess-create` cause is a `command_rejected` for the same command, that is
 the re-author resubmitting, and the loop goes to `stall(identical_resubmission)`
@@ -717,8 +724,18 @@ prompt from a lost one. Two changes:
   from another upload, another workspace or another host would pass —
   while the JSON create binds the request's `agent_id` verbatim
   (`orchestration.py:7179-7240`, `_create_session_from_existing_agent`),
-  so a session carrying the `agent_id` this create asked for is the one
-  this create made, or none. A session the server
+  so a session carrying this create's `agent_id`, `host_id` and
+  `workspace` is the one this create made, or none — three fields, each
+  identifying a different thing: the `agent_id` names the upload, which
+  every session this invocation creates under the vendor shares (the
+  runner uploads a bundle once, §3 Author round); the `host_id` the host;
+  and the `workspace` the session, since each has a worktree of its own
+  (§3 Author round). And the `workspace` is compared as the server stores
+  it: `_validate_session_workspace` returns the host's realpath, symlinks
+  resolved (`helpers.py:4191-4236`, called at `orchestration.py:7494-7501`,
+  stored at `:7593`), so the coordinator names the worktree in the create
+  body by its realpath, and a body that named it through a symlink (`/tmp`
+  on macOS, a bind mount) would refuse the session it made. A session the server
   does not list is caught there, at the typing, and the `RC_FAILED` of the
   typed-reconciliation bullet is left for one that disappears after.
   **Recorded, not validated.** `_executor` stores whatever a zero exit
@@ -727,9 +744,9 @@ prompt from a lost one. Two changes:
   body, exit zero, and be confirmed with the server's error JSON as its
   `external_object_id` — a satisfied create no guard can read, and no
   later pass can make the session again (the key is spent, the obligation
-  reads satisfied). Two things close that. The contract requires `-f` or
-  `-sf` on every `SESSION_CONTROL` argv (*The contract names endpoints*,
-  §3 Review round), so an HTTP failure is a non-zero exit, `uncertain`,
+  reads satisfied). Two things close that. The contract requires one of
+  `-f`, `-sf`, `-sSf` on every `SESSION_CONTROL` argv (*The contract names
+  endpoints*, §3 Review round), so an HTTP failure is a non-zero exit, `uncertain`,
   and a halt (§7, *Session creation fails*); every routed site already
   passes `-sf` (`run-queue.sh:1064`, `:1088`, `:1100`, `:1114`). And for
   an intent whose `obligation` is a `sess-create`, `_executor` parses the
@@ -741,9 +758,12 @@ prompt from a lost one. Two changes:
   **What the server says can change.** `POST
   /v1/sessions/{id}/switch-agent` rebinds an idle session to another
   built-in agent, keeping its transcript and workspace
-  (`routes_core.py:2187-2330`): it deletes the session-scoped agent row
-  and clones the target under a fresh id, so after a switch the session's
-  `agent_id` differs from the snapshot's and never returns to it. The
+  (`routes_core.py:2187-2410`; a 409 while the session is `running`,
+  `:2255`): it deletes the session-scoped agent row and clones the target
+  under a fresh id (`generate_agent_id()`, `:2346`) and a fresh name
+  (`"<target> (switch <id[:10]>)"`, `:2347`), so after a switch the
+  session's `agent_id` differs from the snapshot's and never returns to
+  it. The
   snapshot is the binding at the create; the binding at the turn is what
   the artefact's author is. So at every settle the coordinator's read of
   the session (`session.py:71`, the `GET` it already makes for status)
@@ -759,9 +779,13 @@ prompt from a lost one. Two changes:
   store, and the intent names it beside `argv` as `body.artifact`, its hash
   (*The body never rides argv*, §3 Review round); the crash-window
   exclusion reads `body.artifact` (§4) — `argv` being the list of tokens
-  the kernel contract-checked (`cli.py:106`), so nothing in it is addressed
-  as a field; the create body stays inline in `-d` because it is a few
-  hundred bytes of fixed shape. For a session, the fact that
+  the kernel contract-checked (`cli.py:106`), in which one value is read
+  as data and nothing else is addressed as a field: the create body stays
+  inline in `-d` because it is a few hundred bytes of fixed shape, and the
+  executor's stdout check and `reconcile`'s field check (above) both take
+  it from the journaled `argv` by the contract's own valued-flag parse
+  (`contract.py:176-185`; `-d` is valued), one parser, so the body that
+  was checked is the body that is compared. For a session, the fact that
   called for it: `run_created` for the spec phase's first author session in
   the first epoch — in every later epoch, the `bundle_revised` that opened
   it, since that round is briefed with the diff — and, for the plan phase's
@@ -902,6 +926,13 @@ timeout in §7. It is briefed **from files**, never from a pasted history:
 
 - the frozen issue snapshot;
 - the policy (so the author knows whether it may ask);
+- for the plan: the run's current spec — the bytes at the hash `specified`
+  was reached with, read from the store by that hash (§10, the one read) —
+  the same bytes the plan's reviewer is briefed with (§2, `spec_hash`) and
+  the implementer later (§6). Nothing else carries them: an author session
+  starts in a worktree of its own at the base sha (below), the spec is in
+  no repository until the back half lands it, and a plan authored without
+  its spec would be reviewed against a document its author never read;
 - on a revision: the current artefact and the verbatim findings, via the same
   atomic findings file the repair loop uses;
 - the phase's instructions: for the spec, grilling and the brainstorming
@@ -916,7 +947,20 @@ runner and the sessions share (`/workspaces` in `omnigent-runner-bircher`,
 the same mount the runner's `WORKDIR` lives on) and passes it as the
 create's `workspace` — v1's implementer makes its own from inside the
 prompt (`run-queue.sh:4032`), which is a worktree the coordinator would
-have to discover rather than name. `POST /v1/sessions` carries no
+have to discover rather than name. It names it by its realpath: the
+server stores a host-spawned session's `workspace` canonicalised — the
+host's realpath, symlinks resolved (§3 *Obligations*) — and `reconcile`
+compares that against the create body, so a path through a symlink would
+refuse the very session it made. A pass that adopts a session it did not
+create (§7, the crash rows) reads the worktree back from the adopted
+create's snapshot, the `workspace` of its `external_object_id`, equal to
+the body's for the same reason, and computes the file paths from that;
+nothing in memory survives to hand them over. Nothing here removes a
+worktree: a stopped or displaced session may still be writing in its own
+(§3 Review round), so removal is not this loop's, and they accumulate
+under `/workspaces`, one checkout per session, until the operator prunes
+them (Out of scope) — a cost stated, not a correctness residual, since no
+later turn reads one. `POST /v1/sessions` carries no
 environment, so `$BIRCHER_ARTIFACT_OUT`, `$BIRCHER_QUESTIONS_OUT` and
 `$BIRCHER_REVIEW_OUT` are names for a convention, not variables the
 session receives: fixed paths relative to the worktree root, stated in the
@@ -1009,15 +1053,32 @@ rebinds a session to another agent (§3 *Obligations*); `POST
 is `{POST, DELETE}`, and `DELETE /v1/sessions` — the collection — is not.
 It becomes three rules, each anchored and each naming one method: `POST`
 to `r"/v1/sessions$"` (the create), `POST` to
-`r"/v1/sessions/[^/]+/events$"` (the prompt and the stop, one endpoint
-with two bodies) and `DELETE` to `r"/v1/sessions/[^/]+$"` (the runner's
+`r"/v1/sessions/[^/]+/events$"` (the prompt and the stop — one endpoint
+that serves every event type, `routes_events.py:429-1069`: messages,
+interrupts, stops, approvals, compaction, external status and model
+changes; the anchor bounds the path, the contract reads no body, and
+what a routed caller posts there is its own — `message` and
+`stop_session` from the sites below, the kernel's own envelope around a
+`body.artifact` — a residual stated, not a check the contract makes) and
+`DELETE` to `r"/v1/sessions/[^/]+$"` (the runner's
 `_prune_session`, `run-queue.sh:1114`). Every routed site already sends
 one of the three (`:1064`, `:1088`, `:1100`, `:1114`); nothing else on
 the server is a shape the kernel will run, and a caller that wants one
-is a caller with a bug. The rules also require `-f` or `-sf` — curl exits
+is a caller with a bug. The rules also require one of `-f`, `-sf`,
+`-sSf` — a closed set of tokens, because the contract reads a token as
+one flag (`contract.py:176-185`: `-fs`, `--fail` and every other spelling
+are unlisted flags, refused as such), and `Rule` gains the field that
+says "one of these must appear" (§10), a fifth check inside the same
+rule, since `check()` returns on the first rule all of whose allowlists
+match (`:206-270`) and a fourth rule could require nothing — curl exits
 zero on an HTTP error without it, and the executor reads a zero exit as a
 confirmation (§3 *Obligations*, *Recorded, not validated*); every routed
-site already passes `-sf`.
+site already passes `-sf`, and the argv the coordinator builds
+(`author.py`, `review.py`, `phases.py`, through `perform_effect`,
+`v2/coordinator/effects.py:50`) carries `-sSf`: under `-s` a failing curl
+prints nothing, so the halt evidence the executor keeps (`stderr[:200]`,
+`cli.py:96-104`) would read `rc=22:` and stop, and `-S` puts curl's
+status line back.
 
 An intent whose `body.artifact` the store does not hold is
 refused before `journal_intent`. The runner's own `_send_prompt`
@@ -1044,8 +1105,10 @@ start**, which is how the back half's implementer wait applies it (`start`
 at `:4115`, the loop at `:4120`); the runner hands the constant to the
 coordinator as `phases --turn-timeout "$ITEM_TIMEOUT"` (§6) — an
 argument, required, a positive integer or a usage error before any
-effect: `:45` is a shell variable the runner never exports, so an
-environment default would read as a silently infinite cap on any
+effect: `:45` is `${ITEM_TIMEOUT:-5400}`, a shell variable the runner does
+not export — it is in `phases`' environment only when the operator's
+already carried one — so an environment default would read as a silently
+infinite cap on any
 invocation that forgot to pass it. An earlier draft said "the item's
 remaining `ITEM_TIMEOUT`", and there is no such clock: that wait begins
 after `phases` has returned, so the front half has no item-level window to
@@ -1063,7 +1126,14 @@ effect naming the awaited session (`schema.sql:68`; written at
 `journal_intent`, `store.py:308-317`, before the POST, and never touched
 by `mark_effect`, `:319-332`) plus the cap; every pass computes what
 remains from that row and waits for that, and a pass that finds nothing
-remaining records the fact the ended turn earns without waiting at all. A
+remaining reads before it records: a session settled, or dead, with the
+file present is a finished turn whatever the clock says — a turn that
+finished during a long halt is not discarded to hand the retry a second
+`author_empty` and the run `RC_FAILED` (§7) — and only settled or dead
+with no file is the ended turn, recorded without waiting at all; a
+session still running past the deadline with the file present is given
+one settle streak more (`needed` polls, `session.py:140`), since the
+contract ends the turn at the write, and is the ended turn after that. A
 prompt reconciled `delivered` keeps the row it was intended under, so its
 deadline is the intent's — earlier than the truth by the length of the
 halt; the cap errs towards stopping, never towards a turn that outlives
@@ -1082,11 +1152,19 @@ owed on the next pass like every obligation. The stop is a `stop_session`
 event (`:1099`), which ends the live turn without deleting the
 conversation and leaves the session listed and re-promptable
 (`routes_events.py:300-307`). It is a 503 when the session's bound
-runner cannot be reached or does not kill the process (`:612-618`,
+runner cannot be reached or answers non-2xx (`:593-675`,
 `routes/_sessions/helpers.py:5178-5248`), so an executor failure halts
-the run rather than pretends; with no runner bound at all it is a 2xx
-no-op — `_stop_session_via_runner_impl` returns `False` and the route
-answers `{"queued": false}` (`helpers.py:5196`, `routes_events.py:618`)
+the run rather than pretends; what a reachable runner does with it is
+the harness's: for `claude-sdk` and `codex` the runner's `stop_session`
+is `_cancel_inprocess_turn` and a 204 (`runner/app.py:6250-6256`), which
+returns at once when no turn is active (`:4840-4843`) and otherwise
+forwards an interrupt best-effort (`:4852-4859`) — `claude-native` is the
+only harness with a runner-side hard stop (`tool_dispatch.py:7024-7025`)
+— so "does not kill the process" is nothing the server reports, and a
+stop on a session whose turn has ended, by finishing or by dying, is a
+2xx the kernel confirms; with no runner bound at all it is a 2xx no-op
+too — `_stop_session_via_runner_impl` returns `False` and the route
+answers `{"queued": false}` (`helpers.py:5222-5223`, `routes_events.py:675`)
 — a session running nowhere, which is what the stop wanted, and the
 kernel confirms it. Ours are host-spawned — the create names a `host_id`
 — so a stop also tears down the session's dedicated runner (`:632-650`),
@@ -1094,6 +1172,8 @@ best-effort: a host that is offline or does not answer is logged, not
 raised, and the next prompt relaunches the session the way a cold start
 does (`run-queue.sh:1069-1073`). **What the stop guarantees, exactly.**
 Not that the process died: a runner that answered 503 halts the run; a
+runner that answered 204 interrupted a turn best-effort, or had none to
+interrupt; a
 runner that vanished between the server's routing table and the host is
 the case the server cannot see; and the best-effort teardown is a listed
 residual (§9). Correctness never rests on it. Each session has a worktree
@@ -1121,8 +1201,13 @@ create had confirmed. The loop derives, for every satisfied coordinator
 `sess-create` with no satisfied `sess-prompt` naming its session and no
 satisfied `sess-stop` naming it, whose obligation the pass does not
 itself derive, a stop whose cause is the cause of the session obligation
-that displaced it — the phase's currently derived one: the
-`bundle_revised`, the `human_direction`, the `human_ruling`. The filter
+that displaced it — the phase's currently derived one, when the pass
+derives one: the `bundle_revised`, the `human_direction`, the
+`human_ruling` — and, on a pass that derives none (`planned` reached by a
+human approval while a plan reviewer's create stood unprompted; a run
+halted, then cancelled), the newest fact that put the run where it is:
+the approving `human_ruling`, the `cancelled`. One fact the journal holds
+either way, so every pass derives the same intent. The filter
 on `sess-stop` is what makes it one stop per session: a stop re-derived
 after a `not_delivered`, or after a second displacement, may carry a
 different cause, and intent equality would not recognise the first. A
@@ -1143,17 +1228,22 @@ before the state is read, before any listing, dispatch or prompt (§3
 loop): it derives every stop the journal owes and performs each, and a
 stop that fails halts the run as every effect does, so nothing later in
 the pass runs against a session that should have been stopped. Two rules
-derive them, both from facts. The cap: for every `parked {reason:
-no_verdict}` and every `author_empty` — the facts a capped turn earns,
-recorded before the stop (above) — whose session (the `author_empty`
-names it; the park's is the session of the newest satisfied reviewer
-`sess-prompt` of its phase and epoch older than the park) no satisfied
-`sess-stop` names and the server lists in a status `died()` does not
-name (`session.py:83-98`: `failed`, `error`, `cancelled`, or a task
-error code), a stop with that fact as cause — a session that died ended
-its own turn and gets no stop, which is what "when the cap and not the
-session's death ended the turn" (§7) means on a pass that was not there
-to see it. The orphan: the rule above. The pass that records the fact
+derive them, both from the journal and nothing else — no server is read.
+The cap: for every `parked {reason: no_verdict}` and every `author_empty`
+— the facts an ended turn earns, recorded before the stop (above) — whose
+session (the `author_empty` names it; the park's is the session of the
+newest satisfied reviewer `sess-prompt` of its phase and epoch older than
+the park) no satisfied `sess-stop` names, a stop with that fact as cause
+— whether the cap or the session's death ended the turn. An earlier
+draft exempted the dead: "the server lists it in a status `died()`
+names, so it ended its own turn and gets no stop". That put a server
+read inside a derivation — an unreachable server is `unknown` to
+`state()` (`session.py:63-80`), which `died()` does not name (`:83-98`),
+so the rule's answer changed with the network — for nothing the stop
+needed: on a session whose turn has ended it is a 2xx the kernel
+confirms (above), and it still releases the session's host-spawned
+runner (the teardown, above), which the exemption left running. The
+orphan: the rule above. The pass that records the fact
 performs its stop at once, and the next iteration finds it satisfied; a
 pass that dies between leaves it to the next. The §5 resume path calls
 `phases`, so it is covered by the same step; the §8 test's order — the
@@ -1366,7 +1456,9 @@ listing (§8), not by the loop.
 - **Fallback:** `kernel approve --run <id> --phase <spec|plan>`, `kernel
   grant-round --run <id>`, `kernel revise --run <id> --phase <spec|plan>
   --findings <file>` and `kernel direct --run <id> --phase <spec|plan>
-  --text <file>`; and `kernel cancel --run <id>`, which records `cancelled`
+  --text <file>` — legal while an author turn runs, the run being `queued`
+  throughout it: the turn's artefact is then not submitted and the
+  direction starts the next round (§3 loop, §7); and `kernel cancel --run <id>`, which records `cancelled`
   and retires the run's sessions (§5). The same commands, from the
   operator's shell.
 
@@ -1598,7 +1690,7 @@ the code gate. The mutation sweep is the first follow-up once this is live.
 | Review bound exhausted (`max_rounds` in this phase and epoch) | park `bound_exhausted` carrying the final findings hash, verdict and reviewer. `retry` from the human = `grant_round` |
 | Seat budget exhausted (`max_seats`) | the kernel refuses the dispatch; park `budget_exhausted`. `retry` = `grant_round`, which raises both. With no listable session to prompt, one park and `RC_PARKED` (§4) |
 | Plan brief larger than one argv string (128 KiB on Linux) | no case: the brief is a prompt body that the intent names by hash and the kernel writes to a file curl reads (`--data-binary @`); no executor puts it in an argv string (§3 Review round, *The body never rides argv*). The test that keeps it so is in §8 and runs the real executor |
-| Author produced neither artefact nor questions | only once the session has died or the cap has passed — settled with no file is a turn still running (§3 Author round) — the coordinator records `author_empty` (§2) under its author generation, naming the current author session — the newest an author generation of this phase and epoch created; after a crash the finding generation is not the creating one (§2 Refusals) — and retries once with a fresh session whose `sess-create` cause is that fact — stopping the capped session first, as an obligation with the `author_empty` as cause, when the cap and not the session's death ended the turn (§3 Review round) — a distinct obligation, so the retry is not read as satisfied by the session that produced nothing (§3 Sessions are effects); one seat each. An empty turn on the retry itself (a session whose cause is an `author_empty`) is refused by the kernel and the loop exits `RC_FAILED`; an empty turn in a later round, under a different cause, starts the count again |
+| Author produced neither artefact nor questions | only once the session has died or the cap has passed — settled with no file is a turn still running (§3 Author round) — the coordinator records `author_empty` (§2) under its author generation, naming the current author session — the newest an author generation of this phase and epoch created; after a crash the finding generation is not the creating one (§2 Refusals) — and retries once with a fresh session whose `sess-create` cause is that fact — stopping that session first, as an obligation with the `author_empty` as cause, whether the cap or the session's death ended the turn (§3 Review round: a stop on an ended turn is a 2xx the kernel confirms, and it releases the session's runner) — a distinct obligation, so the retry is not read as satisfied by the session that produced nothing (§3 Sessions are effects); one seat each. An empty turn on the retry itself (a session whose cause is an `author_empty`) is refused by the kernel and the loop exits `RC_FAILED`; an empty turn in a later round, under a different cause, starts the count again |
 | `submit_*` refused as identical to a prior artefact in this phase and epoch | treated as a FAIL with findings "identical to the prior artefact"; one re-author — a fresh session whose cause is the refusal's `command_rejected` fact. When the refused bytes came from a session whose own `sess-create` cause is a `command_rejected` for the same command — the re-author resubmitted the same thing — `stall(identical_resubmission)` instead. Derived from the cause chain, not from a count: every refusal is a fresh fact, a count would need a scope nothing states, and "one re-author per refusal" read literally would burn `max_seats` and park for the wrong reason |
 | `submit_plan` refused for shape (no `### Task` heading) | as identical: findings "plan has no tasks"; one re-author under the same rule, then `stall(identical_resubmission)` |
 | Crash after a review verdict was obtained, before `record_review` / `park` | nothing in the journal says a review happened; the next pass reviews again. Bounded by `max_seats`, which counts the lost seat because dispatch was journaled |
@@ -1613,7 +1705,8 @@ the code gate. The mutation sweep is the first follow-up once this is live.
 | Operator cancels a run with sessions live | `kernel cancel` records `cancelled` and `retire` stops every session no satisfied `sess-stop` names, the `cancelled` fact as cause (§5). A cancelled run that was halted is reconciled first, or its sessions are ended in the UI |
 | A session's `agent_id` at settle differs from its create's snapshot | `RC_FAILED` naming the session and both ids, before any file is read and with no fact recorded: the session was rebound (`switch-agent`, §3 *Obligations*) and whatever it wrote is not the snapshot's vendor's work |
 | Human direction typed into a live author session, read at the end of its turn | the turn's artefact is not submitted; the direction is recorded and the next iteration starts a fresh session with it as cause (§3 loop, §2 Refusals); the interrupted session is left listed as a session whose turn ended — prompted, so not an orphan, and never adopted again (§3 Review round, the boundary) |
-| Coordinator restarted during a waited turn | the deadline is the `at_us` of the turn's `sess-prompt` row plus the cap (§3 Review round), so the restart grants no fresh window; a pass that finds the deadline passed records the turn's fact without waiting |
+| Human direction recorded at the operator's shell (`kernel direct`, §4) during a live author turn | legal: the run is `queued` throughout an author turn. The loop reads the journal before it submits and finds the direction newer than its generation's dispatch, or — the direction landing between that read and the submit — the `submit_*` is refused under the §2 row; either way nothing is submitted and the next iteration starts a fresh session with the direction as cause (§3 loop). Not the `RC_FAILED` of an unexpected refusal: this one the loop expects |
+| Coordinator restarted during a waited turn | the deadline is the `at_us` of the turn's `sess-prompt` row plus the cap (§3 Review round), so the restart grants no fresh window; a pass that finds the deadline passed reads the session first — settled or dead with the file present is a finished turn whatever the clock says (§3 Review round) — and records the ended turn's fact without waiting only when there is no file |
 | Kernel refusal the loop did not expect | `RC_FAILED` with the refusal reason logged; never retried blind. The transient-refusal design's classes decide what is retryable |
 | `create_run` replayed with differing inputs | `NotReplayable`; `run_item` treats it as `failed` and the log names both input hashes. Never a silent second policy |
 | Author or reviewer turn exceeds `HARNESS_TURN_TIMEOUT_S` | a prerequisite, not a design point: the bircher runner's 480 s (gap 15) must be raised before the live proof. Spec authoring on a vague issue is one long turn, and a review of this spec has run sixteen minutes |
@@ -1809,13 +1902,25 @@ stop journaled after the park, owed on the next pass if the pass dies
 between; a settled session with the file is read at once; a
 file whose verdict line is followed by findings is `None`; a session whose
 `agent_id` at settle is not its snapshot's is `RC_FAILED` with no file read
-and no fact recorded; a `sess-prompt` row older than the cap is recorded
-as the ended turn at once, without waiting, and a pass restarted against
+and no fact recorded; a `sess-prompt` row older than the cap whose
+session is settled with no file is recorded as the ended turn at once,
+without waiting, one whose session is settled with the file present is
+read as a finished turn — a turn that finished during a halt is not
+discarded — and a pass restarted against
 it under a fake clock gets no fresh window; `retire_owed` runs before
 `publish_owed` — a pass that dies between a `no_verdict` park and its stop
 is followed by one whose journal shows the stop before any publication,
 and a stop that fails leaves the publication unperformed; a `no_verdict`
-park whose session the stub lists as `failed` derives no stop; a direction
+park whose session the stub lists as `failed` derives a stop all the
+same, and one whose session the stub no longer lists derives a stop the
+stub answers 404, which halts — the derivation reads no server; a
+`human_direction` recorded through `kernel direct` while an author turn
+is waited leaves the artefact unsubmitted and the next iteration creates
+a fresh session with it as cause, both when the loop's journal read sees
+it and when only the `submit_*` refusal does; the plan author's brief
+carries the bytes at the current spec hash; the create body names the
+worktree by realpath — a worktree added under a symlinked parent
+reconciles `delivered`; a direction
 typed into the author session and read at the end of an artefact turn
 leaves the artefact unsubmitted, and the next iteration creates a fresh
 session with the direction as cause; `retire` on a cancelled run stops
@@ -1922,7 +2027,7 @@ New authorization inputs and how the kernel comes by them:
 | seat count | `dispatch` records for `author`/`reviewer` | observed |
 | author session creation and prompts | `SESSION_CONTROL` effects | observed |
 | reviewer session creation and prompt | `SESSION_CONTROL` effects, as the author's (§3 Review round) | observed |
-| session stopped | a `sess-stop` effect; a bound runner that cannot stop answers 503 and halts the run; no runner bound answers 2xx (§3 Review round) | that the turn's process died **asserted** — the host teardown is best-effort; correctness does not rest on it, each session having its own worktree and the loop never re-reading a stopped turn |
+| session stopped | a `sess-stop` effect; a bound runner that cannot be reached answers 503 and halts the run; a reachable one answers 2xx whatever the harness did with the stop, and so does no runner bound (§3 Review round) | that the turn's process died **asserted** — the host teardown is best-effort; correctness does not rest on it, each session having its own worktree and the loop never re-reading a stopped turn |
 | human approval / correction | a user-role session item not sent by the coordinator, under a default-deny bundle | observed for the model and the coordinator; **asserted** for any other process on the docker network |
 | human answer to a grill question | as above | as above |
 | exclusive resumption | the runner's flock | **asserted**; the generation fence bounds what a second resumer can do to prompts already sent |
@@ -1952,10 +2057,13 @@ New authorization inputs and how the kernel comes by them:
   owns and appends `--data-binary @<path>` after the contract check, and
   refuses a `sess-create` stdout that is not a JSON object naming `id`,
   `agent_name` and the `-d` body's `agent_id`.
-  `v2/kernel/contract.py` — `SESSION_CONTROL` becomes three rules anchored
-  to the create, events and session-delete endpoints, requires `-f` or
-  `-sf`, refuses a `-d` value beginning with `@` and `--data-binary` from a
-  caller, and drops `-F`.
+  `v2/kernel/contract.py` — `Rule` gains `required: frozenset` (today four
+  allowlists and nothing a rule can demand, `:37-71`), checked in
+  `check()` after them (`:206-270`); `SESSION_CONTROL` becomes three rules
+  anchored to the create, events and session-delete endpoints, each with
+  `required = {"-f", "-sf", "-sSf"}` and `-S`, `-sSf` added to `flags`,
+  refusing a `-d` value beginning with `@` and `--data-binary` from a
+  caller, and dropping `-F`.
   `v2/kernel/policy.py` (new) —
   derivation from labels and Project config, the `policy_frozen` fact, the
   epoch- and phase-scoped counters. `v2/kernel/grill.py` — many-question
@@ -1968,7 +2076,9 @@ New authorization inputs and how the kernel comes by them:
   and author, refused unless the author is the vendor the `agent_name` of
   the snapshot in the newest satisfied author `sess-create`'s
   `external_object_id` names; `record_review` takes and checks `phase` and
-  mirrors that guard for the seat; `record_author_empty`. `v2/kernel/effects.py`
+  mirrors that guard for the seat; `record_author_empty`;
+  `execute_as_human` (§2 Refusals), the operator-side entry that fixes the
+  actor to `human` and skips the generation fence. `v2/kernel/effects.py`
   — `reconcile` refuses `delivered` for an obligation-bearing `sess-create`
   whose value is not a session snapshot naming `id` and `agent_name` with
   the `agent_id`, `host_id` and `workspace` of the create's `intent_json`. `v2/kernel/store.py`,
@@ -1991,9 +2101,19 @@ New authorization inputs and how the kernel comes by them:
   mapping and reads no facts; `outcome.py` takes its verdict from the live
   review call, not the journal. Both are unchanged.
 - `v2/coordinator/phases.py` (new) — the loop, `retire_owed`, `publish_owed`,
-  the durable per-turn deadline from the prompt row's `at_us`. `author.py`
+  the durable per-turn deadline from the prompt row's `at_us`, the file
+  read before the ended turn is recorded, the journal read for a newer
+  `human_direction` before every `submit_*` and the refusal branch beside
+  it (§3 loop). `session.py` — `State` gains `agent_id` (`:57-60`, today
+  `status` and `error_code`), read from the same `GET` (`:63-80`); the
+  settle-time check (§3 *Obligations*) compares the `agent_id` of the read
+  that settled — a failed read resets the streak (`settle()`, `:140`) and
+  settles nothing, so the compared value is always one the server
+  returned. `author.py`
   (new) — author dispatch through `perform_effect(SESSION_CONTROL)` and the
-  artefact/questions contract. `human.py` (new) — the session reader,
+  artefact/questions contract; the worktree added by realpath before the
+  create and read back from an adopted snapshot's `workspace`; the plan
+  author's brief carrying the current spec by hash (§3 Author round). `human.py` (new) — the session reader,
   `prompt_item` recording, the discriminator, the batch rules and the
   dismissal of a refused token. `review.py`
   — artefact mode: the seat as a `SESSION_CONTROL` session with the brief
@@ -2033,6 +2153,8 @@ New authorization inputs and how the kernel comes by them:
   agent, and nothing records it; this design binds sessions to the agent
   the server says they run (§3 *Obligations*) and does not need the
   mapping, so the upload stays as it is.
+- Worktree removal. Each session's worktree outlives it (§3 Author round);
+  pruning them is the operator's.
 - Per-task review seats and the mutation sweep (first follow-up).
 - Multiple projects. The policy derivation reads a Project config so that the
   operator spec can populate it; nothing here depends on more than one repo.
