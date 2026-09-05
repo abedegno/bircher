@@ -973,7 +973,10 @@ until the session dies or the cap passes (`ITEM_TIMEOUT` per waited
 turn, §3 Review round), and only then an empty turn (§7).
 
 Contract: write the artefact to `$BIRCHER_ARTIFACT_OUT` (a path inside its own
-worktree, read by the coordinator from the host) and end the turn. Under
+worktree, read by the coordinator from the host) — written elsewhere in
+the worktree and renamed into place, so that a file at the path is whole:
+the coordinator reads it at the cap whatever the session is still doing
+(§3 Review round) — and end the turn. Under
 `grill=human` it may instead write `$BIRCHER_QUESTIONS_OUT` — each question
 with the model's recommended answer — and end the turn with no artefact; the
 coordinator records one `model_question` per question and parks (§4). Under
@@ -1126,14 +1129,16 @@ effect naming the awaited session (`schema.sql:68`; written at
 `journal_intent`, `store.py:308-317`, before the POST, and never touched
 by `mark_effect`, `:319-332`) plus the cap; every pass computes what
 remains from that row and waits for that, and a pass that finds nothing
-remaining reads before it records: a session settled, or dead, with the
-file present is a finished turn whatever the clock says — a turn that
-finished during a long halt is not discarded to hand the retry a second
-`author_empty` and the run `RC_FAILED` (§7) — and only settled or dead
-with no file is the ended turn, recorded without waiting at all; a
-session still running past the deadline with the file present is given
-one settle streak more (`needed` polls, `session.py:140`), since the
-contract ends the turn at the write, and is the ended turn after that. A
+remaining reads the file before it records, and the file decides, not
+the session's status: present, the turn finished, whatever the clock
+says and whether the session is settled, dead or still running — the
+contract puts the file in place by rename (§3 Author round), so a present
+file is a whole one, and a turn that finished during a long halt is not
+discarded to hand the retry a second `author_empty` and the run
+`RC_FAILED` (§7); absent, the cap ended the turn — settled, dead or still
+running, the same — and the fact is recorded without waiting at all. A
+session still running when its file is read is displaced by what the
+loop does next and stopped by the orphan rule (below). A
 prompt reconciled `delivered` keeps the row it was intended under, so its
 deadline is the intent's — earlier than the truth by the length of the
 halt; the cap errs towards stopping, never towards a turn that outlives
@@ -1706,7 +1711,7 @@ the code gate. The mutation sweep is the first follow-up once this is live.
 | A session's `agent_id` at settle differs from its create's snapshot | `RC_FAILED` naming the session and both ids, before any file is read and with no fact recorded: the session was rebound (`switch-agent`, §3 *Obligations*) and whatever it wrote is not the snapshot's vendor's work |
 | Human direction typed into a live author session, read at the end of its turn | the turn's artefact is not submitted; the direction is recorded and the next iteration starts a fresh session with it as cause (§3 loop, §2 Refusals); the interrupted session is left listed as a session whose turn ended — prompted, so not an orphan, and never adopted again (§3 Review round, the boundary) |
 | Human direction recorded at the operator's shell (`kernel direct`, §4) during a live author turn | legal: the run is `queued` throughout an author turn. The loop reads the journal before it submits and finds the direction newer than its generation's dispatch, or — the direction landing between that read and the submit — the `submit_*` is refused under the §2 row; either way nothing is submitted and the next iteration starts a fresh session with the direction as cause (§3 loop). Not the `RC_FAILED` of an unexpected refusal: this one the loop expects |
-| Coordinator restarted during a waited turn | the deadline is the `at_us` of the turn's `sess-prompt` row plus the cap (§3 Review round), so the restart grants no fresh window; a pass that finds the deadline passed reads the session first — settled or dead with the file present is a finished turn whatever the clock says (§3 Review round) — and records the ended turn's fact without waiting only when there is no file |
+| Coordinator restarted during a waited turn | the deadline is the `at_us` of the turn's `sess-prompt` row plus the cap (§3 Review round), so the restart grants no fresh window; a pass that finds the deadline passed reads the file first — present is a finished turn whatever the clock says and whatever the session's status (§3 Review round) — and records the ended turn's fact without waiting only when there is no file |
 | Kernel refusal the loop did not expect | `RC_FAILED` with the refusal reason logged; never retried blind. The transient-refusal design's classes decide what is retryable |
 | `create_run` replayed with differing inputs | `NotReplayable`; `run_item` treats it as `failed` and the log names both input hashes. Never a silent second policy |
 | Author or reviewer turn exceeds `HARNESS_TURN_TIMEOUT_S` | a prerequisite, not a design point: the bircher runner's 480 s (gap 15) must be raised before the live proof. Spec authoring on a vague issue is one long turn, and a review of this spec has run sixteen minutes |
@@ -1902,11 +1907,11 @@ stop journaled after the park, owed on the next pass if the pass dies
 between; a settled session with the file is read at once; a
 file whose verdict line is followed by findings is `None`; a session whose
 `agent_id` at settle is not its snapshot's is `RC_FAILED` with no file read
-and no fact recorded; a `sess-prompt` row older than the cap whose
-session is settled with no file is recorded as the ended turn at once,
-without waiting, one whose session is settled with the file present is
-read as a finished turn — a turn that finished during a halt is not
-discarded — and a pass restarted against
+and no fact recorded; a `sess-prompt` row older than the cap with no
+file is recorded as the ended turn at once, without waiting, whether the
+stub's session is settled, dead or still running, one with the file
+present is read as a finished turn under each of the three — a turn that
+finished during a halt is not discarded — and a pass restarted against
 it under a fake clock gets no fresh window; `retire_owed` runs before
 `publish_owed` — a pass that dies between a `no_verdict` park and its stop
 is followed by one whose journal shows the stop before any publication,
