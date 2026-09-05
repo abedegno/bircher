@@ -881,8 +881,8 @@ kernel mode is the execution path, not an advisory one
 (`effect-adapter.sh:82`; `cli.py:246` turns `NotAuthorized` into
 `RC_REFUSED`), so in either mode the sweep can never merge, against a
 journal that already says `merged` then `ended`. That is a live v1 defect — a false
-`merged` fact on every transient deferral — that belongs in its own bircher
-issue and is out of scope here. Resumption re-fences an open run whose
+`merged` fact on every transient deferral — filed as bircher#93 and out of
+scope here. Resumption re-fences an open run whose
 outcome has not been taken, and what it borrows from the sweep is only
 `_kernel_dispatch` with the old id and a new generation; nothing about the
 state the run is in, and nothing about what the sweep records afterwards.
