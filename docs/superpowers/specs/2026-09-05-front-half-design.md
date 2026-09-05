@@ -813,8 +813,8 @@ at that path is this turn's only if no earlier turn left it: before it
 re-prompts a session (a grill answer, a gate) the coordinator moves the
 previous turn's file aside, and it reads only after the session settled
 with a file present; settled with neither file is a turn still running
-until the session dies or the cap passes, and only then an empty turn
-(§3 Review round, §7).
+until the session dies or the cap passes (the item's remaining
+`ITEM_TIMEOUT`, §3 Review round), and only then an empty turn (§7).
 
 Contract: write the artefact to `$BIRCHER_ARTIFACT_OUT` (a path inside its own
 worktree, read by the coordinator from the host) and end the turn. Under
@@ -897,8 +897,15 @@ stable item count is what a session mid-tool-call looks like too, which is
 why that function's own docstring hands the weight to the caller's
 predicate, a PR that exists. Here the predicate is the file: settled with
 `$BIRCHER_REVIEW_OUT` present is a finished turn; settled without it is a
-turn still running until the session dies (`session.py:83`) or the seat's
-time cap passes, and only then an absent verdict. The coordinator then
+turn still running until the session dies (`session.py:83`) or the cap
+passes, and only then an absent verdict. The cap is the one the back half's
+wait has today: the item's remaining `ITEM_TIMEOUT` (`run-queue.sh:45`, the
+loop at `:4120`), which the runner hands the coordinator beside the
+generation; at the cap the coordinator stops the session under the runner's
+own key shape (`sess-stop:<session>`, `run-queue.sh:1093-1099`), and the
+stopped session is the ended turn — the reviewer's `None`, the author's
+empty turn — so a turn that outran the item is a park or a retry, never a
+session left running against a pass that has moved on. The coordinator then
 reads the file from the host and runs `extract_verdict` over it, extended
 to require the hash prefix in artefact mode — a verdict that names another
 hash, or none, or a file that is not there, is `None`.
