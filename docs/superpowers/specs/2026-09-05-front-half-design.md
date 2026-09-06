@@ -1057,8 +1057,10 @@ kernel's own directory beside the db, mode 0600, removed in `finally`, so a
 crash between the write and the POST leaves the `intended` row that halts
 (above) and a file nothing reads — and appends `--data-binary @<path>` to the
 argv **after** the contract check, so the path is one the kernel minted. The
-same holds for the event's *type*: the events rule admits no `-d` at all, and
-the kernel composes the whole event from the obligation — the `message` above
+same holds for the event's *type*: the coordinator's events argv carries no
+`-d` at all (the runner's own template sites keep theirs, a few hundred bytes
+each, under the same rule), and the kernel composes the whole event from the
+obligation — the `message` above
 for a `sess-prompt`, `{"type":"stop_session"}` for a `sess-stop` — so no
 routed caller can post any other type the endpoint serves: an
 `external_session_status` of `failed` (`routes_events.py:830-870`) persists
@@ -2140,7 +2142,8 @@ New authorization inputs and how the kernel comes by them:
   {"-f", "-sf", "-sSf"}` and `-S`, `-sSf` added to `flags`, refusing a `-d`
   value beginning with `@` and `--data-binary` from a caller, dropping `-F`;
   the create rule requiring `-d` exactly once as its own token and the events
-  rule admitting none; `_flags_and_operands` (`:168-190`) returning the valued
+  rule admitting at most one, from the runner's template sites, none from the
+  coordinator; `_flags_and_operands` (`:168-190`) returning the valued
   flags' values in its result instead of discarding them, the one parse
   `check()`, the stdout check and `reconcile` read. `v2/kernel/policy.py`
   (new) — derivation from labels and Project config, the `policy_frozen` fact,
@@ -2239,7 +2242,7 @@ round-11 findings that did not become the mechanism above.
 | The direction refusal compares `seq` with the generation's `attempt_dispatched` | §2 Refusals | `test_direction_ordering_by_seq` |
 | Create body `title` = the create's key; returned in the snapshot; compared at reconcile | §3 *Obligations* | `test_reconcile_title_distinguishes_same_tuple` |
 | `host_id` compared with `host_` stripped from both sides; empty refused | §3 *Obligations* | `test_reconcile_host_id_prefix_both_ways` |
-| The parse returns valued flags; `-d` exactly once as its own token on the create; none on events | §3 *Obligations*, §10 | `test_contract_d_twice_refused`, `test_contract_d_equals_refused`, `test_one_parse_three_readers` |
+| The parse returns valued flags; `-d` exactly once as its own token on the create; none from the coordinator on events | §3 *Obligations*, §10 | `test_contract_d_twice_refused`, `test_contract_d_equals_refused`, `test_one_parse_three_readers` |
 | The kernel composes the events body per obligation (`message`, `stop_session`) | §3 *The body never rides argv* | `test_executor_builds_stop_body` |
 | `--delivered <key>` bare only for `sess-stop`; a 404 stop reconciles `delivered` | §3 *Reconciliation is typed*, §7 | `test_reconcile_stop_without_id`, `test_reconcile_create_without_id_refused` |
 | Worktree at `/workspaces/<run>/<gen>`; existing path `RC_FAILED` | §3 Author round | `test_worktree_path_exists_rc_failed` |
