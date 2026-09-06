@@ -25,6 +25,7 @@
 - Commit messages carry **no AI attribution** — no `Co-Authored-By`, no `Claude-Session`, no "Generated with" — in this repo. Commit messages use the repo's `type(scope): summary` form.
 - Mutation discipline (§8): commit before each mutation you run against a test; a test that stays green under the mutation named in its task is not done.
 - Nothing in this plan files a GitHub issue, opens a PR, or pushes; the live-proof tasks (Part E) name the human action they need before they run.
+- Never alias `cmd.payload` to a local name inside `kernel/authz.py` (`p = cmd.payload; p.get(...)`): the provenance extractor names the alias, and the row would be for `p['x']`. Write `cmd.payload.get(...)` at every read.
 - `v2/tests/kernel/test_provenance.py` parses `kernel/authz.py`: every `cmd.payload[...]`/`.get('...')` read, every `store.<method>` call and every `<name>.get('<key>')` call in that file must have a row in `docs/design/provenance-table.md`, and the asserted set is pinned by name. A task that adds such a read in `authz.py` adds its row (observed, or asserted with a bold **Residual**/**Intentional** reason) in the same commit; Task 21 reconciles the pinned set and the count sentence in `docs/design/2026-08-23-v2-kernel-design.md`.
 
 ## Rulings taken while planning
@@ -42,6 +43,11 @@
 11. **`record_review` always names its phase.** The payload's `phase` is required for every `record_review`, `"implementation"` in the back half; the fact records the phase derived from the state, and the two must agree (Task 7). The 22 migrated files add it to their review payloads.
 12. **`turn_ended` names the prompt it ended.** The kernel writes `prompt_key` — the key of the newest satisfied `sess-prompt` of the phase and epoch — into every `turn_ended` (Task 7), so "a `turn_ended` newer than its newest satisfied prompt" (§2 Refusals) is an equality on keys, never a comparison of clocks; the deadline of §3 *The turn's start is in the journal* still uses the prompt row's `at_us`, in the coordinator (Task 14).
 13. **`revise_bundle` refuses an irrelevant change.** The kernel compares the fetched issue's snapshot hash with the current bundle's and refuses when equal (Task 9); the runner's resume path submits it on every resume and treats that refusal as expected (Task 20).
+
+14. **A vendor is named by its bundle.** The snapshot the server returns names the bundle (`agent_name` is the bundle's `name:`, `v2_author_claude`), the dispatch actor names the vendor (`claude`). The kernel maps one to the other with `front.vendor_of(agent_name)` — the name less the `v2_author_` prefix, `None` for any other bundle — and every guard, the driver, the fake server and the proof compare `vendor_of(snapshot.agent_name)` with the actor (Task 7, 12, 16, 25). Round 12 found the plan comparing the two namespaces directly.
+15. **The output guard reads the session's own newest prompt.** §2's refusal quantifies over the round's session ("its newest satisfied sess-prompt"); `record_turn_ended`'s refusal quantifies over the phase ("the newest satisfied sess-prompt of this run in the current phase and epoch"). Task 10 keeps the two apart: `front.newest_prompt_of(session)` for the output guard, `front.newest_prompt(phase, epoch)` for the turn's end.
+
+**Review history.** Round 12 (Kimi, over commit `8a5c738`) found ten things; nine are folded here (the vendor namespace, the append-only effects table in Task 16's tests, the missing halt on a dispatch over pending effects, the untested half of ruling 2, the output guard's quantifier, `prompt_item` uniqueness per session, the CAS-versus-authorize order in migration rule 2, a driver method used before it was defined, and the provenance rows distributed into Tasks 7-9); the tenth located the loopback test in Task 15.
 
 ## §11 closure map
 
@@ -2044,21 +2050,32 @@ def test_a_non_grant_human_ruling_is_not_a_grant(tmp_path):
     assert front.grants(s, "r-1") == 0
 
 
-def test_any_dispatch_over_an_intended_or_uncertain_effect_is_refused(tmp_path):
+def test_any_dispatch_over_an_intended_or_uncertain_effect_is_refused_and_halts(tmp_path):
+    """spec §2 Refusals: refused, AND the run is halted with the keys as evidence."""
+    from kernel.effects import is_halted
     s = _run(tmp_path)
     g = dispatch(s, "r-1", actor="runner", role=Role.OPERATOR).generation
-    s.journal_intent("e1", "r-1", g, "session_control", "sess-create:r-1:%d" % g,
+    key = "sess-create:r-1:%d" % g
+    s.journal_intent("e1", "r-1", g, "session_control", key,
                      {"argv": ["curl"], "obligation": {"kind": "sess-create", "run": "r-1",
                                                        "phase": "spec", "epoch": 0, "cause": "x"}})
+    assert not is_halted(s, "r-1")
     for role in (Role.AUTHOR, Role.REVIEWER, Role.OPERATOR, Role.IMPLEMENTER):
         with pytest.raises(PendingEffects) as exc:
             dispatch(s, "r-1", actor="claude", role=role)
-        assert exc.value.keys == ["sess-create:r-1:%d" % g]
-    s.mark_effect("sess-create:r-1:%d" % g, "uncertain", None, run_id="r-1")
+        assert exc.value.keys == [key]
+    assert is_halted(s, "r-1")
+    evidence = s.reconciliation_evidence("r-1")
+    assert evidence["pending_keys"] == [key] and evidence["affected_resources"] == ["session_control"]
+    s.clear_reconciliation("r-1")
+    s.mark_effect(key, "uncertain", None, run_id="r-1")
     with pytest.raises(PendingEffects):
         dispatch(s, "r-1", actor="claude", role=Role.AUTHOR)
-    s.mark_effect("sess-create:r-1:%d" % g, "confirmed", '{"id": "s1"}', run_id="r-1")
+    assert is_halted(s, "r-1")
+    s.clear_reconciliation("r-1")
+    s.mark_effect(key, "confirmed", '{"id": "s1"}', run_id="r-1")
     dispatch(s, "r-1", actor="claude", role=Role.AUTHOR)
+    assert not is_halted(s, "r-1")
 
 
 def test_refused_dispatch_leaves_no_generation_or_fact(tmp_path):
@@ -2077,6 +2094,8 @@ def test_refused_dispatch_leaves_no_generation_or_fact(tmp_path):
 
 Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_dispatch_front.py -q`
 Expected: FAIL — `ImportError: cannot import name 'PendingEffects' from 'kernel.dispatch'`.
+
+(`Store.set_reconciliation`, `reconciliation_evidence`, `clear_reconciliation` and `last_confirmed` exist at `store.py:360-381`; the evidence dict mirrors `effects._halt_evidence`'s keys plus `pending_keys`, so `kernel.cli pending` reports it as any halt.)
 
 - [ ] **Step 3: Implement `front.py`'s first queries**
 
@@ -2145,10 +2164,25 @@ class SeatsExhausted(Exception):
 and in `dispatch()`, inside the `with store.transaction():` block, before `acquire`:
 
 ```python
+    # Before the transaction, so the halt survives the raise: a run holding an
+    # intended or uncertain effect is halted with those keys as evidence and
+    # the dispatch refused (spec §2 Refusals, §5).
+    pending = store.uncertain_effects(run_id)
+    if pending:
+        keys = [e["idempotency_key"] for e in pending]
+        store.set_reconciliation(run_id, {
+            "run_id": run_id, "generation": None,
+            "affected_resources": sorted({e["effect_class"] for e in pending}),
+            "pending_keys": keys,
+            "last_confirmed_observations": store.last_confirmed(run_id),
+            "stop_attempts": 0,
+            "recommended_actions": [
+                "A dispatch was attempted over unresolved effects; check each key externally",
+                "Then reconcile (--delivered / --not-delivered per key) and resume",
+            ],
+        })
+        raise PendingEffects(keys)
     with store.transaction():
-        pending = [e["idempotency_key"] for e in store.uncertain_effects(run_id)]
-        if pending:
-            raise PendingEffects(pending)
         if role in Role.SEATS:
             from kernel.front import seat_bound, seats_used
             used, bound = seats_used(store, run_id), seat_bound(store, run_id)
@@ -2173,7 +2207,7 @@ Expected: PASS. Full suite: green. Existing tests that dispatch after journaling
 
 - [ ] **Step 7: Mutation check, then commit**
 
-Change `2 * grants(...)` to `grants(...)`: `test_a_grant_raises_the_bound_by_two` fails. Remove the `pending` check: `test_any_dispatch_over_an_intended_or_uncertain_effect_is_refused` fails. Restore both.
+Change `2 * grants(...)` to `grants(...)`: `test_a_grant_raises_the_bound_by_two` fails. Remove the `pending` check: `test_any_dispatch_over_an_intended_or_uncertain_effect_is_refused_and_halts` fails. Keep the raise but drop the `set_reconciliation`: it fails at `assert is_halted`. Restore all three.
 
 ```bash
 git add v2/kernel/dispatch.py v2/kernel/front.py v2/tests/kernel/test_dispatch_front.py v2/tests/kernel/test_executor_body.py
@@ -2198,11 +2232,11 @@ This is the task that supersedes v1's `queued → specified → planned` shortcu
 - Produces:
   - `authz.FRONT_HALF_STATES = frozenset({"queued", "spec_submitted", "spec_accepted", "specified", "plan_submitted", "plan_accepted"})`; `authz.phase_of(state: str) -> str | None` (`"spec"` for `queued`/`spec_*`, `"plan"` for `specified`/`plan_*`, `"implementation"` for `implementing`/`reviewing`, else `None`); `authz.PARK_REASONS`; `authz.TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})`; `authz._VERDICT_WORDS`.
   - `authz.validate_review(store, cmd, actor, *, ruling="review_ruling") -> VerdictBinding | None` — binding checks for every ruling, dispatch checks for `review_ruling` only (Task 8 passes `ruling="human_ruling"`).
-  - `front.FRONT_PHASES = ("spec", "plan")`, `front.HUMAN_FACT_KINDS`, `front.epoch(store, run_id) -> int`, `front.bundle_hash(store, run_id) -> str | None`, `front.submissions(store, run_id, phase, epoch) -> list[Fact]`, `front.newest_submission(store, run_id, phase, epoch) -> Fact | None`, `front.last_transition_seq(store, run_id) -> int`, `front.last_human_fact_seq(store, run_id) -> int`, `front.current_park(store, run_id) -> Fact | None`, `front.satisfied_effects(store, run_id, kind) -> list[dict]` (effects whose `intent["obligation"]["kind"] == kind` and whose state is `confirmed`, or `reconciled` with a non-null `external_object_id`, journal order), `front.newest_seat(store, run_id, role, phase, epoch) -> dict | None` (the newest satisfied `sess-create` whose generation's dispatch role is `role` and whose obligation names `phase` and `epoch`; returns `{"generation", "session": <projection dict>, "cause", "key"}`), `front.newest_prompt(store, run_id, phase, epoch) -> dict | None` (same for `sess-prompt`, returning `{"generation", "session_id", "cause", "key", "seq_at": at_us}`).
+  - `front.BUNDLE_PREFIX = "v2_author_"`, `front.vendor_of(agent_name) -> str | None` (ruling 14), `front.FRONT_PHASES = ("spec", "plan")`, `front.HUMAN_FACT_KINDS`, `front.epoch(store, run_id) -> int`, `front.bundle_hash(store, run_id) -> str | None`, `front.submissions(store, run_id, phase, epoch) -> list[Fact]`, `front.newest_submission(store, run_id, phase, epoch) -> Fact | None`, `front.last_transition_seq(store, run_id) -> int`, `front.last_human_fact_seq(store, run_id) -> int`, `front.current_park(store, run_id) -> Fact | None`, `front.satisfied_effects(store, run_id, kind) -> list[dict]` (effects whose `intent["obligation"]["kind"] == kind` and whose state is `confirmed`, or `reconciled` with a non-null `external_object_id`, journal order), `front.newest_seat(store, run_id, role, phase, epoch) -> dict | None` (the newest satisfied `sess-create` whose generation's dispatch role is `role` and whose obligation names `phase` and `epoch`; returns `{"generation", "session": <projection dict>, "cause", "key"}`), `front.newest_prompt(store, run_id, phase, epoch) -> dict | None` (same for `sess-prompt`, returning `{"generation", "session_id", "cause", "key", "seq_at": at_us}`).
   - New commands: `record_turn_ended {session, ended}` (legal from `queued`, `specified`, `spec_submitted`, `plan_submitted`; fact `turn_ended {session, ended, phase, epoch, generation, prompt_key}` — `prompt_key` the key of the newest satisfied `sess-prompt` of the phase and epoch, derived by the kernel, so "a turn_ended newer than the prompt" is an equality on keys, never a clock comparison), `park {reason, session_id, cursor_item_id, findings_hash, verdict, reviewer}` (legal from every front-half state; fact `parked` with those keys plus `phase, epoch, generation`).
   - `submit_spec`/`submit_plan` payload is `{"artifact_hash": <sha256 the store holds>}`; the accepted command writes `artifact_submitted {phase, epoch, hash, author, round}` and sets the phase artefact.
   - `record_review` payload gains `phase` (required, must equal `phase_of(state)`) and, for front-half `review_ruling`s, `findings_hash` (required, held by the store); the `review_verdict` fact gains `phase, epoch, artifact_hash, findings_hash, ruling`.
-  - Driver: `tests.kernel.front.Front`, `reach_specified`, `reach_planned`, `reach_implementing`, constants `SPEC_BYTES`, `PLAN_BYTES`; CLI `python -m tests.kernel.front --db PATH --run-id ID --to specified|planned|implementing [--existing]`.
+  - Driver: `tests.kernel.front.Front` (`_dispatch`, `_create`, `_session`, `_end_turn`, `_cmd`, `_journal`, `_newest_id`, `_newest_author_session`, `author_round`, `review_round`, `to_specified`, `to_planned`, `to_implementing`), `reach_specified`, `reach_planned`, `reach_implementing`, constants `SPEC_BYTES`, `PLAN_BYTES`; CLI `python -m tests.kernel.front --db PATH --run-id ID --to specified|planned|implementing [--existing]`.
 
 - [ ] **Step 1: Write the table tests**
 
@@ -2403,6 +2437,13 @@ def test_park_records_the_kernels_view_and_currency(tmp_path):
     f._cmd(g, "park", {"reason": "gate", "session_id": None, "cursor_item_id": None,
                        "findings_hash": None, "verdict": None, "reviewer": None})
     assert front.current_park(s, "r-1") is not None
+    s.append_fact(run_id="r-1", kind=EventKind.HUMAN_DIRECTION, actor="human",   # ruling 2
+                  causal_command_id=None, payload={"phase": "spec", "epoch": 0, "text": "no",
+                                                   "cursor_item_id": "i-5"})
+    assert front.current_park(s, "r-1") is None
+    f._cmd(g, "park", {"reason": "gate", "session_id": None, "cursor_item_id": None,
+                       "findings_hash": None, "verdict": None, "reviewer": None})
+    assert front.current_park(s, "r-1") is not None
     f.review_round("accept")                      # a transition consumes it
     assert front.current_park(s, "r-1") is None
 
@@ -2442,6 +2483,17 @@ Append to `v2/kernel/front.py`:
 
 ```python
 FRONT_PHASES = ("spec", "plan")
+
+#: Ruling 14: the server names the bundle, the dispatch names the vendor.
+BUNDLE_PREFIX = "v2_author_"
+
+
+def vendor_of(agent_name) -> str | None:
+    """`v2_author_claude` -> `claude`; any other bundle name -> None."""
+    if isinstance(agent_name, str) and agent_name.startswith(BUNDLE_PREFIX) and len(agent_name) > len(BUNDLE_PREFIX):
+        return agent_name[len(BUNDLE_PREFIX):]
+    return None
+
 
 #: Ruling 2: a direction consumes a park as an answer or a ruling does.
 HUMAN_FACT_KINDS = frozenset({
@@ -2786,15 +2838,14 @@ def _check_submit(store, cmd, state: str) -> None:
 
 
 def _check_park(store, cmd) -> None:
-    p = cmd.payload
-    if p.get("reason") not in PARK_REASONS:
-        raise NotAuthorized(f"park reason {p.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
+    if cmd.payload.get("reason") not in PARK_REASONS:
+        raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
     for key in ("session_id", "cursor_item_id", "reviewer"):
-        if p.get(key) is not None and not isinstance(p[key], str):
+        if cmd.payload.get(key) is not None and not isinstance(cmd.payload.get(key), str):
             raise NotAuthorized(f"park {key} must be a string or null")
-    if p.get("findings_hash") is not None and not store.has_artifact(p["findings_hash"]):
+    if cmd.payload.get("findings_hash") is not None and not store.has_artifact(cmd.payload.get("findings_hash")):
         raise NotAuthorized("park findings_hash names an artefact the kernel does not hold")
-    if p.get("verdict") not in (None, "accept", "request_revision"):
+    if cmd.payload.get("verdict") not in (None, "accept", "request_revision"):
         raise NotAuthorized("park verdict must be null, accept or request_revision")
 ```
 
@@ -2954,8 +3005,10 @@ class Front:
                                   key, intent)
         self.store.mark_effect(key, "confirmed", external, run_id=self.run_id)
 
-    def _session(self, generation: int, cause: str, *, actor: str | None = None) -> str:
-        """A satisfied sess-create and sess-prompt under *generation*."""
+    def _create(self, generation: int, cause: str, *, actor: str | None = None) -> str:
+        """A satisfied sess-create under *generation* -- and nothing else. The
+        snapshot names the BUNDLE (`v2_author_<vendor>`), as the server does;
+        the dispatch names the vendor (ruling 14)."""
         actor = actor or self.store.dispatches_for(self.run_id)[-1]["actor"]
         sid = f"s-{generation}"
         phase, epoch = self.phase(), self.epoch()
@@ -2967,8 +3020,18 @@ class Front:
                      "-H", "content-type: application/json", "-d", json.dumps(body)],
             "obligation": {"kind": "sess-create", "run": self.run_id,
                            "phase": phase, "epoch": epoch, "cause": cause},
-        }, json.dumps({"id": sid, "agent_id": body["agent_id"], "agent_name": actor,
+        }, json.dumps({"id": sid, "agent_id": body["agent_id"], "agent_name": f"v2_author_{actor}",
                        "host_id": "h1", "workspace": body["workspace"], "title": ckey}))
+        return sid
+
+    def _newest_author_session(self) -> str | None:
+        seat = fq.newest_seat(self.store, self.run_id, Role.AUTHOR, self.phase(), self.epoch())
+        return None if seat is None else seat["session"]["id"]
+
+    def _session(self, generation: int, cause: str, *, actor: str | None = None) -> str:
+        """A satisfied sess-create and sess-prompt under *generation*."""
+        sid = self._create(generation, cause, actor=actor)
+        phase, epoch = self.phase(), self.epoch()
         prompt_hash = put_artifact(self.store, f"prompt for {sid}".encode())
         pkey = f"sess-prompt:{sid}:{generation}:{cause}"
         self._journal(generation, pkey, {
@@ -3095,7 +3158,7 @@ Expected: failures only in files that reach `specified`/`planned` through v1 sub
 The rule: **a test does not reach a front-half destination by submitting; it calls the driver.** Concretely, per shape:
 
 1. **A helper that submits `submit_spec` then `submit_plan` to reach `planned`** (e.g. `tests/kernel/test_authorization.py::_advance_to_reviewing`, and the `_cmd`/`_submit` helpers in `test_commands.py`, `test_authz_r3.py`, `test_identity.py`, `test_lineage.py`, `test_merge_revalidation.py`, `test_mode.py`, `test_report.py`, `test_review_fixes.py`, `test_review_r2.py`, `test_review_r3b.py`, `test_review_r4.py`, `test_round6.py`, `test_effect_contract.py`, `test_effects.py`, `test_cli_command.py`, `test_decisions.py`, `tests/coordinator/test_recovery_table.py`, `tests/coordinator/test_revision_durability.py`): replace the two submits with `reach_planned(s, "r")` (or `reach_implementing`) from `tests.kernel.front`, and delete the now-unused `SPEC`/`PLAN` hash constants where they existed only to feed the submits. Where the test then compares `artifact_hash` to the spec hash it submitted, read it back: `s.phase_artifact("r", "spec")`. The run must exist through the driver: replace `s.create_run(...)` with `Front(s, "r", base_sha=BASE)` where the test later checks `base_sha`, so the driver's `base_sha` and the test's agree.
-2. **A test whose subject is `submit_spec` itself** (its refusal for a stale version, its idempotent replay, its rejection record) keeps `submit_spec`, dispatches as `Role.AUTHOR`, and passes `{"artifact_hash": put_artifact(s, b"spec")}`; where it asserted the destination `"specified"` it now asserts `"spec_submitted"`. `tests/kernel/test_commands.py::_cmd`'s default payload becomes `{"artifact_hash": put_artifact(store, b"spec")}` and its default role `Role.AUTHOR`; `test_command_derived_from_an_older_version_is_refused` submits `submit_spec` twice with two different artefacts under the stale version — the second is stale before it is illegal, which is what it tests.
+2. **A test whose subject is `submit_spec` itself** (its refusal for a stale version, its idempotent replay, its rejection record) keeps `submit_spec`, dispatches as `Role.AUTHOR`, and passes `{"artifact_hash": put_artifact(s, b"spec")}`; where it asserted the destination `"specified"` it now asserts `"spec_submitted"`. `tests/kernel/test_commands.py::_cmd`'s default payload becomes `{"artifact_hash": put_artifact(store, b"spec")}` and its default role `Role.AUTHOR`; `test_command_derived_from_an_older_version_is_refused` submits `submit_spec` (accepted; the version moves) and then `park` under the stale version — `park` is legal from `spec_submitted` and passes every payload check, so the CAS is the first thing that refuses it and the exception is `StaleVersion`. (`authorize` runs before the transaction's CAS in `submit`, so a second `submit_spec` would be refused as `NotAuthorized` by the identical-hash or turn guard first, not as stale.)
 3. **`record_review` payloads** gain `"phase": "implementation"` (back half) — add it in each helper that builds a review payload rather than at every call site; `tests/execution/*` reviews go through `_kernel_record_review`, whose payload gains `"phase":"implementation"` in `batch/lib/kernel-client.sh` in this task (Task 20 rewrites the rest of the client).
 4. **The pin of `COMMAND_NAMES`** in `test_commands.py::test_the_command_interface_is_closed_and_explicit` gains `"record_turn_ended", "park"`.
 5. **Bash-driven lifecycles** (`tests/execution/test_lifecycle_functions.py`, `test_lifecycle_wiring.py`): where a test creates a run with `_kernel_run_start` and then reaches `planned` through `_kernel_submit_spec`/`_kernel_submit_plan`, replace the two bash calls with `python -m tests.kernel.front --db "$db" --run-id <id> --to planned --existing` run from `v2/` with the same interpreter the test already uses for the kernel CLI — but a run `_kernel_run_start` created has the default gates, so those tests create the run through the driver instead: drop `_kernel_run_start` from the script and call `python -m tests.kernel.front --db "$db" --run-id <id> --to planned` before the bash steps under test. Tests whose subject is `_kernel_run_start` keep it and stop at `queued`. Tests whose subject is `_kernel`'s exit-code handling of a refused command (`test_kernel_client.py:153-268`) keep `submit_spec`: it is still refused (no dispatched actor), with the same rc.
@@ -3103,17 +3166,21 @@ The rule: **a test does not reach a front-half destination by submitting; it cal
 
 Run the suite after each file. Do not weaken an assertion to make it pass: if a test asserted something the new table makes false (a run at `specified` right after `submit_spec`), the test's premise was v1's, and the migrated test asserts the new premise (`spec_submitted`, then `specified` after `review_round`).
 
-- [ ] **Step 10: Run the full suite**
+- [ ] **Step 10: Provenance rows**
+
+`tests/kernel/test_provenance.py` scans `authz.py` (Global Constraints). Run it; the `missing` list names this task's reads. Add to `docs/design/provenance-table.md`, in the *Kernel state* table: `store.phase_artifact` (observed — `phase_artifacts`, written only by an accepted `submit_spec`/`submit_plan`), `store.read_blob` (observed — content-addressed bytes), `store.facts_of_kind` (observed — the append-only journal). In *Caller-presented, bound to kernel state*: `cmd.payload['phase']` (observed — refused unless equal to `phase_of(store.run_state)`), `cmd.payload['findings_hash']` (observed — refused unless the store holds it), `cmd.payload['hash']` and `cmd.payload['author']` (observed — read from the kernel's own `artifact_submitted` facts), `cmd.payload['ended']` (observed — refused unless one of `TURN_ENDS`), `cmd.payload['session']` (observed — Task 10 binds it to the newest satisfied `sess-create`/`sess-prompt`; until then a shape check), `cmd.payload['session_id']` and `cmd.payload['reviewer']` (observed — Task 10 and Task 12 bind them; a string-or-null check here). In *Asserted — declared residuals*: `cmd.payload['reason']` and `cmd.payload['cursor_item_id']` — "**Residual, §4.** The coordinator's reading of a park and of a listing: `reason` is bounded to `PARK_REASONS`, `cursor_item_id` to the §4 cursor invariant test (Task 19), neither to a kernel object." Update the row for `cmd.payload['artifact_hash']` to name `submit_spec`/`submit_plan` (held) and the phase artefact (review, approve). Extend the pinned set in `test_the_residuals_are_the_ones_we_know_about` with the two new asserted names, and extend the `words` map in `test_the_spec_and_the_table_agree_on_the_count` to `"ten"`…`"twenty"`, then set the count word in `docs/design/2026-08-23-v2-kernel-design.md` to the new total (count the rows).
+
+- [ ] **Step 11: Run the full suite**
 
 Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest -q`
 Expected: green — baseline count plus this task's 17 new tests.
 
-- [ ] **Step 11: Mutation check, then commit**
+- [ ] **Step 12: Mutation check, then commit**
 
-Change `_review_destination`'s `"spec_accepted" if "spec" in gates else "specified"` to always `"specified"`: `test_accept_under_the_gate_stops_at_accepted` fails. Delete the identical-hash clause of `_check_submit`: `test_identical_resubmission_in_the_phase_and_epoch_is_refused` fails. Make `current_park` ignore `last_human_fact_seq`: `test_park_records_the_kernels_view_and_currency` fails at the `human_answer` line. Restore all three.
+Change `_review_destination`'s `"spec_accepted" if "spec" in gates else "specified"` to always `"specified"`: `test_accept_under_the_gate_stops_at_accepted` fails. Delete the identical-hash clause of `_check_submit`: `test_identical_resubmission_in_the_phase_and_epoch_is_refused` fails. Make `current_park` ignore `last_human_fact_seq`: `test_park_records_the_kernels_view_and_currency` fails at the `human_answer` line; drop `HUMAN_DIRECTION` from `HUMAN_FACT_KINDS`: it fails at the `human_direction` line. Restore all.
 
 ```bash
-git add v2/kernel/authz.py v2/kernel/commands.py v2/kernel/front.py v2/tests/kernel/front.py v2/tests/kernel/test_front_table.py batch/lib/kernel-client.sh v2/tests
+git add v2/kernel/authz.py v2/kernel/commands.py v2/kernel/front.py v2/tests/kernel/front.py v2/tests/kernel/test_front_table.py batch/lib/kernel-client.sh v2/tests docs/design/provenance-table.md docs/design/2026-08-23-v2-kernel-design.md
 git commit -m "feat(kernel): front-half state table, phase artefacts, artifact_submitted; migrate the v1-flow tests"
 ```
 
@@ -3504,20 +3571,19 @@ and after the state check, the four branches:
 
 ```python
     if cmd.name == "record_human_answer":
-        p = cmd.payload
-        if not isinstance(p.get("question_ids"), list) or not all(isinstance(q, str) for q in p["question_ids"]):
+        ids = cmd.payload.get("question_ids")
+        if not isinstance(ids, list) or not all(isinstance(q, str) for q in ids):
             raise NotAuthorized("record_human_answer question_ids must be a list of ids")
-        if not isinstance(p.get("answer"), str) or not p["answer"].strip():
+        if not isinstance(cmd.payload.get("answer"), str) or not cmd.payload.get("answer").strip():
             raise NotAuthorized("record_human_answer carries a non-empty answer")
-        if p.get("cursor_item_id") is not None and not isinstance(p["cursor_item_id"], str):
+        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
             raise NotAuthorized("cursor_item_id must be a string or null")
         return None
 
     if cmd.name == "record_human_direction":
-        p = cmd.payload
-        if not isinstance(p.get("text"), str) or not p["text"].strip():
+        if not isinstance(cmd.payload.get("text"), str) or not cmd.payload.get("text").strip():
             raise NotAuthorized("record_human_direction carries non-empty text")
-        if p.get("cursor_item_id") is not None and not isinstance(p["cursor_item_id"], str):
+        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
             raise NotAuthorized("cursor_item_id must be a string or null")
         return None
 
@@ -3639,9 +3705,11 @@ and make the two reach helpers pass a gate:
         return self
 ```
 
-- [ ] **Step 7: Run the tests**
+- [ ] **Step 7: Provenance rows, then run the tests**
 
-Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_human_commands.py tests/kernel/test_front_table.py tests/kernel/test_commands.py -q`
+Add to `docs/design/provenance-table.md` (*Asserted — declared residuals*): `cmd.payload['question_ids']`, `cmd.payload['answer']`, `cmd.payload['text']` — "**Intentional and permanent.** The human's words. The kernel binds who (the `execute_as_human` path, no dispatched generation can reach it) and when (the epoch, the cursor); the content is the human's to say." Extend the pinned set and the count word as in Task 7.
+
+Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_human_commands.py tests/kernel/test_front_table.py tests/kernel/test_commands.py tests/kernel/test_provenance.py -q`
 Expected: PASS. Update `test_the_command_interface_is_closed_and_explicit`'s pin with the four names. Full suite: green.
 
 - [ ] **Step 8: Mutation check, then commit**
@@ -3649,7 +3717,7 @@ Expected: PASS. Update `test_the_command_interface_is_closed_and_explicit`'s pin
 Make `execute_as_human` pass `fenced=True`: `test_execute_as_human_skips_the_fence_not_the_version_or_the_halt` fails at its first call (the current generation is the author's). Drop the `HUMAN_COMMANDS` refusal in `authorize`: `test_human_commands_do_not_pass_through_submit` fails. Drop the `current_park is None` check: `test_grant_round_needs_a_current_park_and_consumes_it` fails at its first line. Restore all three.
 
 ```bash
-git add v2/kernel/commands.py v2/kernel/authz.py v2/kernel/dispatch.py v2/tests/kernel/front.py v2/tests/kernel/test_human_commands.py v2/tests/kernel/test_commands.py
+git add v2/kernel/commands.py v2/kernel/authz.py v2/kernel/dispatch.py v2/tests/kernel/front.py v2/tests/kernel/test_human_commands.py v2/tests/kernel/test_commands.py v2/tests/kernel/test_provenance.py docs/design/provenance-table.md docs/design/2026-08-23-v2-kernel-design.md
 git commit -m "feat(kernel): execute_as_human and the human's four commands"
 ```
 
@@ -3668,7 +3736,7 @@ git commit -m "feat(kernel): execute_as_human and the human's four commands"
 **Interfaces:**
 - Consumes: `bundle.snapshot`, `bundle.bundle_hash`, `bundle.is_relevant_change` (Task 5); `front.epoch`, `front.bundle_hash`, `front.satisfied_effects` (Task 7); `execute_as_human` (Task 8); `Store.read_blob` (Task 1).
 - Produces:
-  - Commands: `record_model_question {question_id: str, question: str}` (author role; every front-half state; fact `model_question {epoch, phase, question_id, question}`); `record_model_ruling {question_id, ruling: str, reasoning: str, cost_if_wrong: str}` (author role; every front-half state; refused when `question_id` names no `model_question` of the epoch; fact `model_ruling {epoch, question_id, ruling, reasoning, cost_if_wrong}`); `dismiss_human_item {cursor_item_id: str, rejection: str}` (every front-half state, any role; fact `human_item_dismissed {epoch, cursor_item_id, rejection}`); `record_prompt_item {session_id, item_id, sha256}` (every front-half state, any role; fact `prompt_item {session_id, item_id, sha256}`); `revise_bundle {issue: dict}` (every front-half state, any role; → `queued`; fact `bundle_revised {bundle_hash, prior_bundle_hash, reason: "issue changed", diff}`; the new snapshot's canonical bytes are PUT).
+  - Commands (the `prompt_item` duplicate check is per `session_id`): `record_model_question {question_id: str, question: str}` (author role; every front-half state; fact `model_question {epoch, phase, question_id, question}`); `record_model_ruling {question_id, ruling: str, reasoning: str, cost_if_wrong: str}` (author role; every front-half state; refused when `question_id` names no `model_question` of the epoch; fact `model_ruling {epoch, question_id, ruling, reasoning, cost_if_wrong}`); `dismiss_human_item {cursor_item_id: str, rejection: str}` (every front-half state, any role; fact `human_item_dismissed {epoch, cursor_item_id, rejection}`); `record_prompt_item {session_id, item_id, sha256}` (every front-half state, any role; fact `prompt_item {session_id, item_id, sha256}`); `revise_bundle {issue: dict}` (every front-half state, any role; → `queued`; fact `bundle_revised {bundle_hash, prior_bundle_hash, reason: "issue changed", diff}`; the new snapshot's canonical bytes are PUT).
   - `submit_spec` is refused while the grill is open (`front.grill_open`).
   - `front.epoch_facts(store, run_id, kind, epoch_n) -> list[Fact]` (facts of `kind` whose payload `epoch == epoch_n`), `front.grill_open(store, run_id) -> bool`, `front.human_rejections(store, run_id) -> list[Fact]`, `front.dismissed_rejection_ids(store, run_id) -> set[str]`, `front.prompt_hashes_of(store, run_id, session_id) -> set[str]` (the `body.artifact` of every satisfied `sess-prompt` of that session).
   - `bundle.snapshot_diff(old: dict, new: dict) -> dict` = `{"changed": [field, ...], "unified": str}` (unified diff of the two snapshots' indented canonical JSON, capped at 65536 characters with a final line `... truncated`); `bundle.revise_bundle` now also PUTs `canonical_bytes(new_snapshot)`.
@@ -4101,31 +4169,30 @@ In `authorize()`, after the state check, the five branches:
         from kernel import front
         if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
             raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
-        p = cmd.payload
-        if not isinstance(p.get("question_id"), str) or not p["question_id"]:
+        qid = cmd.payload.get("question_id")
+        if not isinstance(qid, str) or not qid:
             raise NotAuthorized(f"{cmd.name} names a question_id")
         if cmd.name == "record_model_question":
-            if not isinstance(p.get("question"), str) or not p["question"].strip():
+            if not isinstance(cmd.payload.get("question"), str) or not cmd.payload.get("question").strip():
                 raise NotAuthorized("record_model_question carries a non-empty question")
             return None
         for key in ("ruling", "reasoning", "cost_if_wrong"):
-            if not isinstance(p.get(key), str) or not p[key].strip():
+            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key).strip():
                 raise NotAuthorized(f"record_model_ruling carries a non-empty {key}")
         n = front.epoch(store, cmd.run_id)
         asked = {q.payload["question_id"] for q in front.epoch_facts(store, cmd.run_id, EventKind.MODEL_QUESTION, n)}
-        if p["question_id"] not in asked:
+        if qid not in asked:
             raise NotAuthorized(
-                f"record_model_ruling names question_id {p['question_id']!r}, which no "
+                f"record_model_ruling names question_id {qid!r}, which no "
                 f"model_question of epoch {n} asked"
             )
         return None
 
     if cmd.name == "dismiss_human_item":
         from kernel import front
-        p = cmd.payload
-        if not isinstance(p.get("cursor_item_id"), str) or not p["cursor_item_id"]:
+        if not isinstance(cmd.payload.get("cursor_item_id"), str) or not cmd.payload.get("cursor_item_id"):
             raise NotAuthorized("dismiss_human_item carries the cursor to move past")
-        rej = p.get("rejection")
+        rej = cmd.payload.get("rejection")
         human = {f.id: f for f in front.human_rejections(store, cmd.run_id)}
         if rej not in human:
             raise NotAuthorized(
@@ -4138,18 +4205,18 @@ In `authorize()`, after the state check, the five branches:
 
     if cmd.name == "record_prompt_item":
         from kernel import front
-        p = cmd.payload
         for key in ("session_id", "item_id", "sha256"):
-            if not isinstance(p.get(key), str) or not p[key]:
+            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key):
                 raise NotAuthorized(f"record_prompt_item carries {key}")
-        if p["sha256"] not in front.prompt_hashes_of(store, cmd.run_id, p["session_id"]):
+        sid, item, sha = cmd.payload.get("session_id"), cmd.payload.get("item_id"), cmd.payload.get("sha256")
+        if sha not in front.prompt_hashes_of(store, cmd.run_id, sid):
             raise NotAuthorized(
-                f"record_prompt_item: no satisfied sess-prompt of session {p['session_id']!r} "
-                f"carries body.artifact {p['sha256'][:12]}..."
+                f"record_prompt_item: no satisfied sess-prompt of session {sid!r} carries body.artifact {sha[:12]}..."
             )
-        if any(f.payload["item_id"] == p["item_id"]
+        # Per session: omnigent's item ids are not shown to be unique across sessions.
+        if any(f.payload["item_id"] == item and f.payload["session_id"] == sid
                for f in store.facts_of_kind(cmd.run_id, EventKind.PROMPT_ITEM)):
-            raise NotAuthorized(f"item {p['item_id']!r} is already recorded as a prompt_item")
+            raise NotAuthorized(f"item {item!r} of session {sid!r} is already recorded as a prompt_item")
         return None
 
     if cmd.name == "revise_bundle":
@@ -4278,9 +4345,11 @@ In `v2/tests/kernel/front.py`, split the prompt out of `_session` and add the ro
         self._cmd(g, "revise_bundle", {"issue": issue})
 ```
 
-- [ ] **Step 11: Run the tests**
+- [ ] **Step 11: Provenance rows, then run the tests**
 
-Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_grill_commands.py tests/kernel/test_cursor_facts.py tests/kernel/test_revise_bundle.py tests/kernel/test_front_table.py tests/kernel/test_human_commands.py tests/kernel/test_bundle.py tests/kernel/test_grill.py -q`
+Add to `docs/design/provenance-table.md`: asserted, "**Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked" — `cmd.payload['question_id']`, `cmd.payload['question']`, `cmd.payload['ruling']`, `cmd.payload['reasoning']`, `cmd.payload['cost_if_wrong']`; observed — `cmd.payload['rejection']` (refused unless a `command_rejected` fact of this run attributed to `human`), `cmd.payload['item_id']` (a per-session identity the kernel cannot see; **Residual, §4** — asserted), `cmd.payload['sha256']` (refused unless a satisfied `sess-prompt` of that session carries it as `body.artifact`), `cmd.payload['issue']` (refused unless its snapshot hashes differently from the current bundle; its content is asserted by the runner adapter, §9 — one row, observed for the comparison, with the residual named). Extend the pinned set and the count word as in Task 7.
+
+Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_provenance.py tests/kernel/test_grill_commands.py tests/kernel/test_cursor_facts.py tests/kernel/test_revise_bundle.py tests/kernel/test_front_table.py tests/kernel/test_human_commands.py tests/kernel/test_bundle.py tests/kernel/test_grill.py -q`
 Expected: PASS. Full suite: green.
 
 - [ ] **Step 12: Mutation check, then commit**
@@ -4288,7 +4357,7 @@ Expected: PASS. Full suite: green.
 Make `grill_open` ignore the epoch (use `store.facts_of_kind` without the epoch filter): `test_the_grill_is_scoped_to_the_epoch` fails. Drop the `new_hash == front.bundle_hash` refusal: `test_a_bircher_only_change_is_refused` fails. Drop the `already dismissed` clause: `test_dismiss_names_a_human_rejection_once` fails at its last line. Restore all three.
 
 ```bash
-git add v2/kernel/authz.py v2/kernel/commands.py v2/kernel/front.py v2/kernel/bundle.py v2/kernel/grill.py v2/tests/kernel/front.py v2/tests/kernel/test_grill_commands.py v2/tests/kernel/test_cursor_facts.py v2/tests/kernel/test_revise_bundle.py v2/tests/kernel/test_commands.py
+git add v2/kernel/authz.py v2/kernel/commands.py v2/kernel/front.py v2/kernel/bundle.py v2/kernel/grill.py v2/tests/kernel/front.py v2/tests/kernel/test_grill_commands.py v2/tests/kernel/test_cursor_facts.py v2/tests/kernel/test_revise_bundle.py v2/tests/kernel/test_commands.py v2/tests/kernel/test_provenance.py docs/design/provenance-table.md docs/design/2026-08-23-v2-kernel-design.md
 git commit -m "feat(kernel): grill facts, dismissals, prompt items, revise_bundle as a command"
 ```
 
@@ -4307,7 +4376,7 @@ Closes §11: `test_output_refused_before_turn_ended`, `test_output_refused_while
 - Consumes: `front.newest_seat`, `front.newest_prompt`, `front.satisfied_effects` (Task 7); `Role.AUTHOR`/`REVIEWER`; the driver's `_dispatch`, `_session`, `_prompt`, `_end_turn`, `_journal` (Tasks 7, 9).
 - Produces:
   - `record_author_empty {session}` (author role; `queued`, `specified`; fact `author_empty {session, phase, epoch, generation}`).
-  - `front.turn_ended_for(store, run_id, prompt_key) -> Fact | None` (the `turn_ended` whose `prompt_key` is that key — the turn the prompt started), `front.stop_satisfied_for(store, run_id, turn_ended_id) -> bool` (a satisfied `sess-stop` whose obligation `cause` is that fact's id), `front.dispatch_seq(store, run_id, generation) -> int` (the `seq` of the generation's `attempt_dispatched` fact), `front.direction_after(store, run_id, seq) -> Fact | None` (the newest `human_direction` with `seq` greater than the given one).
+  - `front.newest_prompt_of(store, run_id, session_id, phase, epoch_n) -> dict | None` (the session's own newest satisfied prompt, ruling 15), `front.turn_ended_for(store, run_id, prompt_key) -> Fact | None` (the `turn_ended` whose `prompt_key` is that key — the turn the prompt started), `front.stop_satisfied_for(store, run_id, turn_ended_id) -> bool` (a satisfied `sess-stop` whose obligation `cause` is that fact's id), `front.dispatch_seq(store, run_id, generation) -> int` (the `seq` of the generation's `attempt_dispatched` fact), `front.direction_after(store, run_id, seq) -> Fact | None` (the newest `human_direction` with `seq` greater than the given one).
   - `authz.OUTPUT_COMMANDS = frozenset({"submit_spec", "submit_plan", "record_author_empty", "record_model_question", "record_model_ruling"})` — plus `record_review` under a `review_ruling` — every one refused until the round's session has a `turn_ended` newer than its newest satisfied prompt and that turn's stop is satisfied.
 
 - [ ] **Step 1: Write the failing tests**
@@ -4405,6 +4474,24 @@ def test_review_ruling_needs_the_reviewers_turn_ended_and_stopped(tmp_path):
     with pytest.raises(NotAuthorized, match="turn_ended"):
         f._cmd(g, "record_review", payload)
     f._end_turn(g, sid)
+    f._cmd(g, "record_review", payload)
+    assert s.run_state("r-1") == "specified"
+
+
+def test_output_guard_reads_the_sessions_own_prompt(tmp_path):
+    """Ruling 15: a newer prompt to ANOTHER session of the phase (a reply to
+    the author while a reviewer seat runs) does not refuse the seat's ruling."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    a_gen = f._dispatch(Role.AUTHOR, "claude")
+    a_sid = f._session(a_gen, f._newest_id()); f._end_turn(a_gen, a_sid)
+    f._cmd(a_gen, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
+    g = f._dispatch(Role.REVIEWER, "codex")
+    r_sid = f._session(g, f._newest_id()); f._end_turn(g, r_sid)
+    f._prompt(g, a_sid, f._newest_id())                    # a newer prompt to the author session
+    payload = {"phase": "spec", "verdict": "accept", "artifact_hash": s.phase_artifact("r-1", "spec"),
+               "base_sha": f.base_sha, "context_bundle_hash": front.bundle_hash(s, "r-1"),
+               "policy_version": front.policy_version(s, "r-1"), "findings_hash": put_artifact(s, b"ok")}
     f._cmd(g, "record_review", payload)
     assert s.run_state("r-1") == "specified"
 
@@ -4544,6 +4631,19 @@ def stop_satisfied_for(store, run_id: str, turn_ended_id: str) -> bool:
                for row in satisfied_effects(store, run_id, "sess-stop"))
 
 
+def newest_prompt_of(store, run_id: str, session_id: str, phase: str, epoch_n: int) -> dict | None:
+    """The SESSION's newest satisfied sess-prompt in the phase and epoch (the
+    output guard's quantifier, spec §2: 'its newest satisfied sess-prompt').
+    newest_prompt() is the phase's, for record_turn_ended (ruling 15)."""
+    found = None
+    for row in satisfied_effects(store, run_id, "sess-prompt"):
+        ob = row["intent"]["obligation"]
+        if ob.get("session") == session_id and ob.get("phase") == phase and ob.get("epoch") == epoch_n:
+            found = {"generation": row["generation"], "key": row["idempotency_key"],
+                     "cause": ob.get("cause"), "session_id": session_id, "at_us": row["at_us"]}
+    return found
+
+
 def dispatch_seq(store, run_id: str, generation: int) -> int:
     for f in store.facts_of_kind(run_id, EventKind.ATTEMPT_DISPATCHED):
         if f.payload.get("generation") == generation:
@@ -4588,8 +4688,8 @@ def _require_turn_recorded(store, cmd, role: str) -> None:
             f"{phase} in epoch {epoch_n}: there is no round's session to have ended"
         )
     sid = seat["session"]["id"]
-    prompt = front.newest_prompt(store, cmd.run_id, phase, epoch_n)
-    if prompt is None or prompt["session_id"] != sid:
+    prompt = front.newest_prompt_of(store, cmd.run_id, sid, phase, epoch_n)
+    if prompt is None:
         raise NotAuthorized(
             f"{cmd.name}: the round's session {sid} has no satisfied sess-prompt in "
             f"{phase}/{epoch_n}: no turn was awaited"
@@ -5065,7 +5165,7 @@ between `_dispatch` and `_session`, and take the binding fields from the brief f
 - [ ] **Step 6: Run the tests**
 
 Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/test_brief.py tests/kernel -q`
-Expected: PASS; add `"issue_review_brief"` to the pin test. Task 10's `test_review_ruling_needs_the_reviewers_turn_ended_and_stopped` builds its seat by hand and now fails for want of a brief: add `f._cmd(g, "issue_review_brief", {"phase": "spec"})` right after its `_dispatch` and take `context_bundle_hash`/`policy_version`/`base_sha` from `front.brief_for(s, "r-1", g).payload` — the refusal it tests is still the turn guard's, which runs first. Full suite: green.
+Expected: PASS; add `"issue_review_brief"` to the pin test. Task 10's `test_review_ruling_needs_the_reviewers_turn_ended_and_stopped` and `test_output_guard_reads_the_sessions_own_prompt` build their seats by hand and now fail for want of a brief: in each, add `f._cmd(g, "issue_review_brief", {"phase": "spec"})` right after its `_dispatch` and take `context_bundle_hash`/`policy_version`/`base_sha` from `front.brief_for(s, "r-1", g).payload` — the refusal it tests is still the turn guard's, which runs first. Full suite: green.
 
 - [ ] **Step 7: Mutation check, then commit**
 
@@ -5098,7 +5198,7 @@ git commit -m "feat(kernel): review brief rendered by the kernel; review_ruling 
 **Interfaces:**
 - Consumes: `front.newest_seat` (Task 7), `front.grants` (Task 6), `policy_of`.
 - Produces: `front.rounds_used(store, run_id, phase, epoch_n) -> int` (count of `review_verdict` facts with `ruling == "review_ruling"`, `verdict == "request_revision"`, that phase and epoch), `front.round_grants(store, run_id, phase, epoch_n) -> int` (count of `human_ruling {ruling: grant_round}` facts with that phase and epoch), `front.round_bound(store, run_id, phase, epoch_n) -> int` = `max_rounds + round_grants`.
-  - `submit_spec`/`submit_plan` refused when the calling actor is not the `agent_name` of the newest satisfied author `sess-create` of the phase and epoch; a `review_ruling` refused when the reviewer actor is not the `agent_name` of the newest satisfied reviewer `sess-create` of the phase and epoch; the `max_rounds+1`th `request_revision` `review_ruling` in a phase and epoch refused (a `human_ruling` is not counted and not bounded).
+  - `submit_spec`/`submit_plan` refused when the calling actor is not `front.vendor_of(agent_name)` of the newest satisfied author `sess-create` of the phase and epoch; a `review_ruling` refused when the reviewer actor is not `vendor_of` the newest satisfied reviewer `sess-create`'s `agent_name` (ruling 14); the `max_rounds+1`th `request_revision` `review_ruling` in a phase and epoch refused (a `human_ruling` is not counted and not bounded).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5163,15 +5263,26 @@ def test_rounds_are_per_phase_and_epoch_and_human_revisions_do_not_count(tmp_pat
 
 
 def test_submit_actor_must_be_the_sessions_vendor(tmp_path):
+    """The snapshot names the BUNDLE (v2_author_claude); the dispatch the
+    vendor (codex). vendor_of maps one to the other (ruling 14)."""
     s = _store(tmp_path)
     f = Front(s, "r-1")
     g = f._dispatch(Role.AUTHOR, "codex")
-    sid = f._session(g, f._newest_id(), actor="claude")     # the snapshot names claude
+    sid = f._session(g, f._newest_id(), actor="claude")     # snapshot agent_name == "v2_author_claude"
     f._end_turn(g, sid)
+    assert __import__("json").loads(s.effect_by_key(f"sess-create:r-1:{g}", run_id="r-1")["external_object_id"])["agent_name"] == "v2_author_claude"
     with pytest.raises(NotAuthorized, match="agent_name"):
         f._cmd(g, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
     rejected = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
     assert rejected.actor == "codex"
+    # The spec's own §8 case: snapshot v2_author_claude, a claude generation -> accepted.
+    g2 = f._dispatch(Role.AUTHOR, "claude")
+    sid2 = f._session(g2, f._newest_id())
+    f._end_turn(g2, sid2)
+    f._cmd(g2, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
+    assert s.run_state("r-1") == "spec_submitted"
+    assert front.vendor_of("v2_author_claude") == "claude" and front.vendor_of("codex") is None
+    assert front.vendor_of("v2_implementer") is None and front.vendor_of("v2_author_") is None
 
 
 def test_reviewer_actor_must_be_the_seats_vendor(tmp_path):
@@ -5255,12 +5366,13 @@ In `_check_submit`, after the role check:
 ```python
     seat = front.newest_seat(store, cmd.run_id, Role.AUTHOR, phase, epoch_n)
     actor = actor_for(store, cmd.run_id, cmd.generation)
-    if seat is None or seat["session"].get("agent_name") != actor:
+    named = None if seat is None else seat["session"].get("agent_name")
+    if seat is None or front.vendor_of(named) != actor:
         raise NotAuthorized(
-            f"{cmd.name}: the calling actor {actor!r} is not the agent_name "
-            f"{None if seat is None else seat['session'].get('agent_name')!r} of the newest "
-            f"satisfied author sess-create of {phase}/epoch {epoch_n}: the artefact was read "
-            "from that session, and its author is the vendor that ran it"
+            f"{cmd.name}: the calling actor {actor!r} is not the vendor of the bundle "
+            f"(agent_name {named!r}) the newest satisfied author sess-create of "
+            f"{phase}/epoch {epoch_n} names: the artefact was read from that session, "
+            "and its author is the vendor that ran it (ruling 14)"
         )
 ```
 
@@ -5268,10 +5380,11 @@ In `_check_submit`, after the role check:
 
 ```python
     seat = front.newest_seat(store, cmd.run_id, Role.REVIEWER, phase, epoch_n)
-    if seat is None or seat["session"].get("agent_name") != actor:
+    named = None if seat is None else seat["session"].get("agent_name")
+    if seat is None or front.vendor_of(named) != actor:
         raise NotAuthorized(
-            f"reviewer {actor!r} is not the agent_name of the newest satisfied reviewer "
-            f"sess-create of {phase}/epoch {epoch_n}"
+            f"reviewer {actor!r} is not the vendor of the bundle (agent_name {named!r}) the "
+            f"newest satisfied reviewer sess-create of {phase}/epoch {epoch_n} names"
         )
 ```
 
@@ -5282,7 +5395,7 @@ Expected: PASS. Full suite: green.
 
 - [ ] **Step 6: Mutation check, then commit**
 
-Count human rulings in `rounds_used` (drop the `ruling` clause): `test_rounds_are_per_phase_and_epoch_and_human_revisions_do_not_count` fails. Compare `seat["session"]["agent_id"]` instead of `agent_name`: both identity tests fail. Restore.
+Count human rulings in `rounds_used` (drop the `ruling` clause): `test_rounds_are_per_phase_and_epoch_and_human_revisions_do_not_count` fails. Compare `agent_name` to `actor` directly (drop `vendor_of`): `test_submit_actor_must_be_the_sessions_vendor` fails on the §8 case. Compare `agent_id` instead: every identity test fails. Restore.
 
 ```bash
 git add v2/kernel/authz.py v2/kernel/front.py v2/tests/kernel/test_rounds_and_identity.py
@@ -6122,7 +6235,8 @@ from coordinator.session import LookupFailed
 
 class FakeOmnigent:
     def __init__(self, agent_names=None):
-        self.agent_names = dict(agent_names or {"ag_claude": "claude", "ag_codex": "codex"})
+        # agent_id -> the BUNDLE's name, as the server reports it (ruling 14).
+        self.agent_names = dict(agent_names or {"ag_claude": "v2_author_claude", "ag_codex": "v2_author_codex"})
         self.sessions = {}
         self.listed = set()
         self.stop_status = 200
@@ -6239,7 +6353,7 @@ def world(tmp_path, monkeypatch):
     return s, f, fake, ctx
 
 
-def _register(fake, sid, agent="ag_claude", name="claude"):
+def _register(fake, sid, agent="ag_claude", name="v2_author_claude"):
     fake.sessions[sid] = {"id": sid, "status": "idle", "agent_id": agent, "agent_name": name,
                           "host_id": "h", "workspace": f"/w/{sid}", "title": "t", "items": [], "labels": {}}
     fake.listed.add(sid)
@@ -6278,10 +6392,8 @@ def test_retire_stops_an_orphan_with_the_displacing_cause(world):
     f.author_round(SPEC_BYTES)
     g = f._dispatch(Role.REVIEWER, "codex")
     f._cmd(g, "issue_review_brief", {"phase": "spec"})
-    sid = f._session(g, f._newest_id())
-    _register(fake, sid, "ag_codex", "codex")
-    # Make the create satisfied but the prompt not: drop the prompt row.
-    s._conn.execute("DELETE FROM effects WHERE idempotency_key LIKE ?", (f"sess-prompt:{sid}:%",))
+    sid = f._create(g, f._newest_id())        # a satisfied create with no prompt: the effects table is append-only
+    _register(fake, sid, "ag_codex", "v2_author_codex")
     # A human request_revision returns the run to queued: the seat is displaced.
     f.human("record_review", {"phase": "spec", "artifact_hash": s.phase_artifact("r-1", "spec"),
                               "verdict": "request_revision", "findings": "no"})
@@ -6300,8 +6412,7 @@ def test_the_pass_does_not_retire_the_session_it_derives(world):
     s, f, fake, ctx = world
     g = f._dispatch(Role.AUTHOR, "claude")
     cause = phases.round_cause(ctx).id
-    sid = f._session(g, cause)
-    s._conn.execute("DELETE FROM effects WHERE idempotency_key LIKE ?", (f"sess-prompt:{sid}:%",))
+    sid = f._create(g, cause)                 # create satisfied, prompt owed
     ctx.generation = f._dispatch(Role.OPERATOR, "runner")
     assert phases.derived_session_obligation(ctx) == {"kind": "sess-create", "run": "r-1", "phase": "spec",
                                                       "epoch": 0, "cause": cause}
@@ -6583,7 +6694,7 @@ Closes §11: `test_read_after_stop_partial_bytes_hashed`.
 - Consumes: `Ctx`, `round_cause`, `answer_to_resume` (Task 16); `sessions.*` (Task 15); `session.wait_turn`, `list_items`, `AgentMismatch` (Task 14); `front.newest_seat`, `front.newest_prompt`, `front.satisfied_effects`; the kernel commands through `Command`/`submit`; `dispatch`, `SeatsExhausted`, `PendingEffects` (Task 6).
 - Produces:
   - `seat.ARTIFACT_OUT = "bircher/artifact.md"`, `seat.QUESTIONS_OUT = "bircher/questions.md"`, `seat.REVIEW_OUT = "bircher/review.md"` (equal to `brief.REVIEW_OUT`).
-  - `@dataclass seat.Turn(session_id, generation, workspace, agent_name, ended: str, files: dict[str, bytes | None], cursor_before: str | None, listing: list[dict])`.
+  - `@dataclass seat.Turn(session_id, generation, workspace, agent_name, ended: str, files: dict[str, bytes | None], cursor_before: str | None, listing: list[dict])` — `agent_name` is the bundle's, as the snapshot reports it.
   - `seat.run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_cause: str, prompt_text: bytes, watched: list[str], read: list[str] | None = None, resume_session: str | None = None) -> Turn` — dispatches `role` as `vendor` (raising `SeatsExhausted`/`PendingEffects` upward); adopts the satisfied create for `session_obligation` else adds a worktree and creates; sends the prompt for `{sess-prompt, session, phase, epoch, cause: prompt_cause}` if owed, else completes it; lists the session and records `prompt_item` for the item whose text hashes to the prompt (by id or, in the crash window, by hash); moves earlier turn files aside before a re-prompt; waits with the deadline from the prompt row's `at_us` + `turn_timeout_s`; records `record_turn_ended`; stops; reads every watched file once (present → bytes, absent → `None`); returns the `Turn`. `AgentMismatch` propagates.
   - `seat.command(ctx, name, payload) -> Result` (a `Command` under `ctx.generation` with a fresh key `f"{name}:{run}:{gen}:{n}"`), `seat.read_once(path) -> bytes | None`.
   - `author.Outcome ∈ {"submitted", "questions", "direction", "empty_retry", "reauthor", "stall", "failed", "budget"}`; `author.author_round(ctx) -> str`; `author.author_brief(ctx, *, phase, resume_answer=None) -> bytes`; `author.parse_questions(text: str) -> list[dict]` (`{"id", "question", "recommended", "ruling"}` from `### Q<id>: <question>` blocks with `Recommended:` and optional `Ruling:` lines); `author.choose_author_vendor(ctx) -> str`.
@@ -6724,7 +6835,7 @@ def test_run_turn_creates_prompts_waits_ends_stops_and_reads(world, tmp_path):
     fake.on_prompt = on_prompt
     t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
                       prompt_cause=cause, prompt_text=b"write the spec", watched=[seat.ARTIFACT_OUT])
-    assert t.agent_name == "claude" and t.ended == "file"
+    assert t.agent_name == "v2_author_claude" and t.ended == "file"
     assert t.files == {seat.ARTIFACT_OUT: b"# the spec"}
     assert t.workspace == os.path.realpath(os.path.join(ctx.workspaces_root, "r-1", str(t.generation)))
     create = s.effect_by_key(f"sess-create:r-1:{t.generation}", run_id="r-1")
@@ -7226,7 +7337,7 @@ def choose_author_vendor(ctx) -> str:
     phase, n = ctx.phase(), ctx.epoch()
     seat_row = front.newest_seat(store, run_id, Role.AUTHOR, phase, n)
     if seat_row is not None:
-        return seat_row["session"]["agent_name"]            # the round's vendor is fixed
+        return front.vendor_of(seat_row["session"]["agent_name"])   # the round's vendor is fixed (ruling 14)
     verdicts = [v for v in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT)
                 if v.payload.get("ruling") == "review_ruling"]
     same_phase = [v for v in verdicts if v.payload["phase"] == phase and v.payload["epoch"] == n]
@@ -7390,7 +7501,7 @@ Expected: PASS. Full suite: green.
 
 - [ ] **Step 9: Mutation check, then commit**
 
-Read the file before the stop in `run_turn` (move the `files =` line above the `stop_session` call): `test_read_after_stop_partial_bytes_hashed` fails (`b"half"`). Skip `_move_aside`: `test_earlier_turn_files_are_moved_aside_before_a_reprompt` fails. Submit before `take_listing`: `test_a_direction_read_at_the_end_of_the_turn_is_not_submitted` fails. Restore all three.
+Read the file before the stop in `run_turn` (move the `files =` line above the `stop_session` call): `test_read_after_stop_partial_bytes_hashed` fails (`b"half"`). In `choose_author_vendor`, return the seat's `agent_name` without `vendor_of`: `test_the_brief_carries_findings_on_a_revision_and_the_spec_for_a_plan` fails at the kernel's identity guard on its second round. Skip `_move_aside`: `test_earlier_turn_files_are_moved_aside_before_a_reprompt` fails. Submit before `take_listing`: `test_a_direction_read_at_the_end_of_the_turn_is_not_submitted` fails. Restore all three.
 
 ```bash
 git add v2/coordinator/seat.py v2/coordinator/author.py v2/coordinator/human.py skills/spec-author/SKILL.md skills/plan-author/SKILL.md v2/tests/coordinator/test_seat.py v2/tests/coordinator/test_author_round.py
@@ -9525,13 +9636,7 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
     assert any("prompt_item" in x for x in prove.assert_sessions(s, "r-1", fetch=fetch))
 ```
 
-`Front._newest_author_session()` is `phases._newest_author_session` for the driver: add to `Front` in this task:
-
-```python
-    def _newest_author_session(self):
-        seat = fq.newest_seat(self.store, self.run_id, Role.AUTHOR, self.phase(), self.epoch())
-        return None if seat is None else seat["session"]["id"]
-```
+`Front._newest_author_session()` is the driver method Task 7 defines.
 
 - [ ] **Step 2: Implement**
 
@@ -9581,7 +9686,7 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     for row in creates:
         snap = json.loads(row["external_object_id"])
         d = roles.get(row["generation"])
-        if d and d["role"] in Role.SEATS and snap.get("agent_name") != d["actor"]:
+        if d and d["role"] in Role.SEATS and front.vendor_of(snap.get("agent_name")) != d["actor"]:
             fails.append(f"{row['idempotency_key']}: snapshot names {snap.get('agent_name')!r}, dispatch actor {d['actor']!r}")
         ob = row["intent"]["obligation"]
         if ob in seen_obs:
@@ -9702,7 +9807,7 @@ Run: `cd v2 && uv run --with pytest --with pyyaml python -m pytest tests/kernel/
 Expected: PASS.
 
 ```bash
-git add v2/tools/__init__.py v2/tools/prove_front_half.py v2/tests/kernel/test_prove_front_half.py v2/tests/kernel/front.py
+git add v2/tools/__init__.py v2/tools/prove_front_half.py v2/tests/kernel/test_prove_front_half.py
 git commit -m "feat(tools): the front-half proof script"
 ```
 
@@ -9731,4 +9836,4 @@ Recorded here so the reader sees what was checked, per the writing-plans skill:
 
 - **Spec coverage.** §1 → Tasks 5, 6, 12. §2 States/commands/refusals → Tasks 7-12 (every row of the commands table has a task; every refusal has a test named in its task). §2 Brief → 11. §2 Grill → 9. §2 Bundle revision → 5, 9, 20. §3 loop → 19; Sessions are effects/obligations/reconciliation → 3, 4, 15, 16; Author round → 17; Review round → 18; the body never rides argv → 3, 15; the contract → 2; the turn's start and end → 10, 14, 17; Rotation → 17, 18; Artefacts → 16. §4 → 19. §5 → 19, 20. §6 → 20, 21. §7 → each row's task is named in Task 19's loop outcomes and Task 17/18's outcomes. §8 kernel/coordinator/runner tests → the tests of each task; proof → 25. §9 → 21. §10 → the file structure. §11 → the closure map.
 - **Placeholder scan.** No "TBD", "TODO", "implement later", "add error handling", "similar to Task N" remain; every code step carries its code.
-- **Type consistency.** `Front` methods (`_dispatch`, `_session`, `_prompt`, `_end_turn`, `_cmd`, `_journal`, `human`, `approve`, `grant`, `answer`, `direct`, `ask_round`, `revise`, `author_round(resume=)`, `review_round(**override)`) are defined in Tasks 7-9 and used with those names after; `front.*` queries are defined before use (Tasks 6, 7, 9, 10, 11, 12); `seat.run_turn`'s signature (Task 17, extended with `reuse_generation` in Task 18) matches its callers; `phases.Ctx` fields match every construction site; `ReviewOutcome.generation` is set in every constructor call in `review_round`.
+- **Type consistency.** `Front` methods (`_dispatch`, `_create`, `_session`, `_prompt`, `_end_turn`, `_cmd`, `_journal`, `_newest_id`, `_newest_author_session`, `human`, `approve`, `grant`, `answer`, `direct`, `ask_round`, `revise`, `author_round(resume=)`, `review_round(**override)`) are defined in Tasks 7-9 and used with those names after; `front.*` queries are defined before use (Tasks 6, 7, 9, 10, 11, 12); `seat.run_turn`'s signature (Task 17, extended with `reuse_generation` in Task 18) matches its callers; `phases.Ctx` fields match every construction site; `ReviewOutcome.generation` is set in every constructor call in `review_round`.
