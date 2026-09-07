@@ -117,7 +117,7 @@ session has settled and exits when the tuple is printed.
 | `cli.py` | the command line, mirroring `kernel.cli` |
 | `sessions.py` | session effects: every create, prompt and stop is a `SESSION_CONTROL` effect with an obligation |
 | `seat.py` | one waited turn of a seat, shared by the author, the reviewer and the human pass |
-| `author.py` | the author round: dispatch, worktree, brief, submission |
+| `author.py` | the author round: the brief and the submission; `author_round` reaches the dispatch and the worktree only through the seat (`seat.run_turn`) |
 | `human.py` | human interaction: the cursor, the discriminator, the batch rules, dismissals and their replies |
 | `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption |
 
@@ -326,7 +326,7 @@ and that is hard to see in a numbered list:
 
 ## 5. Two reviews, and why that matters
 
-Steps 5 and 7 each perform a cross-vendor review of the same PR.
+Steps 6 and 8 each perform a cross-vendor review of the same PR.
 
 | | who dispatches | when | can it repair? | bound |
 |---|---|---|---|---|
