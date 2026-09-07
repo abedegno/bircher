@@ -30,7 +30,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from kernel.effects import EffectClass
+from kernel.effect_class import EffectClass
 
 _METHOD_FLAGS = ("-X", "--method")
 
@@ -68,8 +68,15 @@ def parse(argv: list[str], valued: frozenset[str]) -> Parsed:
                 methods.add(inline)
             i += 1
             continue
-        if flag in valued and i + 1 < len(argv):
-            values.setdefault(flag, []).append(argv[i + 1])
+        # A method flag ALWAYS takes the next token as its value, whether or
+        # not the rule also lists it in `valued`: `-X`/`--method` name the
+        # verb, and a rule that named `--method` in `methods` but forgot it
+        # in `valued` must not leak the verb into `operands` -- the same
+        # defect the `--max-time 120` finding (module docstring) already
+        # fixed for ordinary valued flags.
+        if (flag in valued or flag in _METHOD_FLAGS) and i + 1 < len(argv):
+            if flag in valued:
+                values.setdefault(flag, []).append(argv[i + 1])
             if flag in _METHOD_FLAGS:
                 methods.add(argv[i + 1])
             i += 2
@@ -413,17 +420,3 @@ def merge_target(argv: list[str]) -> tuple[str | None, str | None]:
         elif tok.startswith("--repo="):
             repo = tok.split("=", 1)[1]
     return pr, repo
-
-
-# kernel.effects (this module's own executor and the future reconciler, Tasks
-# 3/4) must read a session-control argv through this SAME parse, not a second
-# one -- so `parse` and `create_body` are bound onto it here, once both exist,
-# rather than by a top-level `from kernel.contract import ...` over there.
-# This module already imports EffectClass from kernel.effects at its own top;
-# a plain import back would make the two modules mutually import each other
-# at load time, and whichever loads first would hit the other before it has
-# defined anything. kernel.cli has no such cycle and imports both plainly.
-import kernel.effects as _effects  # noqa: E402
-
-_effects.create_body = create_body
-_effects.parse = parse

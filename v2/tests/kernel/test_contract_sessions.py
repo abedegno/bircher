@@ -110,6 +110,19 @@ def test_parse_reports_values_and_joined():
     assert p.joined == frozenset({"--max-time"})
 
 
+def test_method_flag_always_takes_a_value_even_if_not_listed_as_valued():
+    # `_flags_and_operands`'s original behaviour: a `_METHOD_FLAGS` entry
+    # (`-X`, `--method`) always consumes its next token as the method, even
+    # when a rule names it in `methods` but forgets to also list it in
+    # `valued`. Otherwise the verb leaks into `operands` -- the same shape as
+    # the `--max-time 120` finding the module docstring already fixed for
+    # ordinary valued flags.
+    p = parse(["--method", "DELETE", "http://srv/x"], frozenset())
+    assert p.methods == frozenset({"DELETE"})
+    assert p.operands == ("http://srv/x",)
+    assert "--method" not in p.values
+
+
 def test_create_body_decodes_single_d():
     assert create_body(_create())["agent_id"] == "ag_1"
     with pytest.raises(ContractViolation):

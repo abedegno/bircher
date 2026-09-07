@@ -8,42 +8,21 @@ Every journalled mutation is a generation-fenced resource.
 from __future__ import annotations
 
 from kernel.dispatch import actor_for
+from kernel.effect_class import EffectClass
 from kernel.events import EventKind
 from kernel.ids import new_id
 from kernel.mode import shadow_or_raise
 from kernel.ownership import OwnershipLost, current_generation
 
-
-class EffectClass:
-    REF_UPDATE = "ref_update"
-    PULL_REQUEST = "pull_request"
-    # Merge is its own class. Folding it into PULL_REQUEST meant the effect
-    # journal could not distinguish opening a PR from merging one, and the
-    # authority-bearing operation shared a gate with the routine one.
-    MERGE = "merge"
-    STATUS_CHECK = "status_check"
-    COMMENT = "comment"
-    ISSUE_OR_LABEL = "issue_or_label"
-    REVERT_OR_RECOVERY = "revert_or_recovery"
-    CREDENTIAL_LIFECYCLE = "credential_lifecycle"
-    SESSION_CONTROL = "session_control"
-    ALL = frozenset({
-        REF_UPDATE, PULL_REQUEST, MERGE, STATUS_CHECK, COMMENT,
-        ISSUE_OR_LABEL, REVERT_OR_RECOVERY, CREDENTIAL_LIFECYCLE, SESSION_CONTROL,
-    })
-
-
-# `create_body` and `parse` are bound onto this module by kernel.contract,
-# near the bottom of that file, once both are defined -- NOT by a top-level
-# `from kernel.contract import create_body, parse` here. kernel.contract
-# imports EffectClass from this module at ITS top, so the reverse import at
-# module-execution time is a genuine cycle: whichever of the two modules is
-# imported first hits the other before it has finished defining anything.
-# `kernel.cli` has no such cycle (kernel.contract never imports kernel.cli)
-# and imports these two plainly. The executor and the future reconciler
-# (Tasks 3/4) call them as `parse(...)` / `create_body(...)` from this
-# module; test_one_parse_three_readers binds all three call sites to one
-# function by identity.
+# `EffectClass` now lives in `kernel.effect_class` (re-exported above, so
+# every existing `from kernel.effects import EffectClass` keeps working)
+# precisely so this import can be a plain one: `kernel.contract` also imports
+# `EffectClass` from `kernel.effect_class`, not from here, so there is no
+# cycle left for this module to import `kernel.contract` back into. The
+# executor and the future reconciler (Tasks 3/4) call these as `parse(...)` /
+# `create_body(...)` from this module; test_one_parse_three_readers binds all
+# three call sites to one function by identity.
+from kernel.contract import create_body, parse
 
 
 class NotReplayable(Exception):
