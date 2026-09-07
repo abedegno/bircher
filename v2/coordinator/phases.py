@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from coordinator import sessions
 from coordinator.effects import perform_effect
 from kernel import front
-from kernel.authz import phase_of
+from kernel.authz import FRONT_HALF_STATES, phase_of
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
 
@@ -16,6 +16,12 @@ PUBLISH_CAP = 60_000
 APPROVED_AT = {"spec": ("specified", "plan_submitted", "plan_accepted", "planned"),
                "plan": ("planned",)}
 _BEYOND_FRONT = ("implementing", "reviewing", "merge_requested", "merged", "ended")
+#: The states `run_loop` works in. `planned` is one of them because the pass
+#: that REACHES it still owes the plan's publication (§3 Artefacts); every
+#: state past it belongs to the back half, and the loop exits 0 without
+#: retiring, publishing or dispatching anything (§3: "A run already at or
+#: beyond `planned` exits 0 at once").
+_LOOP_STATES = FRONT_HALF_STATES | frozenset({"planned"})
 
 
 @dataclass
@@ -198,3 +204,178 @@ def publish_owed(ctx: Ctx) -> list[str]:
                                                   "--body", body], timeout=60, env=ctx.effect_env(), obligation=ob)
         done.append(key)
     return done
+
+
+class Exit:
+    """The loop's exit codes (spec §3): `planned` is 0, a park is 4, and
+    anything the loop cannot act on itself is 1. USAGE is the CLI's, kept
+    here so one table names all four."""
+    OK, FAILED, USAGE, PARKED = 0, 1, 2, 4
+
+
+def stall(ctx: Ctx, reason: str, *, session_id, findings_hash, verdict, reviewer) -> str:
+    """The loop's one way of needing a human (spec §3 loop, §4).
+
+    The session is LISTED first and discriminated: a message already in it is
+    the answer to the stall the pass was about to declare, and taking it means
+    no park at all. Otherwise the park is recorded BEFORE the prompt is sent,
+    because the prompt's obligation is caused by the `parked` fact -- a prompt
+    sent first would have no cause to carry.
+    """
+    from coordinator import human, seat
+    from coordinator.session import LookupFailed, list_items
+    store, run_id = ctx.store, ctx.run_id
+    # "The author session" is the run's most recent author session, whatever
+    # phase made it (spec §4).
+    if session_id is None:
+        session_id = _newest_author_session(ctx)
+    listing = []
+    if session_id is not None:
+        try:
+            listing = list_items(ctx.server, session_id, fetch=ctx.fetch)
+        except LookupFailed as exc:
+            # The carrier cannot be read, so it cannot carry the prompt
+            # either: park with no session rather than park against one the
+            # human will never see. Logged, because a park nobody is told
+            # about is the failure mode this whole path exists to avoid.
+            ctx.log(f"session {session_id}: unreadable at {reason} ({exc}); parking with no carrier")
+            session_id, listing = None, []
+        if listing and human.take_listing(ctx, session_id, listing) not in (None, "dismissed"):
+            return "taken"
+    cur = listing[-1]["id"] if listing else None
+    if cur is None and session_id is None:
+        cur = _last_cursor(ctx)
+    seat.command(ctx, "park", {"reason": reason, "session_id": session_id, "cursor_item_id": cur,
+                               "findings_hash": findings_hash, "verdict": verdict, "reviewer": reviewer})
+    park = front.current_park(store, run_id)
+    if session_id is None:
+        return "parked"
+    return human.human_pass(ctx, park)
+
+
+def _last_cursor(ctx: Ctx):
+    """The run's newest recorded cursor, for a park with no session to list:
+    the park must not claim to have read past anything this pass could not
+    see."""
+    for f in reversed(ctx.store.facts_for(ctx.run_id)):
+        if f.payload.get("cursor_item_id"):
+            return f.payload["cursor_item_id"]
+    return None
+
+
+def run_loop(ctx: Ctx) -> int:
+    """The §3 loop. Every iteration re-reads the state and counts from the
+    journal; nothing survives in memory across iterations, and nothing
+    survives a crash that the journal does not already say.
+
+    The operator fence per iteration is the coordinator's own
+    (`actor="coordinator"`): the runner's resume fence (§5) is taken by
+    `run_item` before `phases` is called, and every seat dispatch inside
+    supersedes it; `retire_owed` and `publish_owed` perform their effects
+    under the coordinator's generation.
+    """
+    from coordinator import author, human, review
+    from coordinator.session import AgentMismatch
+    from coordinator.sessions import WorktreeExists
+    from kernel.dispatch import PendingEffects, Role, dispatch
+    from kernel.effects import UncertainEffect, is_halted, pending_reconciliation
+    store, run_id = ctx.store, ctx.run_id
+    if is_halted(store, run_id) or pending_reconciliation(store, run_id):
+        ctx.log(f"run {run_id} halted or holds pending effects: {pending_reconciliation(store, run_id)}")
+        return Exit.FAILED
+    try:
+        while True:
+            # Before retiring, publishing or dispatching anything: a run
+            # the back half owns is not this loop's to touch, and stopping
+            # its sessions or re-publishing its artefacts would be acting on
+            # someone else's run.
+            if ctx.state() not in _LOOP_STATES:
+                return Exit.OK
+            ctx.generation = dispatch(store, run_id, actor="coordinator", role=Role.OPERATOR).generation
+            retire_owed(ctx)
+            publish_owed(ctx)
+            state = ctx.state()
+            if state == "planned":
+                return Exit.OK
+            # The park comes first: the state alone is ambiguous, and a run
+            # at `spec_submitted` with a current park needs the human, not
+            # another review.
+            park = front.current_park(store, run_id)
+            if park is not None:
+                if human.human_pass(ctx, park) == "parked":
+                    return Exit.PARKED
+                continue
+            if state in ("queued", "specified"):
+                out = author.author_round(ctx)
+                if out == "questions":
+                    if stall(ctx, "grill", session_id=_newest_author_session(ctx), findings_hash=None,
+                             verdict=None, reviewer=None) == "parked":
+                        return Exit.PARKED
+                elif out == "budget":
+                    if stall(ctx, "budget_exhausted", session_id=None, findings_hash=None, verdict=None,
+                             reviewer=None) == "parked":
+                        return Exit.PARKED
+                elif out == "stall":
+                    if stall(ctx, "identical_resubmission", session_id=_newest_author_session(ctx),
+                             findings_hash=None, verdict=None, reviewer=None) == "parked":
+                        return Exit.PARKED
+                elif out == "failed":
+                    return Exit.FAILED
+                continue
+            if state in ("spec_submitted", "plan_submitted"):
+                out = review.review_round(ctx)
+                if out.status == "recorded":
+                    continue
+                if out.status in ("failed", "no_brief"):
+                    return Exit.FAILED
+                reason = {"no_verdict": "no_verdict", "bound_exhausted": "bound_exhausted",
+                          "budget": "budget_exhausted"}[out.status]
+                if stall(ctx, reason, session_id=_newest_author_session(ctx), findings_hash=out.findings_hash,
+                         verdict=(None if out.verdict is None else
+                                  ("accept" if out.verdict == "PASS" else "request_revision")),
+                         reviewer=out.reviewer or None) == "parked":
+                    return Exit.PARKED
+                continue
+            if state in ("spec_accepted", "plan_accepted"):
+                if stall(ctx, "gate", session_id=_newest_author_session(ctx), findings_hash=None, verdict=None,
+                         reviewer=None) == "parked":
+                    return Exit.PARKED
+                continue
+            # A front-half state no branch above claims: exit rather than
+            # spin. Unreachable today; the loop is total anyway.
+            return Exit.OK
+    except (PendingEffects, UncertainEffect) as exc:
+        ctx.log(f"halted: {exc}")
+        return Exit.FAILED
+    except (WorktreeExists, AgentMismatch) as exc:
+        ctx.log(f"failed: {exc}")
+        return Exit.FAILED
+
+
+def _newest_author_session(ctx: Ctx) -> str | None:
+    """The run's most recent author session, whatever phase or epoch made it
+    (spec §4): the carrier a park with no session of its own prompts in."""
+    from kernel.dispatch import Role
+    roles = {d["generation"]: d["role"] for d in ctx.store.dispatches_for(ctx.run_id)}
+    found = None
+    for row in front.satisfied_effects(ctx.store, ctx.run_id, "sess-create"):
+        if roles.get(row["generation"]) == Role.AUTHOR:
+            found = json.loads(row["external_object_id"])["id"]
+    return found
+
+
+def retire(ctx: Ctx) -> list[str]:
+    """spec §5 *Cancellation retires the run's sessions*."""
+    from kernel.effects import is_halted
+    store, run_id = ctx.store, ctx.run_id
+    cancelled = [t for t in store.facts_of_kind(run_id, EventKind.TRANSITION) if t.payload.get("to") == "cancelled"]
+    cause = cancelled[-1].id if cancelled else _displacing_cause(ctx)
+    stopped = {r["intent"]["obligation"]["session"] for r in front.satisfied_effects(store, run_id, "sess-stop")}
+    owed = []
+    for row in front.satisfied_effects(store, run_id, "sess-create"):
+        sid = json.loads(row["external_object_id"])["id"]
+        if sid not in stopped:
+            owed.append(sid)
+    if is_halted(store, run_id) and owed:
+        raise RuntimeError(f"run {run_id} is halted; these sessions could not be stopped: {owed}")
+    return [_stop(ctx, sid, cause) for sid in owed]

@@ -10,6 +10,7 @@ migration has stalled and turned into an API.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -19,12 +20,18 @@ from coordinator.observe import ci_history, classify
 from coordinator.outcome import derive
 from coordinator.pr_selection import is_abandoned, select
 from coordinator.review import extract_verdict
-from coordinator.session import (LookupFailed, item_count, last_assistant_text,
-                                 settle, state)
+from coordinator.session import (LookupFailed, _fetch, item_count,
+                                 last_assistant_text, settle, state)
 
 RC_OK = 0
+#: The front half's own two (spec §3): a run the loop could not carry itself,
+#: and a run waiting on the human. `phases` returns `phases.Exit`, whose
+#: FAILED and PARKED are these values; the fallback commands return RC_FAILED
+#: for a refusal the kernel recorded.
+RC_FAILED = 1
 RC_USAGE = 2
 RC_LOOKUP_FAILED = 3
+RC_PARKED = 4
 #: The adapter's `_EFFECT_RC_DENIED`. Kept identical so the two entry points
 #: are interchangeable to a caller that checks the code.
 RC_EFFECT_DENIED = 87
@@ -33,6 +40,29 @@ RC_EFFECT_DENIED = 87
 # the alternative is dispatching a repair against findings that are stale,
 # truncated, or absent -- and all three read as a normal repair.
 RC_FINDINGS_UNWRITABLE = 88
+
+
+def _human_cmd(store, run_id: str, name: str, payload: dict) -> int:
+    """One of the human's commands, from the operator's shell (spec §4
+    *Fallback*). A refusal is the kernel's answer and is printed as such --
+    `approve --phase plan` at `spec_accepted` names an artefact the run does
+    not hold, and the operator needs to be told which, not to see a traceback.
+
+    The key carries the wall clock because these are typed, not derived: two
+    `revise`s with different findings are two requests, and a fixed key would
+    replay the first one's result for the second.
+    """
+    import time as _t
+
+    from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
+    try:
+        execute_as_human(store, Command(name=name, run_id=run_id, expected_version=store.run_version(run_id),
+                                        idempotency_key=f"cli:{name}:{run_id}:{int(_t.time() * 1e6)}",
+                                        generation=HUMAN_GENERATION, payload=payload))
+    except Exception as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return RC_FAILED
+    return RC_OK
 
 
 def _maybe_stdin(value: str) -> str:
@@ -194,7 +224,107 @@ def main(argv=None) -> int:
     la.add_argument("--id", required=True, dest="conv_id")
     la.add_argument("--n", type=int, default=3)
 
+    # The front half (spec §3 loop, §4 Fallback, §5). `phases` runs the loop;
+    # the rest are the operator's own gestures for a run the loop has parked
+    # or that has to be stopped.
+    #
+    # `--turn-timeout` is NOT `type=int`: argparse would exit(2) on a
+    # non-integer before main() could refuse it, and the refusal has to be
+    # ours so that "no timeout given" and "a nonsense timeout" answer the
+    # same way -- RC_USAGE, before any effect.
+    ph = subs.add_parser("phases")
+    for sp in (ph,):
+        sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
+    ph.add_argument("--server", required=True); ph.add_argument("--repo", required=True)
+    ph.add_argument("--issue", type=int, required=True); ph.add_argument("--repo-dir", required=True)
+    ph.add_argument("--workspaces-root", required=True); ph.add_argument("--bundle-dir", required=True)
+    ph.add_argument("--host-id", required=True); ph.add_argument("--agent-claude", required=True)
+    ph.add_argument("--agent-codex", required=True); ph.add_argument("--default-author", default="claude")
+    ph.add_argument("--turn-timeout", default=None)
+    for name in ("retire", "cancel"):
+        sp = subs.add_parser(name)
+        sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
+        sp.add_argument("--server", required=True)
+    for name in ("approve", "grant-round", "revise", "direct", "parked"):
+        sp = subs.add_parser(name)
+        sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
+        if name in ("approve", "revise", "direct"):
+            sp.add_argument("--phase", required=True, choices=["spec", "plan"])
+        if name == "revise":
+            sp.add_argument("--findings", required=True)
+        if name == "direct":
+            sp.add_argument("--text", required=True)
+
     a = p.parse_args(argv)
+
+    if a.mode == "phases":
+        if a.turn_timeout is None or not str(a.turn_timeout).isdigit() or int(a.turn_timeout) <= 0:
+            print("phases: --turn-timeout must be a positive integer (seconds)", file=sys.stderr)
+            return RC_USAGE
+        from kernel.store import Store
+
+        from coordinator import phases as _phases
+        ctx = _phases.Ctx(store=Store.open(a.db), run_id=a.run_id, server=a.server, repo=a.repo,
+                          issue_number=a.issue, repo_dir=a.repo_dir, workspaces_root=a.workspaces_root,
+                          bundle_dir=a.bundle_dir, agent_ids={"claude": a.agent_claude, "codex": a.agent_codex},
+                          host_id=a.host_id, turn_timeout_s=int(a.turn_timeout), default_author=a.default_author,
+                          env=dict(os.environ, BIRCHER_KERNEL_DB=a.db, BIRCHER_RUN_ID=a.run_id), fetch=_fetch,
+                          log=lambda m: print(m, file=sys.stderr))
+        return _phases.run_loop(ctx)
+
+    if a.mode in ("retire", "cancel"):
+        from kernel.dispatch import Role, dispatch
+        from kernel.store import Store
+
+        from coordinator import phases as _phases
+        store = Store.open(a.db)
+        # `cancel` is ONE gesture: the record first, then the sessions. The
+        # other order would stop the run's sessions while the run is still
+        # live, and the next pass would derive them again.
+        if a.mode == "cancel":
+            rc = _human_cmd(store, a.run_id, "cancel_run", {})
+            if rc != RC_OK:
+                return rc
+        ctx = _phases.Ctx(store=store, run_id=a.run_id, server=a.server, repo="", issue_number=0, repo_dir="",
+                          workspaces_root="", bundle_dir="", agent_ids={}, host_id="", turn_timeout_s=1,
+                          default_author="", env=dict(os.environ, BIRCHER_KERNEL_DB=a.db, BIRCHER_RUN_ID=a.run_id),
+                          fetch=_fetch, log=lambda m: print(m, file=sys.stderr))
+        ctx.generation = dispatch(store, a.run_id, actor="operator", role=Role.OPERATOR).generation
+        try:
+            for k in _phases.retire(ctx):
+                print(k)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return RC_FAILED
+        return RC_OK
+
+    if a.mode == "parked":
+        from kernel import front
+        from kernel.store import Store
+        park = front.current_park(Store.open(a.db), a.run_id)
+        if park is None:
+            return RC_FAILED
+        print(json.dumps(dict(park.payload, seq=park.seq, id=park.id)))
+        return RC_OK
+
+    if a.mode in ("approve", "grant-round", "revise", "direct"):
+        from kernel.store import Store
+        store = Store.open(a.db)
+        if a.mode == "approve":
+            # The HASH comes from the store, never from the operator: the
+            # kernel holds what the phase currently carries, and the caller
+            # can only supply the right answer or a refusal.
+            h = store.phase_artifact(a.run_id, a.phase)
+            return _human_cmd(store, a.run_id, "approve_artifact", {"artifact_hash": h})
+        if a.mode == "grant-round":
+            return _human_cmd(store, a.run_id, "grant_round", {})
+        if a.mode == "revise":
+            h = store.phase_artifact(a.run_id, a.phase)
+            return _human_cmd(store, a.run_id, "record_review", {"phase": a.phase, "artifact_hash": h,
+                                                                 "verdict": "request_revision",
+                                                                 "findings": open(a.findings).read()})
+        return _human_cmd(store, a.run_id, "record_human_direction", {"text": open(a.text).read(),
+                                                                      "cursor_item_id": None})
 
     if a.mode == "ci-history":
         r = ci_history(a.repo, a.branch)
