@@ -1,0 +1,10 @@
+drop	bircher: outcome=merged pr=#12
+drop	  bircher: outcome=escalated
+drop	bircher-status: running
+drop	Outcome derived from the repository state: merged.
+drop	Cross-vendor review (outcome derived from the PR): accept
+drop	bircher: published spec 3f9a1c2e — see the attached artefact
+keep	I think the bircher: outcome=merged line above is wrong, the PR was reverted
+keep	bircher: could you also handle the dark theme?
+keep	published spec looks good to me
+keep	

@@ -21,7 +21,11 @@ from __future__ import annotations
 
 from kernel.artifacts import put_artifact
 from kernel.bundle import bundle_hash
+from kernel.bundle import snapshot as bundle_snapshot
+from kernel.canon import canonical_bytes, canonical_hash, content_hash
+from kernel.effects import NotReplayable
 from kernel.events import EventKind
+from kernel.policy import freeze, policy_of, to_payload
 
 
 class NotApproved(Exception):
@@ -105,3 +109,53 @@ def _create_run_and_transition(store, run_id, base_repo, base_sha,
         payload={"bundle_hash": bhash, "packet_hash": packet_hash,
                  "spec_hash": spec_hash, "plan_hash": plan_hash},
     )
+
+
+def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
+               issue: dict, project_config: dict) -> dict:
+    """Spec §2: `create_run(issue, project_config)`.
+
+    One transaction: the run row (`queued`), the canonical snapshot bytes PUT
+    under `bundle_hash`, `policy_frozen`, `run_enqueued`. Replay only an
+    identical request; a retry whose inputs differ is `NotReplayable` -- the
+    earlier `enqueue` recomputed its answer from the RETRY's arguments and
+    reported success for a policy the journal did not hold.
+    """
+    snap = bundle_snapshot(issue)
+    raw = canonical_bytes(snap)
+    bhash = content_hash(raw)
+    cfg_hash = canonical_hash(project_config or {})
+    labels = sorted(set(issue.get("labels", [])))
+
+    if _run_exists(store, run_id):
+        started = store.newest_fact(run_id, EventKind.RUN_STARTED)
+        enq = store.newest_fact(run_id, EventKind.RUN_ENQUEUED)
+        frozen = store.newest_fact(run_id, EventKind.POLICY_FROZEN)
+        held = {
+            "bundle_hash": None if enq is None else enq.payload.get("bundle_hash"),
+            "project_config_hash": None if frozen is None else frozen.payload.get("project_config_hash"),
+            "base_sha": started.payload.get("base_sha"),
+            "base_repo": started.payload.get("base_repo"),
+        }
+        asked = {"bundle_hash": bhash, "project_config_hash": cfg_hash,
+                 "base_sha": base_sha, "base_repo": base_repo}
+        if held != asked:
+            raise NotReplayable(
+                f"run {run_id} exists with inputs {held}; this retry carries {asked}"
+            )
+        return {"run_id": run_id, "bundle_hash": bhash,
+                "policy": to_payload(policy_of(store, run_id)), "replayed": True}
+
+    with store.transaction():
+        store.create_run(run_id=run_id, base_repo=base_repo, base_sha=base_sha)
+        put = put_artifact(store, raw)
+        assert put == bhash, "bundle_hash is content_hash(canonical_bytes(snapshot))"
+        p = freeze(store, run_id, labels=labels, project_config=project_config)
+        store.append_fact(
+            run_id=run_id, kind=EventKind.RUN_ENQUEUED, actor="human",
+            causal_command_id=None,
+            payload={"bundle_hash": bhash, "packet_hash": None,
+                     "spec_hash": None, "plan_hash": None},
+        )
+    return {"run_id": run_id, "bundle_hash": bhash, "policy": to_payload(p),
+            "replayed": False}

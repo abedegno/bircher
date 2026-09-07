@@ -72,7 +72,9 @@ def test_a_duplicate_label_still_changes_the_hash():
     (lambda i: i.update({"title": "different"}), "title"),
     (lambda i: i.update({"body": "different"}), "body"),
     (lambda i: i.update({"number": 712}), "number"),
-    (lambda i: i["labels"].append("bircher:blocked"), "labels"),
+    # A `bircher:` label is state, not frozen input (canon v2) -- a plain
+    # label is what still proves the labels field itself is frozen.
+    (lambda i: i["labels"].append("regression"), "labels"),
     (lambda i: i["comments"].append({"id": 3, "author": "x", "body": "new"}), "comments"),
     (lambda i: i["comments"][0].update({"body": "edited"}), "comment body"),
     (lambda i: i["comments"][0].update({"author": "someone-else"}), "comment author"),

@@ -17,11 +17,35 @@ from __future__ import annotations
 
 from kernel.canon import canonical_bytes, content_hash
 
-BUNDLE_CANON_VERSION = 1
+#: Version 2 drops what bircher itself writes to an issue. Version 1 froze
+#: every label and every comment, so the runner's own `bircher:running` flip
+#: and the coordinator's publication comment read as a relevant change and
+#: reset the run to `queued` on every pass (spec §2 Bundle revision).
+BUNDLE_CANON_VERSION = 2
 
 #: Pinned by a test, not by convention: changing this set rehashes every
 #: bundle ever frozen, so it is a deliberate, versioned change.
 FROZEN_FIELDS = ("number", "title", "body", "labels", "comments")
+
+#: Labels bircher writes. Never frozen; they carry state, not requirement.
+BIRCHER_LABEL_PREFIX = "bircher:"
+
+#: The single definition of the predicate `run-queue.sh`'s digest also
+#: applies. Five EXACT prefixes, matched with startswith on the stripped body
+#: -- not the generic "bircher: ", which would silence a human discussing a
+#: marker. Both copies are tested against tests/fixtures/bircher_status_comments.tsv.
+BIRCHER_STATUS_PREFIXES: tuple[str, ...] = (
+    "bircher: outcome=",
+    "bircher-status:",
+    "Outcome derived from the repository",
+    "Cross-vendor review (outcome derived",
+    "bircher: published ",
+)
+
+
+def is_bircher_status(body: str) -> bool:
+    head = (body or "").lstrip()
+    return any(head.startswith(p) for p in BIRCHER_STATUS_PREFIXES)
 
 
 def snapshot(issue: dict) -> dict:
@@ -31,12 +55,17 @@ def snapshot(issue: dict) -> dict:
         "number": int(issue["number"]),
         "title": issue["title"],
         "body": issue["body"],
-        # Sorted: label order is not stable and carries no meaning.
-        "labels": sorted(issue.get("labels", [])),
+        # Sorted: label order is not stable and carries no meaning. Bircher's
+        # own labels are state, not input.
+        "labels": sorted(
+            l for l in issue.get("labels", []) if not l.startswith(BIRCHER_LABEL_PREFIX)
+        ),
         # Ordered by id: creation order is the meaningful one, and stable.
+        # Bircher's own status and publication comments are not input.
         "comments": [
             {"id": int(c["id"]), "author": c["author"], "body": c["body"]}
             for c in sorted(issue.get("comments", []), key=lambda c: int(c["id"]))
+            if not is_bircher_status(c.get("body") or "")
         ],
     }
 

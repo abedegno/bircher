@@ -89,6 +89,17 @@ _ALLOWED_LINES = {
         "EXPLAINS THE RETIREMENT, in the same instruction file. Kept because a block that simply vanished would leave a session wondering what to report instead; this says nothing, and why.",
     'So: do not write a `bircher-status:` line, in a PR comment, a PR body, an':
         "FORBIDS IT BY NAME, in the instruction file that used to mandate it. The prohibition has to name the thing to be effective for a model reader -- the smoke items that avoided the marker did so only because their text forbade it by name, while issue-derived text did not and #735 carried one. Prompt wording is not the mechanism (this scan is); it is what stops the model writing one before the scan ever runs.",
+    '"bircher-status:",':
+        "READS the archive, same as run-queue.sh's own "
+        '`head.startswith("bircher-status:")` above: `is_bircher_status` '
+        "recognises a historical bircher-status comment so bundle canon v2 can "
+        "exclude it from the frozen input. Retiring the channel means never "
+        "writing one again, not forgetting how to recognise what earlier code "
+        "wrote.",
+    '"bircher: outcome=", "bircher-status:",':
+        "ASSERTS the recognizer's five prefixes, pinning `is_bircher_status`'s "
+        "reading of the retired channel against "
+        "tests/fixtures/bircher_status_comments.tsv.",
 }
 
 
