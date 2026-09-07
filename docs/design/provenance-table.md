@@ -22,6 +22,7 @@ answer, and the value that survives is the kernel's.
 |---|---|---|---|
 | `actor` | `submit()` | observed | `dispatches`, written by `dispatch()`, which also fences the generation. No payload may name an actor. |
 | `role_for` | `authorize`, `validate_review` | observed | the same dispatch row |
+| `actor_for` | `_check_submit` | observed | the same dispatch row |
 | `_implementer_of` | `validate_review`, `revalidate_merge` | observed | `fact.actor` on the last accepted `start_implementation`, written by the kernel from the dispatch record |
 | `_reviewer_of` | `revalidate_merge` | observed | `reviewer_identity` on a `review_verdict` fact, written by the kernel from the dispatch record |
 

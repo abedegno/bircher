@@ -15,7 +15,7 @@ a workflow language."
 from __future__ import annotations
 
 from kernel.artifacts import VerdictBinding, binding_hash
-from kernel.dispatch import Role, role_for
+from kernel.dispatch import Role, actor_for, role_for
 from kernel.events import EventKind
 
 
@@ -201,6 +201,14 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
             "(a human_ruling); a reviewer has already ruled on this hash"
         )
     if verdict == "request_revision":
+        from kernel import front
+        n = front.epoch(store, run_id)
+        used, bound = front.rounds_used(store, run_id, phase, n), front.round_bound(store, run_id, phase, n)
+        if used >= bound:
+            raise NotAuthorized(
+                f"max_rounds: {used} request_revision rulings already in {phase}/epoch {n} "
+                f"against a bound of {bound}; the loop parks bound_exhausted and a human retry grants one"
+            )
         return "queued" if phase == "spec" else "specified"
     gates = policy_of(store, run_id).gates
     if phase == "spec":
@@ -402,6 +410,13 @@ def validate_review(store, cmd, actor: str, *, ruling: str = "review_ruling") ->
         raise NotAuthorized(
             f"reviewer independence violated: {actor!r} submitted the {phase} under review"
         )
+    seat = front.newest_seat(store, cmd.run_id, Role.REVIEWER, phase, epoch_n)
+    named = None if seat is None else seat["session"].get("agent_name")
+    if seat is None or front.vendor_of(named) != actor:
+        raise NotAuthorized(
+            f"reviewer {actor!r} is not the vendor of the bundle (agent_name {named!r}) the "
+            f"newest satisfied reviewer sess-create of {phase}/epoch {epoch_n} names"
+        )
     return binding
 
 
@@ -534,6 +549,17 @@ def _check_submit(store, cmd, state: str) -> None:
     from kernel import front
     if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
         raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
+    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
+    seat = front.newest_seat(store, cmd.run_id, Role.AUTHOR, phase, epoch_n)
+    actor = actor_for(store, cmd.run_id, cmd.generation)
+    named = None if seat is None else seat["session"].get("agent_name")
+    if seat is None or front.vendor_of(named) != actor:
+        raise NotAuthorized(
+            f"{cmd.name}: the calling actor {actor!r} is not the vendor of the bundle "
+            f"(agent_name {named!r}) the newest satisfied author sess-create of "
+            f"{phase}/epoch {epoch_n} names: the artefact was read from that session, "
+            "and its author is the vendor that ran it (ruling 14)"
+        )
     if cmd.name == "submit_spec" and front.grill_open(store, cmd.run_id):
         raise NotAuthorized(
             "the grill is open: under grill=human the spec waits for a human_answer "
@@ -542,7 +568,6 @@ def _check_submit(store, cmd, state: str) -> None:
     h = cmd.payload.get("artifact_hash")
     if not isinstance(h, str) or not store.has_artifact(h):
         raise NotAuthorized(f"{cmd.name} names an artefact the kernel does not hold: {h!r}")
-    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
     if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n)):
         raise NotAuthorized(
             f"identical to the prior artefact: {h[:12]}... was already submitted "

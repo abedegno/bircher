@@ -29,6 +29,30 @@ def seat_bound(store, run_id: str) -> int:
     return policy_of(store, run_id).max_seats + 2 * grants(store, run_id)
 
 
+def rounds_used(store, run_id: str, phase: str, epoch_n: int) -> int:
+    """How many `request_revision` review_rulings this phase and epoch have
+    already spent. A human's own request_revision is a `human_ruling`
+    review_verdict, not a `review_ruling` one, and does not count."""
+    return sum(
+        1 for f in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT)
+        if f.payload.get("ruling") == "review_ruling"
+        and f.payload.get("verdict") == "request_revision"
+        and f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n
+    )
+
+
+def round_grants(store, run_id: str, phase: str, epoch_n: int) -> int:
+    return sum(
+        1 for f in store.facts_of_kind(run_id, EventKind.HUMAN_RULING)
+        if f.payload.get("ruling") == "grant_round"
+        and f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n
+    )
+
+
+def round_bound(store, run_id: str, phase: str, epoch_n: int) -> int:
+    return policy_of(store, run_id).max_rounds + round_grants(store, run_id, phase, epoch_n)
+
+
 FRONT_PHASES = ("spec", "plan")
 
 #: Ruling 14: the server names the bundle, the dispatch names the vendor.
