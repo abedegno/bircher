@@ -273,7 +273,13 @@ _log_call() {{  # <name> <args...>
   {{ printf '%s' "$name"; local a; for a in "$@"; do printf '\\0%s' "$a"; done; }} > "$f"
 }}
 
-_kernel_run_start()          {{ _log_call _kernel_run_start "$@"; }}
+# The two input files are COPIED ASIDE as they are handed over: `run_item`
+# removes them on the way out, on every exit path, so a test that opened the
+# logged path afterwards would be reading a file that is correctly gone.
+_kernel_run_start() {{
+  _log_call _kernel_run_start "$@"
+  cp "$4" "{issue_copy}" 2>/dev/null; cp "$5" "{cfg_copy}" 2>/dev/null
+}}
 # The front half, stubbed to the mint-and-proceed answers. What each of them
 # DECIDES has its own file (test_front_half_seam.py); this one is about the
 # arguments the back half threads afterwards.
@@ -384,7 +390,8 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     """Drives ONE queue item through `run_item`, for real, with every
     session/network function stubbed. Returns (calls, result) where `calls`
     is an ordered list of (name, [args...]) tuples logged by `_log_call`,
-    and `result` is the CompletedProcess."""
+    `result` is the CompletedProcess, and the third element is the temp
+    directory the stubs copied `run_item`'s input files into."""
     script = _extracted_script(tmp_path)
 
     queue_dir = tmp_path / "queue"
@@ -411,6 +418,8 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
         callseq=callseq, calldir=calldir, gencounter=gencounter,
         observed_review=observed_review, head_sha=HEAD_SHA,
         reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH, ctx_hash=CTX_HASH,
+        issue_copy=tmp_path / "sent-issue.json",
+        cfg_copy=tmp_path / "sent-cfg.json",
         # The EIGHTH field: the PR the derivation settled on. Emitting the same
         # PR the item already has keeps these tests about argument wiring; the
         # settle-and-adopt behaviour has its own file.
@@ -441,7 +450,7 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     for f in sorted(calldir.iterdir()):
         parts = f.read_bytes().split(b"\0")
         calls.append((parts[0].decode(), [p.decode() for p in parts[1:]]))
-    return calls, result
+    return calls, result, tmp_path
 
 
 #: Sourcing the ~7000-line trimmed script and executing `run_item`'s
@@ -501,7 +510,7 @@ _SEQUENCE = [
 
 
 def test_the_drive_reaches_every_kernel_call_site(happy_drive):
-    calls, result = happy_drive
+    calls, result, _tmp = happy_drive
     assert "RC=0" in result.stdout, (result.stdout, result.stderr)
     names = [name for name, _ in calls]
     assert names == _SEQUENCE, names
@@ -510,7 +519,7 @@ def test_the_drive_reaches_every_kernel_call_site(happy_drive):
 # --- each call site gets the RIGHT value, not just A value -------------------
 
 def test_run_start_gets_the_run_id_repo_base_sha_and_both_input_files(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_RUN_START]
     assert name == "_kernel_run_start"
     run_id, repo, base_sha, issue_json, cfg_json = args
@@ -519,22 +528,26 @@ def test_run_start_gets_the_run_id_repo_base_sha_and_both_input_files(happy_driv
     # WORKDIR is deliberately not a git repo, so `git rev-parse HEAD` fails
     # and run_item's documented fallback (40 zeros) must be what lands here.
     assert base_sha == "0" * 40, args
-    # The two inputs `create_run` freezes. Asserted as FILES THAT EXIST AND
-    # PARSE, not merely as non-empty strings: a path run_item never wrote to
-    # looks exactly like one it did until something opens it.
-    issue = json.loads(pathlib.Path(issue_json).read_text())
+    # The two inputs `create_run` freezes. Asserted on the CONTENT that was
+    # handed over, not merely on non-empty strings: a path run_item never wrote
+    # to looks exactly like one it did until something opens it. Read from the
+    # stub's copies, because run_item removes the originals on its way out --
+    # which is itself asserted below.
+    issue = json.loads((_tmp / "sent-issue.json").read_text())
     assert issue["title"] == "t01-test-item", issue
     assert "Implement the thing." in issue["body"], issue
-    assert json.loads(pathlib.Path(cfg_json).read_text()) == {}
+    assert json.loads((_tmp / "sent-cfg.json").read_text()) == {}
+    assert not pathlib.Path(issue_json).exists(), issue_json
+    assert not pathlib.Path(cfg_json).exists(), cfg_json
 
 
 def test_the_operator_is_fenced_before_the_phase_loop(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     assert calls[I_OPERATOR] == ("_kernel_dispatch", ["runner", "operator"]), calls[I_OPERATOR]
 
 
 def test_the_phase_loop_gets_the_run_the_turn_timeout_and_both_author_agents(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_PHASES]
     assert name == "BIRCHER_PY"
     assert args[:3] == ["-m", "coordinator.cli", "phases"], args
@@ -548,7 +561,7 @@ def test_the_phase_loop_gets_the_run_the_turn_timeout_and_both_author_agents(hap
 
 
 def test_the_implementer_dispatch_gets_the_resolved_vendor(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_IMPLEMENTER]
     assert name == "_kernel_dispatch"
     assert args == ["claude_code", "implementer"], args
@@ -558,7 +571,7 @@ def test_the_implementers_prompt_is_the_kernels_brief_not_the_queue_prompt(happy
     """spec §6. The brief is built from the run and the vendor, and the queue
     prompt reaches it nowhere -- the front half has already turned the item
     into an accepted spec and plan."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_BRIEF]
     assert name == "_implementer_brief"
     run_id = calls[I_RUN_START][1][0]
@@ -566,7 +579,7 @@ def test_the_implementers_prompt_is_the_kernels_brief_not_the_queue_prompt(happy
 
 
 def test_start_implementation_gets_the_implementer_generation(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_START_IMPL]
     assert name == "_kernel_start_implementation"
     run_id = calls[I_RUN_START][1][0]
@@ -576,7 +589,7 @@ def test_start_implementation_gets_the_implementer_generation(happy_drive):
 
 
 def test_the_state_is_read_back_for_this_run_after_start_implementation(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_STATE]
     assert name == "_kernel_state"
     assert args == [calls[I_RUN_START][1][0]], args
@@ -587,7 +600,7 @@ def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
     record_output. Everything the kernel records afterwards is derived from
     what it returned -- so if this call ever moves after the recording, the
     recorded facts would describe a run nobody had observed yet."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, _args = calls[I_OBSERVE]
     assert name == "observe_outcome", [c[0] for c in calls]
     assert calls[I_OBSERVE - 1][0] == "_kernel_bundle_hash"
@@ -595,7 +608,7 @@ def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
 
 
 def test_record_output_gets_the_actual_derived_body(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_OUTPUT]
     assert name == "_kernel_record_output"
     run_id = calls[I_RUN_START][1][0]
@@ -611,7 +624,7 @@ def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
     argument to record_ci is $_obs_ci ("green"), never $outcome ("ready") --
     two in-scope variables from the same derived tuple with different
     vocabularies (see module docstring for the mutation this must catch)."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_CI]
     assert name == "_kernel_record_ci"
     run_id = calls[I_RUN_START][1][0]
@@ -619,7 +632,7 @@ def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
 
 
 def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_REVIEWER]
     assert name == "_kernel_dispatch"
     assert args == ["codex", "reviewer"], args
@@ -630,7 +643,7 @@ def test_record_review_gets_the_raw_marker_verdict_at_the_reviewer_generation(ha
     `_kernel_verdict` translates it in the client. Translating here instead
     would put the mapping on the side that cannot be tested against the
     kernel's vocabulary."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_REVIEW]
     assert name == "_kernel_record_review"
     run_id = calls[I_RUN_START][1][0]
@@ -651,7 +664,7 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
                   prompt, PUT as a stand-in spec; the run now holds a real
                   frozen issue snapshot, and that is what "context" means.
     """
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     by_name = {n: a for n, a in calls}
     _, args = calls[I_REVIEW]
 
@@ -666,7 +679,7 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
 
 
 def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_REDISPATCH]
     assert name == "_kernel_dispatch"
     assert args == ["claude_code", "implementer"], args
@@ -679,7 +692,7 @@ def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_4(happy_drive):
     only because REVIEWED_SHA != HEAD_SHA in this fixture; see REVIEWED_SHA's
     module-level comment for why the swap that motivated this test was
     invisible before that separation."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_MERGE_REQ]
     assert name == "_kernel_request_merge"
     run_id = calls[I_RUN_START][1][0]
@@ -693,7 +706,7 @@ def test_request_merge_presents_the_SAME_binding_the_review_did(happy_drive):
     tuple it finds no approval -- so these two must be identical field for
     field, and asserting them against each other is the only way to catch a
     drift that leaves both individually plausible."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     _, review = calls[I_REVIEW]
     _, merge = calls[I_MERGE_REQ]
     assert merge[5:8] == review[3:6], (
@@ -705,7 +718,7 @@ def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):
     """The other half of the same distinction: `merge_ready_pr`'s 3rd
     argument is `$reviewed_sha` -- REVIEWED_SHA, `_merge_gate`'s answer --
     never the marker's own `$marker_head`."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_MERGE]
     assert name == "merge_ready_pr"
     assert args == ["t01-test-item", PR, REVIEWED_SHA], args
@@ -715,7 +728,7 @@ def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):
     """`_k_outcome` must be "merged" (the stubbed merge_ready_pr returns rc
     0) at generation 4 -- the SAME generation request_merge used, not a
     stale one from an earlier dispatch."""
-    calls, _ = happy_drive
+    calls, _, _tmp = happy_drive
     name, args = calls[I_OUTCOME]
     assert name == "_kernel_record_outcome"
     run_id = calls[I_RUN_START][1][0]
@@ -725,7 +738,7 @@ def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):
 def test_record_outcome_gets_failed_when_the_merge_fails(failed_merge_drive):
     """The other half of the branch: a failing merge_ready_pr must make
     _k_outcome "failed", not silently stay "merged"."""
-    calls, _ = failed_merge_drive
+    calls, _, _tmp = failed_merge_drive
     outcome_calls = [args for name, args in calls if name == "_kernel_record_outcome"]
     assert len(outcome_calls) == 1, outcome_calls
     assert outcome_calls[0][2] == "failed", outcome_calls
@@ -747,7 +760,7 @@ def test_the_recovery_branch_does_not_die_on_an_unbound_variable(recovery_drive)
     test_lifecycle_wiring.test_binding_variables_are_declared_at_run_item_scope.
     This one remains a general guard: any future unbound variable on the
     recovery path reds it, which is worth having and is less than it looks."""
-    _, result = recovery_drive
+    _, result, _tmp = recovery_drive
     assert "unbound variable" not in result.stderr, result.stderr[-400:]
 
 
@@ -756,7 +769,7 @@ def test_the_recovery_branch_records_the_lifecycle(recovery_drive):
     merge the kernel had no evidence for -- and correctly refused. A recovery
     that reviews a PR and finds it ready has observed exactly what the marker
     path observes; it simply was not telling the kernel."""
-    calls, _ = recovery_drive
+    calls, _, _tmp = recovery_drive
     names = [n for n, _ in calls]
     for required in ("_kernel_record_output", "_kernel_record_ci",
                      "_kernel_record_review", "_kernel_request_merge"):
@@ -768,14 +781,14 @@ def test_the_recovery_ci_observation_is_the_one_recovery_MADE(recovery_drive):
     inferred from `outcome=ready`. "ready implies green" is true today and is
     still an inference -- a ledger built on one is a claim with nothing behind
     it."""
-    calls, _ = recovery_drive
+    calls, _, _tmp = recovery_drive
     ci = next(a for n, a in calls if n == "_kernel_record_ci")
     assert ci[2] == "green", f"expected the recovered CI value, got {ci[2]!r}"
     assert ci[3] == HEAD_SHA, "CI was not bound to the observed head"
 
 
 def test_the_recovery_review_carries_the_recovered_verdict_and_binding(recovery_drive):
-    calls, _ = recovery_drive
+    calls, _, _tmp = recovery_drive
     rv = next(a for n, a in calls if n == "_kernel_record_review")
     assert rv[2] == "codex:pass", rv
     assert rv[3] == OUT_HASH, "the review does not bind the recovered output"

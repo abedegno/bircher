@@ -212,6 +212,14 @@ _NO_KERNEL_OUTCOME = {
         "non-advisory call in the client, and this row is written when it "
         "refuses -- there is no run to record an outcome against, and naming "
         "one would put a terminal fact on a run id nothing holds",
+    "reconcile them before this item can run":
+        "the run belongs to whoever reconciles it. This pass fenced nothing "
+        "and decided nothing about the run's outcome, and `record_run_outcome` "
+        "is TERMINAL -- ending a run this pass merely declined to touch would "
+        "close it against the next one that can",
+    "beyond the front half; this pass drives nothing":
+        "same: the run is the BACK half's, still live, and this pass is "
+        "reporting that it cannot drive it -- not deciding how it ended",
 }
 
 #: Scorecard rows whose run is NOT OVER. A distinct exemption from the one

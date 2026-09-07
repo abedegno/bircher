@@ -4238,7 +4238,21 @@ run_item() {
   # snapshots and derives the policy from (spec §1). Fetched here, by the
   # runner's credential; asserted, not observed (§9).
   local _issue_json _cfg_json
-  _issue_json=$(mktemp) && _cfg_json=$(mktemp)
+  # FAIL CLOSED. A `mktemp` that could not create the file leaves the variable
+  # empty, the redirect below writes nothing, and `create_run` is handed a path
+  # it cannot open -- a run refused for a reason that has nothing to do with
+  # the issue. Refuse here, where the reason is still legible.
+  _issue_json=$(mktemp) || { echo "[batch] $item: cannot create a temp file for the issue snapshot" >&2; return 5; }
+  _cfg_json=$(mktemp) || { echo "[batch] $item: cannot create a temp file for the project config" >&2; rm -f "$_issue_json"; return 5; }
+  # REMOVED ON EVERY EXIT, not only on the ones somebody remembered. `run_item`
+  # returns from fourteen places and two of them -- the create_run refusal and
+  # a non-zero `phases` -- leaked a file per item. A RETURN trap set here fires
+  # exactly once, for THIS function, on whichever return happens, and disarms
+  # itself so it cannot fire again for the next item. Verified against bash
+  # 3.2 (the version on the box that runs `--self-test`): it does not fire for
+  # the functions run_item calls, because RETURN traps are not inherited
+  # without `functrace`, and it does not change the return code.
+  trap 'rm -f "$_issue_json" "$_cfg_json"; trap - RETURN' RETURN
   if [ -n "$_iss" ]; then
     _net_run "$BIRCHER_NET_TIMEOUT" gh issue view "$_iss" --repo "$REPO" \
       --json number,title,body,labels,comments > "$_issue_json" || { echo "[batch] $item: issue fetch failed" >&2; return 5; }
@@ -4254,13 +4268,26 @@ run_item() {
   if [ -n "$_open" ]; then
     local _pend; _pend=$(_kernel_pending "$_open")
     if _pending_blocks "$_pend"; then
+      # A ROW, not only a log line. The queue file stays where it is (spec §5),
+      # so this item comes round again on every pass and is skipped again on
+      # every pass -- and with nothing on the channel a human reads, it is
+      # skipped forever without anyone learning it needs reconciling.
       echo "[batch] $item: run $_open is halted or holds pending effects; skipping until reconciled: $_pend" >&2
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is halted or holds unresolved effects; reconcile them before this item can run: $_pend" "n/a" >> "$SCORECARD"
       return 0
     fi
     local _st; _st=$(_kernel_state "$_open")
     case "$_st" in
       queued|spec_submitted|spec_accepted|specified|plan_submitted|plan_accepted|planned) ;;
-      *) echo "[batch] $item: run $_open is at $_st (beyond the front half); skipping" >&2; return 0 ;;
+      *) # THE DAMAGING ONE. A pass that dies after `start_implementation`
+         # leaves the run at `implementing`, and every later pass then logs
+         # this line and moves on -- forever, with the queue file still there
+         # and nothing on the channel a human reads. The row is the handoff.
+         echo "[batch] $item: run $_open is at $_st (beyond the front half); skipping" >&2
+         mkdir -p "$(dirname "$SCORECARD")"
+         json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at '$_st', beyond the front half; this pass drives nothing and the item needs a human" "n/a" >> "$SCORECARD"
+         return 0 ;;
     esac
     if [ "$_st" = planned ] && _kernel_implementation_started "$_open"; then
       echo "[batch] $item: run $_open already started implementation; skipping" >&2; return 0
@@ -4269,10 +4296,25 @@ run_item() {
       echo "[batch] $item: refusing to resume $_open without the batch lock" >&2; return 0
     fi
     BIRCHER_RUN_ID="$_open"; export BIRCHER_RUN_ID; resumed=1
+    # THE RUN'S OWN BASE, not this checkout's HEAD. `validate_review` compares
+    # the binding's base_sha against `store.run_base_sha(run_id)` BEFORE the
+    # implementation-phase early return, so a review bound to anything else is
+    # NotAuthorized -- swallowed by `_kernel` as an advisory warning, after
+    # which the merge gate finds no approval for the tuple. Until this task
+    # every run was minted in the pass that reviewed it and the two values were
+    # always equal; a resumed run is the first time `WORKDIR` can have moved in
+    # between. The computed value stays as the fallback: an unreadable kernel
+    # must not blank the base the binding presents.
+    local _kbase; _kbase=$(_kernel_run_base "$_open")
+    [ -n "$_kbase" ] && _base_sha="$_kbase"
     _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$_st" "resume"
   else
     BIRCHER_RUN_ID="${item}-$(date +%s)"; export BIRCHER_RUN_ID
     if ! _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" "$_base_sha" "$_issue_json" "$_cfg_json" >/dev/null; then
+      # The sidecar names a run; there is no run. Leaving a stale one behind
+      # would tell the next pass -- and the human reading the queue directory
+      # -- that an item is waiting on them when nothing is.
+      rm -f "$QUEUE/$code.parked"
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "failed" "false" "" "" 0 "create_run refused (see log)" "failed" >> "$SCORECARD"
       mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
@@ -4322,6 +4364,9 @@ run_item() {
       return 0 ;;                                   # the queue file stays where it is
     *)
       echo "[batch] $item: phases exited $_prc; recording failed" >&2
+      # Same reason as the refusal above: the run is over, so a sidecar saying
+      # it is parked would outlive what it describes.
+      rm -f "$QUEUE/$code.parked"
       _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "failed" "false" "" "" 0 "phases rc=$_prc" "failed" >> "$SCORECARD"

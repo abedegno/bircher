@@ -39,16 +39,19 @@ _kernel_pythonpath() { printf '%s' "${BIRCHER_V2_DIR:-$BUNDLE_DIR/v2}"; }
 # BOUND: a hung python now returns control to the coordinator in this many
 # seconds instead of never.
 #
-# 5, not 20 (fix round 2): this task's wiring added four more kernel calls
-# (_kernel_put_artifact, _kernel_submit_spec, _kernel_submit_plan,
-# _kernel_start_implementation) into the window between session creation
-# and _send_prompt, each bounded by this same cap -- so the 20s default,
-# never itself reasoned about, had widened the worst-case delay to prompt
-# delivery from ~20s to ~100s when the kernel database is unresponsive. 5s
-# still leaves three orders of magnitude of headroom over the millisecond
-# typical case and bounds the new worst case at ~25s. Raise it only with a
-# reason that outweighs that delay -- the sqlite operations behind this cap
-# do not need it.
+# 5, not 20 (fix round 2): Task 4's wiring put four more kernel calls into the
+# window between session creation and _send_prompt, each bounded by this same
+# cap -- so the 20s default, never itself reasoned about, had widened the
+# worst-case delay to prompt delivery from ~20s to ~100s when the kernel
+# database is unresponsive. 5s still leaves three orders of magnitude of
+# headroom over the millisecond typical case and bounds the worst case at
+# ~25s. Raise it only with a reason that outweighs that delay -- the sqlite
+# operations behind this cap do not need it.
+#
+# Two of those four calls (the spec and plan submits) are gone as of Task 20;
+# the reasoning stands because the window still holds several bounded calls,
+# and naming functions that no longer exist made a live constraint read like
+# history.
 # Overridable so a caller (or a test) can shrink it rather than wait out
 # the default.
 _kernel_net_cap() { printf '%s' "${BIRCHER_KERNEL_TIMEOUT:-5}"; }
@@ -313,32 +316,59 @@ _kernel_reconcile() {
   case "${2:-}" in
     --delivered|--not-delivered)
       local version="$1"; shift
-      local args=() tmp
+      # `tmps` holds every snapshot file this call wrote, so they can be
+      # removed AFTER the kernel has read them. One variable held only the last
+      # one, so a second `--delivered sess-create:` left the first on disk --
+      # with a session body in it -- for the life of the box.
+      local args=() tmps=() tmp
       while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --delivered|--not-delivered)
+            # A FLAG WITH NO VALUE is a usage error, not a crash. Reading `$2`
+            # when the flag is last aborts the CALLER under `set -u`, inside
+            # whatever redirect it was invoked behind.
+            if [ "$#" -lt 2 ]; then
+              echo "[kernel] reconcile: $1 needs a value" >&2
+              _kernel_reconcile_usage
+              [ "${#tmps[@]}" -gt 0 ] && rm -f "${tmps[@]}"
+              return 2
+            fi ;;
+        esac
         case "$1" in
           --delivered)
             local spec="$2"; shift 2
             case "$spec" in
               sess-create:*=*)
                 local id="${spec#*=}"
-                tmp=$(mktemp) || return 1
+                # NAMED, and one per key: `mktemp` alone gives a unique path but
+                # nothing recognisable in a listing, and the array is what makes
+                # the removal below cover all of them.
+                tmp=$(mktemp "${TMPDIR:-/tmp}/bircher-sess-XXXXXXXX") || return 1
+                tmps+=("$tmp")
                 if ! _net_run "$BIRCHER_NET_TIMEOUT" curl -sf --max-time 30 "$SERVER/v1/sessions/$id" > "$tmp"; then
                   echo "[kernel] reconcile: GET /v1/sessions/$id failed; refusing --delivered for ${spec%%=*}" >&2
-                  rm -f "$tmp"; return 1
+                  rm -f "${tmps[@]}"; return 1
                 fi
                 if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("agent_name") else 1)' "$tmp"; then
                   echo "[kernel] reconcile: session $id has no agent_name (agent row gone); refusing" >&2
-                  rm -f "$tmp"; return 1
+                  rm -f "${tmps[@]}"; return 1
                 fi
                 args+=(--delivered "${spec%%=*}=@$tmp") ;;
               *) args+=(--delivered "$spec") ;;
             esac ;;
           --not-delivered) args+=(--not-delivered "$2"); shift 2 ;;
           *) echo "[kernel] reconcile: unexpected argument $1" >&2
-             _kernel_reconcile_usage; return 2 ;;
+             _kernel_reconcile_usage
+             [ "${#tmps[@]}" -gt 0 ] && rm -f "${tmps[@]}"
+             return 2 ;;
         esac
       done
-      _kernel reconcile --run-id "$run_id" "${args[@]}" --expected-version "$version" ;;
+      _kernel reconcile --run-id "$run_id" "${args[@]}" --expected-version "$version"
+      # AFTER the kernel has read them, and unconditionally: `_kernel` is
+      # advisory and returns 0 whatever happened, so there is no failure branch
+      # these could be left behind on.
+      [ "${#tmps[@]}" -gt 0 ] && rm -f "${tmps[@]}"
+      return 0 ;;
     *)
       local resolution="$1" version="$2"; shift 2
       [ "$#" -gt 0 ] || return 0

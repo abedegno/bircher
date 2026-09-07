@@ -140,8 +140,16 @@ _kernel_state() {{
   fi
 }}
 _kernel_implementation_started() {{ _log_call _kernel_implementation_started "$@"; return "${{T_IMPL_STARTED:-1}}"; }}
-_kernel_run_start() {{ _log_call _kernel_run_start "$@"; printf '%s' "{ctx_hash}"; return "${{T_RUN_START_RC:-0}}"; }}
-_kernel_revise_bundle() {{ _log_call _kernel_revise_bundle "$@"; }}
+# The two input files are COPIED ASIDE as they are handed over. `run_item`
+# removes them on the way out -- on every exit, which is the point -- so a test
+# that opened the logged path afterwards would be reading a file that is gone.
+_kernel_run_start() {{
+  _log_call _kernel_run_start "$@"
+  cp "$4" "{issue_copy}" 2>/dev/null; cp "$5" "{cfg_copy}" 2>/dev/null
+  printf '%s' "{ctx_hash}"; return "${{T_RUN_START_RC:-0}}"
+}}
+_kernel_revise_bundle() {{ _log_call _kernel_revise_bundle "$@"; cp "$3" "{revise_copy}" 2>/dev/null; }}
+_kernel_run_base() {{ _log_call _kernel_run_base "$@"; printf '%s' "${{T_RUN_BASE:-}}"; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
 _kernel_bundle_hash() {{ _log_call _kernel_bundle_hash "$@"; printf '%s' "{ctx_hash}"; }}
 _implementer_brief() {{ _log_call _implementer_brief "$@"; printf 'BRIEF(%s)' "$2"; }}
@@ -255,6 +263,13 @@ class Drive:
     def sidecar(self):
         return self.queue_dir / f"{CODE}.parked"
 
+    def sent(self, name):
+        """A file `run_item` handed to a kernel call, copied aside by the stub
+        at the moment it was handed over -- `run_item` removes the originals on
+        its way out, by design."""
+        p = self.tmp_path / name
+        return json.loads(p.read_text()) if p.exists() else None
+
     @property
     def sidecar_at_phases(self):
         """The sidecar as it stood when `coordinator.cli phases` was invoked --
@@ -297,6 +312,9 @@ def _drive(tmp_path, *, env_extra=None, with_issue=True, sidecar=None,
         callseq=callseq, calldir=calldir, gencounter=gencounter,
         statecount=statecount, head_sha=HEAD_SHA, reviewed_sha=REVIEWED_SHA,
         outhash=OUT_HASH, ctx_hash=CTX_HASH, pr=PR,
+        issue_copy=tmp_path / "sent-issue.json",
+        cfg_copy=tmp_path / "sent-cfg.json",
+        revise_copy=tmp_path / "revised-issue.json",
     ))
 
     binpath = tmp_path / "bin"
@@ -372,12 +390,14 @@ def test_run_item_calls_phases_between_run_start_and_the_implementer(mint_drive)
     assert dispatches[0] < phases_at < dispatches[1]
     assert d.calls[dispatches[1]][1] == ["claude_code", "implementer"]
 
-    # run_start takes five arguments and the last two are FILES THAT EXIST.
+    # run_start takes five arguments and the last two are FILES IT WROTE.
     args = d.args_of("_kernel_run_start")
     assert len(args) == 5, args
-    issue = json.loads(pathlib.Path(args[3]).read_text())
-    assert issue["number"] == int(ISSUE), issue
-    assert json.loads(pathlib.Path(args[4]).read_text()) == {}
+    assert d.sent("sent-issue.json")["number"] == int(ISSUE), d.sent("sent-issue.json")
+    assert d.sent("sent-cfg.json") == {}
+    # ...and they are gone once run_item returns, on every path.
+    assert not pathlib.Path(args[3]).exists(), args[3]
+    assert not pathlib.Path(args[4]).exists(), args[4]
 
     # phases carries the turn timeout and both author agent ids.
     pargs = d.args_of("BIRCHER_PY")
@@ -458,9 +478,43 @@ def test_resume_finds_the_open_run_and_refences_as_operator(tmp_path):
     rb = d.args_of("_kernel_revise_bundle")
     assert rb[0] == OPEN_RUN, rb
     assert rb[1] == "1", rb          # the operator generation, not a stale one
-    assert json.loads(pathlib.Path(rb[2]).read_text())["number"] == int(ISSUE)
+    assert d.sent("revised-issue.json")["number"] == int(ISSUE)
     # And the implementer's own state carries the resumed run, not a new one.
     assert d.args_of("_kernel_start_implementation")[0] == OPEN_RUN
+
+
+def test_a_resumed_run_binds_the_base_the_KERNEL_recorded(tmp_path):
+    """`validate_review` compares the binding's `base_sha` against
+    `store.run_base_sha(run_id)` BEFORE the implementation-phase early return,
+    so a review bound to anything else is NotAuthorized -- which `_kernel`
+    swallows as an advisory warning, after which the merge gate finds no
+    approval for the tuple and refuses.
+
+    Until resumption existed, every run was minted in the pass that reviewed
+    it and `git rev-parse HEAD` and the recorded base were always the same
+    value; a resumed run is the first time `WORKDIR` can have moved in
+    between. WORKDIR here is not a git repo, so the computed base is the forty
+    zeros -- and the kernel's is deliberately something else.
+    """
+    recorded = "9" * 40
+    d = _resume_drive(tmp_path, T_RUN_BASE=recorded)
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_run_base") == [OPEN_RUN], d.calls
+    review = d.args_of("_kernel_record_review")
+    assert review[4] == recorded, (
+        "the review binds this checkout's HEAD, not the base the kernel "
+        f"recorded; validate_review compares exactly these two: {review}")
+    assert review[4] != "0" * 40, review
+    # The merge request presents the SAME tuple, or the gate finds no approval.
+    assert d.args_of("_kernel_request_merge")[6] == recorded, d.calls
+
+
+def test_an_unreadable_kernel_base_falls_back_to_the_computed_one(tmp_path):
+    """Empty is not a base. Blanking the binding when `_kernel_run_base` cannot
+    answer would send `base_sha=""`, which fails the same comparison for a
+    different and less legible reason."""
+    d = _resume_drive(tmp_path, T_RUN_BASE="")
+    assert d.args_of("_kernel_record_review")[4] == "0" * 40, d.calls
 
 
 def test_sidecar_is_rebuilt_from_the_kernel(tmp_path):
@@ -508,7 +562,13 @@ def test_pending_or_halted_skips_before_any_fence(tmp_path, pending):
     assert "_kernel_dispatch" not in d.names, d.names
     assert "_kernel_run_start" not in d.names, d.names
     assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
-    assert d.outcomes == [], d.calls
+    # AND A ROW. The queue file stays (spec §5), so this item comes round and
+    # is skipped again on every pass -- with nothing on the channel a human
+    # reads, it is skipped forever and nobody learns it needs reconciling.
+    assert d.outcomes == ["escalated"], d.calls
+    note = d.args_of("json_row")[7]
+    assert OPEN_RUN in note, note
+    assert "sess-create:r:3" in note or "halted" in note, note
 
 
 # --- 7. the batch lock -------------------------------------------------------
@@ -524,11 +584,19 @@ def test_resume_refused_without_the_lock(tmp_path):
     assert "_kernel_run_start" not in d.names, d.names
     assert "batch lock" in d.result.stderr, d.result.stderr
     assert (d.queue_dir / f"{ITEM}.md").exists()
+    # NO ROW, unlike the two skips above, and the difference is the point:
+    # another instance holds the lock and is doing this work. A row here would
+    # escalate an item nothing is wrong with, once per pass, per instance.
+    assert d.outcomes == [], d.calls
 
 
 # --- 8/9. the leak guard -----------------------------------------------------
 
 def test_a_run_beyond_the_front_half_is_skipped_not_relaunched(tmp_path):
+    """And it ESCALATES. This is the damaging silence: a pass that dies after
+    `start_implementation` leaves the run at `implementing`, the queue file
+    stays where §5 says it stays, and every later pass logs one line to stderr
+    and moves on -- forever. The item never reaches a human at all."""
     d = _drive(tmp_path, env_extra={
         "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
         "T_PENDING": json.dumps({"halted": False, "pending": []}),
@@ -537,6 +605,10 @@ def test_a_run_beyond_the_front_half_is_skipped_not_relaunched(tmp_path):
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     assert "_kernel_dispatch" not in d.names, d.names
     assert "_kernel_run_start" not in d.names, "it minted a second run"
+    assert d.outcomes == ["escalated"], d.calls
+    note = d.args_of("json_row")[7]
+    assert OPEN_RUN in note and "implementing" in note, note
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
 
 
 def test_planned_with_an_accepted_start_implementation_is_skipped(tmp_path):
@@ -560,7 +632,6 @@ def test_leak_guard_never_mints_over_an_open_run(tmp_path):
         "T_PENDING": json.dumps({"halted": False, "pending": []}),
         "T_STATE_RESUME": "queued",
     })
-    assert not (d.queue_dir / f"{CODE}.parked").exists() or True
     assert "_kernel_run_start" not in d.names, d.names
     assert d.args_of("_kernel_start_implementation")[0] == OPEN_RUN
 
@@ -579,12 +650,41 @@ def test_create_run_refusal_records_failed(tmp_path):
     assert "BIRCHER_PY" not in d.names, "phases ran for a run that was refused"
 
 
+# --- the sidecar does not outlive the run it names ---------------------------
+
+@pytest.mark.parametrize("env,why", [
+    ({"T_RUN_START_RC": "1"}, "create_run refused"),
+    ({"PHASES_RC": "1"}, "phases failed"),
+])
+def test_a_stale_sidecar_is_cleared_when_the_pass_ends_badly(tmp_path, env, why):
+    """The sidecar says an item is waiting on a human. A pass that ends without
+    a run -- refused, or `phases` exiting non-zero -- leaves one from an
+    EARLIER pass describing something that no longer exists, and both the next
+    pass and the human reading the queue directory believe it. Only the success
+    path cleared it, so the two paths that end a run without parking it were
+    the two that could not.
+    """
+    d = _drive(tmp_path, sidecar={"run_id": "an-older-run", "state": "queued",
+                                  "reason": "grill"},
+               env_extra=dict({"BIRCHER_HAVE_LOCK": "1"}, **env))
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["failed"], (why, d.calls)
+    assert not d.sidecar.exists(), (why, d.sidecar.read_text())
+
+
 # --- 11. the typed reconcile --------------------------------------------------
 
 _RECONCILE_STUBS = '''
 _net_run() {{ shift; "$@"; }}
 _kernel() {{
   {{ printf '%s' "_kernel"; for a in "$@"; do printf '\\0%s' "$a"; done; }} > "{log}"
+  # The snapshot file is read HERE, while it exists: `_kernel_reconcile` removes
+  # every one it wrote once the kernel has read them, so a test that opened the
+  # `@path` afterwards would be reading a file the function correctly deleted.
+  local a
+  for a in "$@"; do
+    case "$a" in *=@*) cp "${{a#*=@}}" "{body}" 2>/dev/null ;; esac
+  done
 }}
 _kernel_pythonpath() {{ printf '%s' "{v2}"; }}
 '''
@@ -609,8 +709,10 @@ def _reconcile(tmp_path, script, *, curl=_FAKE_CURL_OK):
     binpath.mkdir()
     _write_exec(binpath / "curl", curl)
     log = tmp_path / "kernel-call"
+    body = tmp_path / "delivered-body.json"
     stubs = tmp_path / "stubs.sh"
-    stubs.write_text(_RECONCILE_STUBS.format(log=log, v2=REPO_ROOT / "v2"))
+    stubs.write_text(_RECONCILE_STUBS.format(log=log, body=body,
+                                             v2=REPO_ROOT / "v2"))
     body = f'. "{CLIENT}"\n. "{stubs}"\n{script}\necho "RC=$?"\n'
     r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env={
         "PATH": f"{binpath}:/usr/bin:/bin",
@@ -622,6 +724,11 @@ def _reconcile(tmp_path, script, *, curl=_FAKE_CURL_OK):
     })
     args = (log.read_bytes().split(b"\0") if log.exists() else [])
     return r, [a.decode() for a in args]
+
+
+def _delivered_body(tmp_path):
+    p = tmp_path / "delivered-body.json"
+    return json.loads(p.read_text()) if p.exists() else None
 
 
 def test_reconcile_typed_delivered_session_carries_the_fetched_snapshot(tmp_path):
@@ -637,8 +744,38 @@ def test_reconcile_typed_delivered_session_carries_the_fetched_snapshot(tmp_path
     key, _, ref = delivered.partition("=")
     assert key == "sess-create:r:1", delivered
     assert ref.startswith("@"), delivered
-    body = json.loads(pathlib.Path(ref[1:]).read_text())
+    body = _delivered_body(tmp_path)
     assert body["agent_name"] == "v2_author_claude", body
+    # AND THE FILE IS GONE afterwards. It holds a session body, and one per
+    # delivered key per invocation would accumulate on the box forever.
+    assert not pathlib.Path(ref[1:]).exists(), ref
+
+
+def test_reconcile_removes_every_snapshot_it_wrote(tmp_path):
+    """TWO delivered sessions in one call. A single `tmp` variable named the
+    last one only, so the first was left on disk for the life of the box --
+    with a session body in it."""
+    r, args = _reconcile(tmp_path,
+        '_kernel_reconcile r 7 --delivered sess-create:r:1=s-9 '
+        '--delivered sess-create:r:2=s-10')
+    assert "RC=0" in r.stdout, (r.stdout, r.stderr)
+    refs = [a.partition("=@")[2] for a in args if "=@" in a]
+    assert len(refs) == 2, args
+    assert len(set(refs)) == 2, ("both keys wrote the same file", refs)
+    for ref in refs:
+        assert not pathlib.Path(ref).exists(), ref
+
+
+@pytest.mark.parametrize("flag", ["--delivered", "--not-delivered"])
+def test_a_reconcile_flag_with_no_value_is_a_usage_error_not_a_crash(tmp_path, flag):
+    """Reading `$2` when the flag is last aborts the CALLER under `set -u`,
+    inside whatever redirect it was invoked behind -- so the failure arrives as
+    a shell that stopped, with no reason anywhere."""
+    r, args = _reconcile(tmp_path, f'_kernel_reconcile r 7 {flag}')
+    assert "RC=2" in r.stdout, (r.stdout, r.stderr)
+    assert args == [], args
+    assert "needs a value" in r.stderr, r.stderr
+    assert "RC_FAILED" in r.stderr, r.stderr
 
 
 def test_reconcile_refuses_a_delivered_session_it_could_not_fetch(tmp_path):
