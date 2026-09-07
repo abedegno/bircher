@@ -47,7 +47,8 @@ def _run_unjournalled(argv, timeout) -> str:
     return r.stdout.strip() or "ok"
 
 
-def perform_effect(effect_class: str, key: str, argv, *, timeout=None, env=None) -> str:
+def perform_effect(effect_class: str, key: str, argv, *, timeout=None, env=None,
+                   obligation: dict | None = None, body: dict | None = None) -> str:
     """Perform one externally visible mutation, per the configured mode."""
     env = os.environ if env is None else env
     mode = effect_mode(env)
@@ -59,16 +60,26 @@ def perform_effect(effect_class: str, key: str, argv, *, timeout=None, env=None)
         raise EffectDenied(f"effect refused: {effect_class} {key}")
 
     if mode == LEGACY:
+        if body is not None:
+            # Legacy has no store to compose a body from: the whole point of a
+            # body is that the kernel reads it out of the journal, and legacy
+            # journals nothing.
+            raise EffectDenied("a body-bearing effect has no unjournalled form")
         return _run_unjournalled(argv, timeout)
 
     # Imported HERE, not at module scope: `legacy` must work when the kernel is
     # unimportable, which is the situation it exists to diagnose.
-    from kernel.cli import _executor
+    from kernel.cli import make_executor
     from kernel.effects import perform
     from kernel.store import Store
 
     assert mode == KERNEL
     store = Store.open(_required(env, "BIRCHER_KERNEL_DB"))
+    intent = {"argv": list(argv)}
+    if obligation is not None:
+        intent["obligation"] = obligation
+    if body is not None:
+        intent["body"] = body
     return perform(store, _required(env, "BIRCHER_RUN_ID"),
                    int(_required(env, "BIRCHER_GENERATION")),
-                   effect_class, key, {"argv": list(argv)}, _executor)
+                   effect_class, key, intent, make_executor(store))

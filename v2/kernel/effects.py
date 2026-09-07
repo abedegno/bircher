@@ -7,6 +7,8 @@ Every journalled mutation is a generation-fenced resource.
 
 from __future__ import annotations
 
+import re
+
 from kernel.dispatch import actor_for
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
@@ -136,6 +138,31 @@ def _halt_evidence(store, run_id, generation, effect_class, idempotency_key) -> 
     }
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _check_body(store, intent: dict) -> None:
+    """Refuse a body the executor could not compose, BEFORE any row exists.
+
+    A body is {"artifact": <sha256 the kernel holds>} or
+    {"event": "stop_session"}; anything else is a request the journal would
+    record and the executor could not honour -- an `intended` row with no
+    way to confirm it.
+    """
+    body = intent.get("body")
+    if body is None:
+        return
+    if not isinstance(body, dict) or len(body) != 1:
+        raise ValueError("intent body must be {'artifact': <sha256>} or {'event': 'stop_session'}")
+    if "artifact" in body:
+        h = body["artifact"]
+        if not isinstance(h, str) or not _HEX64.match(h) or not store.has_artifact(h):
+            raise ValueError(f"intent body names artifact {h!r}, which the kernel does not hold")
+        return
+    if body.get("event") != "stop_session":
+        raise ValueError(f"intent body event must be 'stop_session', got {body.get('event')!r}")
+
+
 def _perform_unhalted(
     store, run_id, generation, effect_class, idempotency_key, intent, executor
 ):
@@ -170,6 +197,14 @@ def _perform_unhalted(
 
     existing = store.effect_by_key(idempotency_key, run_id=run_id)
     if existing is not None:
+        if existing["intent"].get("obligation") != intent.get("obligation"):
+            # Keys name attempts; obligations are what the attempt was for.
+            # The same key under a different cause is a second obligation
+            # asking to be read as satisfied by the first (spec §3).
+            raise NotReplayable(
+                f"{idempotency_key} in run {run_id} was journaled for obligation "
+                f"{existing['intent'].get('obligation')!r}, not {intent.get('obligation')!r}"
+            )
         if existing["state"] in ("uncertain", "intended"):
             # `intended` means journalled but never confirmed -- a crash,
             # KeyboardInterrupt or SystemExit between the two. Treating it as a
@@ -220,6 +255,8 @@ def _perform_unhalted(
         raise OwnershipLost(
             f"generation {generation} superseded; effect request carries no write capability"
         )
+
+    _check_body(store, intent)
 
     eid = new_id("eff")
     store.journal_intent(eid, run_id, generation, effect_class, idempotency_key, intent)

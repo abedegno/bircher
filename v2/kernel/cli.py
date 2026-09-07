@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 from kernel.authz import NotAuthorized
 from kernel.effects import (
@@ -92,28 +93,98 @@ RC_UNCERTAIN = 89
 RC_FAILED = 90
 
 
-def _executor(effect_class, intent, idempotency_key):
-    """Run the real command. Raising here is what makes an effect uncertain.
+SESSION_PROJECTION_KEYS = ("id", "agent_id", "agent_name", "host_id", "workspace", "title")
 
-    `check=False` plus an explicit raise, rather than `check=True`: the raised
-    message carries the command's rc and stderr, which the journal records as
-    the halt's `detail`.
 
-    NOTE what this does NOT do. Every executor failure -- a clean non-zero exit
-    as much as a crash mid-flight -- becomes `effect_uncertain` and halts the
-    run. The effect STATE does not distinguish "ran and failed" from "outcome
-    unknown"; only the recorded error name and detail do. An earlier version of
-    this docstring claimed the journal drew that distinction. It does not, and
-    reading it as a promise would leave a caller expecting a failed push to be
-    retryable without reconciliation.
-    """
-    r = subprocess.run(resolve_command(list(intent["argv"])),
-                       capture_output=True, text=True)
-    if r.returncode != 0:
+def session_projection(snap: dict) -> dict:
+    """The six fields the guards read; a session that has run carries its
+    whole transcript under `items`, which the journal does not want."""
+    return {k: snap.get(k) for k in SESSION_PROJECTION_KEYS}
+
+
+def validate_create_response(stdout: str, body: dict) -> str:
+    """A confirmed create holds a snapshot by construction (spec §3)."""
+    try:
+        snap = json.loads(stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"sess-create returned non-JSON: {stdout[:200]!r}") from exc
+    if not isinstance(snap, dict) or not snap.get("id") or not snap.get("agent_name"):
+        raise RuntimeError(f"sess-create response is not a session snapshot: {stdout[:200]!r}")
+    if snap.get("agent_id") != body.get("agent_id"):
         raise RuntimeError(
-            f"{effect_class} failed rc={r.returncode}: {r.stderr.strip()[:200]}"
-        )
-    return r.stdout.strip() or "ok"
+            f"sess-create bound agent {snap.get('agent_id')!r}, requested {body.get('agent_id')!r}")
+    if "title" in body and snap.get("title") != body["title"]:
+        raise RuntimeError(
+            f"sess-create titled {snap.get('title')!r}, requested {body['title']!r}")
+    return json.dumps(session_projection(snap), sort_keys=True)
+
+
+def compose_event(store, body: dict) -> bytes:
+    """The events-endpoint JSON for an intent body. Read from the journal:
+    the prompt text is the artefact the intent names, never an argv string."""
+    if "artifact" in body:
+        data = store.read_blob(body["artifact"])
+        if data is None:
+            raise RuntimeError(f"artifact {body['artifact']} is not held")
+        event = {"type": "message",
+                 "data": {"role": "user",
+                          "content": [{"type": "input_text", "text": data.decode("utf-8")}]}}
+        return json.dumps(event).encode("utf-8")
+    return json.dumps({"type": "stop_session"}).encode("utf-8")
+
+
+def _write_event_file(store, body: dict) -> str:
+    fh = tempfile.NamedTemporaryFile(
+        dir=os.path.dirname(os.path.abspath(store.path)), prefix="event-",
+        suffix=".json", delete=False)
+    with fh:
+        os.chmod(fh.name, 0o600)
+        fh.write(compose_event(store, body))
+    return fh.name
+
+
+def make_executor(store):
+    """The real executor, closed over the store the body is composed from.
+
+    `check=False` plus an explicit raise: the raised message carries the
+    command's rc and stderr, which the journal records as the halt's detail.
+    Every executor failure -- a clean non-zero exit as much as a crash --
+    becomes `effect_uncertain` and halts the run (spec §7, *Session creation
+    fails*).
+    """
+    from kernel.contract import check
+
+    def executor(effect_class, intent, idempotency_key):
+        argv = list(intent["argv"])
+        rule = check(effect_class, argv)
+        body = intent.get("body")
+        extra: list[str] = []
+        path = None
+        try:
+            if body is not None:
+                if store is None:
+                    raise RuntimeError("an intent with a body needs the store it is composed from")
+                path = _write_event_file(store, body)
+                extra = ["--data-binary", f"@{path}"]
+            r = subprocess.run(resolve_command(argv + extra), capture_output=True, text=True)
+        finally:
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"{effect_class} failed rc={r.returncode}: {r.stderr.strip()[:200]}")
+        out = r.stdout.strip()
+        if rule.name == "sess-create":
+            return validate_create_response(out, create_body(argv))
+        return out or "ok"
+
+    return executor
+
+
+_executor = make_executor(None)
 
 
 def _add_common(p):
@@ -242,7 +313,7 @@ def _do_effect(a) -> int:
     store = Store.open(a.db)
     try:
         print(perform(store, a.run_id, a.generation, a.effect_class,
-                      a.idempotency_key, {"argv": cmd}, _executor))
+                      a.idempotency_key, {"argv": cmd}, make_executor(store)))
         return RC_OK
     except UnresolvableTool as e:
         print(f"unresolvable: {e}", file=sys.stderr)
