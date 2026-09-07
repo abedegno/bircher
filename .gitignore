@@ -6,3 +6,4 @@ queue/i*
 
 # Local worktrees (superpowers)
 .worktrees/
+.superpowers/
