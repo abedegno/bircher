@@ -7,6 +7,8 @@ is merely legible now.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 #: How many trim passes before giving up. BOUNDED on purpose: without it a line
 #: of pure decoration could normalise into a verdict one character at a time.
 _MAX_TRIM_PASSES = 8
@@ -14,7 +16,7 @@ _MAX_TRIM_PASSES = 8
 _EDGE = "*`_"
 
 
-def extract_verdict(text: str) -> str | None:
+def extract_verdict(text: str, hash8: str | None = None) -> str | None:
     """`PASS`, `FAIL`, or None from a reviewer's output.
 
     `VERDICT: BLOCKED` maps to None -- the reviewer says it formed no opinion,
@@ -30,6 +32,13 @@ def extract_verdict(text: str) -> str | None:
     Decoration is tolerated because reviewers emit markdown: `**VERDICT:
     PASS**`, `` `VERDICT: PASS` ``, `VERDICT: PASS.` all count. ONE trailing
     sentence-ending mark is allowed, once -- a line ending `...` is prose.
+
+    *hash8* is the artefact mode this task adds (spec §3 Review round): the
+    reviewer names WHAT it reviewed, not just its opinion of it. Without it a
+    reviewer's stale verdict from a superseded revision -- or a verdict for a
+    different phase's artefact entirely -- would read as approval of whatever
+    the run currently holds. `None` keeps the PR path's grammar exactly as it
+    was: a bare `VERDICT: PASS|FAIL`, no hash.
     """
     lines = [l.rstrip() for l in (text or "").splitlines()]
     non_blank = [l for l in lines if l.strip()]
@@ -51,9 +60,16 @@ def extract_verdict(text: str) -> str | None:
         if last == before:
             break
 
-    if last == "VERDICT: PASS":
+    if hash8 is None:
+        if last == "VERDICT: PASS":
+            return "PASS"
+        if last == "VERDICT: FAIL":
+            return "FAIL"
+        return None
+    # Artefact mode: the verdict names what it reviewed (spec §3 Review round).
+    if last == f"VERDICT: PASS {hash8}":
         return "PASS"
-    if last == "VERDICT: FAIL":
+    if last == f"VERDICT: FAIL {hash8}":
         return "FAIL"
     return None
 
@@ -163,3 +179,139 @@ def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
     if r.returncode != 0:
         return None, out
     return extract_verdict(out), out
+
+
+# -- Artefact mode (spec §3 Review round) -------------------------------------
+#
+# The PR path above dispatches a reviewer through `omnigent run` and reads a
+# finished process's stdout. Artefact mode reviews a spec or a plan: the
+# reviewer is a SEAT (a session the coordinator itself prompts and watches,
+# same as the author round), the brief the kernel rendered is its first and
+# only prompt, and the verdict must name the artefact's `hash8` -- the
+# grammar `extract_verdict` gained above. The two paths share nothing but the
+# grammar; keeping them in one file is a statement that reading a verdict is
+# one problem even though producing the prompt that earns one is two.
+
+
+@dataclass
+class ReviewOutcome:
+    """What one call to `review_round` did, for the loop to park on.
+
+    `status` is the discriminator: "recorded" (accept or request_revision
+    written), "no_verdict" (the file was absent, unparsable, or named the
+    wrong hash), "bound_exhausted" (a FAIL with no rounds left -- recorded
+    nothing, since the kernel itself refuses that `request_revision`),
+    "budget" (no seat left to dispatch), "failed" (an adopted session turned
+    out to belong to someone else), "no_brief" (the kernel refused to issue
+    one, e.g. the run has moved on).
+    """
+    status: str
+    verdict: str | None = None
+    findings_hash: str | None = None
+    reviewer: str = ""
+    recorded: bool = False
+    rounds_left: int = 0
+    session_id: str | None = None
+    cursor: str | None = None
+    generation: int | None = None
+
+
+def choose_reviewer_vendor(ctx) -> str:
+    """spec §3 Rotation: the vendor that did not author the artefact under review."""
+    from kernel import front
+    sub = front.newest_submission(ctx.store, ctx.run_id, ctx.phase(), ctx.epoch())
+    author_vendor = sub.payload["author"]
+    others = [v for v in sorted(ctx.agent_ids) if v != author_vendor]
+    return others[0] if others else author_vendor
+
+
+def review_round(ctx) -> ReviewOutcome:
+    """One pass of the review round: dispatch the reviewer, issue the brief,
+    run its one turn, and record what it said (spec §3 Review round).
+
+    The seat is dispatched BEFORE the brief is issued, not after: the brief
+    the kernel renders binds itself to a generation (`review_brief_issued`
+    carries `generation`), and `validate_review` later requires that
+    generation to be the one the reviewer's `record_review` comes from. Brief
+    first would render under whatever generation happened to be current --
+    not necessarily the seat about to be prompted with it -- and the reviewer
+    would submit a review the kernel refuses for carrying the wrong
+    generation's brief. `run_turn`'s `reuse_generation=True` is the other half
+    of this: it must NOT dispatch a second time and strand the brief under a
+    generation nothing was ever prompted under.
+
+    The SESSION obligation's cause is the round's own (`phases.seat_cause`):
+    a round has one seat, so a retry of the same round -- no new submission,
+    no new grant -- adopts it rather than opening a second one. The PROMPT's
+    cause is this call's own dispatch id, not the round's: two review_round
+    calls under the same round cause but with no verdict recorded between
+    them are two separate attempts at reading a verdict from the SAME
+    ongoing session, and the second must send its brief as a fresh turn
+    rather than read whatever the first attempt's turn left on disk. Keying
+    the prompt to the round's cause instead collapsed every no-verdict retry
+    into one already-satisfied `sess-prompt`, so a second attempt never
+    re-prompted at all and silently reported the first attempt's stale file.
+    """
+    from coordinator import phases, seat
+    from coordinator.session import AgentMismatch
+    from kernel import front
+    from kernel.artifacts import put_artifact
+    from kernel.authz import NotAuthorized
+    from kernel.brief import hash8
+    from kernel.dispatch import Role, SeatsExhausted, dispatch
+
+    store, run_id = ctx.store, ctx.run_id
+    phase, n = ctx.phase(), ctx.epoch()
+    cause = phases.seat_cause(ctx)
+    vendor = choose_reviewer_vendor(ctx)
+    session_ob = {"kind": "sess-create", "run": run_id, "phase": phase, "epoch": n, "cause": cause.id}
+    # The seat is dispatched here, before the brief, so the brief's generation
+    # is the seat's; run_turn re-uses ctx.generation when it is the newest.
+    try:
+        dispatched = dispatch(store, run_id, actor=vendor, role=Role.REVIEWER)
+    except SeatsExhausted:
+        return ReviewOutcome("budget", reviewer=vendor)
+    ctx.generation = dispatched.generation
+    try:
+        seat.command(ctx, "issue_review_brief", {"phase": phase})
+    except NotAuthorized as exc:
+        ctx.log(f"brief refused: {exc}")
+        return ReviewOutcome("no_brief", reviewer=vendor, generation=ctx.generation)
+    issued = front.brief_for(store, run_id, ctx.generation).payload
+    brief_bytes = store.read_blob(issued["brief_hash"])
+    try:
+        # This attempt's own dispatch id, not the round's cause -- see the
+        # docstring above.
+        turn = seat.run_turn(ctx, role=Role.REVIEWER, vendor=vendor, session_obligation=session_ob,
+                             prompt_cause=dispatched.dispatch_id, prompt_text=brief_bytes,
+                             watched=[seat.REVIEW_OUT], reuse_generation=True)
+    except SeatsExhausted:
+        return ReviewOutcome("budget", reviewer=vendor)
+    except AgentMismatch as exc:
+        ctx.log(f"agent mismatch: {exc}")
+        return ReviewOutcome("failed", reviewer=vendor)
+    data = turn.files.get(seat.REVIEW_OUT)
+    cursor = turn.listing[-1]["id"] if turn.listing else None
+    if data is None:
+        return ReviewOutcome("no_verdict", reviewer=vendor, session_id=turn.session_id, cursor=cursor,
+                             generation=turn.generation)
+    findings_hash = put_artifact(store, data)
+    verdict = extract_verdict(data.decode("utf-8", "replace"), hash8(issued["artifact_hash"]))
+    left = front.round_bound(store, run_id, phase, n) - front.rounds_used(store, run_id, phase, n)
+    base = dict(reviewer=vendor, findings_hash=findings_hash, session_id=turn.session_id, cursor=cursor,
+                generation=turn.generation, rounds_left=left, verdict=verdict)
+    if verdict is None:
+        return ReviewOutcome("no_verdict", **base)
+    # A FAIL with no rounds left is not recorded: the kernel itself refuses
+    # that request_revision (`_review_destination`'s max_rounds check), and
+    # sending it anyway would turn a bound the spec means to enforce into an
+    # exception the loop has to catch instead of a status it can park on.
+    if verdict == "FAIL" and left <= 0:
+        return ReviewOutcome("bound_exhausted", **base)
+    seat.command(ctx, "record_review", {
+        "phase": phase, "verdict": "accept" if verdict == "PASS" else "request_revision",
+        "artifact_hash": issued["artifact_hash"], "base_sha": issued["base_sha"],
+        "context_bundle_hash": issued["context_bundle_hash"], "policy_version": issued["policy_version"],
+        "findings_hash": findings_hash,
+    })
+    return ReviewOutcome("recorded", recorded=True, **base)

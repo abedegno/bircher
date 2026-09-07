@@ -146,7 +146,7 @@ def _record_prompt_item(ctx, session_id: str, prompt_hash: str) -> list[dict]:
 
 def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_cause: str,
              prompt_text: bytes, watched: list[str], read: list[str] | None = None,
-             resume_session: str | None = None) -> Turn:
+             resume_session: str | None = None, reuse_generation: bool = False) -> Turn:
     """*watched* are the paths the poll ends the turn on; *read* (default the
     watched ones) are the paths read once after the stop -- under grill=model
     the questions file is read beside the artefact but never watched.
@@ -160,9 +160,18 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
     set is the same defect the other way round: a stale watched file ends the
     turn `file` on the first poll, and the round spends its one empty-turn
     retry on a turn that never ran.
+
+    *reuse_generation*: when true and `ctx.generation` is already the run's
+    current generation, this call does not dispatch again. The review round
+    dispatches the reviewer's seat itself so it can issue the brief UNDER
+    that generation before the seat's first prompt -- the brief binds a
+    generation, and it must be the one the turn below actually runs in, not
+    one a second dispatch here would mint out from under it.
     """
     read = list(watched) if read is None else list(read)
-    ctx.generation = dispatch(ctx.store, ctx.run_id, actor=vendor, role=role).generation
+    from kernel.ownership import current_generation
+    if not (reuse_generation and ctx.generation == current_generation(ctx.store, ctx.run_id)):
+        ctx.generation = dispatch(ctx.store, ctx.run_id, actor=vendor, role=role).generation
     snap = _adopt_or_create(ctx, role, vendor, session_obligation, resume_session)
     sid, workspace = snap["id"], snap["workspace"]
     phase, epoch = session_obligation["phase"], session_obligation["epoch"]
