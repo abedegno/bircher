@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from kernel.artifacts import binding_hash
+from kernel.artifacts import binding_hash, put_artifact
 from kernel.authz import NotAuthorized, authorize, validate_review
 from kernel.canon import canonical_hash
 from kernel.dispatch import actor_for
@@ -24,6 +24,17 @@ from kernel.ownership import OwnershipLost, current_generation
 #: short literals -- an authorization decision resting on an implementation
 #: detail of the interpreter.
 UNDISPATCHED = "undispatched"
+
+#: The generation a human command carries. No dispatch record has it, so no
+#: fenced path can claim it, and `dispatch()` refuses the actor "human".
+HUMAN_GENERATION = -1
+HUMAN_ACTOR = "human"
+
+#: Reachable only through execute_as_human. record_review is reachable
+#: through both paths; `ruling` says which.
+HUMAN_COMMANDS = frozenset({
+    "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
+})
 
 COMMAND_NAMES = frozenset({
     "submit_spec", "submit_plan", "record_review", "start_implementation",
@@ -58,6 +69,9 @@ COMMAND_NAMES = frozenset({
     # journal; `park` records why a pass stopped without a transition, which
     # v1 expressed only as the absence of anything.
     "record_turn_ended", "park",
+    # The human's commands (spec §2 Commands), reachable only through
+    # `execute_as_human`.
+    "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
 })
 
 
@@ -143,9 +157,46 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
                      "findings_hash": p.get("findings_hash"), "verdict": p.get("verdict"),
                      "reviewer": p.get("reviewer"), "generation": cmd.generation},
         )
+    elif cmd.name == "record_human_answer":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_ANSWER, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "question_ids": list(cmd.payload["question_ids"]),
+                     "answer": cmd.payload["answer"], "cursor_item_id": cmd.payload.get("cursor_item_id")},
+        )
+    elif cmd.name == "record_human_direction":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_DIRECTION, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"phase": phase, "epoch": epoch_n, "text": cmd.payload["text"],
+                     "cursor_item_id": cmd.payload.get("cursor_item_id")},
+        )
+    elif cmd.name == "approve_artifact":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"ruling": "approve", "phase": phase, "epoch": epoch_n,
+                     "artifact_hash": cmd.payload["artifact_hash"]},
+        )
+    elif cmd.name == "grant_round":
+        park = front.current_park(store, cmd.run_id)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"ruling": "grant_round", "phase": phase, "epoch": epoch_n,
+                     "park_seq": park.seq},
+        )
+    elif cmd.name == "record_review" and actor == HUMAN_ACTOR:
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"ruling": "request_revision", "phase": phase, "epoch": epoch_n,
+                     "artifact_hash": cmd.payload["artifact_hash"]},
+        )
 
 
 def submit(store, cmd: Command) -> Result:
+    """The fenced path: identity is READ from the dispatch record."""
     if cmd.name not in COMMAND_NAMES:
         raise ValueError(f"unknown command: {cmd.name}")
 
@@ -161,6 +212,28 @@ def submit(store, cmd: Command) -> Result:
     # attributing its work to anyone -- including "kernel" -- would be a
     # fabricated audit trail.
     actor = actor_for(store, cmd.run_id, cmd.generation)
+    return _submit(store, cmd, actor, fenced=True, ruling="review_ruling")
+
+
+def execute_as_human(store, cmd: Command) -> Result:
+    """spec §2 *execute_as_human*: the human's commands go through the same
+    journal with the actor fixed to `human`, no generation fence -- a human
+    fact must land whichever generation is current -- and concurrency by
+    `expected_version` alone."""
+    if cmd.name not in COMMAND_NAMES:
+        raise ValueError(f"unknown command: {cmd.name}")
+    if cmd.generation != HUMAN_GENERATION:
+        raise ValueError(
+            f"a human command carries generation HUMAN_GENERATION ({HUMAN_GENERATION}), "
+            f"not {cmd.generation}"
+        )
+    named = ACTOR_FIELDS & cmd.payload.keys()
+    if named:
+        raise ValueError(f"payload names an actor via {sorted(named)}")
+    return _submit(store, cmd, HUMAN_ACTOR, fenced=False, ruling="human_ruling")
+
+
+def _submit(store, cmd: Command, actor: str | None, *, fenced: bool, ruling: str) -> Result:
     recorded_actor = UNDISPATCHED if actor is None else actor
 
     from kernel.effects import is_halted
@@ -212,7 +285,7 @@ def submit(store, cmd: Command) -> Result:
             f"run {cmd.run_id} is halted pending reconciliation; resolve it first"
         )
 
-    if cmd.generation != current_generation(store, cmd.run_id):
+    if fenced and cmd.generation != current_generation(store, cmd.run_id):
         _record_rejection(store, cmd, "OwnershipLost", "superseded generation", actor)
         raise OwnershipLost(
             f"generation {cmd.generation} superseded; command carries no write capability"
@@ -241,7 +314,7 @@ def submit(store, cmd: Command) -> Result:
     # refusal here returns immediately -- recorded, not acted on -- and
     # control never reaches the transaction below at all.
     try:
-        next_state = authorize(store, cmd, actor, ruling="review_ruling")
+        next_state = authorize(store, cmd, actor, ruling=ruling)
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
         shadow_or_raise(store, cmd.run_id, exc, cmd.idempotency_key, command_name=cmd.name)
@@ -254,7 +327,7 @@ def submit(store, cmd: Command) -> Result:
     # something the mechanism observed.
     try:
         review_binding = (
-            validate_review(store, cmd, actor, ruling="review_ruling")
+            validate_review(store, cmd, actor, ruling=ruling)
             if cmd.name == "record_review"
             else None
         )
@@ -309,6 +382,13 @@ def submit(store, cmd: Command) -> Result:
                 from kernel import front
                 from kernel.authz import phase_of
                 state_now = store.run_state(cmd.run_id)
+                # A human's findings arrive as text, not a hash the caller
+                # already put in the store -- there is no dispatch to have
+                # journaled one first. The kernel puts the bytes itself, so
+                # the fact still names a hash the store holds either way.
+                findings_hash = cmd.payload.get("findings_hash")
+                if findings_hash is None and isinstance(cmd.payload.get("findings"), str):
+                    findings_hash = put_artifact(store, cmd.payload["findings"].encode("utf-8"))
                 store.append_fact(
                     run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor=actor,
                     causal_command_id=cmd.idempotency_key,
@@ -317,7 +397,7 @@ def submit(store, cmd: Command) -> Result:
                         "phase": phase_of(state_now),
                         "epoch": front.epoch(store, cmd.run_id),
                         "artifact_hash": cmd.payload.get("artifact_hash"),
-                        "findings_hash": cmd.payload.get("findings_hash"),
+                        "findings_hash": findings_hash,
                         "ruling": "review_ruling" if review_binding is not None else "human_ruling",
                         "binding_hash": None if review_binding is None else binding_hash(review_binding),
                         # From the dispatch record, not the binding: the

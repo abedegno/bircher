@@ -95,6 +95,13 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
     # for a run that in fact merged, corrupting the terminal outcome.
     "record_merge_outcome": (frozenset({"merge_requested"}), None),
+    # The human's commands (spec §2 Commands), reachable only through
+    # execute_as_human -- checked in authorize() below.
+    "record_human_answer": (FRONT_HALF_STATES, None),
+    "record_human_direction": (frozenset({"queued", "specified"}), None),
+    # Destination by phase: computed in authorize().
+    "approve_artifact": (frozenset({"spec_accepted", "plan_accepted"}), None),
+    "grant_round": (frozenset({"queued", "specified", "spec_submitted", "plan_submitted"}), None),
     # Records what the implementation produced; does not itself transition.
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
@@ -129,8 +136,22 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
     In the front half the same word means different things at different
     states, and an accept stops at `*_accepted` when the run's policy gates
     that phase -- so the destination cannot be a lookup on the verdict alone.
+
+    The human clause comes FIRST: a human_ruling is never routed by the
+    back-half or gate logic below it, which exist for a reviewer's dispatched
+    accept and have no opinion on a human's correction.
     """
     from kernel.policy import policy_of
+    phase = phase_of(state)
+    if ruling == "human_ruling":
+        if state not in FRONT_HALF_STATES:
+            raise NotAuthorized("a human record_review is front-half only (spec §2 Commands)")
+        if verdict != "request_revision":
+            raise NotAuthorized(
+                "the human's record_review is request_revision; approval is "
+                "approve_artifact, after the reviewer"
+            )
+        return "queued" if phase == "spec" else "specified"
     if state in ("implementing", "reviewing"):
         return _BACK_HALF_DESTINATIONS[verdict]
     if verdict == "reject":
@@ -138,10 +159,7 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
             "reject is not a front-half verdict: a spec or plan is accepted or "
             "revised, never rejected (spec §2 Commands)"
         )
-    phase = phase_of(state)
     if state.endswith("_accepted"):
-        # Task 8 adds the human's request_revision from here; a review_ruling
-        # never moves an accepted artefact.
         raise NotAuthorized(
             f"record_review from {state!r} is the human's correction only "
             "(a human_ruling); a reviewer has already ruled on this hash"
@@ -501,6 +519,13 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             "implementer role"
         )
 
+    from kernel.commands import HUMAN_COMMANDS
+    if cmd.name in HUMAN_COMMANDS and ruling != "human_ruling":
+        raise NotAuthorized(
+            f"{cmd.name} is the human's: it reaches the kernel only through "
+            "execute_as_human, never a dispatched generation"
+        )
+
     allowed, next_state = _TRANSITIONS[cmd.name]
     current = store.run_state(cmd.run_id)
     if current not in allowed:
@@ -530,6 +555,43 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
 
     if cmd.name == "park":
         _check_park(store, cmd)
+        return None
+
+    if cmd.name == "record_human_answer":
+        ids = cmd.payload.get("question_ids")
+        if not isinstance(ids, list) or not all(isinstance(q, str) for q in ids):
+            raise NotAuthorized("record_human_answer question_ids must be a list of ids")
+        if not isinstance(cmd.payload.get("answer"), str) or not cmd.payload.get("answer").strip():
+            raise NotAuthorized("record_human_answer carries a non-empty answer")
+        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
+            raise NotAuthorized("cursor_item_id must be a string or null")
+        return None
+
+    if cmd.name == "record_human_direction":
+        if not isinstance(cmd.payload.get("text"), str) or not cmd.payload.get("text").strip():
+            raise NotAuthorized("record_human_direction carries non-empty text")
+        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
+            raise NotAuthorized("cursor_item_id must be a string or null")
+        return None
+
+    if cmd.name == "approve_artifact":
+        phase = phase_of(current)
+        held = store.phase_artifact(cmd.run_id, phase)
+        if cmd.payload.get("artifact_hash") != held:
+            raise NotAuthorized(
+                f"approve_artifact names {str(cmd.payload.get('artifact_hash'))[:12]}..., but "
+                f"the {phase} phase's current artefact is {str(held)[:12]}...: the kernel holds "
+                "the hash; the caller can only supply the right answer"
+            )
+        return "specified" if phase == "spec" else "planned"
+
+    if cmd.name == "grant_round":
+        from kernel import front
+        if front.current_park(store, cmd.run_id) is None:
+            raise NotAuthorized(
+                "grant_round needs a current park: nothing is stalled, and a grant "
+                "at a running seat would displace it"
+            )
         return None
 
     if cmd.name == "record_implementation_output":

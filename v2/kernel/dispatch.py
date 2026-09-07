@@ -80,6 +80,11 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
         raise ValueError(f"unknown role: {role!r}; expected one of {sorted(Role.ALL)}")
     if not actor or not isinstance(actor, str):
         raise ValueError("an attempt must be dispatched to a named actor")
+    if actor == "human":
+        raise ValueError(
+            "'human' is not a dispatchable actor: human commands go through "
+            "execute_as_human and carry no generation"
+        )
     # Before the transaction, so the halt survives the raise: a run holding an
     # intended or uncertain effect is halted with those keys as evidence and
     # the dispatch refused (spec §2 Refusals, §5).

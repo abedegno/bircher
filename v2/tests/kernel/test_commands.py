@@ -60,6 +60,11 @@ def test_the_command_interface_is_closed_and_explicit():
         # coordinator performs; park records why a pass stopped without a
         # transition, which v1 could express only as the absence of anything.
         "record_turn_ended", "park",
+        # The human's four (spec §2 Commands), reachable only through
+        # execute_as_human. record_review is the human's fifth command, and
+        # is already listed above -- reachable through both submit and
+        # execute_as_human, with `ruling` telling which.
+        "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
     ])
 
 

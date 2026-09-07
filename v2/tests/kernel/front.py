@@ -160,9 +160,36 @@ class Front:
         payload.update(override)
         self._cmd(g, "record_review", payload)
 
+    # -- the human's commands ---------------------------------------------------
+
+    def human(self, name: str, payload: dict):
+        from kernel.commands import HUMAN_GENERATION, execute_as_human
+        return execute_as_human(self.store, Command(
+            name=name, run_id=self.run_id,
+            expected_version=self.store.run_version(self.run_id),
+            idempotency_key=self._key(f"human-{name}"), generation=HUMAN_GENERATION,
+            payload=payload,
+        ))
+
+    def approve(self) -> None:
+        self.human("approve_artifact",
+                   {"artifact_hash": self.store.phase_artifact(self.run_id, self.phase())})
+
+    def grant(self) -> None:
+        self.human("grant_round", {})
+
+    def answer(self, answer: str, question_ids=(), cursor: str | None = "i-h") -> None:
+        self.human("record_human_answer",
+                   {"question_ids": list(question_ids), "answer": answer, "cursor_item_id": cursor})
+
+    def direct(self, text: str, cursor: str | None = "i-h") -> None:
+        self.human("record_human_direction", {"text": text, "cursor_item_id": cursor})
+
     def to_specified(self) -> "Front":
         self.author_round(SPEC_BYTES)
         self.review_round("accept")
+        if self.state() == "spec_accepted":
+            self.approve()
         assert self.state() == "specified", self.state()
         return self
 
@@ -170,6 +197,8 @@ class Front:
         self.to_specified()
         self.author_round(PLAN_BYTES)
         self.review_round("accept")
+        if self.state() == "plan_accepted":
+            self.approve()
         assert self.state() == "planned", self.state()
         return self
 

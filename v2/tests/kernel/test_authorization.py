@@ -175,6 +175,14 @@ def test_every_command_declares_its_legal_states():
             # The front half's two observations: the end of a turn and the
             # reason a pass stopped. Neither moves the run.
             "record_turn_ended", "park",
+            # The human's four. record_human_answer and record_human_direction
+            # observe without transitioning, like record_turn_ended and park.
+            # approve_artifact's destination depends on which phase's artefact
+            # was approved, and grant_round never transitions the run -- both
+            # computed in authorize(), same as record_review's outcome-shaped
+            # destination.
+            "record_human_answer", "record_human_direction",
+            "approve_artifact", "grant_round",
         )
 
 
