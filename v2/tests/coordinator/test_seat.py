@@ -223,3 +223,89 @@ def test_a_read_but_unwatched_file_is_moved_aside_too(world):
     assert t2.files == {seat.ARTIFACT_OUT: None, seat.QUESTIONS_OUT: None}
     for name in both:
         assert os.path.exists(os.path.join(t.workspace, name + ".1.prev"))
+
+
+def test_a_watched_but_unread_file_is_moved_aside_too(world):
+    """The UNION, not either set: nothing enforces read >= watched, and a
+    stale WATCHED file ends the turn `file` on the first poll -- so the round
+    spends its one empty-turn retry on a turn that never ran."""
+    s, f, fake, ctx, clock = world
+    cause = phases.round_cause(ctx).id
+    ctx.turn_timeout_s = 10
+
+    def on_prompt(sid, text):
+        ws = fake.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        open(os.path.join(ws, seat.QUESTIONS_OUT), "wb").write(b"### Q1: x?\nRecommended: y\n")
+    fake.on_prompt = on_prompt
+    watched = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT]
+    t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                      prompt_cause=cause, prompt_text=b"go", watched=watched, read=[seat.ARTIFACT_OUT])
+    assert t.ended == "file" and t.files == {seat.ARTIFACT_OUT: None}   # questions watched, not read
+    f.answer("y", question_ids=("Q1",))
+    ans = s.newest_fact("r-1", EventKind.HUMAN_ANSWER)
+    fake.on_prompt = lambda sid, text: None                    # the next turn writes nothing
+    t2 = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                       prompt_cause=ans.id, prompt_text=b"Answered; continue.",
+                       watched=watched, read=[seat.ARTIFACT_OUT], resume_session=t.session_id)
+    assert t2.ended == "cap"        # NOT `file` off the previous turn's questions.md
+    assert os.path.exists(os.path.join(t.workspace, seat.QUESTIONS_OUT + ".1.prev"))
+
+
+def _recorded_elsewhere(s, f, fake, ctx):
+    """A session this run created under one obligation, so a later pass that
+    resumes it under a different prompt cause takes the resume branch."""
+    from coordinator import sessions
+    g = f._dispatch(Role.AUTHOR, "claude")
+    ctx.generation = g
+    ws = os.path.join(ctx.workspaces_root, "r-1", str(g))
+    os.makedirs(ws)
+    snap = sessions.create_session(s, run_id="r-1", generation=g, server="http://srv", agent_id="ag_claude",
+                                   host_id="host_h", workspace=os.path.realpath(ws), phase="spec", epoch=0,
+                                   cause=phases.round_cause(ctx).id, env=ctx.effect_env())
+    f.answer("carry on")                       # a fresh cause, so the create is not satisfied for it
+    return snap, s.newest_fact("r-1", EventKind.HUMAN_ANSWER).id
+
+
+def test_an_adopted_session_is_checked_against_the_journals_snapshot(world):
+    """§11: `agent_id_expected` must come from the create the journal RECORDED.
+    Taking it from a fresh fetch compares the server's answer against itself,
+    so a redeployed or hostile server naming any agent it likes passes."""
+    s, f, fake, ctx, clock = world
+    snap, cause2 = _recorded_elsewhere(s, f, fake, ctx)
+    fake.sessions[snap["id"]]["agent_id"] = "ag_switched"
+    with pytest.raises(AgentMismatch):
+        seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause2),
+                      prompt_cause=cause2, prompt_text=b"go", watched=[seat.ARTIFACT_OUT],
+                      resume_session=snap["id"])
+    assert s.newest_fact("r-1", EventKind.TURN_ENDED) is None
+    assert [k for k, _ in fake.posts if k.endswith("/events")] == []      # nothing sent
+
+
+def test_an_adopted_sessions_workspace_is_the_journals_not_the_servers(world, tmp_path):
+    """The read location is server-chosen too. The turn reads the workspace
+    the create recorded, so a server that renames it cannot redirect the read."""
+    s, f, fake, ctx, clock = world
+    snap, cause2 = _recorded_elsewhere(s, f, fake, ctx)
+    elsewhere = tmp_path / "server-chosen"
+    os.makedirs(os.path.join(elsewhere, "bircher"))
+    fake.sessions[snap["id"]]["workspace"] = str(elsewhere)     # the server moves it
+
+    def on_prompt(sid, text):
+        open(os.path.join(elsewhere, seat.ARTIFACT_OUT), "wb").write(b"# planted")
+    fake.on_prompt = on_prompt
+    ctx.turn_timeout_s = 10
+    t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause2),
+                      prompt_cause=cause2, prompt_text=b"go", watched=[seat.ARTIFACT_OUT],
+                      resume_session=snap["id"])
+    assert t.workspace == snap["workspace"] and t.workspace != str(elsewhere)
+    assert t.ended == "cap" and t.files == {seat.ARTIFACT_OUT: None}   # the planted file is not read
+
+
+def test_resuming_a_session_the_journal_never_recorded_is_refused(world):
+    s, f, fake, ctx, clock = world
+    cause = phases.round_cause(ctx).id
+    with pytest.raises(AgentMismatch, match="no satisfied sess-create"):
+        seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                      prompt_cause=cause, prompt_text=b"go", watched=[seat.ARTIFACT_OUT],
+                      resume_session="s-nobody")

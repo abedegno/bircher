@@ -7,15 +7,17 @@ import os
 from dataclasses import dataclass, field
 
 from coordinator import sessions
-from coordinator.session import LookupFailed, list_items, wait_turn
+from coordinator.session import AgentMismatch, LookupFailed, list_items, wait_turn
 from kernel import front
+# Re-exported, not re-declared: the reviewer writes the path the kernel's
+# rendered brief tells it to, and two literals would let the two drift.
+from kernel.brief import REVIEW_OUT  # noqa: F401
 from kernel.canon import content_hash
 from kernel.commands import Command, submit
 from kernel.dispatch import dispatch
 
 ARTIFACT_OUT = "bircher/artifact.md"
 QUESTIONS_OUT = "bircher/questions.md"
-REVIEW_OUT = "bircher/review.md"
 
 
 @dataclass
@@ -74,13 +76,53 @@ def _move_aside(workspace: str, names: list[str]) -> None:
             os.replace(p, f"{p}.{n}.prev")
 
 
-def _adopt_or_create(ctx, vendor: str, ob: dict, resume_session: str | None) -> dict:
+def _recorded_session(ctx, role: str, ob: dict, session_id: str) -> dict | None:
+    """The snapshot the JOURNAL holds for *session_id*, or None.
+
+    The round's own seat first, then any satisfied sess-create of the run that
+    delivered this session -- a session resumed across a phase or a role is
+    still one this run created, and only a session it never created is absent
+    from here.
+    """
+    seat_row = front.newest_seat(ctx.store, ctx.run_id, role, ob["phase"], ob["epoch"])
+    if seat_row is not None and seat_row["session"].get("id") == session_id:
+        return seat_row["session"]
+    for row in front.satisfied_effects(ctx.store, ctx.run_id, "sess-create"):
+        snap = json.loads(row["external_object_id"])
+        if snap.get("id") == session_id:
+            return snap
+    return None
+
+
+def _resume(ctx, role: str, ob: dict, session_id: str) -> dict:
+    """Adopt a session this run created earlier, on the JOURNAL's snapshot.
+
+    spec §11: the guard `wait_turn` performs is that the session still reports
+    the agent_id its create recorded. Taking that expectation from a fresh
+    fetch would compare the server's answer against itself, so a redeployed or
+    hostile server could hand back any agent it liked and the check would pass
+    -- and the workspace read after the turn would be the server's choice too.
+    Both come from the journal; the fetch is only the thing being checked.
+    """
+    recorded = _recorded_session(ctx, role, ob, session_id)
+    if recorded is None:
+        # Not a server problem: the coordinator asked to resume a session this
+        # run never created, so there is no recorded identity to check against
+        # and nothing to safely adopt.
+        raise AgentMismatch(session_id, "(no satisfied sess-create in this run's journal)", "(unread)")
+    live = json.loads(ctx.fetch(f"{ctx.server}/v1/sessions/{session_id}"))
+    observed = str(live.get("agent_id") or "")
+    if observed != recorded.get("agent_id"):
+        raise AgentMismatch(session_id, recorded.get("agent_id"), observed)
+    return recorded
+
+
+def _adopt_or_create(ctx, role: str, vendor: str, ob: dict, resume_session: str | None) -> dict:
     row = sessions.satisfied(ctx.store, ctx.run_id, ob)
     if row is not None:
         return json.loads(row["external_object_id"])
     if resume_session is not None:
-        snap = json.loads(ctx.fetch(f"{ctx.server}/v1/sessions/{resume_session}"))
-        return {k: snap.get(k) for k in ("id", "agent_id", "agent_name", "host_id", "workspace", "title")}
+        return _resume(ctx, role, ob, resume_session)
     path = sessions.worktree_path(ctx.workspaces_root, ctx.run_id, ctx.generation)
     workspace = sessions.add_worktree(ctx.repo_dir, ctx.store.run_base_sha(ctx.run_id), path)
     return sessions.create_session(ctx.store, run_id=ctx.run_id, generation=ctx.generation, server=ctx.server,
@@ -90,7 +132,11 @@ def _adopt_or_create(ctx, vendor: str, ob: dict, resume_session: str | None) -> 
 
 def _record_prompt_item(ctx, session_id: str, prompt_hash: str) -> list[dict]:
     items = list_items(ctx.server, session_id, fetch=ctx.fetch)
-    known = {p.payload["item_id"] for p in ctx.store.facts_of_kind(ctx.run_id, "prompt_item")}
+    # Per session, as the kernel's own duplicate rule is: omnigent's item ids
+    # are not shown to be unique across sessions, so a bare id set could read
+    # another session's item as this one's and skip the record.
+    known = {p.payload["item_id"] for p in ctx.store.facts_of_kind(ctx.run_id, "prompt_item")
+             if p.payload["session_id"] == session_id}
     for it in items:
         if it["role"] == "user" and it["id"] not in known and content_hash(it["text"].encode()) == prompt_hash:
             command(ctx, "record_prompt_item", {"session_id": session_id, "item_id": it["id"], "sha256": prompt_hash})
@@ -105,23 +151,26 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
     watched ones) are the paths read once after the stop -- under grill=model
     the questions file is read beside the artefact but never watched.
 
-    Every READABLE path is moved aside before a re-prompt, not only the
-    watched ones: a file this turn will read has to be this turn's. Retiring
-    only the watched set left a stale `questions.md` in an adopted session
-    under grill=model, where it is read but never watched, and the round
-    recorded its questions and rulings a second time -- the kernel has no
-    duplicate guard on either command.
+    The UNION of the two is moved aside before a re-prompt: a file this turn
+    watches or reads has to be this turn's, and neither set contains the
+    other. Retiring only the watched set left a stale `questions.md` in an
+    adopted session under grill=model, where it is read but never watched,
+    and the round recorded its questions and rulings a second time -- the
+    kernel has no duplicate guard on either command. Retiring only the read
+    set is the same defect the other way round: a stale watched file ends the
+    turn `file` on the first poll, and the round spends its one empty-turn
+    retry on a turn that never ran.
     """
     read = list(watched) if read is None else list(read)
     ctx.generation = dispatch(ctx.store, ctx.run_id, actor=vendor, role=role).generation
-    snap = _adopt_or_create(ctx, vendor, session_obligation, resume_session)
+    snap = _adopt_or_create(ctx, role, vendor, session_obligation, resume_session)
     sid, workspace = snap["id"], snap["workspace"]
     phase, epoch = session_obligation["phase"], session_obligation["epoch"]
     prompt_ob = {"kind": "sess-prompt", "session": sid, "phase": phase, "epoch": epoch, "cause": prompt_cause}
     prompt_hash = content_hash(prompt_text)
     cursor_before = None
     if sessions.satisfied(ctx.store, ctx.run_id, prompt_ob) is None:
-        _move_aside(workspace, read)
+        _move_aside(workspace, list(dict.fromkeys([*watched, *read])))
         sessions.prompt_session(ctx.store, run_id=ctx.run_id, generation=ctx.generation, server=ctx.server,
                                 session_id=sid, phase=phase, epoch=epoch, cause=prompt_cause,
                                 text=prompt_text, env=ctx.effect_env())

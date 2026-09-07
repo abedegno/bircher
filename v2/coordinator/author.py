@@ -146,7 +146,15 @@ def author_round(ctx) -> str:
     questions = turn.files.get(seat.QUESTIONS_OUT)
     artefact = turn.files.get(seat.ARTIFACT_OUT)
     if questions:
-        for q in parse_questions(questions.decode("utf-8", "replace")):
+        asked = parse_questions(questions.decode("utf-8", "replace"))
+        if not asked:
+            # A questions file no `### Q<n>:` heading matches asks the run
+            # NOTHING. Returning "questions" for it parks the loop on a grill
+            # with no model_question to answer, and every pass after it spends
+            # another seat on the same unreadable file; the turn produced no
+            # artefact and no question, which is the empty turn.
+            ctx.log(f"questions file matches no `### Q<n>:` block, ignored: {questions[:200]!r}")
+        for q in asked:
             seat.command(ctx, "record_model_question", {"question_id": q["id"], "question": q["question"]})
             if q["ruling"]:
                 # The skill asks for `<decision> — <reasoning> — <cost>`. A
@@ -157,12 +165,16 @@ def author_round(ctx) -> str:
                 bits = [b.strip() for b in q["ruling"].split("—")] + ["", ""]
                 seat.command(ctx, "record_model_ruling", {"question_id": q["id"], "ruling": bits[0] or q["ruling"],
                                                           "reasoning": bits[1] or "-", "cost_if_wrong": bits[2] or "-"})
-        if artefact is None:
+        if asked and artefact is None:
             return "questions"
     if artefact is None:
         try:
             seat.command(ctx, "record_author_empty", {"session": turn.session_id})
-        except NotAuthorized:
+        except NotAuthorized as exc:
+            # The kernel refuses a second empty turn in a row (the seat's own
+            # create was caused by an author_empty): that is RC_FAILED, and
+            # the reason belongs in the log rather than only in the journal.
+            ctx.log(f"author_empty refused: {exc}")
             return "failed"
         return "empty_retry"
     h = put_artifact(store, artefact)

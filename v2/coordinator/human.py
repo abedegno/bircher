@@ -8,7 +8,11 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     until then nothing human is taken."""
     from kernel import front
     from kernel.canon import content_hash
-    known = {p.payload["item_id"] for p in ctx.store.facts_of_kind(ctx.run_id, "prompt_item")}
+    # Per session, as the kernel's own duplicate rule is: omnigent's item ids
+    # are not shown to be unique across sessions, and a bare id set could read
+    # a human's message here as another session's recorded prompt.
+    known = {p.payload["item_id"] for p in ctx.store.facts_of_kind(ctx.run_id, "prompt_item")
+             if p.payload["session_id"] == session_id}
     hashes = front.prompt_hashes_of(ctx.store, ctx.run_id, session_id)
     human = [it for it in listing if it["role"] == "user" and it["id"] not in known
              and content_hash(it["text"].encode()) not in hashes]

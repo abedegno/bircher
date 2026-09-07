@@ -127,6 +127,21 @@ def test_an_empty_turn_retries_once_then_fails(world):
     assert len(s.facts_of_kind("r-1", EventKind.AUTHOR_EMPTY)) == 1
 
 
+def test_a_questions_file_that_asks_nothing_is_an_empty_turn(world):
+    """A questions file no `### Q<n>:` heading matches asks the run NOTHING.
+    Returning "questions" for it parks the loop on a grill with no
+    model_question to answer, and every pass after it spends another seat on
+    the same unreadable file."""
+    s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
+    logged = []
+    ctx.log = logged.append
+    _writes(fake, seat.QUESTIONS_OUT, b"### Question 1: db?\nRecommended: sqlite\n")
+    assert author.author_round(ctx) == "empty_retry"
+    assert s.newest_fact("r-1", EventKind.AUTHOR_EMPTY) is not None
+    assert s.facts_of_kind("r-1", EventKind.MODEL_QUESTION) == []
+    assert any("matches no" in m for m in logged)
+
+
 def test_a_direction_read_at_the_end_of_the_turn_is_not_submitted(world):
     s, f, fake, ctx = world()
 
