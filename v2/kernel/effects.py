@@ -7,7 +7,10 @@ Every journalled mutation is a generation-fenced resource.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+from dataclasses import dataclass
 
 from kernel.dispatch import actor_for
 from kernel.effect_class import EffectClass
@@ -348,6 +351,9 @@ def reconcile_many(store, run_id, keys, resolution, expected_version) -> int:
                 f"cannot reconcile {key!r} in run {run_id!r}: state is "
                 f"{state!r}, expected 'uncertain' or 'intended'"
             )
+        row = store.effect_by_key(key, run_id=run_id)
+        if isinstance(row["intent"].get("obligation"), dict):
+            raise ValueError(f"{key!r} carries an obligation; use --delivered/--not-delivered")
 
     with store.transaction():
         if not store.bump_version_cas(run_id, expected_version):
@@ -366,6 +372,100 @@ def reconcile_many(store, run_id, keys, resolution, expected_version) -> int:
         if not pending_reconciliation(store, run_id):
             store.clear_reconciliation(run_id)
     return len(keys)
+
+
+@dataclass(frozen=True)
+class Resolution:
+    key: str
+    delivered: bool
+    value: str | None = None
+
+
+def _strip_host(h) -> str:
+    h = "" if h is None else str(h)
+    return h[5:] if h.startswith("host_") else h
+
+
+def _delivered_value(store, run_id: str, key: str, value: str | None) -> str:
+    """What a delivered obligation stores, validated by its kind (spec §3)."""
+    from kernel.cli import session_projection
+
+    row = store.effect_by_key(key, run_id=run_id)
+    intent = row["intent"]
+    kind = intent["obligation"].get("kind")
+    if kind == "sess-stop":
+        if value is not None:
+            raise ValueError(f"{key}: a sess-stop takes no delivered value")
+        return "ok"
+    if kind in ("sess-prompt", "publish"):
+        if not value:
+            raise ValueError(f"{key}: a delivered {kind} needs its item id or URL")
+        return value
+    if kind == "sess-create":
+        try:
+            snap = json.loads(value or "")
+        except ValueError as exc:
+            raise ValueError(f"{key}: a delivered sess-create needs the session snapshot JSON") from exc
+        if not isinstance(snap, dict) or not snap.get("id") or not snap.get("agent_name"):
+            raise ValueError(f"{key}: snapshot must name id and agent_name")
+        body = create_body(intent["argv"])
+        if snap.get("agent_id") != body.get("agent_id"):
+            raise ValueError(f"{key}: snapshot agent_id {snap.get('agent_id')!r} != create's {body.get('agent_id')!r}")
+        want, got = _strip_host(body.get("host_id")), _strip_host(snap.get("host_id"))
+        if not want or want != got:
+            raise ValueError(f"{key}: snapshot host_id {snap.get('host_id')!r} != create's {body.get('host_id')!r}")
+        if os.path.realpath(str(snap.get("workspace") or "")) != os.path.realpath(str(body.get("workspace") or "")):
+            raise ValueError(f"{key}: snapshot workspace {snap.get('workspace')!r} != create's {body.get('workspace')!r}")
+        if not (snap.get("title") == body.get("title") == key):
+            raise ValueError(f"{key}: snapshot title {snap.get('title')!r} must equal the create's title and the key")
+        return json.dumps(session_projection(snap), sort_keys=True)
+    raise ValueError(f"{key}: obligation kind {kind!r} has no delivered form")
+
+
+def reconcile_typed(store, run_id, items, expected_version) -> int:
+    """Resolve uncertain obligation-bearing effects, one typed result per key.
+
+    All-or-nothing: every key is validated before the CAS; a key named twice,
+    a key without an obligation, a result its kind cannot take, or a
+    not_delivered with a value refuses the whole batch and writes nothing.
+    """
+    from kernel.commands import StaleVersion
+
+    items = list(items)
+    if not items:
+        return 0
+    keys = [i.key for i in items]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"a key is named twice: {sorted(k for k in keys if keys.count(k) > 1)}")
+    stored: dict[str, str | None] = {}
+    for item in items:
+        row = store.effect_by_key(item.key, run_id=run_id)
+        if row is None or row["state"] not in ("uncertain", "intended"):
+            raise ValueError(f"cannot reconcile {item.key!r}: state is "
+                             f"{None if row is None else row['state']!r}")
+        if not isinstance(row["intent"].get("obligation"), dict):
+            raise ValueError(f"{item.key!r} carries no obligation; use --idempotency-key/--resolution")
+        if item.delivered:
+            stored[item.key] = _delivered_value(store, run_id, item.key, item.value)
+        else:
+            if item.value is not None:
+                raise ValueError(f"{item.key}: not_delivered takes no value")
+            stored[item.key] = None
+
+    with store.transaction():
+        if not store.bump_version_cas(run_id, expected_version):
+            raise StaleVersion(f"reconciliation derived from version {expected_version}, which has moved")
+        for item in items:
+            store.mark_effect(item.key, "reconciled", stored[item.key], run_id=run_id)
+            store.append_fact(
+                run_id=run_id, kind=EventKind.EFFECT_RECONCILED, actor="human",
+                causal_command_id=item.key,
+                payload={"resolution": "delivered" if item.delivered else "not_delivered",
+                         "external_object_id": stored[item.key]},
+            )
+        if not pending_reconciliation(store, run_id):
+            store.clear_reconciliation(run_id)
+    return len(items)
 
 
 def reconcile(store, run_id, idempotency_key, resolution, expected_version) -> None:

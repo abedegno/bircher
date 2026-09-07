@@ -25,8 +25,8 @@ import tempfile
 
 from kernel.authz import NotAuthorized
 from kernel.effects import (
-    EffectClass, UncertainEffect, is_halted, pending_reconciliation,
-    perform, reconcile, reconcile_many,
+    EffectClass, Resolution, UncertainEffect, is_halted, pending_reconciliation,
+    perform, reconcile, reconcile_many, reconcile_typed,
 )
 # Re-exported so `create_body` / `parse` are the SAME functions `check` uses
 # to admit an argv in the first place, not a second reading of it. Tasks 3
@@ -226,13 +226,22 @@ def main(argv=None) -> int:
     # Repeatable: several uncertain effects are resolved under ONE CAS, in one
     # transaction. Resolving them one call at a time cannot be made safe from
     # outside -- a CAS cannot tell the caller's own bump from a foreign one.
-    r.add_argument("--idempotency-key", required=True, action="append")
-    r.add_argument("--resolution", required=True)
+    # Not `required` any more: this is the LEGACY form, for keys that carry no
+    # obligation (spec §3). The typed form below (--delivered/--not-delivered)
+    # is the other, and _do_reconcile refuses a call that mixes them.
+    r.add_argument("--idempotency-key", action="append", default=[])
+    r.add_argument("--resolution")
     # Supplied by the caller, not read here: the CAS exists so a resolution
     # derived from an observation at version N is refused when the run has
     # moved since. Reading the version inside this command would compare it
     # against itself and check nothing.
     r.add_argument("--expected-version", type=int, required=True)
+    # Typed form: one RESULT per obligation-bearing key, not one free-text
+    # resolution for the whole batch. `KEY=VALUE` is what a delivered
+    # obligation returned (a session snapshot, a prompt item id, a publish
+    # URL); a bare `KEY` is a sess-stop, which takes none.
+    r.add_argument("--delivered", action="append", default=[], metavar="KEY[=VALUE]")
+    r.add_argument("--not-delivered", action="append", default=[], metavar="KEY")
 
     v = subs.add_parser("verify-nomination")
     v.add_argument("--db", required=True)
@@ -286,10 +295,34 @@ def _do_pending(a) -> int:
 
 def _do_reconcile(a) -> int:
     from kernel.commands import StaleVersion
+
+    # Exactly one form. Mixing them would let a caller name a typed key
+    # through the legacy, unvalidated path (or vice versa), and "neither" is
+    # as much a usage error as "both" -- there is no default reconciliation.
+    typed = bool(a.delivered or a.not_delivered)
+    legacy = bool(a.idempotency_key or a.resolution)
+    if typed == legacy:
+        print("reconcile takes either --delivered/--not-delivered or"
+              " --idempotency-key/--resolution, not both and not neither", file=sys.stderr)
+        return RC_USAGE
+
     store = Store.open(a.db)
     try:
-        reconcile_many(store, a.run_id, a.idempotency_key, a.resolution,
-                       a.expected_version)
+        if typed:
+            items = []
+            for spec in a.delivered:
+                key, sep, value = spec.partition("=")
+                if sep and value.startswith("@"):
+                    # The runner hands a session snapshot this way (Task 20):
+                    # the shell composes it to a file rather than a command
+                    # line, which has its own length limit and quoting rules.
+                    value = open(value[1:]).read()
+                items.append(Resolution(key, True, value if sep else None))
+            items += [Resolution(k, False) for k in a.not_delivered]
+            reconcile_typed(store, a.run_id, items, a.expected_version)
+        else:
+            reconcile_many(store, a.run_id, a.idempotency_key, a.resolution,
+                           a.expected_version)
     except StaleVersion as exc:
         print(f"stale: {exc}", file=sys.stderr)
         return RC_FAILED
