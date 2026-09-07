@@ -220,3 +220,26 @@ def test_direction_ordering_is_by_seq_not_by_time(tmp_path):
     assert front.direction_after(s, "r-1", d_seq).seq == direction.seq
     with pytest.raises(NotAuthorized, match="human_direction"):
         f._cmd(g, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
+
+
+def test_submit_refused_when_the_generation_has_no_attempt_dispatched_fact(tmp_path):
+    """The direction clause's dispatch_seq lookup: a generation with a
+    dispatches-table row but no attempt_dispatched fact -- unreachable via
+    dispatch() itself, since Task 6 writes both in the fence's one
+    transaction -- is refused with NotAuthorized naming what is missing, not
+    a bare LookupError escaping submit()."""
+    from kernel.ids import new_id
+    from kernel.ownership import acquire
+
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.direct("first")
+    g = acquire(s, "r-1", "claude")
+    s.record_dispatch(new_id("dsp"), "r-1", g, "claude", Role.AUTHOR)
+    sid = f._session(g, f._newest_id())
+    f._end_turn(g, sid)
+    h = put_artifact(s, SPEC_BYTES)
+    with pytest.raises(NotAuthorized, match="attempt_dispatched"):
+        f._cmd(g, "submit_spec", {"artifact_hash": h})
+    rejected = s.facts_of_kind("r-1", EventKind.COMMAND_REJECTED)
+    assert rejected and rejected[-1].payload["reason"] == "NotAuthorized"

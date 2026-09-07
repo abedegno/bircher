@@ -172,11 +172,11 @@ def newest_prompt_of(store, run_id: str, session_id: str, phase: str, epoch_n: i
     return found
 
 
-def dispatch_seq(store, run_id: str, generation: int) -> int:
+def dispatch_seq(store, run_id: str, generation: int) -> int | None:
     for f in store.facts_of_kind(run_id, EventKind.ATTEMPT_DISPATCHED):
         if f.payload.get("generation") == generation:
             return f.seq
-    raise LookupError(f"generation {generation} has no attempt_dispatched fact")
+    return None
 
 
 def direction_after(store, run_id: str, seq: int):

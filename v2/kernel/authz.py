@@ -540,7 +540,13 @@ def _check_submit(store, cmd, state: str) -> None:
     # dispatch means a human interrupted the turn this submission is the
     # output of. The artefact of the turn it interrupted is not this run's to
     # submit; the direction starts a fresh round instead.
-    newer = front.direction_after(store, cmd.run_id, front.dispatch_seq(store, cmd.run_id, cmd.generation))
+    dispatched_seq = front.dispatch_seq(store, cmd.run_id, cmd.generation)
+    if dispatched_seq is None:
+        raise NotAuthorized(
+            f"generation {cmd.generation} has no attempt_dispatched fact: nothing to "
+            "order a human_direction against"
+        )
+    newer = front.direction_after(store, cmd.run_id, dispatched_seq)
     if newer is not None:
         raise NotAuthorized(
             f"a human_direction (seq {newer.seq}) is newer than generation "
