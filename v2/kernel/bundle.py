@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 
 from kernel.canon import canonical_bytes, content_hash
 
@@ -49,6 +50,27 @@ BIRCHER_STATUS_PREFIXES: tuple[str, ...] = (
 def is_bircher_status(body: str) -> bool:
     head = (body or "").lstrip()
     return any(head.startswith(p) for p in BIRCHER_STATUS_PREFIXES)
+
+
+_COMMENT_ID = re.compile(r"issuecomment-(\d+)$")
+
+
+def from_gh(raw: dict) -> dict:
+    """`gh issue view --json number,title,body,labels,comments` to the shape
+    snapshot() takes. The comment id is the numeric one in the url: gh's
+    `id` is a node id string, and the canon sorts comments numerically."""
+    comments = []
+    for c in raw.get("comments") or []:
+        m = _COMMENT_ID.search(c.get("url") or "")
+        if not m:
+            continue
+        comments.append({"id": int(m.group(1)),
+                         "author": ((c.get("author") or {}).get("login")) or "unknown",
+                         "body": c.get("body") or ""})
+    return {"number": int(raw["number"]), "title": raw.get("title") or "",
+            "body": raw.get("body") or "",
+            "labels": [l["name"] if isinstance(l, dict) else str(l) for l in raw.get("labels") or []],
+            "comments": comments}
 
 
 def snapshot(issue: dict) -> dict:

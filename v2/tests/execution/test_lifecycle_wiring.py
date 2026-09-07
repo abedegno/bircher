@@ -80,12 +80,23 @@ def test_the_run_id_carries_the_attempt_epoch():
     assert re.search(r'BIRCHER_RUN_ID="\$\{item\}-\$\(date \+%s\)"', _run_item())
 
 
+#: The `_kernel_*` functions whose EXIT CODE is their ANSWER, not a report of
+#: whether a recording succeeded. Named one by one, because the guard below is
+#: a name-shaped heuristic and a silent widening of it would retire the
+#: property it exists to hold. Neither records anything: they ask the journal a
+#: question and the caller has to be able to act on the answer.
+_KERNEL_QUERIES = ("_kernel_implementation_started",)
+
+
 def test_no_kernel_call_is_tested_for_success():
-    """Advisory means no branch reads a kernel exit code. `if _kernel ...` or
-    `_kernel ... &&` would make the recorder able to change the run."""
+    """Advisory means no branch reads a kernel RECORDER's exit code.
+    `if _kernel ...` or `_kernel ... &&` would make the recorder able to change
+    the run."""
     for line in _run_item().splitlines():
         s = line.strip()
         if "_kernel" not in s or s.startswith("#"):
+            continue
+        if any(q in s for q in _KERNEL_QUERIES):
             continue
         assert not re.match(r"(if|while|until)\s+_kernel", s), s
         assert "&&" not in s.split("_kernel")[0][-4:], s
@@ -98,7 +109,7 @@ def test_no_kernel_call_is_tested_for_success():
 # the functions work.")
 
 @pytest.mark.parametrize("fn", [
-    "_kernel_run_start", "_kernel_submit_spec", "_kernel_submit_plan",
+    "_kernel_run_start",
     "_kernel_start_implementation", "_kernel_record_output", "_kernel_record_ci",
     "_kernel_record_review", "_kernel_request_merge", "_kernel_record_outcome",
 ])
@@ -106,20 +117,50 @@ def test_run_item_calls_the_named_lifecycle_function(fn):
     assert fn in _run_item(), f"run_item never calls {fn}"
 
 
-def test_the_three_missing_transitions_precede_the_implementation_output():
-    """Fix round 1, IMPORTANT (b): without submit_spec / submit_plan /
-    start_implementation, the run never leaves `queued`, and every later
-    command is refused for the same reason regardless of what it is --
-    reviewed empirically against a live database, not merely reasoned about
-    (see test_lifecycle_functions.py). All three must run, in state-machine
-    order, before record_implementation_output (which requires state
-    'implementing')."""
+def test_the_phase_loop_runs_between_run_creation_and_the_implementer():
+    """The §6 seam, as an ORDER.
+
+    Fix round 1's version of this test asserted submit_spec < submit_plan <
+    start_implementation, because without those the run never left `queued`
+    and every later command was refused for the same reason regardless of what
+    it was. The two stand-in submits are gone: a real spec and a real plan are
+    authored, reviewed and accepted by `coordinator.cli phases`, which the
+    runner calls HERE -- after the run exists and before any implementer is
+    dispatched. Dispatching the implementer first would fence a generation
+    across the whole front half; calling phases after start_implementation
+    would ask it to author a spec for a run already implementing."""
     body = _run_item()
-    spec = body.index("_kernel_submit_spec")
-    plan = body.index("_kernel_submit_plan")
+    run_start = body.index("_kernel_run_start")
+    phases = body.index("coordinator.cli phases")
+    dispatch = body.index('_kernel_dispatch "$vendor" implementer')
     start = body.index("_kernel_start_implementation")
     output = body.index("_kernel_record_output")
-    assert spec < plan < start < output, (spec, plan, start, output)
+    assert run_start < phases < dispatch < start < output, (
+        run_start, phases, dispatch, start, output)
+
+
+def test_the_operator_fence_precedes_the_phase_loop_and_is_not_a_seat():
+    """The runner fences an OPERATOR generation before calling phases (spec
+    §5). Not `author` and not `reviewer`: those are the two roles the seat
+    budget counts, and a runner that took one would spend the run's budget on
+    its own bookkeeping before any author had written a word."""
+    body = _run_item()
+    fence = body.index("_kernel_dispatch runner operator")
+    assert fence < body.index("coordinator.cli phases")
+    assert fence < body.index('_kernel_dispatch "$vendor" implementer')
+
+
+def test_the_state_is_read_back_before_a_session_is_created():
+    """`_kernel_start_implementation` is advisory and returns 0 whether the
+    kernel accepted it or refused it, so the only honest way to know the run is
+    implementing is to ask. A session created over a refusal is an implementer
+    working a run the kernel never authorized."""
+    body = _run_item()
+    start = body.index("_kernel_start_implementation")
+    read_back = body.index("_st_after=$(_kernel_state")
+    session = body.index("conv_id=$(_create_session")
+    assert start < read_back < session, (start, read_back, session)
+    assert body.index('"$_st_after" != implementing') < session
 
 
 def test_run_item_never_inlines_a_kernel_command_call():
@@ -166,6 +207,24 @@ _NO_KERNEL_OUTCOME = {
         "there is no run in the kernel to end",
     "empty/blank prompt":
         "same -- refused before the run id is minted",
+    "create_run refused":
+        "the run was never created. `_kernel_run_start` is the one "
+        "non-advisory call in the client, and this row is written when it "
+        "refuses -- there is no run to record an outcome against, and naming "
+        "one would put a terminal fact on a run id nothing holds",
+}
+
+#: Scorecard rows whose run is NOT OVER. A distinct exemption from the one
+#: above, and the distinction is the whole point: those sites have no run to
+#: end, this one has a run that must stay live. `record_run_outcome` is
+#: terminal and not idempotent -- a second one is refused by design -- so
+#: recording it here would end a run the next pass has to resume, and the
+#: resume would then find a run at `ended` and skip the item forever.
+_RUN_NOT_OVER = {
+    '"parked"':
+        "the run is waiting on a human. The queue file stays where it is and "
+        "the sidecar names the run, so the next pass resumes THIS run rather "
+        "than minting a second one for the same item",
 }
 
 
@@ -223,7 +282,7 @@ def test_every_terminal_scorecard_row_records_a_kernel_outcome():
     lines = [_strip_comment(l) for l in _run_item().splitlines()]
     missing = []
     for i, line in _scorecard_sites():
-        if any(k in line for k in _NO_KERNEL_OUTCOME):
+        if any(k in line for k in _NO_KERNEL_OUTCOME) or any(k in line for k in _RUN_NOT_OVER):
             continue
         window = "\n".join(lines[max(0, i - 8):i])
         if "_kernel_record_run_outcome" not in window:
@@ -237,7 +296,7 @@ def test_every_exemption_still_matches_a_real_site():
     """A stale exemption is worse than none: it silently excuses whatever
     site later happens to contain its text."""
     sites = [l for _, l in _scorecard_sites()]
-    for key in _NO_KERNEL_OUTCOME:
+    for key in list(_NO_KERNEL_OUTCOME) + list(_RUN_NOT_OVER):
         assert sum(key in l for l in sites) == 1, (
             f"exemption {key!r} matches {sum(key in l for l in sites)} sites, "
             "expected exactly 1")
@@ -259,6 +318,22 @@ def test_the_exempt_sites_really_are_before_a_generation_exists():
                 f"exempt site at run_item line {i} is BELOW the dispatch at "
                 f"{dispatch_at}; a generation exists, so it can and must "
                 f"record an outcome: {line.strip()[:80]}")
+
+
+def test_the_not_over_sites_really_are_below_the_dispatch():
+    """The mirror of the test above, and it goes the OTHER way for a reason.
+    A `_NO_KERNEL_OUTCOME` site is legitimate because no generation exists yet;
+    a `_RUN_NOT_OVER` site has one and deliberately declines to end the run.
+    If one of these ever drifted ABOVE the dispatch it would be in the first
+    category and its stated reason would be describing a different site."""
+    lines = _run_item().splitlines()
+    dispatch_at = next(i for i, l in enumerate(lines)
+                       if "_kernel_dispatch" in l and "BIRCHER_GENERATION=" in l)
+    for i, line in _scorecard_sites():
+        if any(k in line for k in _RUN_NOT_OVER):
+            assert i > dispatch_at, (
+                f"site at run_item line {i} claims the run is still live, but "
+                f"it sits above the dispatch at {dispatch_at}: {line.strip()[:80]}")
 
 
 # --- no routed effect may precede the generation it is recorded under ---------
@@ -456,11 +531,13 @@ def test_the_run_id_is_still_minted_in_exactly_one_place():
     assigns = [l.strip() for l in src.splitlines()
                if "BIRCHER_RUN_ID=" in l and "export BIRCHER_RUN_ID" in l
                and not l.strip().startswith("#")]
-    # TWO now, and the second is deliberate: the sweep restores the run id
-    # RECORDED with a deferred row rather than guessing by item code. It mints
-    # nothing -- it reuses an id the kernel already holds -- so the
-    # "run_item is the only place a run is CREATED" premise still stands.
-    assert len(assigns) == 2, (
+    # THREE now, and only ONE of them mints. The sweep restores the run id
+    # RECORDED with a deferred row rather than guessing by item code, and
+    # run_item RESUMES the open run the kernel already holds for this code
+    # rather than minting a second one over it -- both reuse an id the kernel
+    # has, so the "run_item is the only place a run is CREATED" premise still
+    # stands, and the leak guard that keeps it standing is the resume branch.
+    assert len(assigns) == 3, (
         "BIRCHER_RUN_ID is assigned somewhere new; every REACHED/ADOPTS "
         f"classification above assumed the places it is set are known: {assigns}")
     assert any('="${item}-$(date +%s)"' in a for a in assigns), (
@@ -468,26 +545,49 @@ def test_the_run_id_is_still_minted_in_exactly_one_place():
     assert any('="$deferred_run"' in a for a in assigns), (
         "the sweep no longer restores the recorded run id, so it is back to "
         "guessing by item code")
+    assert any('="$_open"' in a for a in assigns), (
+        "run_item no longer adopts the open run the kernel holds for this "
+        "code, so a resumed item would mint a second run over the first")
 
 
 # --- the work-repo directive, RENDERED rather than grepped --------------------
 
+def _function(name):
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith(f"{name}() {{"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    return "\n".join(src[start:end + 1])
+
+
 def _rendered_prompt(workdir, repo, vendor="codex", reviewer="claude_code"):
-    """Evaluate run_item's actual prompt assignment in bash.
+    """Evaluate the DIRECTIVE half of `_implementer_brief` in bash.
 
     A source-text assertion here would only prove the directive is present.
     What matters is what it RENDERS to -- a directive that names the wrong
     variable, or interpolates nothing, reads fine and instructs nothing.
+
+    Only the directive: the rest of the brief is read out of the kernel, and
+    pointing BIRCHER_PY at nothing makes that half produce nothing while the
+    printf above it still renders. What the kernel half carries is driven
+    against a real database in test_front_half_seam.py.
     """
-    body = _run_item()
-    start = body.index('prompt="IMPLEMENTER VENDOR DIRECTIVE')
-    end = body.index('${prompt}"', start) + len('${prompt}"')
-    script = (f'WORKDIR={workdir}\nREPO={repo}\nvendor={vendor}\n'
-              f'RECOVERY_REVIEWER={reviewer}\nprompt="ORIGINAL ITEM TEXT"\n'
-              f'{body[start:end]}\nprintf %s "$prompt"')
+    script = (f'WORKDIR={workdir}\nREPO={repo}\n'
+              f'RECOVERY_REVIEWER={reviewer}\nBIRCHER_PY=/nonexistent/python\n'
+              f'{_function("_implementer_brief")}\n'
+              f'_implementer_brief run-1 {vendor} 2>/dev/null')
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
     return r.stdout
+
+
+def test_the_implementer_brief_is_not_the_queue_prompt():
+    """spec §6. By the time an implementer runs, a spec and a plan have been
+    authored, reviewed and accepted; handing it the queue text instead would
+    send it the question the front half already answered. The brief reads its
+    body out of the kernel and never touches `$prompt` -- and run_item
+    OVERWRITES `prompt` with it, so nothing downstream can send the old one."""
+    body = _function("_implementer_brief")
+    assert "$prompt" not in body and "${prompt}" not in body, body
+    assert 'prompt="$(_implementer_brief "$BIRCHER_RUN_ID" "$vendor")"' in _run_item()
 
 
 def test_the_implementer_is_told_which_repo_to_work_in():
@@ -503,7 +603,6 @@ def test_the_implementer_is_told_which_repo_to_work_in():
         "does not actually override the bundle's literal path")
     assert "git -C /workspaces/smoke fetch origin main" in out
     assert "abedegno/bircher-smoke" in out, "the target repo is never named"
-    assert "ORIGINAL ITEM TEXT" in out, "the item's own prompt was dropped"
 
 
 def test_the_directive_is_present_for_the_default_target_too():

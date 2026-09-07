@@ -1,0 +1,41 @@
+spec_version: 1
+name: v2_author_claude
+description: >-
+  Bircher v2 author (Claude) — writes a spec or a plan for one issue in its
+  own worktree from the brief it is sent, and CANNOT push, open a PR, comment
+  or label. Every external effect is the kernel's.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are a Bircher v2 author. Your first message is a brief that names the
+  phase (spec or plan), the files to write, the policy, the issue and any
+  findings. Follow it exactly: write the artefact where it says, then end
+  your turn. You hold no credentials and no network beyond your model
+  provider; do not attempt git push, gh, or any HTTP call. Do not write
+  outside your worktree.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_landlock
+    write_paths:
+      - .
+    egress_rules:
+      # The model provider only. No GitHub: an author reads a brief and
+      # writes a file.
+      - "GET,POST api.anthropic.com/**"
+
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: true

@@ -1970,8 +1970,43 @@ reconcile_deferred_ready() {
         continue
       fi
     else
+      # ASK BEFORE ADOPTING, exactly as the deferred branch above asks before
+      # trusting its recorded id. A dispatch over an intended or uncertain
+      # effect HALTS the run and raises, so `_kernel_adopt_run` would come back
+      # with an empty generation -- and the first `_effect` then aborts on
+      # `${BIRCHER_GENERATION:?}`, which under `set -u` kills this whole sweep
+      # loop at rc 0 with the remaining PRs never looked at. `_kernel_find_run`
+      # is used rather than adopt because adopt MINTS when it finds nothing:
+      # asking it would answer "is there a halted run?" by creating one.
+      local _sweep_run _sweep_pend
+      _sweep_run=$(_kernel_find_run "$item")
+      if [ -n "$_sweep_run" ]; then
+        _sweep_pend=$(_kernel_pending "$_sweep_run")
+        if _pending_blocks "$_sweep_pend"; then
+          echo "[batch:sweep] $item: run $_sweep_run is halted or holds pending effects -> skipping (reconcile first): $_sweep_pend" >&2
+          mkdir -p "$(dirname "$SCORECARD")" 2>/dev/null
+          json_row "$item" "$pr" escalated false sweep 0 0 \
+            "sweep: run '$_sweep_run' is halted or holds unresolved effects; reconcile before this PR can be swept - needs a human" ok \
+            >> "$SCORECARD"
+          continue
+        fi
+      fi
       _kernel_adopt_run "$item" "$REPO" "${sha:-0000000000000000000000000000000000000000}" \
         "$RECOVERY_REVIEWER" >/dev/null
+      # The same guard the deferred branch carries: an adopt that yielded no
+      # generation must not be carried into an effect. `:-` rather than the
+      # deferred branch's bare form -- that branch assigns the variable one
+      # line above, this one relies on a function to have exported it, and an
+      # unbound read here would abort the sweep under `set -u`, which is the
+      # very failure the guard exists to prevent.
+      if [ -z "${BIRCHER_GENERATION:-}" ]; then
+        echo "[batch:sweep] $item: adopting run '${BIRCHER_RUN_ID:-<none>}' yielded no generation -> skipping" >&2
+        mkdir -p "$(dirname "$SCORECARD")" 2>/dev/null
+        json_row "$item" "$pr" escalated false sweep 0 0 \
+          "sweep: adopting the run for '$item' yielded no generation; refusing to perform effects with none - needs a human" ok \
+          >> "$SCORECARD"
+        continue
+      fi
     fi
     st=$(gh pr view "$pr" --repo "$REPO" --json state -q '.state' 2>/dev/null)
     case "$st" in
@@ -2174,8 +2209,31 @@ recover_pr_cmd() {
   # record_implementation_output, which refuses any other role. The reviewer
   # dispatch happens below, at the role change, before the verdict.
   local _rec_impl; _rec_impl=$([ "$RECOVERY_REVIEWER" = codex ] && printf claude_code || printf codex)
+  # ASK BEFORE ADOPTING. A dispatch over an intended or uncertain effect HALTS
+  # the run and raises, so the adopt below would return an empty generation --
+  # and every `_effect` on this path then aborts on `${BIRCHER_GENERATION:?}`,
+  # after the recovery has already reported which run it adopted. Worse, the
+  # refused dispatch HALTS a run that merely held an intended effect, so
+  # attempting it is itself a mutation. `_kernel_find_run` is used rather than
+  # adopt because adopt mints when it finds nothing.
+  local _rec_run _rec_pend
+  _rec_run=$(_kernel_find_run "$code")
+  if [ -n "$_rec_run" ]; then
+    _rec_pend=$(_kernel_pending "$_rec_run")
+    if _pending_blocks "$_rec_pend"; then
+      echo "[batch:recover-pr] $code: run $_rec_run is halted or holds pending effects -> refusing to adopt it; reconcile those keys first: $_rec_pend" >&2
+      return 1
+    fi
+  fi
   _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$_rec_impl" implementer >/dev/null
   echo "[batch:recover-pr] $code: kernel run=${BIRCHER_RUN_ID:-<none>} generation=${BIRCHER_GENERATION:-<none>}" >&2
+  # The same guard the sweep carries: no generation means no effect may be
+  # performed, and carrying on would abort on `${BIRCHER_GENERATION:?}` inside a
+  # redirect that swallows the reason.
+  if [ -z "${BIRCHER_GENERATION:-}" ]; then
+    echo "[batch:recover-pr] $code: adopting ${BIRCHER_RUN_ID:-<none>} yielded no generation -> refusing to perform effects with none" >&2
+    return 1
+  fi
 
   # RESOLVE A HALT FIRST. An uncertain effect halts its run and `perform`
   # refuses everything after it, so a halted run adopted here would have every
@@ -2955,11 +3013,25 @@ def is_bircher_status(body):
     # recognising them would start feeding a session the status lines written
     # by its predecessor. Retiring a channel means never writing one again; it
     # does not mean forgetting how to read the archive.
+    #
+    # FIVE prefixes, the same five kernel/bundle.py holds. The new one,
+    # "bircher: published ", is the publication comment the coordinator writes:
+    # bircher reading its own output back as human discussion is exactly what
+    # this filter exists to prevent. The two copies are driven against
+    # tests/fixtures/bircher_status_comments.tsv by
+    # v2/tests/execution/test_bircher_status_bash.py, which EXTRACTS this
+    # function from this file and executes it. That is why each `or` sits at the
+    # END of its line: the extractor takes everything up to the first line that
+    # closes a paren, and a leading `or` would end the match one clause in.
+    #
+    # NO APOSTROPHES anywhere in this program. It is a bash single-quoted
+    # string, so one closes it and the rest of the python becomes shell.
     head = body.lstrip()
-    return (head.startswith("bircher: outcome=")
-            or head.startswith("bircher-status:")
-            or head.startswith("Outcome derived from the repository")
-            or head.startswith("Cross-vendor review (outcome derived"))
+    return (head.startswith("bircher: outcome=") or
+            head.startswith("bircher-status:") or
+            head.startswith("Outcome derived from the repository") or
+            head.startswith("Cross-vendor review (outcome derived") or
+            head.startswith("bircher: published "))
 
 kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
 maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])
@@ -3956,6 +4028,107 @@ _host_ids_match() {
   if [ -n "$a" ] && [ "$a" = "$b" ]; then echo "yes"; else echo "no"; fi
 }
 
+# --- run_item's front-half helpers -------------------------------------------
+
+# _project_config -> the omnigent Project's `config.bircher`, or {}.
+#
+# Ruling 9: a Project's config is the POLICY DEFAULT a run's labels then
+# override. Unset BIRCHER_PROJECT_ID means "no project default", which is `{}`
+# and not an error -- and so does every failure below it. A config that cannot
+# be read must not become a config that was read as something else: `{}` is the
+# value the kernel treats as "the labels decide", which is the same answer a
+# run with no project gets.
+_project_config() {
+  if [ -z "${BIRCHER_PROJECT_ID:-}" ]; then echo '{}'; return 0; fi
+  _http_json GET "/v1/projects/$BIRCHER_PROJECT_ID" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("{}"); sys.exit(0)
+cfg = ((d.get("config") or {}).get("bircher")) or {}
+print(json.dumps(cfg if isinstance(cfg, dict) else {}))' || echo '{}'
+}
+
+# _pending_blocks <pending-json> -> 0 when the run is halted or holds pending
+# effects, 1 otherwise (including when the JSON is unreadable).
+#
+# UNREADABLE IS NOT BLOCKED, deliberately: `_kernel_pending` is advisory and
+# answers "" when the kernel cannot be reached, and treating that as "halted"
+# would stop the queue every time the database was busy. What it guards is the
+# opposite direction -- a run that IS halted, or holds an intended/uncertain
+# effect, refuses the next dispatch and raises, so a caller that dispatched
+# anyway would carry an EMPTY generation into `_effect` and abort under
+# `set -u`.
+_pending_blocks() {
+  python3 -c 'import json,sys
+try:
+    d = json.loads(sys.argv[1] or "{}")
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (d.get("halted") or d.get("pending")) else 1)' "$1"
+}
+
+# _kernel_implementation_started <run_id> -> 0 when a start_implementation was
+# ACCEPTED for this run. `planned` alone does not say whether the back half has
+# already begun -- a run returns to `planned` on a request_revision too -- so
+# the journal is asked rather than the aggregate row.
+_kernel_implementation_started() {  # <run_id>
+  local out; out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+    "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+print(any(f.kind == "command_accepted" and f.payload.get("command_name") == "start_implementation"
+          for f in s.facts_for(sys.argv[1])))' "$1" 2>/dev/null ) || out=""
+  [ "$out" = True ]
+}
+
+# _write_parked_sidecar <code> <run_id> <state> <reason>
+#
+# A HINT, never the truth. The kernel is asked first on every pass
+# (`_kernel_find_run <code> open`), and this file exists so a human looking at
+# the queue directory can see which item is waiting on them and why. Rebuilt
+# from the kernel whenever the two disagree.
+_write_parked_sidecar() {  # <code> <run_id> <state> <reason>
+  mkdir -p "$QUEUE"
+  python3 -c 'import json,sys; print(json.dumps({"run_id": sys.argv[1], "state": sys.argv[2], "reason": sys.argv[3]}))' \
+    "$2" "$3" "$4" > "$QUEUE/$1.parked"
+}
+
+# _implementer_brief <run_id> <vendor> -> the implementer's prompt on stdout.
+#
+# The directives, then the spec and the plan the KERNEL holds, then the issue
+# snapshot. Never the queue prompt (§6): by the time an implementer runs, a
+# spec and a plan have been authored, reviewed and accepted, and handing it the
+# queue text instead would send it the question the front half already answered.
+#
+# WORK REPO DIRECTIVE. The agent bundles spell their worktree setup with a
+# LITERAL /workspaces/muesli (agents/codex/config.yaml,
+# agents/claude_code/config.yaml), so an implementer working any other target
+# would branch from -- and push to -- muesli regardless of WORKDIR. Sent as a
+# directive rather than fixed in the bundles because the bundle is uploaded as
+# static text and WORKDIR is only known here, per run. It is stated
+# unconditionally, not only when WORKDIR differs from the default: a directive
+# that appears only in the unusual case is one nobody has read when the unusual
+# case arrives.
+_implementer_brief() {   # <run_id> <vendor> -> the prompt on stdout
+  local run_id="$1" vendor="$2"
+  printf 'IMPLEMENTER VENDOR DIRECTIVE: dispatch the implement sub-agent to %s; the cross-vendor reviewer MUST be the opposite vendor (%s). Do not set any model or model_override.\n\nWORK REPO DIRECTIVE: the repository for this task is %s, checked out at %s. This OVERRIDES any path written in your agent bundle. Wherever the bundle says /workspaces/muesli, read %s. Set your isolated worktree up with:\n    git -C %s fetch origin main\n    git -C %s worktree add -b <code>-<slug> /tmp/wt-<code> origin/main\nand open the pull request against %s. Do not fetch, branch from, push to, or open a pull request against any other repository.\n\n' \
+    "$vendor" "$RECOVERY_REVIEWER" "$REPO" "$WORKDIR" "$WORKDIR" "$WORKDIR" "$WORKDIR" "$REPO"
+  PYTHONPATH="$(_kernel_pythonpath)" BIRCHER_V2_DIR="$(_kernel_pythonpath)" "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel import front
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+run = sys.argv[1]
+spec = s.read_blob(s.phase_artifact(run, "spec")).decode()
+plan = s.read_blob(s.phase_artifact(run, "plan")).decode()
+issue = s.read_blob(front.bundle_hash(s, run)).decode()
+print("# The accepted spec\n\n" + spec + "\n\n# The accepted plan\n\n" + plan + "\n\n# The issue snapshot\n\n```json\n" + issue + "\n```\n")' "$run_id"
+}
 run_item() {
   local f="$1"; local item; item=$(basename "$f" .md)
   local code; code=$(printf '%s' "$item" | cut -d- -f1 | tr 'A-Z' 'a-z')  # item code, e.g. a06
@@ -3980,15 +4153,12 @@ run_item() {
     return 0
   fi
   echo "[batch] === $item ==="
-  # The kernel's record of this run. Item codes recur across attempts, so the
-  # epoch makes each attempt its own aggregate.
-  BIRCHER_RUN_ID="${item}-$(date +%s)"; export BIRCHER_RUN_ID
-  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"
-  export BIRCHER_KERNEL_DB
+  # The kernel's record of this run. Item codes recur across attempts, so a
+  # minted id carries the epoch; a RESUMED one is whatever the kernel already
+  # holds (below).
+  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"; export BIRCHER_KERNEL_DB
   mkdir -p "$(dirname "$BIRCHER_KERNEL_DB")" 2>/dev/null || true
-  # enqueue: creates this run's row in the kernel. See
-  # batch/lib/kernel-client.sh's _kernel_run_start for why this is not
-  # `_kernel command --name enqueue` (that command name does not exist).
+  local _iss; _iss=$(_item_issue "$prompt")
   local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
   # Defaulted ONCE, here, rather than at the call below: the verdict binding
   # must present the base the kernel actually recorded, and `validate_review`
@@ -3996,13 +4166,12 @@ run_item() {
   # the empty string while the run held forty zeros -- a mismatch the reviewer
   # could not have caused and could not have fixed.
   : "${_base_sha:=0000000000000000000000000000000000000000}"
-  _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" "$_base_sha"
-  local _iss; _iss=$(_item_issue "$prompt")
   # B-3 vendor dispatch: resolve THIS item's implementer and flip the reviewer to
   # the opposite vendor (cross-vendor integrity is invariant). A per-item queue tag
   # `bircher-implementer: <vendor>` wins over the runner-level PICKED_VENDOR (set by
-  # the usage-aware gate / BIRCHER_IMPLEMENTER). muesli-loop step 3 honors the
-  # directive line; the reviewer agent is selected via RECOVERY_REVIEWER below.
+  # the usage-aware gate / BIRCHER_IMPLEMENTER). The reviewer agent is selected via
+  # RECOVERY_REVIEWER below. Resolved BEFORE the run is created, because the
+  # implementer's brief names both vendors and the seam below builds it.
   local vendor tag
   tag=$(printf '%s\n' "$prompt" | grep -iE '^[[:space:]]*bircher-implementer:' | head -1 \
         | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]' | tr 'A-Z' 'a-z')
@@ -4013,65 +4182,148 @@ run_item() {
   esac
   [ "$vendor" = auto ] && vendor=claude_code   # never dispatch the literal 'auto'
   if [ "$vendor" = codex ]; then RECOVERY_REVIEWER=claude_code; else RECOVERY_REVIEWER=codex; fi
-  # WORK REPO DIRECTIVE. The agent bundles spell their worktree setup with a
-  # LITERAL /workspaces/muesli (agents/codex/config.yaml,
-  # agents/claude_code/config.yaml), so an implementer working any other target
-  # would branch from -- and push to -- muesli regardless of WORKDIR. That made
-  # a throwaway-repo end-to-end run unsafe: the only reason tonight's smoke
-  # dropped to --recover-pr, which launches no implementer.
-  #
-  # Sent as a directive rather than fixed in the bundles because the bundle is
-  # uploaded as static text and WORKDIR is only known here, per run. It is
-  # stated unconditionally, not only when WORKDIR differs from the default: a
-  # directive that appears only in the unusual case is one nobody has read when
-  # the unusual case arrives.
-  prompt="IMPLEMENTER VENDOR DIRECTIVE: dispatch the implement sub-agent to ${vendor}; the cross-vendor reviewer MUST be the opposite vendor (${RECOVERY_REVIEWER}). Do not set any model or model_override.
-
-WORK REPO DIRECTIVE: the repository for this task is ${REPO}, checked out at ${WORKDIR}. This OVERRIDES any path written in your agent bundle. Wherever the bundle says /workspaces/muesli, read ${WORKDIR}. Set your isolated worktree up with:
-    git -C ${WORKDIR} fetch origin main
-    git -C ${WORKDIR} worktree add -b <code>-<slug> /tmp/wt-<code> origin/main
-and open the pull request against ${REPO}. Do not fetch, branch from, push to, or open a pull request against any other repository.
-
-${prompt}"
   echo "[batch] $item: implementer=$vendor reviewer=$RECOVERY_REVIEWER" >&2
+
+  # The fetched issue and the Project config: the two inputs create_run
+  # snapshots and derives the policy from (spec §1). Fetched here, by the
+  # runner's credential; asserted, not observed (§9).
+  local _issue_json _cfg_json
+  _issue_json=$(mktemp) && _cfg_json=$(mktemp)
+  if [ -n "$_iss" ]; then
+    _net_run "$BIRCHER_NET_TIMEOUT" gh issue view "$_iss" --repo "$REPO" \
+      --json number,title,body,labels,comments > "$_issue_json" || { echo "[batch] $item: issue fetch failed" >&2; return 5; }
+  else
+    python3 -c 'import json,sys; print(json.dumps({"number":0,"title":sys.argv[1],"body":sys.argv[2],"labels":[],"comments":[]}))' \
+      "$item" "$prompt" > "$_issue_json"
+  fi
+  _project_config > "$_cfg_json"
+
+  # RESUME OR MINT (spec §5). The kernel is the truth; the sidecar a hint.
+  local resumed=0 _open
+  _open=$(_kernel_find_run "$code" open)
+  if [ -n "$_open" ]; then
+    local _pend; _pend=$(_kernel_pending "$_open")
+    if _pending_blocks "$_pend"; then
+      echo "[batch] $item: run $_open is halted or holds pending effects; skipping until reconciled: $_pend" >&2
+      return 0
+    fi
+    local _st; _st=$(_kernel_state "$_open")
+    case "$_st" in
+      queued|spec_submitted|spec_accepted|specified|plan_submitted|plan_accepted|planned) ;;
+      *) echo "[batch] $item: run $_open is at $_st (beyond the front half); skipping" >&2; return 0 ;;
+    esac
+    if [ "$_st" = planned ] && _kernel_implementation_started "$_open"; then
+      echo "[batch] $item: run $_open already started implementation; skipping" >&2; return 0
+    fi
+    if [ "${BIRCHER_HAVE_LOCK:-0}" != 1 ]; then
+      echo "[batch] $item: refusing to resume $_open without the batch lock" >&2; return 0
+    fi
+    BIRCHER_RUN_ID="$_open"; export BIRCHER_RUN_ID; resumed=1
+    _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$_st" "resume"
+  else
+    BIRCHER_RUN_ID="${item}-$(date +%s)"; export BIRCHER_RUN_ID
+    if ! _kernel_run_start "$BIRCHER_RUN_ID" "$REPO" "$_base_sha" "$_issue_json" "$_cfg_json" >/dev/null; then
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "failed" "false" "" "" 0 "create_run refused (see log)" "failed" >> "$SCORECARD"
+      mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+      return 0
+    fi
+  fi
+
+  # The resume fence: operator, actor runner -- not a seat (§5). Seats are the
+  # author's and the reviewer's, and `phases` dispatches those itself; a runner
+  # that took one would spend the run's seat budget on its own bookkeeping.
+  BIRCHER_GENERATION=$(_kernel_dispatch runner operator); export BIRCHER_GENERATION
+  [ -n "$BIRCHER_GENERATION" ] || { echo "[batch] $item: operator dispatch failed" >&2; return 5; }
+  # Now that a generation exists, the label is a routed effect like any other.
+  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
+  if [ "$resumed" = 1 ]; then
+    # Re-snapshot the issue; a relevant change re-freezes it (§5). The
+    # kernel refuses an irrelevant one, and that refusal is expected.
+    _kernel_revise_bundle "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_issue_json"
+  fi
+
+  local host_id; host_id=$(_local_host_id 2>/dev/null) || host_id=""
+  # THE SEAM (spec §6). Everything before `planned` is the coordinator's phase
+  # loop, in Python, driving author and reviewer seats against the kernel. The
+  # runner does not spec, plan or review: it creates the run, fences an
+  # operator generation, and calls this. It resumes here on the next pass too,
+  # which is why the loop reads its obligations off the journal rather than
+  # from anything this shell hands it.
+  local _prc=0
+  PYTHONPATH="$(_kernel_pythonpath)" \
+  BIRCHER_AGENT_V2_AUTHOR_CLAUDE="$AGENT_AUTHOR_CLAUDE" BIRCHER_AGENT_V2_AUTHOR_CODEX="$AGENT_AUTHOR_CODEX" \
+    "${BIRCHER_PY:-python3}" -m coordinator.cli phases \
+      --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" --server "$SERVER" --repo "$REPO" --issue "${_iss:-0}" \
+      --repo-dir "$WORKDIR" --workspaces-root "${BIRCHER_WORKSPACES_ROOT:-/workspaces}" --bundle-dir "$BUNDLE_DIR" \
+      --host-id "$host_id" --agent-claude "$AGENT_AUTHOR_CLAUDE" --agent-codex "$AGENT_AUTHOR_CODEX" \
+      --turn-timeout "$ITEM_TIMEOUT" || _prc=$?
+  case "$_prc" in
+    0) ;;
+    4)
+      # PARKED: the run is waiting on a human and is NOT over. The queue file
+      # stays where it is, no terminal outcome is recorded, and the sidecar
+      # names the run so the next pass resumes this one instead of minting a
+      # second run for the same item.
+      local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null || echo '{}')
+      _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$(printf '%s' "$_park" | _json_get reason)"
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "parked" "false" "" "" 0 "parked: $(printf '%s' "$_park" | _json_get reason)" "parked" >> "$SCORECARD"
+      return 0 ;;                                   # the queue file stays where it is
+    *)
+      echo "[batch] $item: phases exited $_prc; recording failed" >&2
+      _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "failed" "false" "" "" 0 "phases rc=$_prc" "failed" >> "$SCORECARD"
+      mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+      return 0 ;;
+  esac
+  rm -f "$QUEUE/$code.parked"
+
+  # §6: the implementer is dispatched AFTER phases, afresh. `phases` fences its
+  # own seats, so the operator generation above is stale by now.
+  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer); export BIRCHER_GENERATION
+  _kernel_start_implementation "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION"
+  # READ THE STATE BACK, before any session exists. `_kernel_start_implementation`
+  # is advisory and returns 0 whether the kernel accepted it or refused it, so
+  # the only honest way to know the run is implementing is to ask. A session
+  # created over a refusal is an implementer working a run the kernel never
+  # authorized.
+  local _st_after; _st_after=$(_kernel_state "$BIRCHER_RUN_ID")
+  if [ "$_st_after" != implementing ]; then
+    echo "[batch] $item: state after start_implementation is '$_st_after', not implementing; RC_FAILED, no session" >&2
+    _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
+    mkdir -p "$(dirname "$SCORECARD")"
+    json_row "$item" "" "failed" "false" "" "" 0 "start_implementation refused at $_st_after" "failed" >> "$SCORECARD"
+    mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+    return 0
+  fi
+  # The implementer's brief: the directives, then the spec and plan the
+  # kernel holds, then the issue snapshot -- never the queue prompt (§6).
+  prompt="$(_implementer_brief "$BIRCHER_RUN_ID" "$vendor")"
   # REST launch: create the run session bound to the bircher host (deterministic
   # conv_id from the create response - no discovery heuristic), then send the
   # prompt. (omnigent/server/API.md: Create From Existing Agent + Post Event.)
-  # The implementer attempt is dispatched HERE, as soon as the vendor is known
-  # and BEFORE the session exists. It used to sit after session creation, which
-  # left every effect between run start and that point with no generation --
-  # and in kernel mode `${BIRCHER_GENERATION:?}` aborts the call, so the
-  # `bircher:running` label below was SILENTLY dropped (its `|| true` swallowed
-  # the failure) while legacy mode applied it. On the second item of a run it
-  # was worse than dropped: BIRCHER_GENERATION is exported, so the stale value
-  # from the previous item would have attributed this item's label effect to
-  # another run. Dispatching here also gives the session-create failure exit a
-  # generation to record a terminal outcome under.
-  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-  export BIRCHER_GENERATION
-  # Now that a generation exists, the label is a routed effect like any other.
-  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
-  local host_id conv_id bound_outcome="ok"
-  host_id=$(_local_host_id 2>/dev/null) || host_id=""
+  local conv_id bound_outcome="ok"
   conv_id=$(_create_session "$AGENT_ID" "$host_id" "$WORKDIR")
   if [ -z "$conv_id" ]; then
     echo "[batch] $item: REST session create FAILED; recording failed" >&2
     mkdir -p "$(dirname "$SCORECARD")"
-    # The run was started at _kernel_run_start above, so without this the
-    # kernel would sit at `queued` while the scorecard says `failed` -- a
-    # criterion-1 divergence previously waved through as an exemption on the
-    # grounds that no generation existed. One now does, because the dispatch
-    # moved above session creation.
+    # The run was created above, so without this the kernel would sit at
+    # `implementing` while the scorecard says `failed` -- a criterion-1
+    # divergence previously waved through as an exemption on the grounds that
+    # no generation existed. One now does.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
     json_row "$item" "" "failed" "false" "" "" 0 "REST session create failed" "failed" >> "$SCORECARD"
     mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
     return 0
   fi
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
-  # The queue item's prompt, PUT once as the spec artifact and reused as a
-  # stand-in plan artifact (v1 has no separate plan document -- see
-  # kernel-client.sh's submit_plan wrapper for why that reuse is deliberate).
-  local _spec_hash; _spec_hash=$(_kernel_put_artifact "$prompt")
+  # The CONTEXT this run's verdict binding names: the frozen issue snapshot the
+  # kernel holds, read back rather than invented. It used to be the artifact
+  # hash of the queue prompt, PUT here as a stand-in spec; the front half holds
+  # a real spec and a real bundle, and the bundle is what "context" means.
+  local _ctx_hash; _ctx_hash=$(_kernel_bundle_hash "$BIRCHER_RUN_ID")
   # Declared at RUN scope, not inside the marker branch that assigns it.
   # It was a `local` in that branch and is read at the merge gate below, which
   # every path reaches -- so the no-marker recovery path died on `set -u` with
@@ -4080,10 +4332,6 @@ ${prompt}"
   # implementation output, so there is no artifact to bind, and the client
   # refuses an incomplete binding rather than sending one.
   local _out_hash=""
-  _kernel_submit_spec "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
-  _kernel_submit_plan "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_spec_hash"
-  # start_implementation
-  _kernel_start_implementation "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION"
   # Binding check: we set host_id in create; confirm the session bound to THIS runner.
   local sess_host; sess_host=$(_http_json GET "/v1/sessions/$conv_id" | _json_get host_id)
   if [ -n "$host_id" ] && [ "$(_host_ids_match "$sess_host" "$host_id")" != "yes" ]; then
@@ -4465,7 +4713,7 @@ EOF
       # revision genuinely is owed there and nothing performed it.
       _rev_terminal=$(_terminal_review_flag "$outcome")
       _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-        "$_out_hash" "$_base_sha" "$_spec_hash" "$_rev_key" "$_rev_terminal"
+        "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal"
       BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
       export BIRCHER_GENERATION
     fi
@@ -4580,7 +4828,7 @@ EOF
     if [ "$_gate" != "skip" ]; then
       # request_merge, record_merge_outcome
       _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
-        "$_out_hash" "$_base_sha" "$_spec_hash"
+        "$_out_hash" "$_base_sha" "$_ctx_hash"
       merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
       local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
       _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
@@ -6904,6 +7152,17 @@ SH
   rm -rf "$updir"; echo "merge_ready_pr unpinned-refused OK (#66)"
   # --- Task 4: _record_deferred_ready + reconcile_deferred_ready ----------------
   local rdir; rdir=$(mktemp -d)
+  # A REAL kernel database from here on. The sweep and `recover_pr_cmd` both
+  # adopt a run before their first effect, and both now REFUSE to carry on with
+  # no generation (a dispatch over an unresolved effect is declined, and an
+  # empty generation aborts `_effect` under `set -u`, silently killing the whole
+  # loop). A fixture with no kernel at all would exercise that refusal instead
+  # of the merge, close and escalate behaviour these cases are about.
+  # Function-scoped, so it is gone when self_test returns; in its OWN directory,
+  # because `$rdir` is removed at the end of the sweep cases and the recovery
+  # ones below need the same database.
+  local _st_kdb; _st_kdb=$(mktemp -d)
+  local BIRCHER_KERNEL_DB="$_st_kdb/kernel.db"; export BIRCHER_KERNEL_DB
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="ready but cross-review status post failed -> human merge" MERGE_RETRY_ELIGIBLE=1 \
     _record_deferred_ready itemA 11 0 77 headsha1234567
   DEFERRED_READY_FILE="$rdir/deferred.tsv" MERGE_NOTE="" MERGE_RETRY_ELIGIBLE=0 \
@@ -8430,6 +8689,7 @@ assert t.startswith('世'*10), 'expected 10 whole chars, got %r' % t[:14]
   rm -rf "$ndir"
   echo "_read_note OK"
 
+  rm -rf "$_st_kdb"
   echo "self-test OK"
 }
 
@@ -8546,6 +8806,12 @@ __HELP__
       echo "[batch] another run-queue.sh already holds $lock; refusing to start a second instance" >&2
       exit 1
     fi
+    # SET HERE AND NOWHERE ELSE. Resuming a run means writing to a run another
+    # instance may be driving, and only the lock holder can know it is not. A
+    # flag set anywhere else -- defaulted, exported by a caller, assigned after
+    # the `else` below -- would say "I hold the lock" on behalf of a process
+    # that does not, which is the one claim this variable exists to make.
+    BIRCHER_HAVE_LOCK=1; export BIRCHER_HAVE_LOCK
   else
     echo "[batch] WARN: flock not found; running without singleton protection" >&2
   fi
@@ -8573,6 +8839,17 @@ __HELP__
   AGENT_ID=$(_get_agent_id "$holder")
   [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
   echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
+
+  # The two AUTHOR bundles, beside the implementer's. `coordinator.cli phases`
+  # creates the author and reviewer seats itself and needs an agent id per
+  # vendor to create them from; nothing else uploads these, so a run that
+  # started without them would reach the seam and be unable to open a seat at
+  # all. FATAL rather than warn, for the same reason the implementer's is.
+  AGENT_AUTHOR_CLAUDE=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_claude" "v2_author_claude upload")")
+  AGENT_AUTHOR_CODEX=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_codex" "v2_author_codex upload")")
+  [ -n "$AGENT_AUTHOR_CLAUDE" ] && [ -n "$AGENT_AUTHOR_CODEX" ] || { echo "[batch] FATAL: author bundle upload failed" >&2; exit 3; }
+  export AGENT_AUTHOR_CLAUDE AGENT_AUTHOR_CODEX
+  echo "[batch] uploaded author bundles -> claude=$AGENT_AUTHOR_CLAUDE codex=$AGENT_AUTHOR_CODEX"
 
   # Force the operator commit identity (codex's default Codex author otherwise
   # becomes a squash Co-authored-by trailer) + install the attribution-strip

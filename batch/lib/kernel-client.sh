@@ -139,26 +139,54 @@ _kernel() {
 # stdout is CAPTURED here, unlike `_kernel`, which discards it: the answer is
 # the point. An uncertain effect halts its run and nothing may be performed
 # until someone looks, so this is the "what do I look at" half of the halt.
-# _kernel_find_run <code> -> the newest run id starting "<code>-", or empty.
+# _kernel_find_run <code> [open] -> the newest run id starting "<code>-", or
+# empty. With `open`, only a run whose state is not `ended`/`cancelled` --
+# which is what `run_item` resumes into rather than minting over.
 #
 # NON-MINTING, unlike `_kernel_adopt_run`, and that is the whole point.
 # Publication has to be able to ask "did the kernel dispatch this work?" and
 # be told NO. Asking adopt would answer by creating the run that makes the
 # answer yes -- a junk `queued` row per refusal, and a caller that then reads
 # its own minting as provenance.
-_kernel_find_run() {  # <code>
-  local code="$1" out=""
-  out=$( K_CODE="$code" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+#
+# The filter is NEGATIVE -- "not one of the two closed states" -- rather than a
+# positive list of open ones passed to `Store.open_run_ids`. That is the
+# fail-closed direction: a state added to the kernel later is open until
+# someone says otherwise, so the leak guard in `run_item` (never mint over a
+# live run) keeps holding. A positive list would silently read a new state as
+# closed and mint a second run for the same item. `open_run_ids` is not used
+# here for the additional reason that it returns NOTHING for an empty state
+# set, so "every run with this prefix" is not expressible through it.
+_kernel_find_run() {  # <code> [open]
+  local code="$1" mode="${2:-}" out=""
+  out=$( K_CODE="$code" K_MODE="$mode" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
          _net_run "$(_kernel_net_cap)" \
          "${BIRCHER_PY:-python3}" -c '
 import os, sys
 sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
 from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 code = os.environ["K_CODE"]
-runs = [r for r in Store.open(os.environ["BIRCHER_KERNEL_DB"]).all_run_ids()
-        if r.startswith(code + "-")]
+closed = frozenset({"ended", "cancelled"})
+runs = [r for r in s.all_run_ids() if r.startswith(code + "-")]
+if os.environ["K_MODE"] == "open":
+    runs = [r for r in runs if s.run_state(r) not in closed]
 print(runs[-1] if runs else "")' 2>/dev/null
   ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_state <run_id> -> the run's state, or empty.
+#
+# Read back rather than inferred: `run_item` dispatches the implementer and
+# records start_implementation, then asks the kernel what state that actually
+# left the run in, BEFORE any session exists. A refusal here means no session
+# is created at all (spec §6).
+_kernel_state() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli state \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
   printf '%s' "$out"
 }
 
@@ -176,6 +204,29 @@ from kernel.store import Store
 try:
     print(Store.open(os.environ["BIRCHER_KERNEL_DB"]).run_base_sha(
         os.environ["K_RUN"]) or "")
+except Exception:
+    print("")' 2>/dev/null
+  ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_bundle_hash <run_id> -> the run's frozen issue snapshot hash, or
+# empty. The CONTEXT half of every verdict binding the coordinator produces.
+# Read back rather than recomputed out here: the binding must name what the
+# kernel froze, and a second rendering of the same issue is a value that
+# happens to agree until it does not.
+_kernel_bundle_hash() {  # <run_id>
+  local run_id="$1" out=""
+  out=$( K_RUN="$run_id" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel import front
+from kernel.store import Store
+try:
+    print(front.bundle_hash(Store.open(os.environ["BIRCHER_KERNEL_DB"]),
+                            os.environ["K_RUN"]) or "")
 except Exception:
     print("")' 2>/dev/null
   ) || out=""
@@ -211,7 +262,9 @@ _kernel_pending() {  # <run_id>
   printf '%s' "$out"
 }
 
-# _kernel_reconcile <run_id> <key> <resolution> <expected_version>
+# _kernel_reconcile <run_id> <resolution> <expected_version> <key>...   (legacy)
+# _kernel_reconcile <run_id> <expected_version> --delivered K[=V]... \
+#                   --not-delivered K...                                (typed)
 #
 # Advisory like every other call here: a coordinator that cannot reach the
 # kernel must not change what it does about the PR. The resolution is an
@@ -227,13 +280,73 @@ _kernel_pending() {  # <run_id>
 # out those are the same defect, and a third worked around it by resolving only
 # one key per invocation, which left a run with several uncertain effects
 # halted with nothing owning the follow-up.
-_kernel_reconcile() {  # <run_id> <resolution> <expected_version> <key>...
-  local run_id="$1" resolution="$2" version="$3"; shift 3
-  [ "$#" -gt 0 ] || return 0
-  local args=() k
-  for k in "$@"; do args+=(--idempotency-key "$k"); done
-  _kernel reconcile --run-id "$run_id" "${args[@]}" \
-    --resolution "$resolution" --expected-version "$version"
+# Printed on a bad argument. `printf`, not a heredoc: this sandbox refuses to
+# create the temp file a heredoc needs, and `_kernel_dispatch`'s own docstring
+# records the same restriction and the same workaround.
+_kernel_reconcile_usage() {
+  printf '%s\n' \
+    '[kernel] reconcile usage:' \
+    '  _kernel_reconcile <run_id> <resolution> <expected_version> <key>...' \
+    '  _kernel_reconcile <run_id> <expected_version> [--delivered KEY[=VALUE]]... [--not-delivered KEY]...' \
+    '' \
+    '  --delivered sess-create:<run>:<n>=<session_id> fetches GET $SERVER/v1/sessions/<id>' \
+    '  and passes the SNAPSHOT as the delivered value. A session the server later' \
+    '  stops listing makes every command bound to it RC_FAILED -- so a fetch that' \
+    '  fails, or a row with no agent_name, is refused here rather than recorded as' \
+    '  delivered (spec section 3, Reconciliation is typed).' >&2
+}
+
+# TWO FORMS, told apart by the second argument. The legacy one records a free
+# prose resolution against a list of keys; the typed one says, per key, whether
+# the effect was DELIVERED (and with what external object) or NOT. Only the
+# typed form can un-halt a run without inventing an answer, so it is the one
+# the front half uses; the legacy form stays for `--recover-pr`'s observation.
+#
+# `--delivered sess-create:*=<id>` is special-cased because a session's
+# delivered VALUE is the server's session snapshot, not the id -- the kernel
+# stores what was delivered and later commands are checked against it. Fetching
+# it here, and REFUSING when the fetch fails or the row carries no agent_name,
+# is what stops a run being told a session exists that the server has already
+# forgotten.
+_kernel_reconcile() {
+  local run_id="$1"; shift
+  case "${2:-}" in
+    --delivered|--not-delivered)
+      local version="$1"; shift
+      local args=() tmp
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --delivered)
+            local spec="$2"; shift 2
+            case "$spec" in
+              sess-create:*=*)
+                local id="${spec#*=}"
+                tmp=$(mktemp) || return 1
+                if ! _net_run "$BIRCHER_NET_TIMEOUT" curl -sf --max-time 30 "$SERVER/v1/sessions/$id" > "$tmp"; then
+                  echo "[kernel] reconcile: GET /v1/sessions/$id failed; refusing --delivered for ${spec%%=*}" >&2
+                  rm -f "$tmp"; return 1
+                fi
+                if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("agent_name") else 1)' "$tmp"; then
+                  echo "[kernel] reconcile: session $id has no agent_name (agent row gone); refusing" >&2
+                  rm -f "$tmp"; return 1
+                fi
+                args+=(--delivered "${spec%%=*}=@$tmp") ;;
+              *) args+=(--delivered "$spec") ;;
+            esac ;;
+          --not-delivered) args+=(--not-delivered "$2"); shift 2 ;;
+          *) echo "[kernel] reconcile: unexpected argument $1" >&2
+             _kernel_reconcile_usage; return 2 ;;
+        esac
+      done
+      _kernel reconcile --run-id "$run_id" "${args[@]}" --expected-version "$version" ;;
+    *)
+      local resolution="$1" version="$2"; shift 2
+      [ "$#" -gt 0 ] || return 0
+      local args=() k
+      for k in "$@"; do args+=(--idempotency-key "$k"); done
+      _kernel reconcile --run-id "$run_id" "${args[@]}" \
+        --resolution "$resolution" --expected-version "$version" ;;
+  esac
 }
 
 _kernel_adopt_run() {  # <code> <repo> <base_sha> <actor> [role=reviewer]
@@ -281,7 +394,24 @@ print(Store.open(os.environ["BIRCHER_KERNEL_DB"]).run_base_sha(os.environ["K_RUN
   else
     BIRCHER_RUN_ID="${code}-adopted-$(date +%s)"
     _kernel_warn "no existing run for '$code' -- minting $BIRCHER_RUN_ID"
-    _kernel_run_start "$BIRCHER_RUN_ID" "$repo" "$base"
+    # A PLACEHOLDER ISSUE, because there is not a real one. `create_run` takes
+    # the fetched issue and the Project config; this path exists for a PR that
+    # never came from the queue, so it has neither. The placeholder names the
+    # code and nothing else, which keeps the minted run exactly as empty as the
+    # comment below describes -- a `queued` run whose every lifecycle drive is
+    # refused, which is the merge gate working. Inventing a richer issue here
+    # would be fabricating the history that gate exists to check.
+    # Initialised, not merely declared: a failed `mktemp` would otherwise leave
+    # the second one UNSET, and the redirect below reads it under the caller's
+    # `set -u`, which exits the shell rather than failing this one call.
+    local _adopt_issue="" _adopt_cfg=""
+    _adopt_issue=$(mktemp) && _adopt_cfg=$(mktemp) || _kernel_warn "adopt: mktemp failed"
+    "${BIRCHER_PY:-python3}" -c 'import json,sys; print(json.dumps({"number":0,"title":sys.argv[1],"body":"","labels":[],"comments":[]}))' \
+      "adopted: $code" > "$_adopt_issue" 2>/dev/null || printf '%s' '{"number":0,"title":"adopted","body":"","labels":[],"comments":[]}' > "$_adopt_issue"
+    printf '%s' '{}' > "$_adopt_cfg"
+    _kernel_run_start "$BIRCHER_RUN_ID" "$repo" "$base" "$_adopt_issue" "$_adopt_cfg" >/dev/null \
+      || _kernel_warn "adopt: create_run refused for the minted $BIRCHER_RUN_ID"
+    rm -f "$_adopt_issue" "$_adopt_cfg"
     BIRCHER_RUN_BASE="$base"
   fi
   export BIRCHER_RUN_ID BIRCHER_RUN_BASE
@@ -351,61 +481,57 @@ print(dispatch(s, os.environ["BIRCHER_RUN_ID"],
 # place per stage.
 #
 # Every one of them is exactly as advisory as `_kernel` itself: each ends in
-# a call to `_kernel` (or, for `_kernel_run_start`/`_kernel_put_artifact`,
-# the same bounded-python-via-_net_run shape `_kernel_dispatch` already
-# uses), never branches on its result, and always returns 0.
+# a call to `_kernel` (or, for `_kernel_put_artifact`, the same bounded-
+# python-via-_net_run shape `_kernel_dispatch` already uses), never branches
+# on its result, and always returns 0.
+#
+# `_kernel_run_start` IS THE EXCEPTION, and says so at its own definition: it
+# CREATES the run rather than recording against one, so its failure is the
+# single failure in this file a caller must not carry on past.
 
-# _kernel_run_start <run_id> <base_repo> <base_sha> -- creates this run's row.
+# _kernel_run_start <run_id> <base_repo> <base_sha> <issue_json> <project_config_json>
+# -> prints the bundle hash; rc 1 on NotReplayable or any other failure.
 #
-# The plan's Step 3 called this `_kernel command --name enqueue ...`, routed
-# through submit()'s COMMAND_NAMES set. That does not work: "enqueue" is not
-# one of those names (kernel/commands.py's COMMAND_NAMES omits it on
-# purpose -- see kernel/enqueue.py's docstring, which reserves `enqueue()`
-# for a human-approved spec+plan+grill workflow this batch queue does not
-# have). Verified directly against the CLI: `--name enqueue` exits 2,
-# "unknown command: enqueue" -- not a shadow-refusal, a usage error, and the
-# run's row is never created. Every later command for the run then fails too:
-# `store.run_version()` reads `.fetchone()[0]` on a run that was never
-# inserted and raises an uncaught TypeError. `_kernel` treats that exactly
-# like a healthy shadow-refusal -- warn (or not, if it happened to look like
-# one) and move on -- so the whole lifecycle would record NOTHING, silently,
-# behind the same "advisory, so nothing breaks" cover every other failure
-# here legitimately uses. That is the exact near-miss this file's own header
-# warns about, one call earlier than Task 3's.
+# NOT ADVISORY, and it is the one function here that is not. Every other call
+# records; this one CREATES the run, and a run the kernel would not create is
+# not a run the coordinator may go on to work (spec section 7). Carrying on
+# would perform effects against a run id nothing holds -- the exact "advisory,
+# so nothing breaks" cover this file's header warns about, one call earlier
+# than Task 3's.
 #
-# The fix mirrors `_kernel_dispatch` rather than `_kernel`: `dispatch()` is
-# ALSO not a submit() command (a worker cannot CAS a version against a run
-# that has no version yet), and it is called directly, by name, against the
-# store. Creating the run's row is the same shape of foundational operation,
-# so it is called the same way. `kernel.enqueue.enqueue()` itself is not
-# reused here -- it persists a spec/plan/bundle this call site does not have
-# and does not need; `store.create_run()` is the whole of what a fresh run
-# requires to become a legal target for every other command below.
-#
-# Idempotent: a duplicate run_id (there should never be one -- BIRCHER_RUN_ID
-# carries the attempt epoch) hits the `runs` table's primary key and is
-# swallowed rather than warned about, the same way `kernel.enqueue.enqueue`
-# treats a repeat as a safe retry rather than a failure.
-_kernel_run_start() {  # <run_id> <base_repo> <base_sha>
-  local run_id="$1" base_repo="$2" base_sha="$3"
+# `kernel.enqueue.create_run` rather than the bare `store.create_run` this used
+# to call: the run's INPUTS -- the fetched issue and the Project config -- are
+# what the policy is derived from and what every approval is bound to, and
+# `create_run` freezes both in the same transaction as the row. A retry with
+# the same inputs replays; a retry whose inputs differ is `NotReplayable`,
+# which is a refusal and not a warning, because the alternative is a run whose
+# journal describes a policy it does not hold.
+_kernel_run_start() {  # <run_id> <base_repo> <base_sha> <issue_json> <project_config_json>
+  local run_id="$1" base_repo="$2" base_sha="$3" issue_json="$4" cfg_json="$5"
   local src='
-import os, sqlite3, sys
+import json, os, sys
 sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.bundle import from_gh
+from kernel.effects import NotReplayable
+from kernel.enqueue import create_run
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+issue = from_gh(json.load(open(os.environ["K_ISSUE_JSON"])))
+cfg = json.load(open(os.environ["K_CFG_JSON"])) if os.environ.get("K_CFG_JSON") else {}
 try:
-    s.create_run(run_id=os.environ["K_RUN_ID"],
-                 base_repo=os.environ["K_BASE_REPO"],
-                 base_sha=os.environ["K_BASE_SHA"])
-except sqlite3.IntegrityError:
-    pass  # already created -- idempotent, same run_id retried
+    out = create_run(s, run_id=os.environ["K_RUN_ID"], base_repo=os.environ["K_BASE_REPO"],
+                     base_sha=os.environ["K_BASE_SHA"], issue=issue, project_config=cfg)
+except NotReplayable as exc:
+    print(f"create_run NotReplayable: {exc}", file=sys.stderr); sys.exit(1)
+print(out["bundle_hash"])
 '
-  K_RUN_ID="$run_id" K_BASE_REPO="$base_repo" K_BASE_SHA="$base_sha" \
-    BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
-    _net_run "$(_kernel_net_cap)" \
-    "${BIRCHER_PY:-python3}" -c "$src" >/dev/null 2>&1 \
-    || _kernel_warn "run start failed (advisory): $run_id"
-  return 0
+  local out
+  out=$( K_RUN_ID="$run_id" K_BASE_REPO="$base_repo" K_BASE_SHA="$base_sha" \
+         K_ISSUE_JSON="$issue_json" K_CFG_JSON="$cfg_json" \
+         BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+         _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -c "$src" 2>&1 ) || { _kernel_warn "run start FAILED: $run_id -- $out"; return 1; }
+  printf '%s' "$out"
 }
 
 # _kernel_put_artifact <data> -- PUTs *data* into the store and echoes its
@@ -445,30 +571,33 @@ print(put_artifact(s, os.environ["K_ARTIFACT_DATA"].encode("utf-8")))
   return 0
 }
 
-# _kernel_submit_spec <run_id> <generation> <spec_hash> -- records
-# submit_spec (queued -> specified). *spec_hash* must already be PUT (see
-# _kernel_put_artifact) -- the same PUT-before-reference discipline as
-# record_implementation_output, even though authorize() does not currently
-# check it for this command: this is the run's recorded INPUT, and an
-# unverifiable hash here would be as wrong as one on the output.
-_kernel_submit_spec() {  # <run_id> <generation> <spec_hash>
-  local run_id="$1" generation="$2" hash="$3"
-  # submit_spec
+# _kernel_revise_bundle <run_id> <generation> <issue_json> -- re-snapshots the
+# issue under a resumed run's operator generation (spec §5). A RELEVANT change
+# re-freezes the input and opens a new epoch; an irrelevant one -- bircher's own
+# `bircher:running` label, its own published-artefact comment -- is REFUSED by
+# the kernel, and that refusal is the expected outcome on almost every resume.
+# Advisory like the rest: the run continues either way.
+#
+# A named function rather than a `_kernel command` inlined in `run_item`, for
+# the same reason as every other wrapper here: the payload shape is got right
+# in one place, and run_item holds no second copy of it.
+_kernel_revise_bundle() {  # <run_id> <generation> <issue_json>
+  local run_id="$1" generation="$2" issue_json="$3" payload
+  # `from_gh` FIRST. The file holds `gh issue view --json ...` output, whose
+  # labels are objects and whose comment ids are node id strings; the command's
+  # `issue` is the shape `bundle.snapshot` takes. Handing the raw form over
+  # does not merely fail the relevance check -- `snapshot` raises
+  # AttributeError on a label object, which authorize() does not catch.
+  payload=$( K_ISSUE_JSON="$issue_json" BIRCHER_V2_DIR="$(_kernel_pythonpath)" \
+    "${BIRCHER_PY:-python3}" -c '
+import json, os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel.bundle import from_gh
+print(json.dumps({"issue": from_gh(json.load(open(os.environ["K_ISSUE_JSON"])))}))' 2>/dev/null ) || payload=""
+  [ -n "$payload" ] || { _kernel_warn "revise_bundle: unreadable issue json $issue_json"; return 0; }
+  # revise_bundle
   _kernel command --run-id "$run_id" --generation "$generation" \
-    --name submit_spec --payload-json "{\"artifact_hash\":\"$hash\"}"
-}
-
-# _kernel_submit_plan <run_id> <generation> <plan_hash> -- records submit_plan
-# (specified -> planned). v1 has no separate plan document, so the caller
-# passes the SAME hash `_kernel_submit_spec` was given -- the queue item's
-# prompt stands in for a plan artifact until a real one exists, exactly as
-# the marker body stands in for a real implementation-output artifact in
-# `_kernel_record_output`.
-_kernel_submit_plan() {  # <run_id> <generation> <plan_hash>
-  local run_id="$1" generation="$2" hash="$3"
-  # submit_plan
-  _kernel command --run-id "$run_id" --generation "$generation" \
-    --name submit_plan --payload-json "{\"artifact_hash\":\"$hash\"}"
+    --name revise_bundle --payload-json "$payload"
 }
 
 # _kernel_start_implementation <run_id> <generation> -- records

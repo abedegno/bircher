@@ -245,7 +245,7 @@ def main(argv=None) -> int:
         sp = subs.add_parser(name)
         sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
         sp.add_argument("--server", required=True)
-    for name in ("approve", "grant-round", "revise", "direct", "parked"):
+    for name in ("approve", "grant-round", "revise", "direct", "parked", "state"):
         sp = subs.add_parser(name)
         sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
         if name in ("approve", "revise", "direct"):
@@ -304,6 +304,15 @@ def main(argv=None) -> int:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return RC_FAILED
+        return RC_OK
+
+    # The run's state, for a shell caller that must READ it rather than infer
+    # it from a command having returned 0. `run_item` asks after
+    # start_implementation and creates no session unless the answer is
+    # `implementing` (spec §6).
+    if a.mode == "state":
+        from kernel.store import Store
+        print(Store.open(a.db).run_state(a.run_id))
         return RC_OK
 
     if a.mode == "parked":

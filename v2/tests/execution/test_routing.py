@@ -288,6 +288,9 @@ _GH_SUBCOMMANDS = {
     ("issue", "comment"): True,
     ("issue", "edit"): True,
     ("issue", "reopen"): True,
+    # READ-ONLY. `run_item` fetches the issue with it to build the run's frozen
+    # input bundle (kernel.enqueue.create_run); nothing about the issue changes.
+    ("issue", "view"): False,
     ("pr", "checks"): False,
     ("pr", "close"): True,
     ("pr", "create"): True,

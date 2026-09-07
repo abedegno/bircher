@@ -25,6 +25,7 @@ ENFORCING stub (a real fork/kill, not a passthrough) so the timeout tests
 below prove an actual bound, not merely that a cap value was threaded
 through.
 """
+import json
 import pathlib
 import subprocess
 import sys
@@ -326,6 +327,122 @@ def test_an_unknown_run_reads_back_EMPTY_not_a_plausible_sha(tmp_path):
     assert _run('_kernel_find_run ITEM-9',
                 env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
     assert _run('_kernel_run_base ITEM-9-nope',
+                env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
+
+
+def test_bundle_hash_reads_back_what_the_kernel_FROZE(tmp_path):
+    """The CONTEXT half of every verdict binding this coordinator produces.
+
+    Read back rather than recomputed out here: the binding must name the bytes
+    the kernel holds, and a second rendering of the same issue is a value that
+    happens to agree until it does not. Empty for a run the kernel does not
+    know -- the client refuses an incomplete binding rather than sending one.
+    """
+    from kernel.enqueue import create_run
+
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    out = create_run(store, run_id="r-ctx", base_repo="o/r", base_sha="ab" * 20,
+                     issue={"number": 7, "title": "t", "body": "b",
+                            "labels": [], "comments": []},
+                     project_config={})
+    env = {"BIRCHER_KERNEL_DB": str(db)}
+    got = _run('_kernel_bundle_hash r-ctx', env=env).stdout
+    assert got == out["bundle_hash"], got
+    assert store.read_blob(got) is not None, "the hash names bytes nobody holds"
+    assert _run('_kernel_bundle_hash r-nope', env=env).stdout == ""
+
+
+def test_revise_bundle_reduces_the_gh_json_before_the_kernel_sees_it(tmp_path):
+    """The file `run_item` holds is `gh issue view --json ...` output, whose
+    labels are OBJECTS and whose comment ids are node id strings. The command
+    takes the shape `bundle.snapshot` reads. Handing the raw form over does not
+    merely fail the relevance check: `snapshot` raises AttributeError on a
+    label object, and `authorize` catches only KeyError/TypeError/ValueError,
+    so the CLI dies and `_kernel` swallows it as one more advisory failure --
+    a resumed run silently never re-freezing its input.
+
+    Driven against a real store: the proof is a BUNDLE_REVISED fact, which only
+    exists if the payload parsed AND the change was relevant.
+    """
+    from kernel.enqueue import create_run
+
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    create_run(store, run_id="r-rev", base_repo="o/r", base_sha="ab" * 20,
+               issue={"number": 7, "title": "before", "body": "b",
+                      "labels": ["bug"], "comments": []},
+               project_config={})
+    gen = dispatch(store, "r-rev", actor="runner", role="operator").generation
+
+    raw = tmp_path / "issue.json"
+    raw.write_text(json.dumps({
+        "number": 7, "title": "AFTER", "body": "b",
+        "labels": [{"name": "bug", "color": "x"}],
+        "comments": [{"id": "IC_kwDOA", "author": {"login": "jon"}, "body": "hi",
+                      "url": "https://github.com/o/r/issues/7#issuecomment-9"}],
+    }))
+    r = _run(f'_kernel_revise_bundle r-rev {gen} "{raw}"',
+             env={"BIRCHER_KERNEL_DB": str(db)})
+    assert r.returncode == 0, r.stderr
+
+    store = Store.open(db)
+    revised = store.facts_of_kind("r-rev", EventKind.BUNDLE_REVISED)
+    assert revised, ("no bundle_revised fact -- the payload never parsed",
+                     [f.kind for f in store.facts_for("r-rev")], r.stderr)
+    # And the new bundle is the SNAPSHOT of the reduced issue, comment and all.
+    from kernel import bundle as _bundle
+    expected = _bundle.bundle_hash(_bundle.snapshot(
+        _bundle.from_gh(json.loads(raw.read_text()))))
+    assert revised[-1].payload["bundle_hash"] == expected
+
+
+def test_kernel_state_reads_the_run_back_from_a_REAL_store(tmp_path):
+    """`run_item` creates no session unless this answers `implementing`, so it
+    has to be a real read. Driven against a live database rather than a stub:
+    a client mis-wired to fail every call answers EMPTY, which the caller
+    treats as "not implementing" -- fail-closed, and therefore indistinguishable
+    from a correct refusal unless something checks the healthy case too."""
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    store.create_run(run_id="ITEM-1-a", base_repo="o/r", base_sha="ab" * 20)
+    env = {"BIRCHER_KERNEL_DB": str(db)}
+    assert _run('_kernel_state ITEM-1-a', env=env).stdout.strip() == "queued"
+    store.set_run_state("ITEM-1-a", "implementing")
+    assert _run('_kernel_state ITEM-1-a', env=env).stdout.strip() == "implementing"
+    # A run the kernel does not hold answers EMPTY, never a plausible state.
+    assert _run('_kernel_state NOPE-1-a', env=env).stdout.strip() == ""
+
+
+def test_find_run_open_skips_ended_and_cancelled_runs(tmp_path):
+    """`open` is what stops `run_item` minting a second run over a live one.
+
+    The filter is NEGATIVE -- everything but `ended` and `cancelled` counts as
+    open -- and that is the fail-closed direction: a state the kernel gains
+    later reads as open, so the leak guard keeps holding. A positive list would
+    read the new state as closed and mint over it.
+    """
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    for run_id, state in (("ITEM-9-a", "ended"), ("ITEM-9-b", "specified"),
+                          ("ITEM-9-c", "cancelled")):
+        store.create_run(run_id=run_id, base_repo="o/r", base_sha="ab" * 20)
+        store.set_run_state(run_id, state)
+
+    env = {"BIRCHER_KERNEL_DB": str(db)}
+    # Without the filter the answer is the NEWEST, which here is cancelled.
+    assert _run('_kernel_find_run ITEM-9', env=env).stdout == "ITEM-9-c"
+    assert _run('_kernel_find_run ITEM-9 open', env=env).stdout == "ITEM-9-b"
+
+
+def test_find_run_open_answers_empty_when_every_run_is_closed(tmp_path):
+    """Empty is the answer that lets `run_item` mint. A filter that fell back
+    to the newest run on a miss would resume an ended one forever."""
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    store.create_run(run_id="ITEM-9-a", base_repo="o/r", base_sha="ab" * 20)
+    store.set_run_state("ITEM-9-a", "ended")
+    assert _run('_kernel_find_run ITEM-9 open',
                 env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
 
 

@@ -68,11 +68,6 @@ def test_the_guard_can_actually_see_the_files_it_claims_to_check():
 #: and a listed site that disappears fails it too. A one-way allowlist rots
 #: into a dumping ground -- this one cannot, because a stale entry is an error.
 _ALLOWED_LINES = {
-    'or head.startswith("bircher-status:")':
-        "READS the archive. Real PRs carry thousands of legacy markers, and a "
-        "digest filter that stopped recognising them would start feeding a "
-        "session the status lines its predecessor wrote. Retiring a channel "
-        "means never writing one again, not forgetting how to read history.",
     "grep -q 'bircher-status:' \"$shimdir/comment.txt\" \\":
         "ASSERTS ABSENCE. The self-test that fails if a future edit restores "
         "the channel by restoring its prefix.",
@@ -89,6 +84,13 @@ _ALLOWED_LINES = {
         "EXPLAINS THE RETIREMENT, in the same instruction file. Kept because a block that simply vanished would leave a session wondering what to report instead; this says nothing, and why.",
     'So: do not write a `bircher-status:` line, in a PR comment, a PR body, an':
         "FORBIDS IT BY NAME, in the instruction file that used to mandate it. The prohibition has to name the thing to be effective for a model reader -- the smoke items that avoided the marker did so only because their text forbade it by name, while issue-derived text did not and #735 carried one. Prompt wording is not the mechanism (this scan is); it is what stops the model writing one before the scan ever runs.",
+    'head.startswith("bircher-status:") or':
+        "READS the archive. Real PRs carry thousands of legacy markers, and a "
+        "digest filter that stopped recognising them would start feeding a "
+        "session the status lines its predecessor wrote. Retiring a channel "
+        "means never writing one again, not forgetting how to read history. "
+        "The `or` TRAILS its clause so test_bircher_status_bash.py can extract "
+        "the whole predicate in one match and execute it.",
     '"bircher-status:",':
         "READS the archive, same as run-queue.sh's own "
         '`head.startswith("bircher-status:")` above: `is_bircher_status` '

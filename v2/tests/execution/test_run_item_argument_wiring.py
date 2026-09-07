@@ -53,22 +53,16 @@ file reliably green in this session: repeated runs after adding it still
 show the same 5-reliable/9-blocked split documented below. Treat it as
 best-effort mitigation, not a fix verified to hold.
 
-**What this means for THIS session's test run, concretely:** the five
-tests up to and including `test_start_implementation_gets_the_implementer_generation`
-(covering `_kernel_run_start`, the implementer `_kernel_dispatch`,
-`_kernel_put_artifact`, `_kernel_submit_spec`, `_kernel_submit_plan`,
-`_kernel_start_implementation`) pass reliably, repeatedly, in this sandbox
--- every attempt made while developing this file, dozens of runs. The nine
-after the marker-parsing `read` (`_kernel_record_ci` onward) reproduce
-"cannot create temp file for here document" -> a downstream unbound-variable
-crash, consistently, in this session, and did not clear across many retries
-or across the here-string rewrite. This is environmental, not a code
-defect: `run_item`'s two heredocs predate this fix round, the restriction
-is the documented one `--self-test` already reports as sandbox-only and
-unresolved, and it was reproduced with content that has NOTHING to do with
-`run_item`, this task, or the kernel (a bare `IFS=... <<EOF` with no
-sourcing at all). The fix round's report records this precisely rather
-than claiming a false green.
+**The split that paragraph used to record no longer reproduces.** It said
+the five tests up to `test_start_implementation_gets_the_implementer_generation`
+passed and the nine after the marker-parsing `read` did not, on this box, and
+that the cause was environmental rather than a code defect. As of Task 20 the
+whole drive runs green here, repeatedly, from `_kernel_find_run` through
+`_kernel_record_run_outcome`. The here-string rewrite below is kept because it
+costs nothing and the restriction it routes around is real and
+non-deterministic -- but the observation is recorded as PAST, because a
+docstring that keeps reporting a failure the suite no longer has is a claim
+about the code that is false.
 
 Every session/network-touching function `run_item` calls is stubbed to a
 deterministic, local value (`_create_session`, `_send_prompt`, `_http_json`,
@@ -77,14 +71,22 @@ deterministic, local value (`_create_session`, `_send_prompt`, `_http_json`,
 function is stubbed to LOG its full argument list instead of touching a
 database -- argument wiring is what this file checks, and
 `test_lifecycle_functions.py` already proves the real functions work when
-given real arguments. `_kernel_dispatch` and `_kernel_put_artifact` still
-return realistic, deterministic values (a counting generation; a real
-sha256) because later call sites' arguments depend on what they returned,
-and getting THAT threading right is exactly what is under test.
+given real arguments. `_kernel_dispatch`, `_kernel_state` and
+`_kernel_bundle_hash` still return realistic, deterministic values (a
+counting generation; `implementing`; a distinct hash) because later call
+sites' arguments depend on what they returned, and getting THAT threading
+right is exactly what is under test.
+
+The §6 SEAM is stubbed the same way but through a different door:
+`coordinator.cli phases` is reached by name through `${BIRCHER_PY:-python3}`,
+so `_FAKE_PY` stands in for the interpreter and logs into the same call log.
+What `phases` DECIDES -- parking, resumption, the leak guard, the state read
+back -- is `test_front_half_seam.py`; what this file checks is that the seam
+sits between the run and the implementer and is handed the right arguments.
 """
 from __future__ import annotations
 
-import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -110,7 +112,7 @@ HEAD_SHA = "b" * 40
 #: for `"$reviewed_sha"` at the request_merge call site left every test
 #: green. `_merge_gate` is therefore STUBBED here (not extracted as real
 #: code, see `_NEEDED_REAL_FUNCTIONS` below) to return this deliberately
-#: DIFFERENT value, so `test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3`
+#: DIFFERENT value, so `test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_4`
 #: and `test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha` can actually
 #: discriminate which variable landed where.
 REVIEWED_SHA = "c" * 40
@@ -120,6 +122,11 @@ REVIEWED_SHA = "c" * 40
 #: prove the value the coordinator binds is the one that call RETURNED, and a
 #: hash that merely looks right could be arriving from anywhere.
 OUT_HASH = "outputhash" + "0" * 54
+#: What the stubbed `_kernel_bundle_hash` echoes -- the run's frozen issue
+#: snapshot, which is the CONTEXT half of every verdict binding. Deliberately
+#: distinct from OUT_HASH so a call site that threads the artifact where the
+#: context belongs is visible.
+CTX_HASH = "ctxbundle" + "0" * 55
 VENDOR = "claude_code"
 REVIEWER = "codex"
 PR = "777"
@@ -194,6 +201,8 @@ DEFERRED_READY_FILE="${DEFERRED_READY_FILE:?}"
 NOOP_DIR="${BIRCHER_NOOP_DIR:?}"
 ITEM_TIMEOUT="${ITEM_TIMEOUT:-5400}"
 POLL="${POLL_INTERVAL:-45}"
+SERVER="${OMNIGENT_SERVER:-http://omnigent.invalid}"
+BIRCHER_NET_TIMEOUT="${BIRCHER_NET_TIMEOUT:-30}"
 RECOVERY_REVIEWER="${BIRCHER_RECOVERY_REVIEWER:-codex}"
 INRUN_MERGE="${BIRCHER_INRUN_MERGE:-1}"
 IMPLEMENTER="${BIRCHER_IMPLEMENTER:-auto}"
@@ -265,8 +274,14 @@ _log_call() {{  # <name> <args...>
 }}
 
 _kernel_run_start()          {{ _log_call _kernel_run_start "$@"; }}
-_kernel_submit_spec()        {{ _log_call _kernel_submit_spec "$@"; }}
-_kernel_submit_plan()        {{ _log_call _kernel_submit_plan "$@"; }}
+# The front half, stubbed to the mint-and-proceed answers. What each of them
+# DECIDES has its own file (test_front_half_seam.py); this one is about the
+# arguments the back half threads afterwards.
+_kernel_find_run()           {{ _log_call _kernel_find_run "$@"; printf ''; }}
+_kernel_state()              {{ _log_call _kernel_state "$@"; printf 'implementing'; }}
+_kernel_bundle_hash()        {{ _log_call _kernel_bundle_hash "$@"; printf '%s' "{ctx_hash}"; }}
+_implementer_brief()         {{ _log_call _implementer_brief "$@"; printf 'BRIEF(%s)' "$2"; }}
+_project_config()            {{ printf '{{}}'; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 observe_outcome() {{
@@ -277,6 +292,7 @@ _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
+_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; }}
 _kernel_put_artifact() {{
   _log_call _kernel_put_artifact "$@"
   printf '%s' "$1" | shasum -a 256 | cut -c1-64
@@ -309,6 +325,37 @@ _merge_gate() {{ [ -n "${{2:-}}" ] && {{ printf 'pin|%s' {reviewed_sha!r}; retur
 '''
 
 
+#: `run_item` reaches Python twice by name -- `coordinator.cli phases` and
+#: `coordinator.cli parked` -- through `${BIRCHER_PY:-python3}`. Every other
+#: Python call it makes is inside a stubbed function, so pointing BIRCHER_PY at
+#: this script intercepts exactly those two and leaves the bare `python3` the
+#: issue synthesiser uses untouched. It logs into the SAME call log, so the
+#: seam's position in the order is visible rather than inferred.
+#:
+#: Placeholders are substituted with `.replace`, not `.format`: the script is
+#: mostly braces and doubling every one of them makes it unreadable.
+_FAKE_PY = '''#!/bin/bash
+n=$(cat "@CALLSEQ@"); n=$((n+1)); printf '%s' "$n" > "@CALLSEQ@"
+f="@CALLDIR@/$(printf '%03d' "$n")"
+{ printf '%s' BIRCHER_PY; for a in "$@"; do printf '\\0%s' "$a"; done; } > "$f"
+park="${PARKED_JSON:-}"
+[ -n "$park" ] || park='{"reason": "gate"}'
+for a in "$@"; do
+  [ "$a" = phases ] && exit "${PHASES_RC:-0}"
+  [ "$a" = parked ] && { printf '%s' "$park"; exit 0; }
+done
+exit 0
+'''
+
+
+def _write_fake_py(tmp_path, callseq, calldir):
+    p = tmp_path / "fake-python3"
+    p.write_text(_FAKE_PY.replace("@CALLSEQ@", str(callseq))
+                         .replace("@CALLDIR@", str(calldir)))
+    p.chmod(0o755)
+    return p
+
+
 def _base_env(tmp_path, queue_dir, noop_dir):
     return {
         "PATH": "/usr/bin:/bin:/usr/local/bin",
@@ -321,6 +368,8 @@ def _base_env(tmp_path, queue_dir, noop_dir):
         "BIRCHER_REPO": "acme/widgets",
         "WORKDIR": str(tmp_path / "workdir"),  # deliberately NOT a git repo
         "AGENT_ID": "test-agent",
+        "AGENT_AUTHOR_CLAUDE": "ag-author-claude",
+        "AGENT_AUTHOR_CODEX": "ag-author-codex",
         "POLL_INTERVAL": "0",
         "QUEUE": str(queue_dir),
         "SCORECARD": str(tmp_path / "scorecard.jsonl"),
@@ -361,7 +410,7 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
         observed_review=observed_review, head_sha=HEAD_SHA,
-        reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH,
+        reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH, ctx_hash=CTX_HASH,
         # The EIGHTH field: the PR the derivation settled on. Emitting the same
         # PR the item already has keeps these tests about argument wiring; the
         # settle-and-adopt behaviour has its own file.
@@ -384,6 +433,7 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
         f'echo "RC=$?"\n'
     )
     env = _base_env(tmp_path, queue_dir, noop_dir)
+    env["BIRCHER_PY"] = str(_write_fake_py(tmp_path, callseq, calldir))
     result = subprocess.run(["bash", "-c", script_body],
                             capture_output=True, text=True, env=env)
 
@@ -434,75 +484,102 @@ def failed_merge_drive(tmp_path_factory):
 
 # --- the drive actually reaches run_item's kernel call sites -----------------
 
+#: The whole drive, in order. Named constants rather than bare numbers below,
+#: because the indices moved when the front half landed and a wrong one reads
+#: as a wrong ARGUMENT rather than as a stale index.
+_SEQUENCE = [
+    "_kernel_find_run", "_kernel_run_start", "_kernel_dispatch", "BIRCHER_PY",
+    "_kernel_dispatch", "_kernel_start_implementation", "_kernel_state",
+    "_implementer_brief", "_kernel_bundle_hash", "observe_outcome",
+    "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
+    "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
+    "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
+]
+(I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_IMPLEMENTER, I_START_IMPL,
+ I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_OUTPUT, I_CI, I_REVIEWER, I_REVIEW,
+ I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME, I_RUN_OUTCOME) = range(len(_SEQUENCE))
+
+
 def test_the_drive_reaches_every_kernel_call_site(happy_drive):
     calls, result = happy_drive
     assert "RC=0" in result.stdout, (result.stdout, result.stderr)
     names = [name for name, _ in calls]
-    assert names == [
-        "_kernel_run_start", "_kernel_dispatch", "_kernel_put_artifact",
-        "_kernel_submit_spec", "_kernel_submit_plan",
-        "_kernel_start_implementation", "observe_outcome", "_kernel_record_output",
-        "_kernel_record_ci", "_kernel_dispatch", "_kernel_record_review",
-        "_kernel_dispatch", "_kernel_request_merge", "merge_ready_pr",
-        "_kernel_record_outcome",
-    ], names
+    assert names == _SEQUENCE, names
 
 
 # --- each call site gets the RIGHT value, not just A value -------------------
 
-def test_run_start_gets_the_run_id_repo_and_a_base_sha(happy_drive):
+def test_run_start_gets_the_run_id_repo_base_sha_and_both_input_files(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[0]
+    name, args = calls[I_RUN_START]
     assert name == "_kernel_run_start"
-    run_id, repo, base_sha = args
+    run_id, repo, base_sha, issue_json, cfg_json = args
     assert run_id.startswith("t01-test-item-") and run_id[len("t01-test-item-"):].isdigit(), run_id
     assert repo == "acme/widgets", args
     # WORKDIR is deliberately not a git repo, so `git rev-parse HEAD` fails
     # and run_item's documented fallback (40 zeros) must be what lands here.
     assert base_sha == "0" * 40, args
+    # The two inputs `create_run` freezes. Asserted as FILES THAT EXIST AND
+    # PARSE, not merely as non-empty strings: a path run_item never wrote to
+    # looks exactly like one it did until something opens it.
+    issue = json.loads(pathlib.Path(issue_json).read_text())
+    assert issue["title"] == "t01-test-item", issue
+    assert "Implement the thing." in issue["body"], issue
+    assert json.loads(pathlib.Path(cfg_json).read_text()) == {}
+
+
+def test_the_operator_is_fenced_before_the_phase_loop(happy_drive):
+    calls, _ = happy_drive
+    assert calls[I_OPERATOR] == ("_kernel_dispatch", ["runner", "operator"]), calls[I_OPERATOR]
+
+
+def test_the_phase_loop_gets_the_run_the_turn_timeout_and_both_author_agents(happy_drive):
+    calls, _ = happy_drive
+    name, args = calls[I_PHASES]
+    assert name == "BIRCHER_PY"
+    assert args[:3] == ["-m", "coordinator.cli", "phases"], args
+    run_id = calls[I_RUN_START][1][0]
+    pairs = dict(zip(args, args[1:]))
+    assert pairs["--run-id"] == run_id, args
+    assert pairs["--repo"] == "acme/widgets", args
+    assert pairs["--turn-timeout"] == "5400", args
+    assert pairs["--agent-claude"] == "ag-author-claude", args
+    assert pairs["--agent-codex"] == "ag-author-codex", args
 
 
 def test_the_implementer_dispatch_gets_the_resolved_vendor(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[1]
+    name, args = calls[I_IMPLEMENTER]
     assert name == "_kernel_dispatch"
     assert args == ["claude_code", "implementer"], args
 
 
-def test_submit_spec_and_plan_get_the_same_hash_of_the_actual_prompt(happy_drive):
-    """The hash reaching submit_spec/submit_plan must be the hash of the
-    prompt run_item ACTUALLY sent -- the vendor-directive-augmented text,
-    not the raw queue file, and not two independently-plausible strings that
-    happen to look similar."""
+def test_the_implementers_prompt_is_the_kernels_brief_not_the_queue_prompt(happy_drive):
+    """spec §6. The brief is built from the run and the vendor, and the queue
+    prompt reaches it nowhere -- the front half has already turned the item
+    into an accepted spec and plan."""
     calls, _ = happy_drive
-    put_name, put_args = calls[2]
-    assert put_name == "_kernel_put_artifact"
-    augmented_prompt = put_args[0]
-    assert augmented_prompt.startswith(
-        "IMPLEMENTER VENDOR DIRECTIVE: dispatch the implement sub-agent to "
-        "claude_code; the cross-vendor reviewer MUST be the opposite vendor "
-        "(codex)."
-    ), augmented_prompt
-    assert augmented_prompt.endswith(
-        "Implement the thing.\nbircher-implementer: claude_code"
-    ), augmented_prompt
-    expected_hash = hashlib.sha256(augmented_prompt.encode("utf-8")).hexdigest()
-
-    spec_name, spec_args = calls[3]
-    plan_name, plan_args = calls[4]
-    assert spec_name == "_kernel_submit_spec"
-    assert plan_name == "_kernel_submit_plan"
-    run_id = calls[0][1][0]
-    assert spec_args == [run_id, "1", expected_hash], spec_args
-    assert plan_args == [run_id, "1", expected_hash], plan_args
+    name, args = calls[I_BRIEF]
+    assert name == "_implementer_brief"
+    run_id = calls[I_RUN_START][1][0]
+    assert args == [run_id, "claude_code"], args
 
 
 def test_start_implementation_gets_the_implementer_generation(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[5]
+    name, args = calls[I_START_IMPL]
     assert name == "_kernel_start_implementation"
-    run_id = calls[0][1][0]
-    assert args == [run_id, "1"], args
+    run_id = calls[I_RUN_START][1][0]
+    # generation 2: the operator fence took 1, and the implementer is
+    # dispatched AFRESH after phases rather than reusing it.
+    assert args == [run_id, "2"], args
+
+
+def test_the_state_is_read_back_for_this_run_after_start_implementation(happy_drive):
+    calls, _ = happy_drive
+    name, args = calls[I_STATE]
+    assert name == "_kernel_state"
+    assert args == [calls[I_RUN_START][1][0]], args
 
 
 def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
@@ -511,20 +588,20 @@ def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
     what it returned -- so if this call ever moves after the recording, the
     recorded facts would describe a run nobody had observed yet."""
     calls, _ = happy_drive
-    name, _args = calls[6]
+    name, _args = calls[I_OBSERVE]
     assert name == "observe_outcome", [c[0] for c in calls]
-    assert calls[5][0] == "_kernel_start_implementation"
-    assert calls[7][0] == "_kernel_record_output"
+    assert calls[I_OBSERVE - 1][0] == "_kernel_bundle_hash"
+    assert calls[I_OBSERVE + 1][0] == "_kernel_record_output"
 
 
 def test_record_output_gets_the_actual_derived_body(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[7]
+    name, args = calls[I_OUTPUT]
     assert name == "_kernel_record_output"
-    run_id = calls[0][1][0]
+    run_id = calls[I_RUN_START][1][0]
     run_id_arg, gen_arg, body_arg = args
     assert run_id_arg == run_id
-    assert gen_arg == "1"
+    assert gen_arg == "2"
     assert body_arg.startswith("derived: outcome=ready review=codex:pass"), body_arg
     assert f"head={HEAD_SHA}" in body_arg, body_arg
 
@@ -535,15 +612,15 @@ def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
     two in-scope variables from the same derived tuple with different
     vocabularies (see module docstring for the mutation this must catch)."""
     calls, _ = happy_drive
-    name, args = calls[8]
+    name, args = calls[I_CI]
     assert name == "_kernel_record_ci"
-    run_id = calls[0][1][0]
-    assert args == [run_id, "1", "green", HEAD_SHA], args
+    run_id = calls[I_RUN_START][1][0]
+    assert args == [run_id, "2", "green", HEAD_SHA], args
 
 
 def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[9]
+    name, args = calls[I_REVIEWER]
     assert name == "_kernel_dispatch"
     assert args == ["codex", "reviewer"], args
 
@@ -554,10 +631,10 @@ def test_record_review_gets_the_raw_marker_verdict_at_the_reviewer_generation(ha
     would put the mapping on the side that cannot be tested against the
     kernel's vocabulary."""
     calls, _ = happy_drive
-    name, args = calls[10]
+    name, args = calls[I_REVIEW]
     assert name == "_kernel_record_review"
-    run_id = calls[0][1][0]
-    assert args[:3] == [run_id, "2", "codex:pass"], args
+    run_id = calls[I_RUN_START][1][0]
+    assert args[:3] == [run_id, "3", "codex:pass"], args
 
 
 def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive):
@@ -569,29 +646,33 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
                   that stopped capturing it, or invented a hash, reds here;
       base     -- exactly what _kernel_run_start recorded, which is the
                   comparison validate_review makes;
-      context  -- exactly the spec artifact _kernel_submit_spec named.
+      context  -- exactly the bundle hash _kernel_bundle_hash read back from
+                  the kernel. It used to be the artifact hash of the queue
+                  prompt, PUT as a stand-in spec; the run now holds a real
+                  frozen issue snapshot, and that is what "context" means.
     """
     calls, _ = happy_drive
     by_name = {n: a for n, a in calls}
-    _, args = calls[10]
+    _, args = calls[I_REVIEW]
 
     assert args[3] == OUT_HASH, (
         "the review does not bind the hash _kernel_record_output returned")
     assert args[4] == by_name["_kernel_run_start"][2], (
         "the review binds a different base than the run was started with -- "
         "validate_review compares exactly these two")
-    assert args[5] == by_name["_kernel_submit_spec"][2], (
-        "the review binds a context hash that is not this run's spec artifact")
+    assert args[5] == CTX_HASH, (
+        "the review binds a context hash that is not the bundle the kernel "
+        "froze for this run")
 
 
 def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):
     calls, _ = happy_drive
-    name, args = calls[11]
+    name, args = calls[I_REDISPATCH]
     assert name == "_kernel_dispatch"
     assert args == ["claude_code", "implementer"], args
 
 
-def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3(happy_drive):
+def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_4(happy_drive):
     """Fix round 2, ITEM 1: the 5th argument is `$marker_head` -- HEAD_SHA,
     what the crafted marker claims -- never `$reviewed_sha` (REVIEWED_SHA,
     `_merge_gate`'s stubbed, deliberately DIFFERENT answer). Distinguishable
@@ -599,10 +680,10 @@ def test_request_merge_gets_the_pr_repo_and_reviewed_head_at_gen_3(happy_drive):
     module-level comment for why the swap that motivated this test was
     invisible before that separation."""
     calls, _ = happy_drive
-    name, args = calls[12]
+    name, args = calls[I_MERGE_REQ]
     assert name == "_kernel_request_merge"
-    run_id = calls[0][1][0]
-    assert args[:5] == [run_id, "3", PR, "acme/widgets", HEAD_SHA], args
+    run_id = calls[I_RUN_START][1][0]
+    assert args[:5] == [run_id, "4", PR, "acme/widgets", HEAD_SHA], args
     assert HEAD_SHA != REVIEWED_SHA  # the whole point -- see REVIEWED_SHA above
 
 
@@ -613,8 +694,8 @@ def test_request_merge_presents_the_SAME_binding_the_review_did(happy_drive):
     field, and asserting them against each other is the only way to catch a
     drift that leaves both individually plausible."""
     calls, _ = happy_drive
-    _, review = calls[10]
-    _, merge = calls[12]
+    _, review = calls[I_REVIEW]
+    _, merge = calls[I_MERGE_REQ]
     assert merge[5:8] == review[3:6], (
         f"merge binds {merge[5:8]} but the review bound {review[3:6]}; the "
         "merge gate will find no approval for this tuple")
@@ -625,20 +706,20 @@ def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):
     argument is `$reviewed_sha` -- REVIEWED_SHA, `_merge_gate`'s answer --
     never the marker's own `$marker_head`."""
     calls, _ = happy_drive
-    name, args = calls[13]
+    name, args = calls[I_MERGE]
     assert name == "merge_ready_pr"
     assert args == ["t01-test-item", PR, REVIEWED_SHA], args
 
 
 def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):
     """`_k_outcome` must be "merged" (the stubbed merge_ready_pr returns rc
-    0) at generation 3 -- the SAME generation request_merge used, not a
+    0) at generation 4 -- the SAME generation request_merge used, not a
     stale one from an earlier dispatch."""
     calls, _ = happy_drive
-    name, args = calls[14]
+    name, args = calls[I_OUTCOME]
     assert name == "_kernel_record_outcome"
-    run_id = calls[0][1][0]
-    assert args == [run_id, "3", "merged"], args
+    run_id = calls[I_RUN_START][1][0]
+    assert args == [run_id, "4", "merged"], args
 
 
 def test_record_outcome_gets_failed_when_the_merge_fails(failed_merge_drive):
@@ -700,3 +781,4 @@ def test_the_recovery_review_carries_the_recovered_verdict_and_binding(recovery_
     assert rv[3] == OUT_HASH, "the review does not bind the recovered output"
     by_name = {n: a for n, a in calls}
     assert rv[4] == by_name["_kernel_run_start"][2], "base differs from run_start's"
+    assert rv[5] == CTX_HASH, "context differs from the kernel's bundle hash"

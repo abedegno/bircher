@@ -12,8 +12,8 @@ call was survivable).
 
 This file is the other half: every function in `batch/lib/kernel-client.sh`
 added for Task 4 (`_kernel_run_start`, `_kernel_put_artifact`,
-`_kernel_submit_spec`, `_kernel_submit_plan`, `_kernel_start_implementation`,
-`_kernel_record_output`, `_kernel_record_ci`, `_kernel_record_review`,
+`_kernel_start_implementation`, `_kernel_record_output`,
+`_kernel_record_ci`, `_kernel_record_review`,
 `_kernel_request_merge`, `_kernel_record_outcome`) is exercised against a
 real temporary SQLite database, and the facts it leaves behind are read back
 and asserted on.
@@ -50,10 +50,10 @@ assertion:
    proven here by actually replaying the sequence against a live database
    (`test_every_stage_actually_reaches_the_kernel`, before this fix: five
    NotAuthorized rejections, all state-illegal, none of them informative).
-   `_kernel_submit_spec`/`_kernel_submit_plan` PUT the queue item's prompt
-   as the spec artifact and reuse it as a stand-in plan artifact (v1 has no
-   separate plan document); `_kernel_start_implementation` follows, under
-   the same implementer generation. All three, in order, now precede
+   The two stand-in submits that fixed it are RETIRED as of Task 20 -- the
+   front half authors a real spec and a real plan and accepts them through
+   `coordinator.cli phases` -- and `_kernel_start_implementation` is what the
+   runner still drives, under the implementer generation, before
    `_kernel_record_output`.
 
 With the run correctly advanced to `implementing`, empirical replay
@@ -96,6 +96,7 @@ from __future__ import annotations
 import pytest
 
 import hashlib
+import json
 import pathlib
 import subprocess
 import sys
@@ -183,16 +184,33 @@ def _db_env(db):
     return {"BIRCHER_KERNEL_DB": str(db)}
 
 
+def _inputs(tmp_path, number=0, title="t", name="issue"):
+    """The two files `_kernel_run_start` takes since Task 20.
+
+    `create_run` freezes the FETCHED ISSUE and the Project config in the same
+    transaction as the run row -- the run's policy is derived from them -- so
+    there is no longer a way to create a run without saying what it is about.
+    Written to real files because the function takes paths, and the same paths
+    reused within a test so a repeat is a replay rather than `NotReplayable`.
+    """
+    iss = tmp_path / f"{name}.json"
+    cfg = tmp_path / f"{name}-cfg.json"
+    iss.write_text(json.dumps({"number": number, "title": title, "body": "",
+                               "labels": [], "comments": []}))
+    cfg.write_text("{}")
+    return f'"{iss}" "{cfg}"'
+
+
 def _reach_planned(db, run_id):
     """Create the run and drive it to `planned` through the kernel's own
     front-half driver (`v2/tests/kernel/front.py`).
 
-    `_kernel_run_start` + `_kernel_submit_spec` + `_kernel_submit_plan` no
-    longer gets there. A submit lands at `spec_submitted` and only a
-    reviewer's accept of the current hash moves the run on, and the accept
-    binds the run's frozen policy -- which `create_run` writes and
-    `store.create_run` (what `_kernel_run_start` calls) does not. So the run
-    is created by the driver too, not adopted from `_kernel_run_start`.
+    The runner does not reach `planned` at all any more: authoring, reviewing
+    and accepting a spec and a plan is `coordinator.cli phases`, and the two
+    ceremonial submit wrappers are gone. So the run is created by the driver
+    too, not adopted from `_kernel_run_start` -- keeping the two halves of this
+    file's subject (the lifecycle FUNCTIONS) apart from the front half's own
+    machinery.
 
     Returns the journal seq of the last fact the front half wrote, so a
     caller can assert on what IT added rather than on the whole history.
@@ -222,11 +240,15 @@ def _sleepy_python(tmp_path):
 def test_run_start_creates_a_real_run_others_can_build_on(tmp_path):
     """The test that would have caught the `--name enqueue` defect: it
     asserts the run actually exists afterward, not merely that the shell
-    call returned 0 (every _kernel call returns 0 -- that is the whole
-    advisory contract, and it is exactly as true of a call that reached
-    nothing as of one that worked)."""
+    call returned 0.
+
+    Since Task 20 it asserts more: the run is created by `create_run`, so the
+    ISSUE IS FROZEN and a policy is derived from it in the same transaction.
+    A `store.create_run` that merely inserted a row would leave
+    `run_enqueued`/`policy_frozen` absent and every front-half command
+    afterwards refused for the same reason regardless of what it was."""
     db = tmp_path / "kernel.db"
-    r = _run('_kernel_run_start run-1 abedegno/muesli ' + BASE_SHA,
+    r = _run('_kernel_run_start run-1 abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path),
              env=_db_env(db))
     assert r.returncode == 0
 
@@ -235,23 +257,52 @@ def test_run_start_creates_a_real_run_others_can_build_on(tmp_path):
     assert store.run_base_sha("run-1") == BASE_SHA
     kinds = [f.kind for f in store.facts_for("run-1")]
     assert EventKind.RUN_STARTED in kinds, kinds
+    assert EventKind.RUN_ENQUEUED in kinds, kinds
+    assert EventKind.POLICY_FROZEN in kinds, kinds
+    # It ECHOES the bundle hash, and the kernel holds those exact bytes.
+    printed = r.stdout.strip()
+    assert len(printed) == 64, r.stdout
+    from kernel import front
+    assert front.bundle_hash(store, "run-1") == printed
+    assert store.read_blob(printed) is not None, "the frozen snapshot was not PUT"
 
 
 def test_run_start_is_idempotent_on_a_repeated_run_id(tmp_path):
-    """A retried call for the same run_id must not raise past the advisory
-    boundary or corrupt the row already there."""
+    """A retried call for the same run_id AND THE SAME INPUTS is a replay: it
+    returns the same bundle hash and changes nothing."""
     db = tmp_path / "kernel.db"
-    _run('_kernel_run_start run-2 abedegno/muesli ' + BASE_SHA, env=_db_env(db))
-    r2 = _run('_kernel_run_start run-2 abedegno/muesli ' + BASE_SHA, env=_db_env(db))
+    args = '_kernel_run_start run-2 abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path)
+    r1 = _run(args, env=_db_env(db))
+    r2 = _run(args, env=_db_env(db))
     assert r2.returncode == 0
+    assert r2.stdout.strip() == r1.stdout.strip() != ""
     store = Store.open(db)
     assert store.run_state("run-2") == "queued"
 
 
-def test_run_start_against_a_missing_database_succeeds_anyway(tmp_path):
-    r = _run('_kernel_run_start run-3 abedegno/muesli ' + BASE_SHA,
+def test_run_start_refuses_a_retry_whose_inputs_differ(tmp_path):
+    """`NotReplayable`, and rc 1 -- NOT advisory. The earlier `enqueue`
+    recomputed its answer from the RETRY's arguments and reported success for
+    a policy the journal did not hold; carrying on from that is a run whose
+    ledger describes inputs nobody approved."""
+    db = tmp_path / "kernel.db"
+    base = '_kernel_run_start run-2b abedegno/muesli ' + BASE_SHA + ' '
+    assert _run(base + _inputs(tmp_path, title="first"), env=_db_env(db)).returncode == 0
+    r = _run(base + _inputs(tmp_path, title="second", name="other"), env=_db_env(db))
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "NotReplayable" in r.stderr, r.stderr
+
+
+def test_run_start_against_a_missing_database_returns_1(tmp_path):
+    """THE ONE NON-ADVISORY CALL in this file. Every other function here
+    returns 0 whatever happened, because the kernel records and the
+    coordinator decides -- but a run that was never created is not a run the
+    coordinator may work, and carrying on would perform effects against a run
+    id nothing holds."""
+    r = _run('_kernel_run_start run-3 abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path),
              env={"BIRCHER_KERNEL_DB": str(tmp_path / "nonexistent" / "k.db")})
-    assert r.returncode == 0
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "[batch:kernel]" in r.stderr, r.stderr
 
 
 # --- _kernel_put_artifact / _kernel_record_output ---------------------------
@@ -262,7 +313,7 @@ def test_record_output_puts_before_it_names_the_hash(tmp_path):
     caller computes over the same bytes -- not merely "some string"."""
     db = tmp_path / "kernel.db"
     body = "derived: outcome=ready review=codex:pass head=" + HEAD_SHA
-    _run('_kernel_run_start run-4 abedegno/muesli ' + BASE_SHA, env=_db_env(db))
+    _run('_kernel_run_start run-4 abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path), env=_db_env(db))
     r = _run(
         f'g=$(_kernel_dispatch claude_code implementer); '
         f'_kernel_record_output run-4 "$g" {body!r}',
@@ -279,7 +330,7 @@ def test_record_output_puts_before_it_names_the_hash(tmp_path):
 
 def test_put_artifact_echoes_the_real_content_hash(tmp_path):
     db = tmp_path / "kernel.db"
-    _run('_kernel_run_start run-5 abedegno/muesli ' + BASE_SHA, env=_db_env(db))
+    _run('_kernel_run_start run-5 abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path), env=_db_env(db))
     r = _run("h=$(_kernel_put_artifact 'hello world'); echo \"[$h]\"", env=_db_env(db))
     expected = hashlib.sha256(b"hello world").hexdigest()
     assert f"[{expected}]" in r.stdout, (r.stdout, r.stderr)
@@ -300,7 +351,7 @@ def test_a_hung_python_does_not_block_run_start(tmp_path):
     proof: a hung interpreter must not block the caller."""
     sleepy = _sleepy_python(tmp_path)
     started = time.monotonic()
-    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + '\necho SURVIVED',
+    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + ' ' + _inputs(tmp_path) + '\necho SURVIVED',
              env={"BIRCHER_PY": str(sleepy), "BIRCHER_KERNEL_TIMEOUT": "2"})
     elapsed = time.monotonic() - started
     assert "SURVIVED" in r.stdout, r.stdout
@@ -308,10 +359,18 @@ def test_a_hung_python_does_not_block_run_start(tmp_path):
     assert "[batch:kernel]" in r.stderr, r.stderr
 
 
-def test_a_missing_interpreter_does_not_fail_run_start():
-    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + '; echo "rc=$?"',
+def test_a_missing_interpreter_makes_run_start_refuse(tmp_path):
+    """The counterpart of `test_a_missing_interpreter_does_not_fail_put_artifact`
+    below, and it goes the OTHER way on purpose. A PUT that cannot happen is
+    survivable -- the caller sees an empty hash and declines to name it. A run
+    that cannot be created is not: every command afterwards would name a run
+    the kernel does not hold, and `_kernel` would swallow each refusal as an
+    advisory failure."""
+    r = _run('_kernel_run_start r abedegno/muesli ' + BASE_SHA + ' '
+             + _inputs(tmp_path) + '; echo "rc=$?"',
              env={"BIRCHER_PY": "/nonexistent/python"})
-    assert "rc=0" in r.stdout, r.stderr
+    assert "rc=1" in r.stdout, r.stdout
+    assert "[batch:kernel]" in r.stderr, r.stderr
 
 
 def test_a_hung_python_does_not_block_put_artifact(tmp_path):
@@ -332,75 +391,15 @@ def test_a_missing_interpreter_does_not_fail_put_artifact():
     assert "rc=0" in r.stdout, r.stdout
 
 
-# --- _kernel_submit_spec / _kernel_submit_plan / _kernel_start_implementation
-
-def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
-    """Fix round 1, IMPORTANT (b): submit_spec and submit_plan both take an
-    already-PUT hash as an argument (the same PUT-before-reference contract
-    record_implementation_output has), and run_item PUTs the prompt ONCE and
-    passes that one hash to both -- proven here by putting it once and
-    feeding the same hash to both functions.
-
-    WHERE THE TWO CALLS LAND HAS MOVED. A submission is no longer its own
-    acceptance: `submit_spec` lands at `spec_submitted` and becomes the spec
-    phase's current artefact, and `submit_plan` is legal only from
-    `specified`, which a reviewer's accept reaches. So the second call is
-    refused here and the run stops short of `planned`. The client still makes
-    both calls until Task 20 rewrites it; this records what they do, and the
-    PUT-before-reference contract -- the hash the kernel accepts is one it
-    holds -- is what survives unchanged.
-
-    Dispatched as AUTHOR: a submission must come from an author seat.
-    """
-    db = tmp_path / "kernel.db"
-    run_id = "run-spec"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
-    r = _run('g=$(_kernel_dispatch claude_code author); echo "[$g]"',
-              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
-    gen = r.stdout.strip().strip("[]")
-    assert gen == "1", (r.stdout, r.stderr)
-
-    # submit_spec now waits for its round's turn to have ended (Task 10);
-    # this test is about run_item reusing one PUT for both submits, not the
-    # ceremony, so it is done directly against the same database.
-    from tests.kernel.front import Front
-    store = Store.open(db)
-    f = Front(store, run_id, existing=True)
-    sid = f._session(int(gen), f._newest_id())
-    f._end_turn(int(gen), sid)
-
-    prompt = "do the thing"
-    r = _run(
-        f"h=$(_kernel_put_artifact {prompt!r}); "
-        f'_kernel_submit_spec {run_id} {gen} "$h"; '
-        f'_kernel_submit_plan {run_id} {gen} "$h"',
-        env=_db_env(db),
-    )
-    assert r.returncode == 0, r.stderr
-
-    store = Store.open(db)
-    expected_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    assert store.has_artifact(expected_hash)
-    facts = store.facts_for(run_id)
-    accepted = {
-        f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
-    }
-    # record_turn_ended is the ceremony this test's own setup performed
-    # (Task 10's precondition for submit_spec); submit_plan is refused (the
-    # state check, not accepted), so submit_spec is the only lifecycle
-    # command this run actually accepted.
-    assert accepted == {"record_turn_ended", "submit_spec"}, accepted
-    assert store.phase_artifact(run_id, "spec") == expected_hash, (
-        "the hash the function was given did not become the spec phase's "
-        "current artefact"
-    )
-    rejected = {
-        (f.payload["command_name"], f.payload["reason"])
-        for f in facts if f.kind == EventKind.COMMAND_REJECTED
-    }
-    assert ("submit_plan", "NotAuthorized") in rejected, rejected
-    assert store.run_state(run_id) == "spec_submitted"
-
+# --- _kernel_start_implementation --------------------------------------------
+#
+# `_kernel_submit_spec` and `_kernel_submit_plan` are GONE (Task 20). They PUT
+# the queue item's prompt as a stand-in spec and reused the same hash as a
+# stand-in plan -- ceremony that advanced the run through two states nobody had
+# authored anything for. The front half authors, reviews and accepts a real
+# spec and a real plan through `coordinator.cli phases`, so the runner submits
+# neither; what it still does at this seam is start the implementation, and
+# that is what the tests below drive.
 
 def test_start_implementation_needs_the_implementer_role(tmp_path):
     """authorize() refuses start_implementation from any generation not
@@ -433,14 +432,14 @@ def test_start_implementation_needs_the_implementer_role(tmp_path):
 # --- the full lifecycle, driven for real ------------------------------------
 
 def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
-    """Drives the exact sequence `run_item` drives, end to end, entirely
-    through the named shell functions: run start, implementer dispatch,
-    submit_spec, submit_plan, start_implementation, output, CI, reviewer
-    dispatch, review, implementer redispatch, merge request, outcome.
+    """Drives the exact sequence `run_item` drives from the seam on, entirely
+    through the named shell functions: implementer dispatch,
+    start_implementation, output, CI, reviewer dispatch, review, implementer
+    redispatch, merge request, outcome.
 
-    The front half is the DRIVER's: run start, submit_spec and submit_plan no
-    longer reach `planned` on their own. Returns the three generations
-    observed on stdout, plus the journal seq the front half ended at.
+    The front half is the DRIVER's -- the runner hands it to
+    `coordinator.cli phases`. Returns the three generations observed on
+    stdout, plus the journal seq the front half ended at.
     """
     front_seq = _reach_planned(db, run_id)
 
@@ -636,7 +635,7 @@ def test_a_bogus_outcome_is_refused_rather_than_recorded(tmp_path):
     string would 'match' the scorecard by construction, typos included."""
     db = tmp_path / "kernel.db"
     run_id = "run-bogus"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA} ' + _inputs(tmp_path), env=_db_env(db))
     _run('_kernel_dispatch codex implementer',
          env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     _run(f"_kernel_record_run_outcome {run_id} 1 totally-made-up", env=_db_env(db))
@@ -811,7 +810,7 @@ def test_adopting_a_run_reports_the_base_the_KERNEL_recorded(tmp_path):
     with the merge unauthorized.
     """
     db = tmp_path / "k.db"
-    _run(f'_kernel_run_start r-adopt-1 abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _run(f'_kernel_run_start r-adopt-1 abedegno/muesli {BASE_SHA} ' + _inputs(tmp_path), env=_db_env(db))
 
     moved = "f" * 40
     r = _run(f'_kernel_adopt_run r-adopt {"abedegno/muesli"} {moved} codex implementer '
