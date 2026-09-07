@@ -3,3 +3,6 @@ queue/i*
 .bircher/
 *.log
 .run/
+
+# Local worktrees (superpowers)
+.worktrees/
