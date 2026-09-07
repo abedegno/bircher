@@ -193,3 +193,33 @@ def test_earlier_turn_files_are_moved_aside_before_a_reprompt(world):
                        watched=[seat.ARTIFACT_OUT, seat.QUESTIONS_OUT], resume_session=t.session_id)
     assert t2.files == {seat.ARTIFACT_OUT: None, seat.QUESTIONS_OUT: None}    # the old file is not this turn's
     assert os.path.exists(os.path.join(t.workspace, seat.QUESTIONS_OUT + ".1.prev"))
+
+
+def test_a_read_but_unwatched_file_is_moved_aside_too(world):
+    """Under grill=model the questions file is READ beside the artefact but
+    never watched. Retiring only the watched set left it in place across a
+    re-prompt of the same session, and the round recorded its questions and
+    rulings a second time -- the kernel guards neither against a duplicate."""
+    s, f, fake, ctx, clock = world
+    cause = phases.round_cause(ctx).id
+    qs = b"### Q1: db?\nRecommended: sqlite\nRuling: sqlite - simplest - low\n"
+
+    def on_prompt(sid, text):
+        ws = fake.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        open(os.path.join(ws, seat.QUESTIONS_OUT), "wb").write(qs)
+        open(os.path.join(ws, seat.ARTIFACT_OUT), "wb").write(b"# the spec")
+    fake.on_prompt = on_prompt
+    both = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT]
+    t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                      prompt_cause=cause, prompt_text=b"go", watched=[seat.ARTIFACT_OUT], read=both)
+    assert t.files == {seat.ARTIFACT_OUT: b"# the spec", seat.QUESTIONS_OUT: qs}
+    f.answer("sqlite", question_ids=("Q1",))
+    ans = s.newest_fact("r-1", EventKind.HUMAN_ANSWER)
+    fake.on_prompt = lambda sid, text: None                    # the next turn writes nothing
+    t2 = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                       prompt_cause=ans.id, prompt_text=b"Answered; continue.",
+                       watched=[seat.ARTIFACT_OUT], read=both, resume_session=t.session_id)
+    assert t2.files == {seat.ARTIFACT_OUT: None, seat.QUESTIONS_OUT: None}
+    for name in both:
+        assert os.path.exists(os.path.join(t.workspace, name + ".1.prev"))

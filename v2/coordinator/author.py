@@ -41,10 +41,19 @@ def choose_author_vendor(ctx) -> str:
     second pass over a round the coordinator crashed part-way through adopts
     that session, and the artefact it submits was written by the vendor the
     server ran, so the vendor is read from the bundle name rather than chosen
-    again (ruling 14). The seat is this round's only when its create carries
-    the round's own cause -- the PREVIOUS round's seat is still the newest one
-    of the phase and epoch, and reading the vendor off that would hand every
-    revision back to the vendor whose draft was just sent for revision."""
+    again (ruling 14).
+
+    "The round's session" is the CURRENT round's, so the seat counts only when
+    its create carries this round's cause. `front.newest_seat` is the newest
+    author create of the PHASE and EPOCH, and a request_revision returns the
+    run to the same phase and epoch -- the previous round's seat is still the
+    newest one, and reading the vendor off it would hand every revision back
+    to the vendor whose draft was just sent for revision, so the rotation
+    would never happen. Excluding it costs nothing: the kernel's identity
+    guard compares the submitting actor against the newest seat AT SUBMIT
+    TIME, which by then is this round's own create, made with whichever vendor
+    this function chose.
+    """
     store, run_id = ctx.store, ctx.run_id
     phase, n = ctx.phase(), ctx.epoch()
     seat_row = front.newest_seat(store, run_id, Role.AUTHOR, phase, n)

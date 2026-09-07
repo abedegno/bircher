@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field
 
 from coordinator import sessions
-from coordinator.session import list_items, wait_turn
+from coordinator.session import LookupFailed, list_items, wait_turn
 from kernel import front
 from kernel.canon import content_hash
 from kernel.commands import Command, submit
@@ -103,7 +103,15 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
              resume_session: str | None = None) -> Turn:
     """*watched* are the paths the poll ends the turn on; *read* (default the
     watched ones) are the paths read once after the stop -- under grill=model
-    the questions file is read beside the artefact but never watched."""
+    the questions file is read beside the artefact but never watched.
+
+    Every READABLE path is moved aside before a re-prompt, not only the
+    watched ones: a file this turn will read has to be this turn's. Retiring
+    only the watched set left a stale `questions.md` in an adopted session
+    under grill=model, where it is read but never watched, and the round
+    recorded its questions and rulings a second time -- the kernel has no
+    duplicate guard on either command.
+    """
     read = list(watched) if read is None else list(read)
     ctx.generation = dispatch(ctx.store, ctx.run_id, actor=vendor, role=role).generation
     snap = _adopt_or_create(ctx, vendor, session_obligation, resume_session)
@@ -113,7 +121,7 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
     prompt_hash = content_hash(prompt_text)
     cursor_before = None
     if sessions.satisfied(ctx.store, ctx.run_id, prompt_ob) is None:
-        _move_aside(workspace, watched)
+        _move_aside(workspace, read)
         sessions.prompt_session(ctx.store, run_id=ctx.run_id, generation=ctx.generation, server=ctx.server,
                                 session_id=sid, phase=phase, epoch=epoch, cause=prompt_cause,
                                 text=prompt_text, env=ctx.effect_env())
@@ -134,9 +142,17 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
         w: read_once(os.path.join(workspace, w)) for w in read}
     # The listing at the end of the turn (spec §4: every listing is
     # discriminated) -- a message typed during the turn is in this one.
+    #
+    # ONLY LookupFailed is swallowed, and it is logged: an unreadable server
+    # leaves the caller discriminating the mid-turn listing, which cannot see
+    # a message typed during the turn, so the fallback has to be visible
+    # rather than silent. Anything else -- a bug in list_items, a store error
+    # -- propagates: `except Exception` here would turn every one of those
+    # into the same quiet stale listing.
     try:
         listing = list_items(ctx.server, sid, fetch=ctx.fetch)
-    except Exception:
-        pass
+    except LookupFailed as exc:
+        ctx.log(f"session {sid}: end-of-turn listing unreadable ({exc}); "
+                "discriminating the listing taken before the turn")
     return Turn(session_id=sid, generation=ctx.generation, workspace=workspace, agent_name=snap["agent_name"],
                 ended=ended.payload["ended"], files=files, cursor_before=cursor_before, listing=listing)
