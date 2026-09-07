@@ -296,6 +296,16 @@ def validate_review(store, cmd, actor: str, *, ruling: str = "review_ruling") ->
         raise NotAuthorized(f"the kernel does not hold {current[:12]}...")
 
     if ruling == "human_ruling":
+        # A review_ruling's findings arrive as a hash the store already holds
+        # (checked below, for that path only); a human's arrive as text, put
+        # into the store by the kernel itself, in `submit()`'s transaction.
+        # Without this, an omitted or non-string `findings` reached that
+        # transaction and was recorded as `findings_hash: None` -- a
+        # request_revision with no findings a subsequent author round could
+        # be briefed with.
+        findings = cmd.payload.get("findings")
+        if not isinstance(findings, str) or not findings.strip():
+            raise NotAuthorized("a human record_review carries non-empty findings")
         return None
 
     binding = _binding_from(cmd.payload)

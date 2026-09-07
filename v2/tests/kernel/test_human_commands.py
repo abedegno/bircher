@@ -198,3 +198,48 @@ def test_driver_approves_at_a_gate(tmp_path):
     f.to_planned()
     assert s.run_state("r-1") == "planned"
     assert [r.payload["ruling"] for r in s.facts_of_kind("r-1", EventKind.HUMAN_RULING)] == ["approve", "approve"]
+
+
+def test_execute_as_human_runs_only_the_humans_commands(tmp_path):
+    """Everything but the human's five is a dispatched actor's command, and
+    execute_as_human must refuse it before _submit ever sees it -- otherwise
+    a caller can run ANY command as `human` with no dispatch behind it."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.author_round(SPEC_BYTES)
+    before = len(s.facts_for("r-1"))
+    refused = (
+        ("park", {"reason": "gate", "session_id": None, "cursor_item_id": None,
+                  "findings_hash": None, "verdict": None, "reviewer": None}),
+        ("record_turn_ended", {"session": "s-1", "ended": "file"}),
+        ("submit_spec", {"artifact_hash": s.phase_artifact("r-1", "spec")}),
+        ("start_implementation", {}),
+    )
+    for name, payload in refused:
+        with pytest.raises(ValueError, match="does not go through execute_as_human"):
+            _human(s, "r-1", name, payload)
+        assert len(s.facts_for("r-1")) == before, f"{name} wrote a fact through execute_as_human"
+
+    _human(s, "r-1", "cancel_run", {})
+    assert s.run_state("r-1") == "cancelled"
+    cancelled = [x for x in s.facts_of_kind("r-1", EventKind.COMMAND_ACCEPTED)
+                 if x.payload["command_name"] == "cancel_run"]
+    assert cancelled[-1].actor == "human"
+
+
+def test_human_record_review_needs_non_empty_findings(tmp_path):
+    s = _store(tmp_path)
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES); f.review_round("accept")
+    h = s.phase_artifact("r-1", "spec")
+    state_before = s.run_state("r-1")
+    verdicts_before = len(s.facts_of_kind("r-1", EventKind.REVIEW_VERDICT))
+    rulings_before = len(s.facts_of_kind("r-1", EventKind.HUMAN_RULING))
+    for extra in ({}, {"findings": ""}, {"findings": 123}):
+        payload = {"phase": "spec", "artifact_hash": h, "verdict": "request_revision"}
+        payload.update(extra)
+        with pytest.raises(NotAuthorized, match="non-empty findings"):
+            _human(s, "r-1", "record_review", payload)
+    assert s.run_state("r-1") == state_before
+    assert len(s.facts_of_kind("r-1", EventKind.REVIEW_VERDICT)) == verdicts_before
+    assert len(s.facts_of_kind("r-1", EventKind.HUMAN_RULING)) == rulings_before

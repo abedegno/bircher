@@ -158,13 +158,15 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['session']",
         "cmd.payload['session_id']",
         "cmd.payload['reviewer']",
-        # The human's words: what a human answer says, and what a human
-        # direction says. Intentional and permanent -- the kernel binds who
-        # (execute_as_human, no dispatched generation can reach it) and when
-        # (the epoch, the cursor); the content is the human's to say.
+        # The human's words: what a human answer says, what a human
+        # direction says, and what a human's request_revision found.
+        # Intentional and permanent -- the kernel binds who (execute_as_human,
+        # no dispatched generation can reach it) and when (the epoch, the
+        # cursor); the content is the human's to say.
         "cmd.payload['question_ids']",
         "cmd.payload['answer']",
         "cmd.payload['text']",
+        "cmd.payload['findings']",
     }
 
 

@@ -36,6 +36,17 @@ HUMAN_COMMANDS = frozenset({
     "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
 })
 
+#: Every name `execute_as_human` will run: the four human-only commands, plus
+#: `record_review` (reachable through both paths -- `ruling` says which) and
+#: `cancel_run` (the spec's `kernel cancel` path, spec §4 Fallback/§5; a later
+#: task's CLI records it through execute_as_human). Anything else -- park,
+#: record_turn_ended, a submit, start_implementation -- is a dispatched
+#: actor's command, and execute_as_human refuses it before `_submit` ever
+#: sees it: without this, a caller could run ANY command as `human` with no
+#: dispatch behind it, which is exactly the unfenced write capability
+#: `execute_as_human` exists to grant to four commands, not the whole set.
+HUMAN_EXECUTABLE = HUMAN_COMMANDS | frozenset({"record_review", "cancel_run"})
+
 COMMAND_NAMES = frozenset({
     "submit_spec", "submit_plan", "record_review", "start_implementation",
     "record_ci_observation", "request_merge", "cancel_run",
@@ -222,6 +233,8 @@ def execute_as_human(store, cmd: Command) -> Result:
     `expected_version` alone."""
     if cmd.name not in COMMAND_NAMES:
         raise ValueError(f"unknown command: {cmd.name}")
+    if cmd.name not in HUMAN_EXECUTABLE:
+        raise ValueError(f"{cmd.name} does not go through execute_as_human")
     if cmd.generation != HUMAN_GENERATION:
         raise ValueError(
             f"a human command carries generation HUMAN_GENERATION ({HUMAN_GENERATION}), "
