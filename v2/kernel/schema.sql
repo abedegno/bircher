@@ -88,3 +88,12 @@ CREATE TABLE IF NOT EXISTS dispatches (
   at_us      INTEGER NOT NULL,
   UNIQUE (run_id, generation)
 );
+
+-- One current artefact per phase. Rewritten on every accepted submission;
+-- the history is in artifact_submitted facts, this is the projection.
+CREATE TABLE IF NOT EXISTS phase_artifacts (
+    run_id        TEXT NOT NULL,
+    phase         TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL,
+    PRIMARY KEY (run_id, phase)
+);

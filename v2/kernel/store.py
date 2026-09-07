@@ -44,12 +44,16 @@ class Fact:
 class Store:
     def __init__(self, conn: sqlite3.Connection, clock: Any) -> None:
         self._conn, self._clock = conn, clock
+        # Set by open(); the executor mints body files beside the db.
+        self.path: str | None = None
 
     @classmethod
     def open(cls, path: Path | str, clock: Any = None) -> Store:
         conn = sqlite3.connect(str(path), isolation_level=None)
         conn.executescript(_SCHEMA)
-        return cls(conn, clock or _SystemClock())
+        store = cls(conn, clock or _SystemClock())
+        store.path = str(path)
+        return store
 
     def append_fact(
         self,
@@ -338,8 +342,8 @@ class Store:
         caller in any run -- no execution, no fact, no fence.
         """
         row = self._conn.execute(
-            "SELECT state, external_object_id, effect_class FROM effects"
-            " WHERE idempotency_key = ? AND run_id = ?",
+            "SELECT state, external_object_id, effect_class, intent_json, generation"
+            " FROM effects WHERE idempotency_key = ? AND run_id = ?",
             (idempotency_key, run_id),
         ).fetchone()
         # effect_class is the JOURNALLED one, not the retry's. A halt raised on
@@ -348,6 +352,7 @@ class Store:
         # front of the operator.
         return None if row is None else {
             "state": row[0], "external_object_id": row[1], "effect_class": row[2],
+            "intent": json.loads(row[3]), "generation": row[4],
         }
 
     def effect_state(self, idempotency_key: str, *, run_id: str) -> str | None:
@@ -398,4 +403,78 @@ class Store:
             " FROM facts WHERE run_id=? ORDER BY seq",
             (run_id,),
         ).fetchall()
-        return [Fact(*r[:-1], payload=json.loads(r[-1])) for r in rows]
+        return [self._fact_from_row(r) for r in rows]
+
+    def _fact_from_row(self, r) -> Fact:
+        return Fact(*r[:-1], payload=json.loads(r[-1]))
+
+    def read_blob(self, content_hash: str) -> bytes | None:
+        row = self._conn.execute(
+            "SELECT bytes FROM artifacts WHERE hash = ?", (content_hash,)
+        ).fetchone()
+        return None if row is None else bytes(row[0])
+
+    def set_phase_artifact(self, run_id: str, phase: str, content_hash: str) -> None:
+        self._conn.execute(
+            "INSERT INTO phase_artifacts (run_id, phase, artifact_hash) VALUES (?,?,?)"
+            " ON CONFLICT(run_id, phase) DO UPDATE SET artifact_hash = excluded.artifact_hash",
+            (run_id, phase, content_hash),
+        )
+
+    def phase_artifact(self, run_id: str, phase: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT artifact_hash FROM phase_artifacts WHERE run_id = ? AND phase = ?",
+            (run_id, phase),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def facts_of_kind(self, run_id: str, *kinds: str) -> list[Fact]:
+        if not kinds:
+            return []
+        marks = ",".join("?" * len(kinds))
+        rows = self._conn.execute(
+            "SELECT seq, id, run_id, kind, schema_version, mechanism_version,"
+            " causal_command_id, actor, observed_at_us, payload_json FROM facts"
+            f" WHERE run_id = ? AND kind IN ({marks}) ORDER BY seq",
+            (run_id, *kinds),
+        ).fetchall()
+        return [self._fact_from_row(r) for r in rows]
+
+    def newest_fact(self, run_id: str, *kinds: str) -> Fact | None:
+        facts = self.facts_of_kind(run_id, *kinds)
+        return facts[-1] if facts else None
+
+    def effects_for(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT idempotency_key, effect_class, generation, state,"
+            " external_object_id, intent_json, at_us FROM effects"
+            " WHERE run_id = ? ORDER BY rowid",
+            (run_id,),
+        ).fetchall()
+        return [{
+            "idempotency_key": r[0], "effect_class": r[1], "generation": r[2],
+            "state": r[3], "external_object_id": r[4],
+            "intent": json.loads(r[5]), "at_us": r[6],
+        } for r in rows]
+
+    def dispatches_for(self, run_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT generation, actor, role, at_us FROM dispatches"
+            " WHERE run_id = ? ORDER BY generation",
+            (run_id,),
+        ).fetchall()
+        return [{"generation": r[0], "actor": r[1], "role": r[2], "at_us": r[3]}
+                for r in rows]
+
+    def open_run_ids(self, prefix: str, states: frozenset[str]) -> list[str]:
+        if "%" in prefix or "_" in prefix:
+            raise ValueError(f"prefix must not contain LIKE wildcards: {prefix!r}")
+        if not states:
+            return []
+        marks = ",".join("?" * len(states))
+        rows = self._conn.execute(
+            "SELECT run_id FROM runs WHERE run_id LIKE ? AND state IN"
+            f" ({marks}) ORDER BY created_at_us",
+            (prefix + "-%", *sorted(states)),
+        ).fetchall()
+        return [r[0] for r in rows]

@@ -32,6 +32,20 @@ class EventKind:
     BUNDLE_REVISED = "bundle_revised"
     SHADOW_REJECTED = "shadow_rejected"
 
+    # Front half (spec §2). Each is written by exactly one command; see
+    # kernel/commands.py::_side_fact.
+    POLICY_FROZEN = "policy_frozen"
+    ARTIFACT_SUBMITTED = "artifact_submitted"
+    REVIEW_BRIEF_ISSUED = "review_brief_issued"
+    PARKED = "parked"
+    TURN_ENDED = "turn_ended"
+    AUTHOR_EMPTY = "author_empty"
+    HUMAN_ANSWER = "human_answer"
+    MODEL_RULING = "model_ruling"
+    HUMAN_DIRECTION = "human_direction"
+    HUMAN_ITEM_DISMISSED = "human_item_dismissed"
+    PROMPT_ITEM = "prompt_item"
+
 
 SCHEMA_VERSIONS = {
     EventKind.RUN_STARTED: 1,
@@ -56,6 +70,17 @@ SCHEMA_VERSIONS = {
     EventKind.REVISION_PROPOSED: 1,
     EventKind.BUNDLE_REVISED: 1,
     EventKind.SHADOW_REJECTED: 1,
+    EventKind.POLICY_FROZEN: 1,
+    EventKind.ARTIFACT_SUBMITTED: 1,
+    EventKind.REVIEW_BRIEF_ISSUED: 1,
+    EventKind.PARKED: 1,
+    EventKind.TURN_ENDED: 1,
+    EventKind.AUTHOR_EMPTY: 1,
+    EventKind.HUMAN_ANSWER: 1,
+    EventKind.MODEL_RULING: 1,
+    EventKind.HUMAN_DIRECTION: 1,
+    EventKind.HUMAN_ITEM_DISMISSED: 1,
+    EventKind.PROMPT_ITEM: 1,
 }
 
 MECHANISM_VERSION = 1
