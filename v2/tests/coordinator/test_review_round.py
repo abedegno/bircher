@@ -110,11 +110,40 @@ def test_no_verdict_shapes(world):
         out = review.review_round(ctx)
         assert out.status == "no_verdict" and out.verdict is None
         assert out.findings_hash == content_hash(text.encode())
+        # The loop parks after a no_verdict; only a human grant_round opens
+        # the next attempt, and a grant is what moves `seat_cause` (spec §3
+        # Obligations) so the NEXT review_round call derives a fresh session
+        # and prompt rather than adopting this one.
+        seat.command(ctx, "park", {"reason": "no_verdict", "session_id": out.session_id,
+                                   "cursor_item_id": out.cursor, "findings_hash": out.findings_hash,
+                                   "verdict": None, "reviewer": out.reviewer})
+        f.grant()
     ctx.turn_timeout_s = 10
     fake.on_prompt = lambda sid, prompt: None
     out = review.review_round(ctx)
     assert out.status == "no_verdict" and out.findings_hash is None
     assert s.run_state("r-1") == "spec_submitted"
+
+
+def test_a_second_review_round_with_no_park_or_grant_adopts_the_session_and_resends_nothing(world):
+    """The crash-resume property (spec §3 Obligations, §8 'every satisfied
+    create was prompted'): with the seat cause unchanged -- no park, no
+    grant_round between calls -- a second `review_round` must derive the
+    SAME session and prompt obligations as the first, not fresh ones. It
+    adopts the existing session, sends no second prompt, and reads the same
+    turn's file rather than opening a duplicate."""
+    s, f, fake, ctx = world()
+    f.author_round(SPEC_BYTES)
+    _reviewer_writes(fake, "no verdict at all\n")
+    out1 = review.review_round(ctx)
+    assert out1.status == "no_verdict"
+    sessions_after_first = len(fake.sessions)
+    prompts_after_first = sum(len(sess["items"]) for sess in fake.sessions.values())
+    out2 = review.review_round(ctx)
+    assert out2.status == "no_verdict"
+    assert out2.findings_hash == out1.findings_hash
+    assert len(fake.sessions) == sessions_after_first == 1
+    assert sum(len(sess["items"]) for sess in fake.sessions.values()) == prompts_after_first == 1
 
 
 def test_the_seat_after_a_grant_has_the_grant_as_cause(world):

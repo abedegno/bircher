@@ -240,17 +240,21 @@ def review_round(ctx) -> ReviewOutcome:
     of this: it must NOT dispatch a second time and strand the brief under a
     generation nothing was ever prompted under.
 
-    The SESSION obligation's cause is the round's own (`phases.seat_cause`):
-    a round has one seat, so a retry of the same round -- no new submission,
-    no new grant -- adopts it rather than opening a second one. The PROMPT's
-    cause is this call's own dispatch id, not the round's: two review_round
-    calls under the same round cause but with no verdict recorded between
-    them are two separate attempts at reading a verdict from the SAME
-    ongoing session, and the second must send its brief as a fresh turn
-    rather than read whatever the first attempt's turn left on disk. Keying
-    the prompt to the round's cause instead collapsed every no-verdict retry
-    into one already-satisfied `sess-prompt`, so a second attempt never
-    re-prompted at all and silently reported the first attempt's stale file.
+    Both the SESSION and the PROMPT obligations carry the round's own cause
+    (`phases.seat_cause`), not this attempt's dispatch (spec §3
+    *Obligations*: "the first prompt to a fresh session shares the
+    session's cause, here as everywhere"). A round has one seat: a pass
+    resumed after a crash between the create and the prompt must derive the
+    SAME prompt obligation it would have sent the first time, find it owed,
+    and send it -- not a fresh one, which would be the duplicate prompt the
+    design forbids and would leave §8's "every satisfied create was
+    prompted" unreachable from a later pass. The corollary is that a second
+    `review_round` call under an UNCHANGED seat cause adopts the session and
+    re-reads that same turn's file rather than re-prompting -- correct,
+    because the loop never calls `review_round` twice for one seat: after
+    `no_verdict` it parks, and only a human `grant_round` opens the next
+    attempt, which is what moves `seat_cause` (the newest grant newer than
+    the artifact_submitted) and so derives a fresh session and prompt.
     """
     from coordinator import phases, seat
     from coordinator.session import AgentMismatch
@@ -268,10 +272,9 @@ def review_round(ctx) -> ReviewOutcome:
     # The seat is dispatched here, before the brief, so the brief's generation
     # is the seat's; run_turn re-uses ctx.generation when it is the newest.
     try:
-        dispatched = dispatch(store, run_id, actor=vendor, role=Role.REVIEWER)
+        ctx.generation = dispatch(store, run_id, actor=vendor, role=Role.REVIEWER).generation
     except SeatsExhausted:
         return ReviewOutcome("budget", reviewer=vendor)
-    ctx.generation = dispatched.generation
     try:
         seat.command(ctx, "issue_review_brief", {"phase": phase})
     except NotAuthorized as exc:
@@ -280,11 +283,9 @@ def review_round(ctx) -> ReviewOutcome:
     issued = front.brief_for(store, run_id, ctx.generation).payload
     brief_bytes = store.read_blob(issued["brief_hash"])
     try:
-        # This attempt's own dispatch id, not the round's cause -- see the
-        # docstring above.
         turn = seat.run_turn(ctx, role=Role.REVIEWER, vendor=vendor, session_obligation=session_ob,
-                             prompt_cause=dispatched.dispatch_id, prompt_text=brief_bytes,
-                             watched=[seat.REVIEW_OUT], reuse_generation=True)
+                             prompt_cause=cause.id, prompt_text=brief_bytes, watched=[seat.REVIEW_OUT],
+                             reuse_generation=True)
     except SeatsExhausted:
         return ReviewOutcome("budget", reviewer=vendor)
     except AgentMismatch as exc:
