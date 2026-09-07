@@ -3,7 +3,8 @@ import pytest
 from kernel import bundle, front
 from kernel.authz import NotAuthorized
 from kernel.canon import canonical_bytes, content_hash
-from kernel.dispatch import Role
+from kernel.commands import Command, submit
+from kernel.dispatch import Role, dispatch
 from kernel.events import EventKind
 from kernel.store import Store
 from tests.kernel.front import PLAN_BYTES, SPEC_BYTES, Front
@@ -83,3 +84,21 @@ def test_v1_revise_bundle_function_now_puts_the_bytes(tmp_path):
     snap = bundle.snapshot(dict(ISSUE, title="T3"))
     h = bundle.revise_bundle(s, "r-1", new_snapshot=snap, reason="operator")
     assert s.read_blob(h) == canonical_bytes(snap)
+
+
+def test_revise_bundle_on_a_v1_run_with_no_bundle_bytes_is_refused(tmp_path):
+    """A run made with the bare Store.create_run (no RUN_ENQUEUED, so
+    front.bundle_hash is None) has nothing revise_bundle can diff against.
+    Without the guard, `_side_fact` crashed mid-transaction on
+    `json.loads(store.read_blob(None))` with no command_rejected recorded."""
+    s = Store.open(tmp_path / "k.db")
+    s.create_run(run_id="r-1", base_repo="o/r", base_sha="0" * 40)
+    g = dispatch(s, "r-1", actor="runner", role=Role.OPERATOR).generation
+    with pytest.raises(NotAuthorized, match="not in the store"):
+        submit(s, Command(name="revise_bundle", run_id="r-1",
+                          expected_version=s.run_version("r-1"),
+                          idempotency_key="k1", generation=g,
+                          payload={"issue": ISSUE}))
+    rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
+    assert rej is not None and rej.payload["command_name"] == "revise_bundle"
+    assert s.run_state("r-1") == "queued"

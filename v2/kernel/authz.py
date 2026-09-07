@@ -523,6 +523,10 @@ def _check_submit(store, cmd, state: str) -> None:
             raise NotAuthorized("plan has no tasks: no `### Task` heading (a shape check)")
 
 
+def _non_empty_str(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
     of the six the loop has, not free text the coordinator invents."""
@@ -577,9 +581,18 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             if not isinstance(cmd.payload.get("question"), str) or not cmd.payload.get("question").strip():
                 raise NotAuthorized("record_model_question carries a non-empty question")
             return None
-        for key in ("ruling", "reasoning", "cost_if_wrong"):
-            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key).strip():
-                raise NotAuthorized(f"record_model_ruling carries a non-empty {key}")
+        # Literal `.get(...)` calls, not a loop over a variable key: the
+        # provenance extractor (test_provenance.py::authorization_inputs)
+        # matches `cmd.payload.get("literal")` syntactically, and a dynamic
+        # key defeats it -- the three rows the table declares would then be
+        # unbound to the source that actually reads them.
+        for name, value in (
+            ("ruling", cmd.payload.get("ruling")),
+            ("reasoning", cmd.payload.get("reasoning")),
+            ("cost_if_wrong", cmd.payload.get("cost_if_wrong")),
+        ):
+            if not _non_empty_str(value):
+                raise NotAuthorized(f"record_model_ruling carries a non-empty {name}")
         n = front.epoch(store, cmd.run_id)
         asked = {q.payload["question_id"] for q in front.epoch_facts(store, cmd.run_id, EventKind.MODEL_QUESTION, n)}
         if qid not in asked:
@@ -594,6 +607,8 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         if not isinstance(cmd.payload.get("cursor_item_id"), str) or not cmd.payload.get("cursor_item_id"):
             raise NotAuthorized("dismiss_human_item carries the cursor to move past")
         rej = cmd.payload.get("rejection")
+        if not isinstance(rej, str) or not rej:
+            raise NotAuthorized("dismiss_human_item names the command_rejected fact it dismisses")
         human = {f.id: f for f in front.human_rejections(store, cmd.run_id)}
         if rej not in human:
             raise NotAuthorized(
@@ -606,10 +621,15 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
 
     if cmd.name == "record_prompt_item":
         from kernel import front
-        for key in ("session_id", "item_id", "sha256"):
-            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key):
-                raise NotAuthorized(f"record_prompt_item carries {key}")
-        sid, item, sha = cmd.payload.get("session_id"), cmd.payload.get("item_id"), cmd.payload.get("sha256")
+        # Literal `.get(...)` calls throughout, for the same reason as
+        # record_model_ruling above: the shape check and the read must both
+        # be literal, so the provenance extractor sees all three regardless
+        # of which line it walks.
+        sid, item, sha = (cmd.payload.get("session_id"), cmd.payload.get("item_id"),
+                          cmd.payload.get("sha256"))
+        for name, value in (("session_id", sid), ("item_id", item), ("sha256", sha)):
+            if not isinstance(value, str) or not value:
+                raise NotAuthorized(f"record_prompt_item carries {name}")
         if sha not in front.prompt_hashes_of(store, cmd.run_id, sid):
             raise NotAuthorized(
                 f"record_prompt_item: no satisfied sess-prompt of session {sid!r} carries body.artifact {sha[:12]}..."
@@ -630,7 +650,19 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             new_hash = _bundle.bundle_hash(_bundle.snapshot(issue))
         except (KeyError, TypeError, ValueError) as exc:
             raise NotAuthorized(f"revise_bundle: malformed issue: {exc}") from exc
-        if new_hash == front.bundle_hash(store, cmd.run_id):
+        prior_hash = front.bundle_hash(store, cmd.run_id)
+        # A v1 run's RUN_ENQUEUED names a bundle_hash whose bytes were never
+        # PUT (enqueue() computed the hash but only persisted spec and plan),
+        # and a bare Store.create_run has no RUN_ENQUEUED at all -- either way
+        # there is nothing here to diff against. Without this check, _side_fact
+        # crashes mid-transaction on `json.loads(store.read_blob(None))` with
+        # no command_rejected recorded.
+        if prior_hash is None or store.read_blob(prior_hash) is None:
+            raise NotAuthorized(
+                "revise_bundle: the current bundle's bytes are not in the store "
+                "(a v1 run); nothing to diff against"
+            )
+        if new_hash == prior_hash:
             raise NotAuthorized(
                 "revise_bundle: no relevant change -- the frozen fields hash as the current bundle"
             )

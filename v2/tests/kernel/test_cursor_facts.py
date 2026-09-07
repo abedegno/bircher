@@ -50,6 +50,19 @@ def test_dismiss_names_a_human_rejection_once(tmp_path):
         f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-6", "rejection": rej.id})
 
 
+@pytest.mark.parametrize("bad_rejection", [["a", "b"], None])
+def test_dismiss_refuses_a_malformed_rejection(tmp_path, bad_rejection):
+    """`rejection` must be a non-empty string before it is used as a dict key:
+    an unhashable value (a list) or None must raise NotAuthorized, not
+    TypeError."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.author_round(SPEC_BYTES)
+    g = f._dispatch(Role.OPERATOR, "runner")
+    with pytest.raises(NotAuthorized, match="command_rejected fact"):
+        f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-5", "rejection": bad_rejection})
+
+
 def test_dismiss_does_not_consume_a_park(tmp_path):
     s = _store(tmp_path)
     f = Front(s, "r-1")
