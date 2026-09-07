@@ -144,6 +144,46 @@ def newest_prompt(store, run_id: str, phase: str, epoch_n: int) -> dict | None:
     return found
 
 
+def turn_ended_for(store, run_id: str, prompt_key: str):
+    """The turn_ended that ended the turn *prompt_key* started. One per
+    prompt: record_turn_ended derives the key from the newest satisfied
+    sess-prompt at the moment it is accepted (Task 7)."""
+    for f in store.facts_of_kind(run_id, EventKind.TURN_ENDED):
+        if f.payload.get("prompt_key") == prompt_key:
+            return f
+    return None
+
+
+def stop_satisfied_for(store, run_id: str, turn_ended_id: str) -> bool:
+    return any(row["intent"]["obligation"].get("cause") == turn_ended_id
+               for row in satisfied_effects(store, run_id, "sess-stop"))
+
+
+def newest_prompt_of(store, run_id: str, session_id: str, phase: str, epoch_n: int) -> dict | None:
+    """The SESSION's newest satisfied sess-prompt in the phase and epoch (the
+    output guard's quantifier, spec §2: 'its newest satisfied sess-prompt').
+    newest_prompt() is the phase's, for record_turn_ended (ruling 15)."""
+    found = None
+    for row in satisfied_effects(store, run_id, "sess-prompt"):
+        ob = row["intent"]["obligation"]
+        if ob.get("session") == session_id and ob.get("phase") == phase and ob.get("epoch") == epoch_n:
+            found = {"generation": row["generation"], "key": row["idempotency_key"],
+                     "cause": ob.get("cause"), "session_id": session_id, "at_us": row["at_us"]}
+    return found
+
+
+def dispatch_seq(store, run_id: str, generation: int) -> int:
+    for f in store.facts_of_kind(run_id, EventKind.ATTEMPT_DISPATCHED):
+        if f.payload.get("generation") == generation:
+            return f.seq
+    raise LookupError(f"generation {generation} has no attempt_dispatched fact")
+
+
+def direction_after(store, run_id: str, seq: int):
+    facts = [f for f in store.facts_of_kind(run_id, EventKind.HUMAN_DIRECTION) if f.seq > seq]
+    return facts[-1] if facts else None
+
+
 def epoch_facts(store, run_id: str, kind: str, epoch_n: int) -> list:
     return [f for f in store.facts_of_kind(run_id, kind) if f.payload.get("epoch") == epoch_n]
 

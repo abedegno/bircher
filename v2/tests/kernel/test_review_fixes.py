@@ -72,19 +72,32 @@ def test_reconcile_does_not_unhalt_while_another_effect_is_uncertain():
 
 # --- 2. idempotency-key scope is per-run, and mismatches are loud -------------
 
+def _ended_author(s, run_id, actor="claude"):
+    """Dispatch a fresh author generation and give it a satisfied session
+    whose turn has already ended -- the precondition submit_spec now requires
+    (Task 10). These tests are about the command/journal mechanics, not the
+    turn ceremony, so it is done for them."""
+    from tests.kernel.front import Front
+    g = dispatch(s, run_id, actor=actor, role=Role.AUTHOR).generation
+    f = Front(s, run_id, existing=True)
+    sid = f._session(g, f._newest_id())
+    f._end_turn(g, sid)
+    return g
+
+
 def test_the_same_key_in_two_runs_is_not_a_replay():
     """Global scope silently returns one run's result to another run's
     command -- a misattribution of authority, not a replay."""
     s = _store("runA", "runB")
-    gA = dispatch(s, "runA", actor="a", role=Role.AUTHOR).generation
-    submit(s, Command(name="submit_spec", run_id="runA", expected_version=0,
+    gA = _ended_author(s, "runA", "a")
+    submit(s, Command(name="submit_spec", run_id="runA", expected_version=s.run_version("runA"),
                       idempotency_key="shared", generation=gA,
                       payload={"artifact_hash": put_artifact(s, b"spec A")}))
-    gB = dispatch(s, "runB", actor="b", role=Role.AUTHOR).generation
+    gB = _ended_author(s, "runB", "b")
     # submit_spec on runB: same key, same name, different run. Uses a command
     # legal from `queued` so the test exercises key scoping rather than
     # tripping the state check.
-    res = submit(s, Command(name="submit_spec", run_id="runB", expected_version=0,
+    res = submit(s, Command(name="submit_spec", run_id="runB", expected_version=s.run_version("runB"),
                             idempotency_key="shared", generation=gB,
                             payload={"artifact_hash": put_artifact(s, b"spec B")}))
     assert not res.replayed, "runB's command was answered with runA's result"
@@ -93,12 +106,12 @@ def test_the_same_key_in_two_runs_is_not_a_replay():
 
 def test_reusing_a_key_for_a_different_command_in_one_run_is_refused():
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
-    submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
+    g = _ended_author(s, "r", "a")
+    submit(s, Command(name="submit_spec", run_id="r", expected_version=s.run_version("r"),
                       idempotency_key="k", generation=g,
                       payload={"artifact_hash": put_artifact(s, b"spec")}))
     with pytest.raises(ValueError, match="idempotency"):
-        submit(s, Command(name="submit_plan", run_id="r", expected_version=1,
+        submit(s, Command(name="submit_plan", run_id="r", expected_version=s.run_version("r"),
                           idempotency_key="k", generation=g, payload={}))
 
 
@@ -133,7 +146,7 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
     import kernel.commands as commands
 
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
+    g = _ended_author(s, "r", "a")
     spec = put_artifact(s, b"spec")
     v_before = s.run_version("r")
 
@@ -153,7 +166,11 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
         "the version advanced despite the command failing; a retry will now "
         "get StaleVersion for a command that was never recorded"
     )
-    assert not [f for f in s.facts_for("r") if f.kind == "command_accepted"], (
+    # Excludes the ceremony's own record_turn_ended, which legitimately
+    # accepted before record_command was patched to crash; what must not
+    # exist is a fact for the submit_spec that crashed.
+    assert not [f for f in s.facts_for("r")
+                if f.kind == "command_accepted" and f.payload.get("command_name") == "submit_spec"], (
         "a COMMAND_ACCEPTED fact survived a failed submit"
     )
 
@@ -161,7 +178,7 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
 def test_a_retry_after_a_crashed_submit_succeeds():
     """The point of the transaction: the retry must be able to succeed."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
+    g = _ended_author(s, "r", "a")
     spec = put_artifact(s, b"spec")
     v = s.run_version("r")
     real_record = s.record_command
@@ -183,8 +200,8 @@ def test_command_requested_is_recorded():
     Recording only outcomes means the audit cannot distinguish no retry from
     forty retries."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
-    submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
+    g = _ended_author(s, "r", "a")
+    submit(s, Command(name="submit_spec", run_id="r", expected_version=s.run_version("r"),
                       idempotency_key="k", generation=g,
                       payload={"artifact_hash": put_artifact(s, b"spec")}))
     kinds = [f.kind for f in s.facts_for("r")]
@@ -196,8 +213,8 @@ def test_a_replayed_command_still_records_the_request():
     """A replay mutates nothing, but a fact is an observation, not a mutation:
     without it the audit cannot see the retry happened at all."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
-    c = Command(name="submit_spec", run_id="r", expected_version=0,
+    g = _ended_author(s, "r", "a")
+    c = Command(name="submit_spec", run_id="r", expected_version=s.run_version("r"),
                 idempotency_key="k", generation=g,
                 payload={"artifact_hash": put_artifact(s, b"spec")})
     submit(s, c)
@@ -213,13 +230,16 @@ def test_a_payload_key_cannot_shadow_the_command_name():
     """Splatting the payload alongside the command's own keys let a payload
     field silently overwrite the recorded command name."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
+    g = _ended_author(s, "r", "a")
     submit(s, Command(
-        name="submit_spec", run_id="r", expected_version=0, idempotency_key="k",
+        name="submit_spec", run_id="r", expected_version=s.run_version("r"), idempotency_key="k",
         generation=g, payload={"command_name": "request_merge", "generation": 999,
                                "artifact_hash": put_artifact(s, b"spec")},
     ))
-    fact = [f for f in s.facts_for("r") if f.kind == "command_accepted"][0]
+    # [-1], not [0]: the turn-ceremony (Task 10) accepts its own commands
+    # first, so the FIRST command_accepted fact is record_turn_ended's, not
+    # this submit_spec's.
+    fact = [f for f in s.facts_for("r") if f.kind == "command_accepted"][-1]
     assert fact.payload["command_name"] == "submit_spec", (
         f"payload shadowed the command name: {fact.payload}"
     )

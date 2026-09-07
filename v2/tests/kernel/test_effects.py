@@ -159,11 +159,19 @@ def test_the_halt_records_the_evidence_an_operator_needs(store):
 def test_unrelated_runs_continue(store):
     """Only the affected run halts. The wedge is per-run because an
     unconfirmed attempt holds that run's resources and nothing else."""
+    from tests.kernel.front import Front
+
     _fail(store)
     assert not is_halted(store, "other")
     gen = dispatch(store, "other", actor="claude", role=Role.AUTHOR).generation
+    # submit_spec now waits for its round's turn to have ended (Task 10);
+    # this test is about the halt being per-run, not the turn ceremony, so
+    # the ceremony is done for it.
+    f = Front(store, "other", existing=True)
+    sid = f._session(gen, f._newest_id())
+    f._end_turn(gen, sid)
     assert submit(store, Command(
-        name="submit_spec", run_id="other", expected_version=0,
+        name="submit_spec", run_id="other", expected_version=store.run_version("other"),
         idempotency_key="ok", generation=gen,
         payload={"artifact_hash": put_artifact(store, b"spec")},
     )).accepted

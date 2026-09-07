@@ -26,10 +26,22 @@ def _gen(db, actor, role):
     return dispatch(s, "r", actor=actor, role=role).generation
 
 
+def _end_the_turn(db, generation):
+    """Give *generation* a satisfied session whose turn has already ended --
+    the precondition submit_spec now requires (Task 10). These CLI tests are
+    about the command subcommand's plumbing, not the turn ceremony."""
+    from tests.kernel.front import Front
+    s = Store.open(db, clock=Clock(start_us=1))
+    f = Front(s, "r", existing=True)
+    sid = f._session(generation, f._newest_id())
+    f._end_turn(generation, sid)
+
+
 def test_a_command_is_accepted(db, capsys):
     s = Store.open(db, clock=Clock(start_us=1))
     spec = put_artifact(s, b"# spec")
     g = _gen(db, "claude", Role.AUTHOR)
+    _end_the_turn(db, g)
     rc = main(["command", "--db", db, "--run-id", "r", "--generation", str(g),
                "--name", "submit_spec",
                "--payload-json", json.dumps({"artifact_hash": spec})])
@@ -87,6 +99,7 @@ def test_the_idempotency_key_defaults_to_run_name_generation(db):
     s = Store.open(db, clock=Clock(start_us=1))
     spec = put_artifact(s, b"# spec")
     g = _gen(db, "claude", Role.AUTHOR)
+    _end_the_turn(db, g)
     args = ["command", "--db", db, "--run-id", "r", "--generation", str(g),
             "--name", "submit_spec", "--payload-json", json.dumps({"artifact_hash": spec})]
     assert main(args) == 0

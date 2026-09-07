@@ -95,9 +95,16 @@ def test_reconcile_is_atomic(monkeypatch):
 def test_reusing_a_key_for_the_same_command_with_a_different_payload_is_refused():
     """Replay compared only the stored name, so the same command with a
     DIFFERENT payload was answered with the first result."""
+    from tests.kernel.front import Front
+
     s = _store()
     g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
-    submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
+    # submit_spec now waits for its round's turn to have ended (Task 10);
+    # this test is about idempotency-key/payload identity, not the ceremony.
+    f = Front(s, "r", existing=True)
+    sid = f._session(g, f._newest_id())
+    f._end_turn(g, sid)
+    submit(s, Command(name="submit_spec", run_id="r", expected_version=s.run_version("r"),
                       idempotency_key="k", generation=g,
                       payload={"artifact_hash": put_artifact(s, b"A")}))
     with pytest.raises(ValueError, match="idempotency"):

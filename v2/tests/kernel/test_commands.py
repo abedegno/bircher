@@ -28,6 +28,21 @@ def _cmd(store, name="submit_spec", version=0, key="k1", generation=None, **payl
     )
 
 
+def _ended_author(store, run_id: str = "r") -> int:
+    """Dispatch a fresh author generation and give it a satisfied session
+    whose turn has already ended -- the precondition submit_spec now requires
+    (Task 10). These tests are about the command envelope (CAS, idempotency,
+    atomicity), not the turn ceremony, so they get the ceremony done for them
+    rather than each writing its own sess-create/sess-prompt/turn_ended/
+    sess-stop."""
+    from tests.kernel.front import Front
+    g = dispatch(store, run_id, actor="claude", role=Role.AUTHOR).generation
+    f = Front(store, run_id, existing=True)
+    sid = f._session(g, f._newest_id())
+    f._end_turn(g, sid)
+    return g
+
+
 def test_the_command_interface_is_closed_and_explicit():
     """A narrow interface, not a general one. Growth here is a design change
     to be argued, not absorbed.
@@ -60,6 +75,11 @@ def test_the_command_interface_is_closed_and_explicit():
         # coordinator performs; park records why a pass stopped without a
         # transition, which v1 could express only as the absence of anything.
         "record_turn_ended", "park",
+        # The author's report that a turn produced nothing (spec §2
+        # Commands, spec §3): a fact the RC_FAILED escalation can be
+        # driven from, rather than the coordinator inferring emptiness
+        # from the absence of a submit.
+        "record_author_empty",
         # The human's four (spec §2 Commands), reachable only through
         # execute_as_human. record_review is the human's fifth command, and
         # is already listed above -- reachable through both submit and
@@ -76,7 +96,9 @@ def test_the_command_interface_is_closed_and_explicit():
 
 
 def test_command_at_the_current_version_is_accepted(store):
-    assert submit(store, _cmd(store)).accepted
+    g = _ended_author(store)
+    v = store.run_version("r")
+    assert submit(store, _cmd(store, generation=g, version=v)).accepted
 
 
 def test_command_derived_from_an_older_version_is_refused(store):
@@ -89,19 +111,22 @@ def test_command_derived_from_an_older_version_is_refused(store):
     before the transaction the CAS lives in, so the test would pass for the
     wrong reason.
     """
-    submit(store, _cmd(store, key="k1"))
+    g = _ended_author(store)
+    submit(store, _cmd(store, generation=g, key="k1", version=store.run_version("r")))
     with pytest.raises(StaleVersion):
         submit(store, _cmd(store, name="park", version=0, key="k2", reason="gate"))
 
 
 def test_replaying_an_idempotency_key_returns_the_first_result(store):
-    a = submit(store, _cmd(store, key="same"))
+    g = _ended_author(store)
+    a = submit(store, _cmd(store, generation=g, key="same", version=store.run_version("r")))
     b = submit(store, _cmd(store, key="same"))
     assert a.result == b.result and b.replayed is True
 
 
 def test_replay_does_not_advance_the_version(store):
-    submit(store, _cmd(store, key="same"))
+    g = _ended_author(store)
+    submit(store, _cmd(store, generation=g, key="same", version=store.run_version("r")))
     v = store.run_version("r")
     submit(store, _cmd(store, key="same"))
     assert store.run_version("r") == v, "a replayed command mutated state"
@@ -120,7 +145,8 @@ def test_command_from_a_superseded_generation_is_refused(store):
 
 
 def test_a_rejected_command_records_a_fact(store):
-    submit(store, _cmd(store, key="k1"))
+    g = _ended_author(store)
+    submit(store, _cmd(store, generation=g, key="k1", version=store.run_version("r")))
     with pytest.raises(StaleVersion):
         submit(store, _cmd(store, name="park", version=0, key="k2", reason="gate"))
     assert "command_rejected" in [f.kind for f in store.facts_for("r")]

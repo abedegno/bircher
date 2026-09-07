@@ -172,9 +172,10 @@ def test_every_command_declares_its_legal_states():
             # Records what the implementation produced; the run stays in
             # `implementing` until a review moves it.
             "record_implementation_output",
-            # The front half's two observations: the end of a turn and the
-            # reason a pass stopped. Neither moves the run.
-            "record_turn_ended", "park",
+            # The front half's three observations: the end of a turn, the
+            # reason a pass stopped, and an author's report of an empty turn.
+            # None moves the run.
+            "record_turn_ended", "park", "record_author_empty",
             # The human's four. record_human_answer and record_human_direction
             # observe without transitioning, like record_turn_ended and park.
             # approve_artifact's destination depends on which phase's artefact

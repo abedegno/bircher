@@ -150,12 +150,12 @@ def test_the_residuals_are_the_ones_we_know_about():
         # rather than by any object the kernel holds.
         "cmd.payload['reason']",
         "cmd.payload['cursor_item_id']",
-        # Shape-checked, not bound: a non-empty string for the turn's session,
-        # a string-or-null for the park's session and reviewer. Task 10 binds
-        # the two session names to the newest satisfied sess-create/sess-prompt
-        # and Task 12 binds the reviewer to the seat's vendor; until then the
-        # kernel takes the caller's word for all three.
-        "cmd.payload['session']",
+        # The park's session and reviewer: the coordinator's own reading of a
+        # listing, shape-checked (string or null) and bound by the §8 cursor
+        # invariant and the §8 proof, never by a kernel object. Permanent --
+        # unlike the turn's own `session` (Task 10 bound that one to the
+        # newest satisfied sess-create/sess-prompt; it is observed now, not
+        # asserted, and does not appear in this set).
         "cmd.payload['session_id']",
         "cmd.payload['reviewer']",
         # The human's words: what a human answer says, what a human

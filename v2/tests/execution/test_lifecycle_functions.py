@@ -360,6 +360,15 @@ def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
     gen = r.stdout.strip().strip("[]")
     assert gen == "1", (r.stdout, r.stderr)
 
+    # submit_spec now waits for its round's turn to have ended (Task 10);
+    # this test is about run_item reusing one PUT for both submits, not the
+    # ceremony, so it is done directly against the same database.
+    from tests.kernel.front import Front
+    store = Store.open(db)
+    f = Front(store, run_id, existing=True)
+    sid = f._session(int(gen), f._newest_id())
+    f._end_turn(int(gen), sid)
+
     prompt = "do the thing"
     r = _run(
         f"h=$(_kernel_put_artifact {prompt!r}); "
@@ -376,7 +385,11 @@ def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
     accepted = {
         f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
     }
-    assert accepted == {"submit_spec"}, accepted
+    # record_turn_ended is the ceremony this test's own setup performed
+    # (Task 10's precondition for submit_spec); submit_plan is refused (the
+    # state check, not accepted), so submit_spec is the only lifecycle
+    # command this run actually accepted.
+    assert accepted == {"record_turn_ended", "submit_spec"}, accepted
     assert store.phase_artifact(run_id, "spec") == expected_hash, (
         "the hash the function was given did not become the spec phase's "
         "current artefact"

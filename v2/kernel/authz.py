@@ -58,6 +58,16 @@ PARK_REASONS = frozenset({
 #: spec §3 *The turn's end is a fact*: the four ways a turn ends.
 TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
 
+#: spec §2 Refusals: every output-recording command is refused until the
+#: round's session carries a turn_ended newer than its newest satisfied
+#: sess-prompt, and that turn's sess-stop is satisfied. `record_review` under
+#: a review_ruling joins this set too, checked separately in authorize()
+#: because its role is REVIEWER rather than AUTHOR.
+OUTPUT_COMMANDS = frozenset({
+    "submit_spec", "submit_plan", "record_author_empty",
+    "record_model_question", "record_model_ruling",
+})
+
 #: Every non-terminal state. `record_run_outcome` and `cancel_run` are legal
 #: from all of them, so listing them by hand meant each new front-half state
 #: had to be remembered in two more places.
@@ -122,6 +132,11 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # moves in it.
     "record_model_question": (FRONT_HALF_STATES, None),
     "record_model_ruling": (FRONT_HALF_STATES, None),
+    # The author's report that a turn produced nothing (spec §2 Commands):
+    # only `queued` and `specified`, the two states an author round can start
+    # from. Does not transition -- the RC_FAILED escalation is the
+    # coordinator's, not a kernel move.
+    "record_author_empty": (frozenset({"queued", "specified"}), None),
     # The coordinator's dismissal of a refused human token (spec §2 Commands):
     # every front-half state, any role. Does not transition -- it is a reply
     # to a rejection, not a move.
@@ -521,10 +536,43 @@ def _check_submit(store, cmd, state: str) -> None:
             raise NotAuthorized("the plan is the run's current spec: a plan is a different artefact")
         if b"### Task" not in store.read_blob(h):
             raise NotAuthorized("plan has no tasks: no `### Task` heading (a shape check)")
+    # spec §2 Refusals: a human_direction newer than this generation's own
+    # dispatch means a human interrupted the turn this submission is the
+    # output of. The artefact of the turn it interrupted is not this run's to
+    # submit; the direction starts a fresh round instead.
+    newer = front.direction_after(store, cmd.run_id, front.dispatch_seq(store, cmd.run_id, cmd.generation))
+    if newer is not None:
+        raise NotAuthorized(
+            f"a human_direction (seq {newer.seq}) is newer than generation "
+            f"{cmd.generation}'s dispatch: the artefact of the turn it interrupted is not "
+            "submitted; the direction starts a fresh round"
+        )
 
 
 def _non_empty_str(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _check_turn_ended(store, cmd, state: str) -> None:
+    """spec §3 *The turn's end is a fact*: names the session the phase and
+    epoch's newest satisfied sess-prompt names (ruling 15: the PHASE's
+    newest, not the session's own -- record_turn_ended is how the kernel
+    learns which session is even the round's), and refuses a second end for
+    the same turn."""
+    from kernel import front
+    if cmd.payload.get("ended") not in TURN_ENDS:
+        raise NotAuthorized(f"ended {cmd.payload.get('ended')!r} is not one of {sorted(TURN_ENDS)}")
+    sid = cmd.payload.get("session")
+    if not isinstance(sid, str) or not sid:
+        raise NotAuthorized("record_turn_ended names the session whose turn ended")
+    prompt = front.newest_prompt(store, cmd.run_id, phase_of(state), front.epoch(store, cmd.run_id))
+    if prompt is None or prompt["session_id"] != sid:
+        raise NotAuthorized(
+            f"record_turn_ended names {sid}, which is not the session the newest satisfied "
+            "sess-prompt of this phase and epoch names: one turn is awaited at a time"
+        )
+    if front.turn_ended_for(store, cmd.run_id, prompt["key"]) is not None:
+        raise NotAuthorized(f"session {sid}'s awaited turn already ended: one end per turn")
 
 
 def _check_park(store, cmd) -> None:
@@ -532,13 +580,54 @@ def _check_park(store, cmd) -> None:
     of the six the loop has, not free text the coordinator invents."""
     if cmd.payload.get("reason") not in PARK_REASONS:
         raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
-    for key in ("session_id", "cursor_item_id", "reviewer"):
-        if cmd.payload.get(key) is not None and not isinstance(cmd.payload.get(key), str):
-            raise NotAuthorized(f"park {key} must be a string or null")
+    # Three literal `.get(...)` reads, not a loop over a variable key: the
+    # provenance extractor matches `cmd.payload.get("literal")` syntactically,
+    # and a dynamic key defeats it -- these three rows would then be unbound
+    # to the source that actually reads them.
+    if cmd.payload.get("session_id") is not None and not isinstance(cmd.payload.get("session_id"), str):
+        raise NotAuthorized("park session_id must be a string or null")
+    if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
+        raise NotAuthorized("park cursor_item_id must be a string or null")
+    if cmd.payload.get("reviewer") is not None and not isinstance(cmd.payload.get("reviewer"), str):
+        raise NotAuthorized("park reviewer must be a string or null")
     if cmd.payload.get("findings_hash") is not None and not store.has_artifact(cmd.payload.get("findings_hash")):
         raise NotAuthorized("park findings_hash names an artefact the kernel does not hold")
     if cmd.payload.get("verdict") not in (None, "accept", "request_revision"):
         raise NotAuthorized("park verdict must be null, accept or request_revision")
+
+
+def _require_turn_recorded(store, cmd, role: str) -> None:
+    """spec §2 Refusals, the output-recording commands: the round's session
+    carries a turn_ended newer than its newest satisfied sess-prompt, and
+    the sess-stop that turn_ended is the cause of is satisfied."""
+    from kernel import front
+    state = store.run_state(cmd.run_id)
+    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
+    seat = front.newest_seat(store, cmd.run_id, role, phase, epoch_n)
+    if seat is None:
+        raise NotAuthorized(
+            f"{cmd.name}: no satisfied sess-create under a {role} generation of "
+            f"{phase} in epoch {epoch_n}: there is no round's session to have ended"
+        )
+    sid = seat["session"]["id"]
+    prompt = front.newest_prompt_of(store, cmd.run_id, sid, phase, epoch_n)
+    if prompt is None:
+        raise NotAuthorized(
+            f"{cmd.name}: the round's session {sid} has no satisfied sess-prompt in "
+            f"{phase}/{epoch_n}: no turn was awaited"
+        )
+    ended = front.turn_ended_for(store, cmd.run_id, prompt["key"])
+    if ended is None:
+        raise NotAuthorized(
+            f"{cmd.name}: session {sid} carries no turn_ended newer than its newest "
+            "satisfied sess-prompt: nothing a turn produced is recorded before the "
+            "turn is observed ended"
+        )
+    if not front.stop_satisfied_for(store, cmd.run_id, ended.id):
+        raise NotAuthorized(
+            f"{cmd.name}: the sess-stop caused by turn_ended {ended.id} is not "
+            "satisfied: the session is stopped before its output is read"
+        )
 
 
 def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str | None:
@@ -569,6 +658,16 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             f"{cmd.name} is not legal from state {current!r}; "
             f"legal from {sorted(allowed)}"
         )
+
+    # spec §2 Refusals: every output-recording command waits for the round's
+    # session to have ended its turn and for that turn's stop to be
+    # satisfied. record_review joins this only under a review_ruling and only
+    # in the front half -- the back half's record_review runs the PR review
+    # through `omnigent run`, not a session.
+    if cmd.name in OUTPUT_COMMANDS:
+        _require_turn_recorded(store, cmd, Role.AUTHOR)
+    if cmd.name == "record_review" and ruling == "review_ruling" and current in FRONT_HALF_STATES:
+        _require_turn_recorded(store, cmd, Role.REVIEWER)
 
     if cmd.name in ("record_model_question", "record_model_ruling"):
         from kernel import front
@@ -679,12 +778,26 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         return _review_destination(store, cmd.run_id, current, verdict, ruling)
 
     if cmd.name == "record_turn_ended":
-        if cmd.payload.get("ended") not in TURN_ENDS:
+        _check_turn_ended(store, cmd, current)
+        return None
+
+    if cmd.name == "record_author_empty":
+        from kernel import front
+        if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
+            raise NotAuthorized("record_author_empty must come from an attempt dispatched in the author role")
+        sid = cmd.payload.get("session")
+        seat = front.newest_seat(store, cmd.run_id, Role.AUTHOR, phase_of(current), front.epoch(store, cmd.run_id))
+        if seat is None or seat["session"]["id"] != sid:
             raise NotAuthorized(
-                f"ended {cmd.payload.get('ended')!r} is not one of {sorted(TURN_ENDS)}"
+                f"record_author_empty names {sid!r}, which is not the session the newest "
+                "satisfied author sess-create of this phase and epoch delivered"
             )
-        if not isinstance(cmd.payload.get("session"), str) or not cmd.payload["session"]:
-            raise NotAuthorized("record_turn_ended names the session whose turn ended")
+        cause = seat["cause"]
+        if any(f.id == cause for f in store.facts_of_kind(cmd.run_id, EventKind.AUTHOR_EMPTY)):
+            raise NotAuthorized(
+                f"session {sid} is itself the retry (its create's cause is an author_empty): "
+                "a second empty turn is RC_FAILED, not a third session"
+            )
         return None
 
     if cmd.name == "park":

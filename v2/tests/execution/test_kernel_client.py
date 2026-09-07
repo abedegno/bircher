@@ -211,6 +211,8 @@ def test_a_real_call_creates_a_run_and_records_a_fact(tmp_path):
     client that always fails is still fully "advisory" by every test above,
     and would ship a recorder that never records anything.
     """
+    from tests.kernel.front import Front
+
     db = tmp_path / "kernel.db"
     store = Store.open(db)
     store.create_run(run_id="r-live", base_repo="abedegno/muesli", base_sha="deadbeef")
@@ -220,6 +222,12 @@ def test_a_real_call_creates_a_run_and_records_a_fact(tmp_path):
     d = dispatch(store, "r-live", actor="claude", role="author")
     assert d.generation == 1
     spec = put_artifact(store, b"# spec")
+    # submit_spec now waits for its round's turn to have ended (Task 10);
+    # this test is about the shell client reaching the kernel, not the
+    # ceremony, so it is done directly against the same database.
+    f = Front(store, "r-live", existing=True)
+    sid = f._session(d.generation, f._newest_id())
+    f._end_turn(d.generation, sid)
 
     r = _run(
         '_kernel command --run-id r-live --generation 1 --name submit_spec '

@@ -80,6 +80,10 @@ COMMAND_NAMES = frozenset({
     # journal; `park` records why a pass stopped without a transition, which
     # v1 expressed only as the absence of anything.
     "record_turn_ended", "park",
+    # The author's report that a turn produced nothing (spec §2 Commands,
+    # spec §3): a fact the RC_FAILED escalation can be driven from, rather
+    # than the coordinator inferring emptiness from the absence of a submit.
+    "record_author_empty",
     # The human's commands (spec §2 Commands), reachable only through
     # `execute_as_human`.
     "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
@@ -166,6 +170,13 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             payload={"session": cmd.payload["session"], "ended": cmd.payload["ended"],
                      "phase": phase, "epoch": epoch_n, "generation": cmd.generation,
                      "prompt_key": None if prompt is None else prompt["key"]},
+        )
+    elif cmd.name == "record_author_empty":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.AUTHOR_EMPTY, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"session": cmd.payload["session"], "phase": phase,
+                     "epoch": epoch_n, "generation": cmd.generation},
         )
     elif cmd.name == "park":
         p = cmd.payload
