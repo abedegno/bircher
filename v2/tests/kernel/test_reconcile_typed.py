@@ -83,6 +83,24 @@ def test_reconcile_title_distinguishes_same_tuple(run, tmp_path):
     assert not is_halted(s, "r-1")
 
 
+def test_reconcile_title_must_equal_the_key_not_only_the_body(run, tmp_path):
+    """The coordinator bug the three-way check exists for: a create's own -d
+    body disagrees with the key it was journalled under. A snapshot that only
+    agrees with the (wrong) body -- title == body.title -- must still be
+    refused, because it does not name the key being reconciled."""
+    s, gen = run
+    body = _body(tmp_path, title="sess-create:r-1:999")
+    key = f"sess-create:r-1:{gen}"
+    assert body["title"] != key
+    _uncertain(s, gen, key, _create_intent(body))
+    snap = _snap(body)
+    assert snap["title"] == body["title"] != key
+    with pytest.raises(ValueError, match="title"):
+        reconcile_typed(s, "r-1", [Resolution(key, True, json.dumps(snap))], s.run_version("r-1"))
+    assert s.effect_by_key(key, run_id="r-1")["state"] == "uncertain"
+    assert is_halted(s, "r-1")
+
+
 def test_reconcile_host_id_prefix_both_ways(run, tmp_path):
     s, gen = run
     for i, (req, got) in enumerate([("host_h1", "h1"), ("h1", "host_h1"),
