@@ -796,54 +796,241 @@ def test_the_sweep_skips_an_adopt_that_yielded_no_generation(tmp_path):
 
 _RECOVER_STUBS = '''
 _kernel_find_run() {{ printf '%s' "${{T_FIND_RUN:-}}"; }}
-_kernel_pending()  {{ printf '%s' "${{T_PENDING:-}}"; }}
-_kernel_adopt_run() {{ printf 'ADOPTED\\n' >> "{log}"; BIRCHER_RUN_ID=r-1; BIRCHER_GENERATION="${{T_GEN:-}}"; export BIRCHER_RUN_ID BIRCHER_GENERATION; }}
+# The answer CHANGES across the pass: halted before the reconcile, whatever
+# T_PENDING_AFTER says once it has run. Calls 1 and 2 are the pre-adopt read
+# and the read the halt branch works from; call 3 is the read-back that decides
+# whether the run is clear.
+_kernel_pending() {{
+  local n; n=$(cat "{pendcount}"); n=$((n+1)); printf '%s' "$n" > "{pendcount}"
+  if [ "$n" -le 2 ]; then printf '%s' "${{T_PENDING:-}}"
+  else printf '%s' "${{T_PENDING_AFTER:-${{T_PENDING:-}}}}"; fi
+}}
+_kernel_reconcile() {{ printf 'RECONCILE version=%s keys=%s\\n' "$3" "${{*:4}}" >> "{log}"; }}
+# The REVIEWER re-dispatch inside the drive is a knob of its own: a kernel that
+# goes away mid-recovery answers it with nothing, and that is the only way the
+# merge is reached with no generation after the pre-derivation guard passed.
+_kernel_dispatch() {{
+  printf 'DISPATCH %s %s\\n' "$1" "$2" >> "{log}"
+  if [ "$2" = reviewer ]; then printf '%s' "${{T_REVIEWER_GEN-7}}"
+  else printf '%s' "${{T_REDISPATCH_GEN:-7}}"; fi
+}}
+# Faithful to the real one: it ALWAYS exports the generation, and the value is
+# empty when the dispatch was refused over unresolved effects.
+_kernel_adopt_run() {{ printf 'ADOPTED\\n' >> "{log}"; BIRCHER_RUN_ID=rdemo-run-1; BIRCHER_RUN_BASE=ab; BIRCHER_GENERATION="${{T_GEN:-}}"; export BIRCHER_RUN_ID BIRCHER_RUN_BASE BIRCHER_GENERATION; }}
 _net_run() {{ shift; "$@"; }}
 _effect()  {{ printf 'EFFECT %s\\n' "$2" >> "{log}"; }}
-observe_outcome() {{ printf 'OBSERVED\\n' >> "{log}"; printf ''; }}
-gh() {{ exit 0; }}
+observe_outcome() {{ printf 'OBSERVED\\n' >> "{log}"; printf '%s' "${{T_TUPLE:-}}"; }}
+merge_ready_pr() {{ printf 'MERGE %s\\n' "$2" >> "{log}"; return 0; }}
+# Answers only what this path asks it: the merge-state probe that decides
+# whether a BEHIND branch needs update-branch. Everything else is a read whose
+# empty answer the caller already handles.
+gh() {{
+  case " $* " in
+    *" mergeStateStatus "*) printf '%s' "${{T_MSS:-}}" ;;
+  esac
+  exit 0
+}}
 _install_work_git_config() {{ :; }}
+# The lifecycle drive, stubbed: this file is about the GUARDS around it. What
+# each of these records has its own suite (test_lifecycle_functions.py).
+_recovery_action() {{ printf ''; }}
+_recovery_forbids_merge() {{ return 1; }}
+_kernel_record_output() {{ printf '%s' "{outhash}"; }}
+_kernel_put_artifact()  {{ printf '%s' "{ctx_hash}"; }}
+_kernel_record_ci()     {{ :; }}
+_kernel_record_review() {{ :; }}
+_kernel_request_merge() {{ :; }}
+_issue_writeback()      {{ printf 'WRITEBACK\\n' >> "{log}"; }}
 '''
 
+#: A halt whose one unresolved effect IS the merge of the PR the command was
+#: invoked with -- the case `--recover-pr` exists for.
+_HALTED_ON_THIS_PR = {
+    "halted": True, "version": 4, "state": "merge_requested",
+    "pending": [{"effect_class": "merge", "idempotency_key": "merge:9:deadbeef"}],
+}
+#: A halt this observation says NOTHING about: a different class, a different
+#: PR. Reconciling it from "did PR #9 merge?" would be an observation about one
+#: thing presented as an observation about another.
+_HALTED_ON_SOMETHING_ELSE = {
+    "halted": True, "version": 4, "state": "reviewing",
+    "pending": [{"effect_class": "status_check", "idempotency_key": "status:abc"}],
+}
+_CLEAR = {"halted": False, "version": 5, "state": "reviewing", "pending": []}
 
-def _recover(tmp_path, *, pending, gen=""):
+
+#: What `observe_outcome` returns on the paths that get as far as the merge:
+#: outcome|review|note|head|ci|ci_first|resubmissions|settled_pr.
+READY_TUPLE = f"ready|codex:pass|derived from the repository|{HEAD_SHA}|green|true|1|9"
+
+
+def _recover(tmp_path, *, pending, after=None, gen="", extra_env=None):
     log = tmp_path / "log"
+    pendcount = tmp_path / "pendcount"
+    pendcount.write_text("0")
     src_lines = RUN_QUEUE.read_text().splitlines()
     script = tmp_path / "recover.sh"
     script.write_text(
         _PREAMBLE
-        + _extract_function(src_lines, "_pending_blocks") + "\n\n"
-        + _extract_function(src_lines, "recover_pr_cmd") + "\n")
+        + "\n\n".join(_extract_function(src_lines, n) for n in
+                       ("_pending_blocks", "_derived_width_ok", "recover_pr_cmd"))
+        + "\n")
     stubs = tmp_path / "stubs.sh"
-    stubs.write_text(_RECOVER_STUBS.format(log=log))
+    stubs.write_text(_RECOVER_STUBS.format(log=log, pendcount=pendcount,
+                                           outhash=OUT_HASH, ctx_hash=CTX_HASH))
     body = f'. "{script}"\n. "{stubs}"\nrecover_pr_cmd rdemo 9 codex\necho "RC=$?"\n'
-    r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env={
+    env = {
         "PATH": "/usr/bin:/bin",
         "WORKDIR": str(tmp_path), "BIRCHER_BUNDLE_DIR": str(REPO_ROOT),
         "QUEUE": str(tmp_path / "queue"), "SCORECARD": str(tmp_path / "sc.jsonl"),
         "DEFERRED_READY_FILE": str(tmp_path / "d.tsv"),
         "BIRCHER_NOOP_DIR": str(tmp_path / "noop"),
-        "T_FIND_RUN": "rdemo-run-1", "T_PENDING": json.dumps(pending), "T_GEN": gen,
-    })
+        "T_FIND_RUN": "rdemo-run-1", "T_GEN": gen,
+        # A str goes through verbatim: `_kernel_pending` answering the EMPTY
+        # STRING is what an unreachable kernel looks like, and `json.dumps("")`
+        # would send the two-character string `""` instead.
+        "T_PENDING": pending if isinstance(pending, str) else json.dumps(pending),
+    }
+    if after is not None:
+        env["T_PENDING_AFTER"] = json.dumps(after)
+    env.update(extra_env or {})
+    r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
     return r, (log.read_text() if log.exists() else "")
 
 
-def test_recover_pr_asks_before_adopting_and_refuses_a_blocked_run(tmp_path):
-    r, log = _recover(tmp_path, pending={"halted": False,
-                                         "pending": [{"idempotency_key": "merge:9:x"}]})
-    assert "RC=1" in r.stdout, (r.stdout, r.stderr)
-    assert "ADOPTED" not in log, log
-    assert "EFFECT" not in log, log
-    assert "halted or holds pending effects" in r.stderr, r.stderr
+def test_recover_pr_reconciles_a_halted_run_instead_of_skipping_it(tmp_path):
+    """`--recover-pr` EXISTS to unstick a halted run, so the halt cannot be a
+    reason to refuse. The adopt comes back with no generation -- a dispatch over
+    an unresolved effect is refused -- and everything between there and the
+    reconcile is advisory and carries no generation, so the reconciliation
+    still happens. Once the kernel reports the run clear, the attempt the adopt
+    could not fence is taken and the pass goes on.
+
+    NO EFFECT IS ATTEMPTED BEFORE THE RECONCILE, and that is the half a log
+    line cannot show: a routed `_effect` under an empty generation aborts the
+    shell on `${BIRCHER_GENERATION:?}`, silently, inside a redirect.
+    """
+    r, log = _recover(tmp_path, pending=_HALTED_ON_THIS_PR, after=_CLEAR)
+    lines = log.splitlines()
+    assert "ADOPTED" in lines, log
+    assert any(l.startswith("RECONCILE") for l in lines), log
+    reconcile_at = next(i for i, l in enumerate(lines) if l.startswith("RECONCILE"))
+    effects = [i for i, l in enumerate(lines) if l.startswith("EFFECT")]
+    assert not [i for i in effects if i < reconcile_at], log
+    # It reconciled the key that names THIS PR, at the version it observed.
+    assert "version=4" in lines[reconcile_at], log
+    assert "merge:9:deadbeef" in lines[reconcile_at], log
+    # ...then re-fenced, as implementer, and carried on into the derivation.
+    dispatch_at = next(i for i, l in enumerate(lines) if l.startswith("DISPATCH"))
+    assert dispatch_at > reconcile_at, log
+    assert lines[dispatch_at] == "DISPATCH claude_code implementer", log
+    assert "OBSERVED" in lines, ("the pass stopped at the reconcile", log)
+    assert "re-fenced generation=7" in r.stderr, r.stderr
 
 
-def test_recover_pr_refuses_an_adopt_that_yielded_no_generation(tmp_path):
-    r, log = _recover(tmp_path, pending={"halted": False, "pending": []})
+def test_recover_pr_stops_without_an_effect_when_the_halt_is_not_its_to_resolve(tmp_path):
+    """A halt whose keys this observation says nothing about stays. The command
+    reports it and returns; it does not drive a lifecycle whose every effect
+    the kernel would refuse, and it performs no effect with the empty
+    generation the refused dispatch left behind."""
+    r, log = _recover(tmp_path, pending=_HALTED_ON_SOMETHING_ELSE)
     assert "RC=1" in r.stdout, (r.stdout, r.stderr)
     assert "ADOPTED" in log, log
+    assert "RECONCILE" not in log, "it reconciled a key it has no observation for"
     assert "EFFECT" not in log, log
-    assert "OBSERVED" not in log, log
-    assert "yielded no generation" in r.stderr, r.stderr
+    assert "MERGE" not in log, log
+    assert "OBSERVED" not in log, "it derived against a still-halted run"
+    assert "still halted after reconciliation" in r.stderr, r.stderr
+
+
+def test_a_halt_that_survives_reconciliation_stops_the_pass_even_WITH_a_generation(tmp_path):
+    """The branch above stops for two different reasons and only one of them is
+    the empty generation. A halt whose reconciliation record outlives its
+    pending effects lets the adopt fence an attempt perfectly well -- and every
+    effect under it is still refused, because `perform` declines everything
+    after a halt. Without this case, deleting the `return` there stayed green:
+    the pass fell through to the no-generation guard instead, which is a
+    different guard giving the right answer for the wrong reason.
+    """
+    r, log = _recover(tmp_path, pending={"halted": True, "version": 4,
+                                         "state": "reviewing", "pending": []},
+                      gen="3")
+    assert "RC=1" in r.stdout, (r.stdout, r.stderr)
+    assert "ADOPTED" in log, log
+    assert "EFFECT" not in log and "MERGE" not in log, log
+    assert "OBSERVED" not in log, "it derived against a run that is still halted"
+    assert "still halted after reconciliation" in r.stderr, r.stderr
+
+
+def test_the_update_branch_effect_is_guarded_on_the_generation(tmp_path):
+    """The FIRST routed effect on this path, and the one that runs before the
+    derivation has had a chance to refuse anything. An unreachable kernel gives
+    the adopt no generation and reports no halt to reconcile, so nothing
+    upstream stops the pass reaching it -- and `_effect` under an empty
+    generation exits the shell on `${BIRCHER_GENERATION:?}` inside a redirect
+    that swallows the reason."""
+    r, log = _recover(tmp_path, pending="", extra_env={"T_MSS": "BEHIND"})
+    assert "RC=1" in r.stdout, (r.stdout, r.stderr)
+    assert "EFFECT" not in log, log
+    assert "no generation to route the update through" in r.stderr, r.stderr
+
+
+def test_a_BEHIND_branch_IS_update_branched_when_there_is_a_generation(tmp_path):
+    """The positive half. A guard that refused unconditionally would satisfy
+    the test above and quietly stop `--recover-pr` bringing a stale PR up to
+    date, which is the only reason it probes mergeStateStatus at all."""
+    r, log = _recover(tmp_path, pending=_CLEAR, gen="3",
+                      extra_env={"T_MSS": "BEHIND", "T_TUPLE": READY_TUPLE})
+    assert "RC=0" in r.stdout, (r.stdout, r.stderr)
+    assert "EFFECT update-branch:9" in log, log
+
+
+def test_the_merge_is_guarded_on_its_OWN_generation_not_the_derivations(tmp_path):
+    """The reviewer re-dispatch sits between the guard before the derivation
+    and the merge, and it can come back empty on its own -- a kernel that went
+    away mid-recovery. Guarding the merge on the earlier check would leave the
+    one effect that cannot be undone running under no generation, which aborts
+    the shell rather than failing the call.
+    """
+    r, log = _recover(tmp_path, pending=_CLEAR, gen="3",
+                      extra_env={"T_TUPLE": READY_TUPLE, "T_REVIEWER_GEN": ""})
+    assert "RC=1" in r.stdout, (r.stdout, r.stderr)
+    assert "OBSERVED" in log, ("it never got as far as the derivation", log)
+    assert "DISPATCH codex reviewer" in log, log
+    assert "MERGE" not in log, "it merged with no generation to route it through"
+    assert "WRITEBACK" not in log, log
+    assert "no generation to route the merge through" in r.stderr, r.stderr
+
+
+def test_a_clear_run_with_a_ready_derivation_still_merges(tmp_path):
+    """The positive case the guard above must not have broken. Without it, a
+    guard that refused everything would pass every negative test in this file
+    and stop `--recover-pr` working at all."""
+    r, log = _recover(tmp_path, pending=_CLEAR, gen="3",
+                      extra_env={"T_TUPLE": READY_TUPLE})
+    assert "RC=0" in r.stdout, (r.stdout, r.stderr)
+    assert "MERGE 9" in log, log
+
+
+def test_recover_pr_says_the_run_was_ALREADY_halted_before_it_asked(tmp_path):
+    """The pre-adopt read is the only place that distinction is visible: the
+    adopt's own refused dispatch records the halt, so afterwards "it was
+    already stuck" and "asking is what stuck it" look identical."""
+    r, _ = _recover(tmp_path, pending=_HALTED_ON_THIS_PR, after=_CLEAR)
+    assert "ALREADY halted or holds unresolved effects" in r.stderr, r.stderr
+
+
+def test_recover_pr_performs_no_effect_when_it_never_gets_a_generation(tmp_path):
+    """The kernel-unreachable shape: no halt to reconcile, and still nothing to
+    bind an effect to. `_kernel_pending` answering EMPTY is what an unreachable
+    kernel looks like, so the halt branch never runs and the guards before the
+    derivation are the only thing between here and a shell that exits on
+    `${BIRCHER_GENERATION:?}` mid-command."""
+    r, log = _recover(tmp_path, pending="")
+    assert "RC=1" in r.stdout, (r.stdout, r.stderr)
+    assert "ADOPTED" in log, log
+    assert "EFFECT" not in log and "MERGE" not in log and "OBSERVED" not in log, log
+    assert "no generation to bind this recovery to" in r.stderr, r.stderr
 
 
 # --- the implementer's brief, read out of a REAL store -----------------------

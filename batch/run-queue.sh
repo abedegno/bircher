@@ -2209,30 +2209,41 @@ recover_pr_cmd() {
   # record_implementation_output, which refuses any other role. The reviewer
   # dispatch happens below, at the role change, before the verdict.
   local _rec_impl; _rec_impl=$([ "$RECOVERY_REVIEWER" = codex ] && printf claude_code || printf codex)
-  # ASK BEFORE ADOPTING. A dispatch over an intended or uncertain effect HALTS
-  # the run and raises, so the adopt below would return an empty generation --
-  # and every `_effect` on this path then aborts on `${BIRCHER_GENERATION:?}`,
-  # after the recovery has already reported which run it adopted. Worse, the
-  # refused dispatch HALTS a run that merely held an intended effect, so
-  # attempting it is itself a mutation. `_kernel_find_run` is used rather than
-  # adopt because adopt mints when it finds nothing.
+  # ASK BEFORE ADOPTING, AND SAY WHAT IT SAYS -- but do NOT skip. This command
+  # EXISTS to unstick a halted run, so a halt cannot be a reason to refuse:
+  # the reconciliation below is the whole of the point. What the read buys is
+  # the state BEFORE the adopt, which is the only place the difference between
+  # "it was already halted" and "this command's own dispatch halted it" is
+  # visible -- a dispatch over an intended or uncertain effect is refused AND
+  # records the halt, so afterwards the two look identical.
+  #
+  # `_kernel_find_run` rather than adopt, because adopt MINTS when it finds
+  # nothing: asking it would answer "is there a halted run?" by creating one.
   local _rec_run _rec_pend
   _rec_run=$(_kernel_find_run "$code")
   if [ -n "$_rec_run" ]; then
     _rec_pend=$(_kernel_pending "$_rec_run")
     if _pending_blocks "$_rec_pend"; then
-      echo "[batch:recover-pr] $code: run $_rec_run is halted or holds pending effects -> refusing to adopt it; reconcile those keys first: $_rec_pend" >&2
-      return 1
+      echo "[batch:recover-pr] $code: run $_rec_run is ALREADY halted or holds unresolved effects; the adopt below will be refused and this pass will try to reconcile them: $_rec_pend" >&2
     fi
   fi
   _kernel_adopt_run "$code" "$REPO" "$_rec_base" "$_rec_impl" implementer >/dev/null
   echo "[batch:recover-pr] $code: kernel run=${BIRCHER_RUN_ID:-<none>} generation=${BIRCHER_GENERATION:-<none>}" >&2
-  # The same guard the sweep carries: no generation means no effect may be
-  # performed, and carrying on would abort on `${BIRCHER_GENERATION:?}` inside a
-  # redirect that swallows the reason.
+  # AN EMPTY GENERATION IS TOLERATED HERE, and the tolerance is bounded.
+  #
+  # Between this line and the reconciliation below, every kernel call carries
+  # no generation at all -- `_kernel_pending` and `_kernel_reconcile` both
+  # submit without one -- and every one of them is advisory: a failure warns
+  # and returns 0. So the reconciliation runs whether or not the adopt could
+  # fence an attempt, which is what makes a halted run recoverable.
+  #
+  # What must NOT run with an empty generation is a ROUTED EFFECT: the
+  # adapter's `${BIRCHER_GENERATION:?}` exits the shell under `set -u`, taking
+  # the command with it inside a redirect that swallows the reason. Each of
+  # those sites is guarded below, and the halt branch re-fences as soon as the
+  # kernel reports the run clear.
   if [ -z "${BIRCHER_GENERATION:-}" ]; then
-    echo "[batch:recover-pr] $code: adopting ${BIRCHER_RUN_ID:-<none>} yielded no generation -> refusing to perform effects with none" >&2
-    return 1
+    echo "[batch:recover-pr] $code: adopt yielded NO generation -- the run is halted or holds unresolved effects; reconciling first, and no effect will be performed until that clears" >&2
   fi
 
   # RESOLVE A HALT FIRST. An uncertain effect halts its run and `perform`
@@ -2328,9 +2339,26 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
     # run of guaranteed refusals and a merge that cannot happen. Stop and say
     # so. An unreadable answer is not treated as "clear".
     case "$_still" in
-      clear\ *) : ;;
-      *) echo "[batch:recover-pr] $code: still halted after reconciliation -> not driving further; needs a human" >&2
-         _rp_drive=0 ;;
+      clear\ *)
+        # RE-FENCE. The dispatch the adopt could not take is takeable now, and
+        # everything below it -- the lifecycle drive and every routed effect --
+        # needs one. IMPLEMENTER, for the same reason the adopt asked for it:
+        # the first command this path issues is record_implementation_output,
+        # which refuses any other role.
+        if [ -z "${BIRCHER_GENERATION:-}" ]; then
+          BIRCHER_GENERATION=$(_kernel_dispatch "$_rec_impl" implementer)
+          export BIRCHER_GENERATION
+          echo "[batch:recover-pr] $code: reconciled -> re-fenced generation=${BIRCHER_GENERATION:-<none>}" >&2
+        fi
+        ;;
+      # RETURN, not a flag. The previous version set `_rp_drive=0` here and a
+      # `local _rp_drive=1` two hundred lines below overwrote it, so the
+      # sentence this branch prints -- "not driving further" -- described
+      # nothing: the recovery went on to update-branch, derive and merge
+      # against a run whose every effect the kernel refuses. Returning is the
+      # only form of "stop" this branch can state truthfully.
+      *) echo "[batch:recover-pr] $code: still halted after reconciliation -> performing no effect and driving nothing; needs a human" >&2
+         return 1 ;;
     esac
 
     if [ -n "${_unspoken//[[:space:]]/}" ]; then
@@ -2348,12 +2376,27 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   local mss
   mss=$(gh pr view "$pr" --repo "$REPO" --json mergeStateStatus -q '.mergeStateStatus' 2>/dev/null)
   if [ "$mss" = "BEHIND" ]; then
+    # The first ROUTED EFFECT on this path, and therefore the first place an
+    # empty generation would abort the shell rather than fail the call.
+    if [ -z "${BIRCHER_GENERATION:-}" ]; then
+      echo "[batch:recover-pr] $code: PR #$pr is BEHIND main, but there is no generation to route the update through -> performing nothing; needs a human" >&2
+      return 1
+    fi
     echo "[batch:recover-pr] $code: PR #$pr is BEHIND main -> update-branch" >&2
     _effect ref_update "update-branch:$pr" - gh api "repos/$REPO/pulls/$pr/update-branch" -X PUT >/dev/null 2>&1 \
       || echo "[batch:recover-pr] WARN $code: update-branch call failed (already updating or up to date)" >&2
   fi
   # Operator identity for the (rare) revert-worktree path inside merge_ready_pr.
   _install_work_git_config "$WORKDIR" >/dev/null 2>&1 || true
+  # The derivation performs its own routed effects (the review comment, the
+  # cross-review status) from Python, where a missing generation raises
+  # `NotDispatched` inside the subprocess and comes back as an EMPTY TUPLE --
+  # which this function then reports as "the recovery crashed". True of the
+  # subprocess, false about the cause. Stopping here says the real one.
+  if [ -z "${BIRCHER_GENERATION:-}" ]; then
+    echo "[batch:recover-pr] $code: no generation to bind this recovery to (the run is halted, or the kernel is unreachable) -> not deriving and not merging; needs a human" >&2
+    return 1
+  fi
   local rec r_outcome r_review r_note r_sha r_ci r_settled_pr
   # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
@@ -2484,6 +2527,13 @@ EOF
     if [ -z "$r_sha" ]; then
       echo "[batch:recover-pr] $code: ready but no reviewed head captured -> NOT merging; left for a human" >&2
       return 0
+    fi
+    # The reviewer re-dispatch inside the drive above can itself come back
+    # empty if the kernel went away mid-recovery, so the merge is guarded on
+    # its own rather than on the check before the derivation.
+    if [ -z "${BIRCHER_GENERATION:-}" ]; then
+      echo "[batch:recover-pr] $code: ready, but there is no generation to route the merge through -> NOT merging; left for a human" >&2
+      return 1
     fi
     merge_ready_pr "$item" "$pr" "$r_sha"; local mrc=$?
     echo "[batch:recover-pr] $code: merge_ready_pr rc=$mrc${MERGE_NOTE:+ note=\"$MERGE_NOTE\"}${MERGE_UNREVIEWED_NOTE:+ UNREVIEWED=\"$MERGE_UNREVIEWED_NOTE\"}" >&2
