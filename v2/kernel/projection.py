@@ -15,6 +15,18 @@ from dataclasses import dataclass, field
 
 from kernel.events import EventKind
 
+# A `review_verdict` carries a `phase` (Task 7): "spec", "plan" or
+# "implementation". The back-half -- the repair loop's allowance, its
+# durability check, and recovery -- must never act on a spec or plan verdict,
+# or a spec-phase FAIL would spend the implementation's revision allowance.
+FRONT_PHASES = ("spec", "plan")
+
+
+def is_front_verdict(payload: dict) -> bool:
+    """A review_verdict of the spec or plan phase. A verdict with no phase
+    was written before the front half existed and is the implementation's."""
+    return payload.get("phase") in FRONT_PHASES
+
 
 @dataclass
 class RunState:
@@ -23,6 +35,7 @@ class RunState:
     base_sha: str
     artifacts: list = field(default_factory=list)
     verdicts: list = field(default_factory=list)
+    front_verdicts: list = field(default_factory=list)
 
 
 def project(facts) -> RunState | None:
@@ -43,5 +56,8 @@ def project(facts) -> RunState | None:
         elif f.kind == EventKind.ARTIFACT_CREATED:
             st.artifacts.append(f.payload["artifact_hash"])
         elif f.kind == EventKind.REVIEW_VERDICT:
-            st.verdicts.append(f.payload)
+            if is_front_verdict(f.payload):
+                st.front_verdicts.append(f.payload)
+            else:
+                st.verdicts.append(f.payload)
     return st

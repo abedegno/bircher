@@ -21,6 +21,8 @@ import json
 import subprocess
 from dataclasses import dataclass
 
+from kernel.projection import is_front_verdict
+
 
 class GhError(Exception):
     """`gh` failed. Distinct from "gh succeeded and returned nothing"."""
@@ -107,6 +109,10 @@ def revisions_used(facts) -> int:
     From the journal and not a variable, so a coordinator that dies and is
     re-driven gets no fresh allowance.
 
+    A spec- or plan-phase verdict is skipped (`is_front_verdict`): the
+    allowance belongs to the implementation, and a spec-phase FAIL must not
+    spend it.
+
     NOTE WHAT THIS DOES NOT PROVE. `commands.py` validates a review, THEN bumps
     the version under CAS, THEN appends this fact -- so a review can validate
     and lose the CAS, leaving no fact. This counts what was ACCEPTED, which is
@@ -120,6 +126,8 @@ def revisions_used(facts) -> int:
         if kind != "review_verdict":
             continue
         payload = getattr(f, "payload", None) or {}
+        if is_front_verdict(payload):
+            continue
         if payload.get("verdict") == "request_revision":
             n += 1
     return n
@@ -139,6 +147,10 @@ def revision_confirmed(facts, key: str) -> bool:
     The fact must carry OUR command's causal id and OUR verdict. Matching on
     the verdict alone would accept a revision from a previous round, which is
     the same class of error as reading a stale findings file.
+
+    A spec- or plan-phase verdict is skipped (`is_front_verdict`): our
+    causal id belongs to the implementation's own revision, and a front-phase
+    verdict can never be the confirmation we are looking for.
     """
     if not key:
         return False
@@ -150,6 +162,8 @@ def revision_confirmed(facts, key: str) -> bool:
         if getattr(f, "causal_command_id", None) != key:
             continue
         payload = getattr(f, "payload", None) or {}
+        if is_front_verdict(payload):
+            continue
         if payload.get("verdict") == "request_revision":
             return True
     return False

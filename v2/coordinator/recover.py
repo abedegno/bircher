@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kernel.projection import is_front_verdict
+
 MERGE = "merge"
 
 
@@ -162,7 +164,11 @@ def decide(facts, *, current_binding_hash=None, merge_effect=None) -> Action:
                       "without re-issuing request_merge")
 
     # --- the review rows -----------------------------------------------------
-    verdicts = _of(facts, "review_verdict")
+    # A spec- or plan-phase verdict is not evidence about the implementation:
+    # skip it (`is_front_verdict`), or a stale spec FAIL left in the journal
+    # after spec was later revised and accepted could be read as the newest
+    # word on a review it was never about.
+    verdicts = [v for v in _of(facts, "review_verdict") if not is_front_verdict(_payload(v))]
     if not verdicts:
         # A record_review that VALIDATED and then lost the CAS leaves a
         # rejection and no verdict fact. The revision did not happen, whatever
