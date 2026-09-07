@@ -110,8 +110,16 @@ def test_a_halt_refusal_records_a_rejection_fact():
     with pytest.raises(UncertainEffect):
         perform(s, "r", gen, EffectClass.PULL_REQUEST, "eff", valid_argv(EffectClass.PULL_REQUEST),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
+    # Reuses the generation above rather than going through _sub's own
+    # dispatch: dispatch() itself now refuses while the run holds an
+    # unresolved effect (Task 6), and this test is about submit()'s halt gate,
+    # not dispatch()'s.
     with pytest.raises(RuntimeError, match="reconcil"):
-        _sub(s, "submit_spec", "k", spec_sha256=put_artifact(s, b"x"))
+        submit(s, Command(
+            name="submit_spec", run_id="r", expected_version=s.run_version("r"),
+            idempotency_key="k", generation=gen,
+            payload={"spec_sha256": put_artifact(s, b"x")},
+        ))
     rejects = [f for f in s.facts_for("r") if f.kind == "command_rejected"]
     assert any(f.payload.get("reason") == "halted" for f in rejects), (
         f"halt refusal left no rejection fact: {[f.payload for f in rejects]}"

@@ -46,7 +46,23 @@ class Role:
     IMPLEMENTER = "implementer"
     REVIEWER = "reviewer"
     OPERATOR = "operator"
-    ALL = frozenset({IMPLEMENTER, REVIEWER, OPERATOR})
+    AUTHOR = "author"
+    ALL = frozenset({IMPLEMENTER, REVIEWER, OPERATOR, AUTHOR})
+    #: The two roles the front half's seat budget counts (spec §1 max_seats).
+    SEATS = frozenset({AUTHOR, REVIEWER})
+
+
+class PendingEffects(Exception):
+    """A dispatch over an intended or uncertain effect (spec §2 Refusals:
+    'any dispatch when the run holds an intended or uncertain effect')."""
+
+    def __init__(self, keys: list[str]) -> None:
+        super().__init__(f"run holds unresolved effects: {keys}")
+        self.keys = keys
+
+
+class SeatsExhausted(Exception):
+    """Front-half dispatches have reached max_seats plus granted rounds."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +80,24 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
         raise ValueError(f"unknown role: {role!r}; expected one of {sorted(Role.ALL)}")
     if not actor or not isinstance(actor, str):
         raise ValueError("an attempt must be dispatched to a named actor")
+    # Before the transaction, so the halt survives the raise: a run holding an
+    # intended or uncertain effect is halted with those keys as evidence and
+    # the dispatch refused (spec §2 Refusals, §5).
+    pending = store.uncertain_effects(run_id)
+    if pending:
+        keys = [e["idempotency_key"] for e in pending]
+        store.set_reconciliation(run_id, {
+            "run_id": run_id, "generation": None,
+            "affected_resources": sorted({e["effect_class"] for e in pending}),
+            "pending_keys": keys,
+            "last_confirmed_observations": store.last_confirmed(run_id),
+            "stop_attempts": 0,
+            "recommended_actions": [
+                "A dispatch was attempted over unresolved effects; check each key externally",
+                "Then reconcile (--delivered / --not-delivered per key) and resume",
+            ],
+        })
+        raise PendingEffects(keys)
     # ONE transaction across the fence and the record. Two statements left a
     # window in which a failure between them fenced a generation with no actor
     # behind it: every command under it is then refused for having no
@@ -72,6 +106,13 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
     # for exactly this reason; dispatch was written afterwards and did not.
     did = new_id("dsp")
     with store.transaction():
+        if role in Role.SEATS:
+            from kernel.front import seat_bound, seats_used
+            used, bound = seats_used(store, run_id), seat_bound(store, run_id)
+            if used >= bound:
+                raise SeatsExhausted(
+                    f"run {run_id} has used {used} of {bound} front-half seats"
+                )
         generation = acquire(store, run_id, actor)
         store.record_dispatch(did, run_id, generation, actor, role)
         store.append_fact(

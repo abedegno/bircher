@@ -50,9 +50,7 @@ def run(tmp_path):
     os.makedirs(tmp_path / "ws")
     s = Store.open(tmp_path / "k.db")
     s.create_run(run_id="r-1", base_repo="o/r", base_sha="0" * 40)
-    # Role.AUTHOR does not exist until Task 6 (see task-3-brief.md's identical
-    # note); Role.IMPLEMENTER is the placeholder until then.
-    gen = dispatch(s, "r-1", actor="claude", role=Role.IMPLEMENTER).generation
+    gen = dispatch(s, "r-1", actor="claude", role=Role.AUTHOR).generation
     return s, gen
 
 

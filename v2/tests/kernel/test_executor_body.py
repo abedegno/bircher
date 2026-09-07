@@ -125,7 +125,7 @@ def test_body_artifact_missing_refused_before_journal(tmp_path):
     with pytest.raises(ValueError):
         _check_body(s, {"argv": EVENTS, "body": {"artifact": "f" * 64, "event": "stop_session"}})
     _check_body(s, {"argv": EVENTS})                   # no body: nothing to check
-    gen = dispatch(s, "r-1", actor="claude", role=Role.IMPLEMENTER).generation
+    gen = dispatch(s, "r-1", actor="claude", role=Role.AUTHOR).generation
     with pytest.raises(ValueError):
         perform(s, "r-1", gen, EffectClass.SESSION_CONTROL, "sess-prompt:s1:1:f1",
                 {"argv": EVENTS, "body": {"artifact": "f" * 64}}, lambda *a: "never")
@@ -134,7 +134,7 @@ def test_body_artifact_missing_refused_before_journal(tmp_path):
 
 def test_obligation_mismatch_is_not_replayable(tmp_path):
     s = _store(tmp_path)
-    gen = dispatch(s, "r-1", actor="claude", role=Role.IMPLEMENTER).generation
+    gen = dispatch(s, "r-1", actor="claude", role=Role.AUTHOR).generation
     intent = {"argv": EVENTS, "obligation": {"kind": "sess-stop", "session": "s1", "cause": "f1"}}
     assert perform(s, "r-1", gen, EffectClass.SESSION_CONTROL, "sess-stop:s1:1", intent,
                    lambda *a: "ok") == "ok"

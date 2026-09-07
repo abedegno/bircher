@@ -28,13 +28,19 @@ def db(tmp_path):
 
 
 def _halt(db, key="m1", cls=EffectClass.STATUS_CHECK):
-    """Drive a real uncertain effect: the executor never answers."""
+    """Drive a real uncertain effect: the executor never answers.
+
+    Returns (store, generation): a caller journalling a SECOND uncertain
+    effect on this now-halted run must reuse this generation rather than
+    dispatch a fresh one -- dispatch() itself now refuses while any effect is
+    intended or uncertain (Task 6).
+    """
     s = Store.open(db)
     g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
     with pytest.raises(UncertainEffect):
         perform(s, "r", g, cls, key, valid_argv(cls),
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no answer")))
-    return s
+    return s, g
 
 
 def _pending(db, capsys):
@@ -96,8 +102,7 @@ def test_reconciling_something_that_was_never_uncertain_is_refused(db, capsys):
 def test_the_halt_holds_while_a_SECOND_effect_is_still_unresolved(db, capsys):
     """Unhalting per-resolution would resume a run that still has an unknown
     mutation outstanding -- the exact state the halt exists to prevent."""
-    s = _halt(db, key="m1")
-    g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    s, g = _halt(db, key="m1")
     from kernel.effects import _perform_unhalted
     with pytest.raises(UncertainEffect):
         _perform_unhalted(s, "r", g, EffectClass.COMMENT, "c1",
@@ -181,8 +186,7 @@ def test_several_keys_are_resolved_under_ONE_cas(db, capsys):
     """
     from kernel.effects import EffectClass, UncertainEffect, _perform_unhalted
 
-    s = _halt(db, key="k1")
-    g = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    s, g = _halt(db, key="k1")
     with pytest.raises(UncertainEffect):
         _perform_unhalted(s, "r", g, EffectClass.COMMENT, "k2",
                           valid_argv(EffectClass.COMMENT),

@@ -187,8 +187,11 @@ def test_resolution_is_an_audited_cas_command(store):
 
 
 def test_a_halted_run_refuses_further_commands(store):
-    _fail(store)
-    gen = dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    # Reuses _fail's own generation rather than dispatching a fresh one:
+    # dispatch() itself now refuses while the run holds an unresolved effect
+    # (Task 6), and that is not what this test is about -- it is about
+    # submit()'s halt gate.
+    gen = _fail(store)
     with pytest.raises(RuntimeError, match="reconcil"):
         submit(store, Command(
             name="submit_spec", run_id="r", expected_version=1,
