@@ -104,5 +104,13 @@ def test_identity_laundering_is_refused(tmp_path):
     g2 = f._dispatch(Role.AUTHOR, "codex")
     f._prompt(g2, sid, f._newest_id())
     f._end_turn(g2, sid)
-    with pytest.raises(NotAuthorized, match="agent_name"):
+    with pytest.raises(NotAuthorized, match=r"codex.*v2_author_claude"):
         f._cmd(g2, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
+    # Positive control: a fresh claude generation with a matching claude
+    # session is accepted -- the refusal above is the vendor mismatch, not
+    # some blanket rejection of this run or this phase.
+    g3 = f._dispatch(Role.AUTHOR, "claude")
+    sid3 = f._session(g3, f._newest_id())
+    f._end_turn(g3, sid3)
+    f._cmd(g3, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES + b"-ctrl")})
+    assert s.run_state("r-1") == "spec_submitted"
