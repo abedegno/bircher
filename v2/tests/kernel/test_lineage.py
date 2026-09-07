@@ -15,6 +15,7 @@ from kernel.commands import Command, submit
 from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
@@ -22,7 +23,9 @@ BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 def _store(*runs):
     s = Store.open(":memory:", clock=Clock(start_us=1))
     for r in runs or ("r",):
-        s.create_run(run_id=r, base_repo="o/r", base_sha=BASE)
+        # Through the driver, so each run has the frozen policy the front
+        # half's guards read and the base_sha every review below binds.
+        Front(s, r, base_sha=BASE)
     return s
 
 
@@ -33,6 +36,10 @@ def _sub(s, name, key, actor, role, run="r", **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id=run, expected_version=s.run_version(run),
         idempotency_key=key,
@@ -42,9 +49,10 @@ def _sub(s, name, key, actor, role, run="r", **payload):
 
 
 def _implementing(s, run="r", impl="claude"):
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, run, base_sha=BASE, existing=True).to_planned()
     spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", f"{run}1", impl, Role.IMPLEMENTER, run=run, spec_sha256=spec)
-    _sub(s, "submit_plan", f"{run}2", impl, Role.IMPLEMENTER, run=run, plan_sha256=spec)
     _sub(s, "start_implementation", f"{run}3", impl, Role.IMPLEMENTER, run=run)
     return spec
 
@@ -90,7 +98,7 @@ def test_recording_an_output_does_not_move_the_run():
 def test_a_review_before_any_output_is_recorded_is_refused():
     s = _store()
     spec = _implementing(s)
-    with pytest.raises(NotAuthorized, match="no implementation output"):
+    with pytest.raises(NotAuthorized, match="nothing is under review"):
         _review(s, "rv", spec)
 
 

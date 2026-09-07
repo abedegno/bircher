@@ -17,6 +17,7 @@ from conftest import valid_argv
 from kernel.effects import EffectClass, perform
 from kernel.ids import Clock
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
@@ -28,6 +29,10 @@ def _sub(s, name, key, actor, role, **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
         idempotency_key=key,
@@ -39,10 +44,9 @@ def _sub(s, name, key, actor, role, **payload):
 def _authorized_merge():
     """A run legitimately at merge_requested. Returns (store, artifact)."""
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
-    spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=spec)
-    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=spec)
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE).to_planned()
     _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
     out = put_artifact(s, b"diff v1")
     _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,

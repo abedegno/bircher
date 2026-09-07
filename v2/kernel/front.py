@@ -6,8 +6,10 @@ writes.
 """
 from __future__ import annotations
 
+import json
+
 from kernel.events import EventKind
-from kernel.policy import policy_of
+from kernel.policy import policy_of, policy_version  # noqa: F401
 
 
 def seats_used(store, run_id: str) -> int:
@@ -25,3 +27,118 @@ def grants(store, run_id: str) -> int:
 def seat_bound(store, run_id: str) -> int:
     """Ruling 4: a granted round is one author seat and one reviewer seat."""
     return policy_of(store, run_id).max_seats + 2 * grants(store, run_id)
+
+
+FRONT_PHASES = ("spec", "plan")
+
+#: Ruling 14: the server names the bundle, the dispatch names the vendor.
+BUNDLE_PREFIX = "v2_author_"
+
+
+def vendor_of(agent_name) -> str | None:
+    """`v2_author_claude` -> `claude`; any other bundle name -> None."""
+    if isinstance(agent_name, str) and agent_name.startswith(BUNDLE_PREFIX) and len(agent_name) > len(BUNDLE_PREFIX):
+        return agent_name[len(BUNDLE_PREFIX):]
+    return None
+
+
+#: Ruling 2: a direction consumes a park as an answer or a ruling does.
+HUMAN_FACT_KINDS = frozenset({
+    EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING, EventKind.HUMAN_DIRECTION,
+})
+
+
+def epoch(store, run_id: str) -> int:
+    return len(store.facts_of_kind(run_id, EventKind.BUNDLE_REVISED))
+
+
+def bundle_hash(store, run_id: str) -> str | None:
+    revised = store.newest_fact(run_id, EventKind.BUNDLE_REVISED)
+    if revised is not None:
+        return revised.payload["bundle_hash"]
+    enq = store.newest_fact(run_id, EventKind.RUN_ENQUEUED)
+    return None if enq is None else enq.payload.get("bundle_hash")
+
+
+def submissions(store, run_id: str, phase: str, epoch_n: int) -> list:
+    return [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+            if f.payload["phase"] == phase and f.payload["epoch"] == epoch_n]
+
+
+def newest_submission(store, run_id: str, phase: str, epoch_n: int):
+    subs = submissions(store, run_id, phase, epoch_n)
+    return subs[-1] if subs else None
+
+
+def _newest_seq(store, run_id: str, *kinds: str) -> int:
+    facts = store.facts_of_kind(run_id, *kinds)
+    return facts[-1].seq if facts else 0
+
+
+def last_transition_seq(store, run_id: str) -> int:
+    return _newest_seq(store, run_id, EventKind.TRANSITION)
+
+
+def last_human_fact_seq(store, run_id: str) -> int:
+    return _newest_seq(store, run_id, *HUMAN_FACT_KINDS)
+
+
+def current_park(store, run_id: str):
+    """The newest `parked` fact, if newer than the last transition and the
+    last human fact (spec §2 *States*). Either consumes it."""
+    park = store.newest_fact(run_id, EventKind.PARKED)
+    if park is None:
+        return None
+    floor = max(last_transition_seq(store, run_id), last_human_fact_seq(store, run_id))
+    return park if park.seq > floor else None
+
+
+def _satisfied(row: dict) -> bool:
+    if row["state"] == "confirmed":
+        return True
+    return row["state"] == "reconciled" and row.get("external_object_id") not in (None, "")
+
+
+def satisfied_effects(store, run_id: str, kind: str) -> list[dict]:
+    out = []
+    for row in store.effects_for(run_id):
+        ob = (row.get("intent") or {}).get("obligation") or {}
+        if ob.get("kind") == kind and _satisfied(row):
+            out.append(row)
+    return out
+
+
+def _roles(store, run_id: str) -> dict[int, str]:
+    return {d["generation"]: d["role"] for d in store.dispatches_for(run_id)}
+
+
+def newest_seat(store, run_id: str, role: str, phase: str, epoch_n: int) -> dict | None:
+    """The newest satisfied `sess-create` under a generation dispatched as
+    *role* whose obligation names *phase* and *epoch* (spec §2 Refusals:
+    'the newest satisfied sess-create under an author generation of this
+    phase and epoch'). Phase and epoch are the obligation's, read from the
+    intent; the effects table has no such columns."""
+    roles = _roles(store, run_id)
+    found = None
+    for row in satisfied_effects(store, run_id, "sess-create"):
+        ob = row["intent"]["obligation"]
+        if roles.get(row["generation"]) != role:
+            continue
+        if ob.get("phase") != phase or ob.get("epoch") != epoch_n:
+            continue
+        found = {"generation": row["generation"], "key": row["idempotency_key"],
+                 "cause": ob.get("cause"),
+                 "session": json.loads(row["external_object_id"])}
+    return found
+
+
+def newest_prompt(store, run_id: str, phase: str, epoch_n: int) -> dict | None:
+    found = None
+    for row in satisfied_effects(store, run_id, "sess-prompt"):
+        ob = row["intent"]["obligation"]
+        if ob.get("phase") != phase or ob.get("epoch") != epoch_n:
+            continue
+        found = {"generation": row["generation"], "key": row["idempotency_key"],
+                 "cause": ob.get("cause"), "session_id": ob.get("session"),
+                 "at_us": row["at_us"]}
+    return found

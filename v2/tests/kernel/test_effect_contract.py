@@ -24,12 +24,17 @@ from kernel.dispatch import Role, dispatch
 from kernel.effects import EffectClass, perform
 from kernel.ids import Clock
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 REPO, PR = "abedegno/muesli", 42
 
 
 def _sub(s, name, key, actor, role, **p):
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        p.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
         idempotency_key=key,
@@ -38,10 +43,9 @@ def _sub(s, name, key, actor, role, **p):
 
 def _authorized():
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
-    spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=spec)
-    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=spec)
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE).to_planned()
     _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
     out = put_artifact(s, b"diff v1")
     _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,
@@ -128,10 +132,7 @@ def test_request_merge_must_name_its_pr_and_repo():
     """The authorization has to record a target, or there is nothing for the
     effect to be bound to."""
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
-    spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=spec)
-    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=spec)
+    Front(s, "r", base_sha=BASE).to_planned()
     _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
     out = put_artifact(s, b"diff")
     _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,

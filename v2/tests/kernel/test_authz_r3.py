@@ -12,15 +12,17 @@ from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, BUNDLE, HEAD = "c" * 40, "e" * 64, "d" * 40
 SPEC = None  # set per-store: reviews may only bind artifacts the kernel holds
+FRONT = None  # the driver that gets this run to `planned`; see _to_implementing
 
 
 def _store():
-    global SPEC
+    global SPEC, FRONT
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    FRONT = Front(s, "r", base_sha=BASE)
     SPEC = put_artifact(s, b"# spec")
     return s
 
@@ -33,6 +35,10 @@ def _sub(s, name, key, actor=None, **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
     if actor is None:
         actor = "codex" if role == Role.REVIEWER else "claude"
@@ -45,8 +51,7 @@ def _sub(s, name, key, actor=None, **payload):
 
 
 def _to_implementing(s):
-    _sub(s, "submit_spec", "k1", spec_sha256=SPEC)
-    _sub(s, "submit_plan", "k2", plan_sha256=put_artifact(s, b"# plan"))
+    FRONT.to_planned()
     _sub(s, "start_implementation", "k3", actor="claude")
     _sub(s, "record_implementation_output", "k3o", actor="claude",
          artifact_hash=SPEC)
@@ -131,10 +136,13 @@ def test_the_recorded_verdict_carries_the_binding_that_authorizes_merge():
          artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
          actor="codex", policy_version=1)
     verdicts = [f for f in s.facts_for("r") if f.kind == "review_verdict"]
-    assert len(verdicts) == 1
+    # The spec and the plan are reviewed too now, so a verdict count of one is
+    # no longer the property: the phases in order are, and the verdict this
+    # test recorded is the last of them.
+    assert [v.payload["phase"] for v in verdicts] == ["spec", "plan", "implementation"]
     expected = binding_hash(VerdictBinding(
         artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
         policy_version=1,
     ))
-    assert verdicts[0].payload["binding_hash"] == expected
-    assert verdicts[0].payload["verdict"] == "accept"
+    assert verdicts[-1].payload["binding_hash"] == expected
+    assert verdicts[-1].payload["verdict"] == "accept"

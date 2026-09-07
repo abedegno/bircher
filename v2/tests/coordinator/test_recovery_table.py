@@ -21,12 +21,17 @@ from kernel.dispatch import Role, dispatch
 from kernel.effects import EffectClass, perform
 from kernel.ids import Clock
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 MERGE_ARGV = {"argv": ["gh", "pr", "merge", "42", "--repo", "o/r"]}
 
 
 def _sub(s, name, key, actor, role, **p):
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        p.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
         idempotency_key=key,
@@ -37,16 +42,19 @@ def _sub(s, name, key, actor, role, **p):
 @pytest.fixture()
 def s():
     st = Store.open(":memory:", clock=Clock(start_us=1))
-    st.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    # Through the driver, so the run has the frozen policy the front half's
+    # guards read and the base_sha every review below binds.
+    Front(st, "r", base_sha=BASE)
     return st
 
 
 @pytest.fixture()
 def reviewing(s):
     """A run at `reviewing` with an accept binding its current output."""
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
     art = put_artifact(s, b"# output one")
-    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=art)
-    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=art)
     _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
     _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,
          artifact_hash=art)
@@ -145,7 +153,8 @@ def test_a_review_that_lost_the_CAS_re_derives_rather_than_reusing_the_accept(
             idempotency_key="rv-lost",
             generation=dispatch(s, "r", actor="codex",
                                 role=Role.REVIEWER).generation,
-            payload=dict(verdict="request_revision", artifact_hash=art,
+            payload=dict(verdict="request_revision", phase="implementation",
+                         artifact_hash=art,
                          base_sha=BASE, context_bundle_hash=BUNDLE,
                          policy_version=1)))
     assert _do(s, current_artifact=art).do == "re_derive", (
@@ -270,11 +279,9 @@ def test_the_cli_reports_the_halt_for_an_uncertain_merge(tmp_path, capsys):
     from coordinator.cli import main
     path = str(tmp_path / "k.db")
     st = Store.open(path, clock=Clock(start_us=1))
-    st.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    Front(st, "r", base_sha=BASE).to_planned()
     art = put_artifact(st, b"# output one")
-    for n, k, p in (("submit_spec", "k1", dict(spec_sha256=art)),
-                    ("submit_plan", "k2", dict(plan_sha256=art)),
-                    ("start_implementation", "k3", {}),
+    for n, k, p in (("start_implementation", "k3", {}),
                     ("record_implementation_output", "k4", dict(artifact_hash=art)),
                     ("record_ci_observation", "k5",
                      dict(status="success", head_git_sha=HEAD))):
@@ -287,7 +294,8 @@ def test_the_cli_reports_the_halt_for_an_uncertain_merge(tmp_path, capsys):
                        expected_version=st.run_version("r"), idempotency_key="k6",
                        generation=dispatch(st, "r", actor="codex",
                                            role=Role.REVIEWER).generation,
-                       payload=dict(verdict="accept", artifact_hash=art,
+                       payload=dict(verdict="accept", phase="implementation",
+                                    artifact_hash=art,
                                     base_sha=BASE, context_bundle_hash=BUNDLE,
                                     policy_version=1)))
     submit(st, Command(name="request_merge", run_id="r",

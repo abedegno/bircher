@@ -52,6 +52,12 @@ COMMAND_NAMES = frozenset({
     # every lineage check downstream is comparing a caller's choice against
     # itself.
     "record_implementation_output",
+    # The front half (spec §2 Commands). `record_turn_ended` makes the end of
+    # a model's turn a FACT the kernel holds rather than a wait the
+    # coordinator performs, so "is this turn over" is answered from the
+    # journal; `park` records why a pass stopped without a transition, which
+    # v1 expressed only as the absence of anything.
+    "record_turn_ended", "park",
 })
 
 
@@ -99,6 +105,44 @@ def _record_rejection(store, cmd, reason: str, detail: str, actor: str) -> None:
         causal_command_id=cmd.idempotency_key,
         payload={"command_name": cmd.name, "reason": reason, "detail": detail[:300]},
     )
+
+
+def _side_fact(store, cmd: Command, actor: str) -> None:
+    """The fact an accepted front-half command writes beside COMMAND_ACCEPTED.
+    Every value is derived by the kernel from the run's state, never copied
+    from the payload except the fields the command exists to carry."""
+    from kernel import front
+    from kernel.authz import phase_of
+    state = store.run_state(cmd.run_id)
+    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
+    if cmd.name in ("submit_spec", "submit_plan"):
+        h = cmd.payload["artifact_hash"]
+        rnd = len(front.submissions(store, cmd.run_id, phase, epoch_n)) + 1
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"phase": phase, "epoch": epoch_n, "hash": h, "author": actor, "round": rnd},
+        )
+        store.set_phase_artifact(cmd.run_id, phase, h)
+    elif cmd.name == "record_turn_ended":
+        prompt = front.newest_prompt(store, cmd.run_id, phase, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.TURN_ENDED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"session": cmd.payload["session"], "ended": cmd.payload["ended"],
+                     "phase": phase, "epoch": epoch_n, "generation": cmd.generation,
+                     "prompt_key": None if prompt is None else prompt["key"]},
+        )
+    elif cmd.name == "park":
+        p = cmd.payload
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.PARKED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"phase": phase, "epoch": epoch_n, "reason": p["reason"],
+                     "session_id": p.get("session_id"), "cursor_item_id": p.get("cursor_item_id"),
+                     "findings_hash": p.get("findings_hash"), "verdict": p.get("verdict"),
+                     "reviewer": p.get("reviewer"), "generation": cmd.generation},
+        )
 
 
 def submit(store, cmd: Command) -> Result:
@@ -197,7 +241,7 @@ def submit(store, cmd: Command) -> Result:
     # refusal here returns immediately -- recorded, not acted on -- and
     # control never reaches the transaction below at all.
     try:
-        next_state = authorize(store, cmd, actor)
+        next_state = authorize(store, cmd, actor, ruling="review_ruling")
     except Exception as exc:
         _record_rejection(store, cmd, type(exc).__name__, str(exc), actor)
         shadow_or_raise(store, cmd.run_id, exc, cmd.idempotency_key, command_name=cmd.name)
@@ -210,7 +254,7 @@ def submit(store, cmd: Command) -> Result:
     # something the mechanism observed.
     try:
         review_binding = (
-            validate_review(store, cmd, actor)
+            validate_review(store, cmd, actor, ruling="review_ruling")
             if cmd.name == "record_review"
             else None
         )
@@ -261,18 +305,27 @@ def submit(store, cmd: Command) -> Result:
                 )
             if cmd.name == "record_implementation_output":
                 store.set_current_artifact(cmd.run_id, cmd.payload["artifact_hash"])
-            if review_binding is not None:
+            if cmd.name == "record_review":
+                from kernel import front
+                from kernel.authz import phase_of
+                state_now = store.run_state(cmd.run_id)
                 store.append_fact(
                     run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor=actor,
                     causal_command_id=cmd.idempotency_key,
                     payload={
                         "verdict": cmd.payload.get("verdict"),
-                        "binding_hash": binding_hash(review_binding),
+                        "phase": phase_of(state_now),
+                        "epoch": front.epoch(store, cmd.run_id),
+                        "artifact_hash": cmd.payload.get("artifact_hash"),
+                        "findings_hash": cmd.payload.get("findings_hash"),
+                        "ruling": "review_ruling" if review_binding is not None else "human_ruling",
+                        "binding_hash": None if review_binding is None else binding_hash(review_binding),
                         # From the dispatch record, not the binding: the
                         # binding says WHAT was approved, this says WHO.
                         "reviewer_identity": actor,
                     },
                 )
+            _side_fact(store, cmd, actor)
             if next_state is not None:
                 store.append_fact(
                     run_id=cmd.run_id, kind=EventKind.TRANSITION, actor=actor,

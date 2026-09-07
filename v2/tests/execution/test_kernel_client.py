@@ -61,6 +61,7 @@ assert not (REPO_ROOT / "kernel").exists(), (
 
 
 
+from kernel.artifacts import put_artifact  # noqa: E402
 from kernel.dispatch import dispatch  # noqa: E402
 from kernel.events import EventKind  # noqa: E402
 from kernel.store import Store  # noqa: E402
@@ -213,12 +214,16 @@ def test_a_real_call_creates_a_run_and_records_a_fact(tmp_path):
     db = tmp_path / "kernel.db"
     store = Store.open(db)
     store.create_run(run_id="r-live", base_repo="abedegno/muesli", base_sha="deadbeef")
-    d = dispatch(store, "r-live", actor="claude", role="implementer")
+    # AUTHOR, and a hash the kernel holds: a submission comes from an author
+    # seat and names an artefact, and it lands at `spec_submitted` -- only a
+    # reviewer's accept of that hash reaches `specified`.
+    d = dispatch(store, "r-live", actor="claude", role="author")
     assert d.generation == 1
+    spec = put_artifact(store, b"# spec")
 
     r = _run(
         '_kernel command --run-id r-live --generation 1 --name submit_spec '
-        '--payload-json "{}"; echo "rc=$?"',
+        f"--payload-json '{{\"artifact_hash\":\"{spec}\"}}'; echo \"rc=$?\"",
         env={"BIRCHER_KERNEL_DB": str(db)},
     )
     assert "rc=0" in r.stdout, r.stderr
@@ -227,7 +232,7 @@ def test_a_real_call_creates_a_run_and_records_a_fact(tmp_path):
     reopened = Store.open(db)
     kinds = [f.kind for f in reopened.facts_for("r-live")]
     assert EventKind.COMMAND_ACCEPTED in kinds, kinds
-    assert reopened.run_state("r-live") == "specified"
+    assert reopened.run_state("r-live") == "spec_submitted"
 
 
 def test_a_real_dispatch_creates_an_attempt_dispatched_fact(tmp_path):

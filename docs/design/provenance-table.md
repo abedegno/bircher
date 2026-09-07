@@ -35,18 +35,30 @@ answer, and the value that survives is the kernel's.
 | `store.run_base_sha` | `validate_review` | observed | recorded at `create_run` |
 | `store.facts_for` | verdicts, CI, implementer, reviewer | observed | append-only fact log, enforced by a trigger |
 | `store.has_confirmed_effect` | `record_merge_outcome` | observed | the effect journal |
+| `store.phase_artifact` | `validate_review`, `_check_submit` | observed | `phase_artifacts`, written only by an accepted `submit_spec`/`submit_plan` |
+| `store.read_blob` | `_check_submit` | observed | content-addressed bytes |
+| `store.facts_of_kind` | `front.submissions`, `front.epoch` | observed | the append-only journal |
 
 ## Caller-presented, bound to kernel state
 
 | Input | Enters at | Provenance | Bound by / reason |
 |---|---|---|---|
-| `cmd.payload['artifact_hash']` | `record_review`, `request_merge`, `record_implementation_output` | observed | refused unless equal to `store.current_artifact`; on `record_implementation_output`, unless `store.has_artifact` |
+| `cmd.payload['artifact_hash']` | `submit_spec`, `submit_plan`, `record_review`, `request_merge`, `record_implementation_output` | observed | on a submit, refused unless `store.has_artifact` holds it; on a front-half review, unless equal to `store.phase_artifact` for the state's phase; on a back-half review and on `request_merge`, unless equal to `store.current_artifact`; on `record_implementation_output`, unless `store.has_artifact` |
+| `cmd.payload['phase']` | `record_review` | observed | refused unless equal to `phase_of(store.run_state)` |
+| `cmd.payload['findings_hash']` | `record_review` | observed | refused unless the store holds it |
+| `cmd.payload['hash']` | `_check_submit` | observed | read from the kernel's own `artifact_submitted` facts |
+| `cmd.payload['author']` | `validate_review` | observed | read from the kernel's own `artifact_submitted` facts |
+| `cmd.payload['ended']` | `record_turn_ended` | observed | refused unless one of `TURN_ENDS` |
+| `cmd.payload['session']` | `record_turn_ended` | observed | Task 10 binds it to the newest satisfied `sess-create`/`sess-prompt`; until then a shape check |
+| `cmd.payload['session_id']` | `park` | observed | Task 10 binds it; a string-or-null check here |
+| `cmd.payload['reviewer']` | `park` | observed | Task 12 binds it; a string-or-null check here |
 | `cmd.payload['base_sha']` | `record_review` | observed | refused unless equal to `store.run_base_sha` |
 | `cmd.payload['outcome']` | `record_merge_outcome` | observed | `merged` refused unless `store.has_confirmed_effect` |
 | `authorized['artifact_hash']` | `revalidate_merge` | observed | read from the kernel's own `merge_authorized` fact |
 | `authorized['head_git_sha']` | `revalidate_merge` | observed | read from the kernel's own `merge_authorized` fact |
 | `fact.payload['binding_hash']` | `_merge_is_authorized` | observed | written by the kernel after `validate_review` |
 | `fact.payload['verdict']` | `_merge_is_authorized`, `_reviewer_of` | observed | written by the kernel alongside the binding it validated |
+| `fact.payload['phase']` | `_merge_is_authorized`, `_reviewer_of` | observed | written by the kernel from `phase_of(store.run_state)` when the review was recorded; only an `implementation` verdict authorizes a merge |
 | `fact.payload['reviewer_identity']` | `_reviewer_of` | observed | written by the kernel from the dispatch record |
 | `fact.payload['command_name']` | `_implementer_of`, `_ci_is_green` | observed | written by the kernel |
 | `fact.payload['payload']` | `_ci_is_green` | observed | the envelope is kernel-written; its CONTENTS are the CI residual below |
@@ -67,3 +79,5 @@ for a check.
 | `cmd.payload['pr']` | `request_merge` | asserted | **Residual, blocked on PR creation.** The requester names the pull request. The kernel now binds the merge EFFECT to this recorded target, so the effect cannot diverge from the authorization — but the link from *this run's artifact* to *that PR number* is never observed. Closing it requires the kernel to create the PR itself and record the number, which does not exist yet (round 6, C8). |
 | `cmd.payload['repo']` | `request_merge` | asserted | **Residual, blocked on PR creation.** As above: the repository is named by the requester. `runs.base_repo` is recorded at `create_run` and is a candidate to compare against, but nothing does so today. |
 | `payload['policy_version']` | `_binding_from` | asserted | **Residual, M1-4.** Type-checked (`type(...) is int`, so no float or bool coerces in) but not compared against any policy the kernel holds. |
+| `cmd.payload['reason']` | `park` | asserted | **Residual, §4.** The coordinator's reading of a park and of a listing: `reason` is bounded to `PARK_REASONS`, `cursor_item_id` to the §4 cursor invariant test (Task 19), neither to a kernel object. |
+| `cmd.payload['cursor_item_id']` | `park` | asserted | **Residual, §4.** The coordinator's reading of a park and of a listing: `reason` is bounded to `PARK_REASONS`, `cursor_item_id` to the §4 cursor invariant test (Task 19), neither to a kernel object. |

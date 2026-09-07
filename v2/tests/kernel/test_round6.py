@@ -18,17 +18,24 @@ from kernel.effects import (
 from kernel.ids import Clock
 from kernel.ownership import current_generation
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
 
 def _store(run="r"):
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id=run, base_repo="o/r", base_sha=BASE)
+    # Through the driver, so the run has the frozen policy the front half's
+    # guards read and the base_sha every review below binds.
+    Front(s, run, base_sha=BASE)
     return s
 
 
 def _sub(s, name, key, actor, role, run="r", **p):
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        p.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id=run, expected_version=s.run_version(run),
         idempotency_key=key,
@@ -38,9 +45,9 @@ def _sub(s, name, key, actor, role, run="r", **p):
 # --- C3: independence must name the producer of the artifact under review ----
 
 def _to_output(s, starter="alice", producer="alice"):
-    spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", starter, Role.IMPLEMENTER, spec_sha256=spec)
-    _sub(s, "submit_plan", "k2", starter, Role.IMPLEMENTER, plan_sha256=spec)
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
     _sub(s, "start_implementation", "k3", starter, Role.IMPLEMENTER)
     out = put_artifact(s, b"output produced by " + producer.encode())
     _sub(s, "record_implementation_output", "k4", producer, Role.IMPLEMENTER,

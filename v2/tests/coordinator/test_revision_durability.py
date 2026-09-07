@@ -18,11 +18,16 @@ from kernel.commands import Command, submit
 from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
 
 def _sub(s, name, key, actor, role, run="r", **payload):
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id=run, expected_version=s.run_version(run),
         idempotency_key=key,
@@ -35,10 +40,10 @@ def db(tmp_path):
     """A run driven as far as `reviewing`, on disk, ready to be reviewed."""
     path = str(tmp_path / "k.db")
     s = Store.open(path, clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE).to_planned()
     art = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", "claude", Role.IMPLEMENTER, spec_sha256=art)
-    _sub(s, "submit_plan", "k2", "claude", Role.IMPLEMENTER, plan_sha256=art)
     _sub(s, "start_implementation", "k3", "claude", Role.IMPLEMENTER)
     _sub(s, "record_implementation_output", "k4", "claude", Role.IMPLEMENTER,
          artifact_hash=art)
@@ -105,7 +110,8 @@ def test_a_review_that_lost_the_CAS_leaves_nothing_to_confirm(db, capsys):
             idempotency_key="rev-lost",
             generation=dispatch(s, "r", actor="codex",
                                 role=Role.REVIEWER).generation,
-            payload=dict(verdict="request_revision", artifact_hash=art,
+            payload=dict(verdict="request_revision", phase="implementation",
+                         artifact_hash=art,
                          base_sha=BASE, context_bundle_hash=BUNDLE,
                          policy_version=1)))
 

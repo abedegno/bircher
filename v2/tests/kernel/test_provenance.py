@@ -144,6 +144,12 @@ def test_the_residuals_are_the_ones_we_know_about():
         # and closing it is blocked on the kernel creating the PR (C8).
         "cmd.payload['pr']",
         "cmd.payload['repo']",
+        # The front half's two: what a pass parked FOR, and where the
+        # coordinator's listing had got to. Both are the coordinator's own
+        # reading, bounded by a vocabulary and by the §4 cursor invariant
+        # rather than by any object the kernel holds.
+        "cmd.payload['reason']",
+        "cmd.payload['cursor_item_id']",
     }
 
 
@@ -194,7 +200,10 @@ def test_the_spec_and_the_table_agree_on_the_count():
             / "2026-08-23-v2-kernel-design.md").read_text()
     m = re.search(r"\*\*(\w+) rows are asserted after Milestone 1\*\*", spec)
     assert m, "the spec no longer states the asserted-row count"
-    words = {"four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+    words = {"four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+             "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+             "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+             "eighteen": 18, "nineteen": 19, "twenty": 20}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")

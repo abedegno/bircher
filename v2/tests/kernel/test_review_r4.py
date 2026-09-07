@@ -11,13 +11,16 @@ from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
 
 def _store():
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    # Through the driver, so the run has the frozen policy the front half's
+    # guards read and the base_sha every review below binds.
+    Front(s, "r", base_sha=BASE)
     return s
 
 
@@ -29,6 +32,10 @@ def _sub(s, name, key, actor=None, **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
     if actor is None:
         actor = "codex" if role == Role.REVIEWER else "claude"
@@ -41,9 +48,10 @@ def _sub(s, name, key, actor=None, **payload):
 
 
 def _to_reviewing(s, implementer="claude"):
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
     spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "a1", spec_sha256=spec)
-    _sub(s, "submit_plan", "a2", plan_sha256=put_artifact(s, b"# plan"))
     _sub(s, "start_implementation", "a3", actor=implementer)
     _sub(s, "record_implementation_output", "a3o", actor=implementer,
          artifact_hash=spec)
@@ -118,7 +126,7 @@ def test_a_halt_refusal_records_a_rejection_fact():
         submit(s, Command(
             name="submit_spec", run_id="r", expected_version=s.run_version("r"),
             idempotency_key="k", generation=gen,
-            payload={"spec_sha256": put_artifact(s, b"x")},
+            payload={"artifact_hash": put_artifact(s, b"x")},
         ))
     rejects = [f for f in s.facts_for("r") if f.kind == "command_rejected"]
     assert any(f.payload.get("reason") == "halted" for f in rejects), (

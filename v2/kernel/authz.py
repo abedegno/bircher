@@ -24,19 +24,72 @@ class NotAuthorized(Exception):
     authorizes the effect it would enable."""
 
 
+#: The six states a run passes through before `planned` (spec §2 *States*).
+#: v1 went `queued -> specified -> planned` on two submits, so an author's own
+#: submission was also its acceptance; the four new states are where a
+#: submission waits for someone else to rule on it.
+FRONT_HALF_STATES = frozenset({
+    "queued", "spec_submitted", "spec_accepted",
+    "specified", "plan_submitted", "plan_accepted",
+})
+
+_PHASE_OF_STATE = {
+    "queued": "spec", "spec_submitted": "spec", "spec_accepted": "spec",
+    "specified": "plan", "plan_submitted": "plan", "plan_accepted": "plan",
+    "implementing": "implementation", "reviewing": "implementation",
+}
+
+
+def phase_of(state: str) -> str | None:
+    """Which artefact the run is working on, derived from its state.
+
+    The kernel derives the phase rather than reading it from a payload, so a
+    review of the plan cannot be recorded against the spec.
+    """
+    return _PHASE_OF_STATE.get(state)
+
+
+#: spec §3 loop: the reasons a pass parks for.
+PARK_REASONS = frozenset({
+    "grill", "no_verdict", "bound_exhausted", "gate", "budget_exhausted",
+    "identical_resubmission",
+})
+
+#: spec §3 *The turn's end is a fact*: the four ways a turn ends.
+TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
+
+#: Every non-terminal state. `record_run_outcome` and `cancel_run` are legal
+#: from all of them, so listing them by hand meant each new front-half state
+#: had to be remembered in two more places.
+_ALL_ACTIVE = frozenset({
+    "queued", "spec_submitted", "spec_accepted", "specified",
+    "plan_submitted", "plan_accepted", "planned", "implementing", "reviewing",
+    "merge_requested",
+})
+
 #: command -> (states it may be issued from, resulting state or None to stay).
 #: Every command declares its states: a command absent from this table would be
 #: legal everywhere or nowhere depending on the lookup's default, and which one
 #: is an accident rather than a decision.
 _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
-    "submit_spec": (frozenset({"queued"}), "specified"),
-    "submit_plan": (frozenset({"specified"}), "planned"),
+    # spec §2 Commands. The front half: a submit lands at *_submitted, and
+    # only a reviewer's accept of the current hash moves on from there.
+    "submit_spec": (frozenset({"queued"}), "spec_submitted"),
+    "submit_plan": (frozenset({"specified"}), "plan_submitted"),
     "start_implementation": (frozenset({"planned"}), "implementing"),
-    # record_review's destination depends on the verdict: a revision request
-    # must return the run to `planned` so implementation can start again.
-    # Landing every review in `reviewing` left a revision request with nowhere
-    # to do the revision.
-    "record_review": (frozenset({"implementing", "reviewing"}), None),
+    # Destination depends on state, verdict and the run's gates: computed in
+    # authorize() by _review_destination. In the back half a revision request
+    # must return the run to `planned` so implementation can start again;
+    # landing every review in `reviewing` left it nowhere to do the revision.
+    "record_review": (
+        frozenset({"spec_submitted", "spec_accepted", "plan_submitted",
+                   "plan_accepted", "implementing", "reviewing"}),
+        None,
+    ),
+    "record_turn_ended": (
+        frozenset({"queued", "specified", "spec_submitted", "plan_submitted"}), None,
+    ),
+    "park": (FRONT_HALF_STATES, None),
     # merge_requested must not be a dead end. Without an outbound transition a
     # merge that comes back uncertain can never be retried after
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
@@ -53,31 +106,53 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # still needs an end. Not idempotent by design -- a second one is refused
     # by the state check, so a duplicate is a visible refusal rather than two
     # contradictory terminal facts.
-    "record_run_outcome": (
-        frozenset({
-            "queued", "specified", "planned", "implementing", "reviewing",
-            "merge_requested", "merged", "cancelled",
-        }),
-        "ended",
-    ),
+    "record_run_outcome": (_ALL_ACTIVE | frozenset({"merged", "cancelled"}), "ended"),
     # Cancellation is legal from anywhere: a run must always be stoppable.
-    "cancel_run": (
-        frozenset({
-            "queued", "specified", "planned", "implementing", "reviewing",
-            "merge_requested",
-        }),
-        "cancelled",
-    ),
+    "cancel_run": (_ALL_ACTIVE, "cancelled"),
 }
 
-#: Verdicts `record_review` may carry, and where each leaves the run. A closed
-#: set: arbitrary strings were accepted while only literal "accept" authorized
-#: a merge, so a typo silently became a non-approval that read as a review.
-_VERDICTS: dict[str, str] = {
-    "accept": "reviewing",
-    "request_revision": "planned",
-    "reject": "reviewing",
+#: Verdicts `record_review` may carry. A closed set: arbitrary strings were
+#: accepted while only literal "accept" authorized a merge, so a typo silently
+#: became a non-approval that read as a review. Where each verdict LEAVES the
+#: run is no longer a property of the word alone -- see `_review_destination`.
+_VERDICT_WORDS = frozenset({"accept", "request_revision", "reject"})
+
+#: Back-half destinations, unchanged from v1.
+_BACK_HALF_DESTINATIONS: dict[str, str] = {
+    "accept": "reviewing", "request_revision": "planned", "reject": "reviewing",
 }
+
+
+def _review_destination(store, run_id: str, state: str, verdict: str, ruling: str) -> str:
+    """Where a review leaves the run: the verdict, the state, and the gates.
+
+    In the front half the same word means different things at different
+    states, and an accept stops at `*_accepted` when the run's policy gates
+    that phase -- so the destination cannot be a lookup on the verdict alone.
+    """
+    from kernel.policy import policy_of
+    if state in ("implementing", "reviewing"):
+        return _BACK_HALF_DESTINATIONS[verdict]
+    if verdict == "reject":
+        raise NotAuthorized(
+            "reject is not a front-half verdict: a spec or plan is accepted or "
+            "revised, never rejected (spec §2 Commands)"
+        )
+    phase = phase_of(state)
+    if state.endswith("_accepted"):
+        # Task 8 adds the human's request_revision from here; a review_ruling
+        # never moves an accepted artefact.
+        raise NotAuthorized(
+            f"record_review from {state!r} is the human's correction only "
+            "(a human_ruling); a reviewer has already ruled on this hash"
+        )
+    if verdict == "request_revision":
+        return "queued" if phase == "spec" else "specified"
+    gates = policy_of(store, run_id).gates
+    if phase == "spec":
+        return "spec_accepted" if "spec" in gates else "specified"
+    return "plan_accepted" if "plan" in gates else "planned"
+
 
 #: Outcomes `record_merge_outcome` may report, and where each leaves the run.
 _MERGE_OUTCOMES: dict[str, str] = {
@@ -149,9 +224,13 @@ def _binding_from(payload: dict) -> VerdictBinding:
         raise NotAuthorized(f"malformed verdict binding: {exc}") from exc
 
 
-def validate_review(store, cmd, actor: str) -> VerdictBinding:
-    """Validate a review BEFORE it is recorded, so the verdict is an
-    observation rather than a claim.
+def validate_review(store, cmd, actor: str, *, ruling: str = "review_ruling") -> VerdictBinding | None:
+    """Validate a review BEFORE it is recorded (spec §2 *execute_as_human*).
+
+    BINDING checks apply to every ruling: the verdict word, the phase against
+    the state, the hash against the phase's current artefact. DISPATCH checks
+    apply to a review_ruling only: base, bundle, policy version, role and
+    independence -- a human's correction comes from no dispatch.
 
     An earlier version validated nothing here and compared the caller's own
     payload at merge time. The hash comparison was real; what it compared was
@@ -163,62 +242,88 @@ def validate_review(store, cmd, actor: str) -> VerdictBinding:
     It is a parameter rather than a payload field because a reviewer that can
     name itself can name someone else.
     """
+    from kernel import front
     verdict = cmd.payload.get("verdict")
-    if verdict not in _VERDICTS:
+    if verdict not in _VERDICT_WORDS:
+        raise NotAuthorized(f"verdict {verdict!r} is not one of {sorted(_VERDICT_WORDS)}")
+
+    state = store.run_state(cmd.run_id)
+    phase = phase_of(state)
+    if cmd.payload.get("phase") != phase:
         raise NotAuthorized(
-            f"verdict {verdict!r} is not one of {sorted(_VERDICTS)}"
+            f"review names phase {cmd.payload.get('phase')!r} but the run is at "
+            f"{state!r}, whose phase is {phase!r}"
         )
+
+    # Existence is not identity. Holding the blob only says the kernel has it;
+    # a review must bind what this run is CURRENTLY carrying for this phase,
+    # or an approval of a superseded revision -- or of another run's object --
+    # counts, and every comparison downstream is caller-chosen against itself.
+    if phase == "implementation":
+        current = store.current_artifact(cmd.run_id)
+        what = "this run's current output"
+    else:
+        current = store.phase_artifact(cmd.run_id, phase)
+        what = f"the {phase} phase's current artefact"
+    if current is None:
+        raise NotAuthorized(f"nothing is under review: {what} is not recorded")
+    given = cmd.payload.get("artifact_hash")
+    if given != current:
+        raise NotAuthorized(
+            f"review binds artifact {str(given)[:12]}..., but {what} is "
+            f"{current[:12]}...: an approval binds what was produced, not any "
+            "object the store holds"
+        )
+    if not store.has_artifact(current):
+        raise NotAuthorized(f"the kernel does not hold {current[:12]}...")
+
+    if ruling == "human_ruling":
+        return None
 
     binding = _binding_from(cmd.payload)
-
-    # The artifact must be one the kernel actually holds. Without this an
-    # independent reviewer could approve hashes for objects that do not exist,
-    # and merge then compared one caller-supplied tuple against another.
-    if not store.has_artifact(binding.artifact_hash):
-        raise NotAuthorized(
-            f"review binds artifact {binding.artifact_hash[:12]}..., which the "
-            "kernel does not hold: an approval binds objects the mechanism has, "
-            "not hashes the actor supplies"
-        )
-
-    # Existence is not identity. The old check asked only whether the store
-    # held the blob, so a review could bind an artifact from another run, or a
-    # superseded revision of this one, and the merge chain compared that
-    # caller-chosen hash against itself the whole way down.
-    current = store.current_artifact(cmd.run_id)
-    if current is None:
-        raise NotAuthorized(
-            "this run has recorded no implementation output: there is nothing "
-            "that is currently under review"
-        )
-    if binding.artifact_hash != current:
-        raise NotAuthorized(
-            f"review binds artifact {binding.artifact_hash[:12]}..., but this "
-            f"run's current output is {current[:12]}...: an approval binds what "
-            "the implementation produced, not any object the store holds"
-        )
-
     observed_base = store.run_base_sha(cmd.run_id)
     if binding.base_sha != observed_base:
         raise NotAuthorized(
             f"review binds base {binding.base_sha!r}, but the kernel observed "
-            f"{observed_base!r} for this run: an approval binds inputs the "
-            "mechanism saw, not ones the actor asserts"
+            f"{observed_base!r} for this run"
         )
-
     if role_for(store, cmd.run_id, cmd.generation) != Role.REVIEWER:
         raise NotAuthorized(
-            "a review must come from an attempt dispatched in the reviewer "
-            "role: the role is assigned with the fence, so an implementer "
-            "cannot elect itself reviewer"
+            "a review must come from an attempt dispatched in the reviewer role"
         )
 
-    conflicted = _conflicted_actors(store, cmd.run_id)
-    if actor in conflicted:
+    if phase == "implementation":
+        conflicted = _conflicted_actors(store, cmd.run_id)
+        if actor in conflicted:
+            raise NotAuthorized(
+                f"reviewer independence violated: {actor!r} is implementing this "
+                f"run or produced the artifact under review (conflicted: {sorted(conflicted)})"
+            )
+        return binding
+
+    epoch_n = front.epoch(store, cmd.run_id)
+    expected_bundle = front.bundle_hash(store, cmd.run_id)
+    if binding.context_bundle_hash != expected_bundle:
         raise NotAuthorized(
-            f"reviewer independence violated: {actor!r} is implementing this "
-            f"run or produced the artifact under review (conflicted: "
-            f"{sorted(conflicted)})"
+            f"review binds context_bundle_hash {binding.context_bundle_hash[:12]}..., "
+            f"but epoch {epoch_n}'s bundle is {str(expected_bundle)[:12]}..."
+        )
+    expected_policy = front.policy_version(store, cmd.run_id)
+    if binding.policy_version != expected_policy:
+        raise NotAuthorized(
+            f"review binds policy_version {binding.policy_version}, but this run's "
+            f"policy_frozen is journal seq {expected_policy}"
+        )
+    findings = cmd.payload.get("findings_hash")
+    if not isinstance(findings, str) or not store.has_artifact(findings):
+        raise NotAuthorized(
+            "a front-half review_ruling names findings_hash the kernel holds: the "
+            "next author round is briefed with them"
+        )
+    submitted = front.newest_submission(store, cmd.run_id, phase, epoch_n)
+    if submitted is not None and submitted.payload["author"] == actor:
+        raise NotAuthorized(
+            f"reviewer independence violated: {actor!r} submitted the {phase} under review"
         )
     return binding
 
@@ -323,12 +428,66 @@ def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
     for fact in store.facts_for(run_id):
         if fact.kind != EventKind.REVIEW_VERDICT:
             continue
+        # ONLY an implementation-phase verdict authorizes a merge. A spec or
+        # plan accept is a `review_verdict` with a binding_hash of the same
+        # shape, so without this the SPEC reviewer's approval authorizes a
+        # merge whenever the run's current output happens to be the spec
+        # artefact and the requester presents the tuple that accept bound --
+        # and the requester chooses the bundle and the policy version, both
+        # declared residuals. A back-half reject binding any other tuple does
+        # not supersede it, so the run reaches merge_requested and
+        # revalidation passes, with no implementation review having accepted
+        # anything. Verdicts written before the front half existed carry no
+        # phase and were all implementation ones.
+        if fact.payload.get("phase") not in (None, "implementation"):
+            continue
         if fact.payload.get("binding_hash") == wanted:
             latest = fact.payload.get("verdict")
     return latest == "accept"
 
 
-def authorize(store, cmd, actor: str) -> str | None:
+def _check_submit(store, cmd, state: str) -> None:
+    """What a submission has to be, before it becomes the phase's artefact.
+
+    The author role, an artefact the kernel holds, and a change: an identical
+    resubmission in the same phase and epoch is the loop spinning, not a
+    revision, and the plan additionally has to be a different object from the
+    spec and to have tasks in it.
+    """
+    from kernel import front
+    if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
+        raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
+    h = cmd.payload.get("artifact_hash")
+    if not isinstance(h, str) or not store.has_artifact(h):
+        raise NotAuthorized(f"{cmd.name} names an artefact the kernel does not hold: {h!r}")
+    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
+    if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n)):
+        raise NotAuthorized(
+            f"identical to the prior artefact: {h[:12]}... was already submitted "
+            f"for {phase} in epoch {epoch_n}; a resubmission that did not change is not a revision"
+        )
+    if cmd.name == "submit_plan":
+        if h == store.phase_artifact(cmd.run_id, "spec"):
+            raise NotAuthorized("the plan is the run's current spec: a plan is a different artefact")
+        if b"### Task" not in store.read_blob(h):
+            raise NotAuthorized("plan has no tasks: no `### Task` heading (a shape check)")
+
+
+def _check_park(store, cmd) -> None:
+    """A park records why a pass stopped. Bounded here so the reason is one
+    of the six the loop has, not free text the coordinator invents."""
+    if cmd.payload.get("reason") not in PARK_REASONS:
+        raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
+    for key in ("session_id", "cursor_item_id", "reviewer"):
+        if cmd.payload.get(key) is not None and not isinstance(cmd.payload.get(key), str):
+            raise NotAuthorized(f"park {key} must be a string or null")
+    if cmd.payload.get("findings_hash") is not None and not store.has_artifact(cmd.payload.get("findings_hash")):
+        raise NotAuthorized("park findings_hash names an artefact the kernel does not hold")
+    if cmd.payload.get("verdict") not in (None, "accept", "request_revision"):
+        raise NotAuthorized("park verdict must be null, accept or request_revision")
+
+
+def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str | None:
     """Authorize *cmd* against the run's current state. Returns the next state.
 
     Raises :class:`NotAuthorized` when the command is illegal here, or when
@@ -350,6 +509,29 @@ def authorize(store, cmd, actor: str) -> str | None:
             f"legal from {sorted(allowed)}"
         )
 
+    if cmd.name in ("submit_spec", "submit_plan"):
+        _check_submit(store, cmd, current)
+        return next_state
+
+    if cmd.name == "record_review":
+        verdict = cmd.payload.get("verdict")
+        if verdict not in _VERDICT_WORDS:
+            raise NotAuthorized(f"verdict {verdict!r} is not one of {sorted(_VERDICT_WORDS)}")
+        return _review_destination(store, cmd.run_id, current, verdict, ruling)
+
+    if cmd.name == "record_turn_ended":
+        if cmd.payload.get("ended") not in TURN_ENDS:
+            raise NotAuthorized(
+                f"ended {cmd.payload.get('ended')!r} is not one of {sorted(TURN_ENDS)}"
+            )
+        if not isinstance(cmd.payload.get("session"), str) or not cmd.payload["session"]:
+            raise NotAuthorized("record_turn_ended names the session whose turn ended")
+        return None
+
+    if cmd.name == "park":
+        _check_park(store, cmd)
+        return None
+
     if cmd.name == "record_implementation_output":
         if role_for(store, cmd.run_id, cmd.generation) != Role.IMPLEMENTER:
             raise NotAuthorized(
@@ -363,14 +545,6 @@ def authorize(store, cmd, actor: str) -> str | None:
                 "kernel holds"
             )
         return None
-
-    if cmd.name == "record_review":
-        verdict = cmd.payload.get("verdict")
-        if verdict not in _VERDICTS:
-            raise NotAuthorized(
-                f"verdict {verdict!r} is not one of {sorted(_VERDICTS)}"
-            )
-        return _VERDICTS[verdict]
 
     if cmd.name == "record_merge_outcome":
         outcome = cmd.payload.get("outcome")
@@ -522,6 +696,10 @@ def _reviewer_of(store, run_id: str, wanted: str) -> str | None:
     for fact in store.facts_for(run_id):
         if (
             fact.kind == EventKind.REVIEW_VERDICT
+            # The same phase filter `_merge_is_authorized` applies: the
+            # reviewer this names is the one whose accept authorized the
+            # merge, so it must be read from the same set of verdicts.
+            and fact.payload.get("phase") in (None, "implementation")
             and fact.payload.get("binding_hash") == wanted
             and fact.payload.get("verdict") == "accept"
         ):

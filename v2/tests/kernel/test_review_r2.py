@@ -2,6 +2,7 @@
 
 import pytest
 
+from kernel.artifacts import put_artifact
 from kernel.commands import Command, submit
 from conftest import valid_argv
 from kernel.effects import (
@@ -95,12 +96,14 @@ def test_reusing_a_key_for_the_same_command_with_a_different_payload_is_refused(
     """Replay compared only the stored name, so the same command with a
     DIFFERENT payload was answered with the first result."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
-                      idempotency_key="k", generation=g, payload={"hash": "A"}))
+                      idempotency_key="k", generation=g,
+                      payload={"artifact_hash": put_artifact(s, b"A")}))
     with pytest.raises(ValueError, match="idempotency"):
         submit(s, Command(name="submit_spec", run_id="r", expected_version=1,
-                          idempotency_key="k", generation=g, payload={"hash": "B"}))
+                          idempotency_key="k", generation=g,
+                          payload={"artifact_hash": put_artifact(s, b"B")}))
 
 
 # --- 6. the halt bypass must not be reachable from the public API ------------

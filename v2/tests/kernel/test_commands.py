@@ -1,5 +1,6 @@
 import pytest
 
+from kernel.artifacts import put_artifact
 from kernel.commands import COMMAND_NAMES, Command, StaleVersion, submit
 from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
@@ -19,9 +20,11 @@ def _cmd(store, name="submit_spec", version=0, key="k1", generation=None, **payl
         name=name, run_id="r", expected_version=version, idempotency_key=key,
         generation=(
             generation if generation is not None
-            else dispatch(store, "r", actor="claude", role=Role.IMPLEMENTER).generation
+            # AUTHOR, because the default command here is submit_spec and a
+            # submission now has to come from an author seat.
+            else dispatch(store, "r", actor="claude", role=Role.AUTHOR).generation
         ),
-        payload=payload or {"spec_sha256": "a" * 64},
+        payload=payload or {"artifact_hash": put_artifact(store, b"spec")},
     )
 
 
@@ -52,6 +55,11 @@ def test_the_command_interface_is_closed_and_explicit():
         # "aggregate matches the scorecard" criterion was unsatisfiable for
         # six of the scorecard's seven terminal outcomes.
         "record_run_outcome",
+        # The front half's two observations. record_turn_ended makes the end
+        # of a model's turn a fact the kernel holds rather than a wait the
+        # coordinator performs; park records why a pass stopped without a
+        # transition, which v1 could express only as the absence of anything.
+        "record_turn_ended", "park",
     ])
 
 
@@ -62,14 +70,16 @@ def test_command_at_the_current_version_is_accepted(store):
 def test_command_derived_from_an_older_version_is_refused(store):
     """A command derived from version 12 cannot mutate version 15.
 
-    Uses a legal SEQUENCE (submit_spec then submit_plan) because commands are
-    now authorized against the run's state; re-issuing submit_spec would be
-    refused for being illegal rather than for being stale, and the test would
-    pass for the wrong reason.
+    The second command is `park`, which is legal from `spec_submitted` and
+    passes every payload check, so the CAS is the first thing that can refuse
+    it. A second `submit_spec` would be refused by the identical-hash guard
+    and a `submit_plan` by the state check -- both NotAuthorized, both raised
+    before the transaction the CAS lives in, so the test would pass for the
+    wrong reason.
     """
     submit(store, _cmd(store, key="k1"))
     with pytest.raises(StaleVersion):
-        submit(store, _cmd(store, name="submit_plan", version=0, key="k2"))
+        submit(store, _cmd(store, name="park", version=0, key="k2", reason="gate"))
 
 
 def test_replaying_an_idempotency_key_returns_the_first_result(store):
@@ -100,7 +110,7 @@ def test_command_from_a_superseded_generation_is_refused(store):
 def test_a_rejected_command_records_a_fact(store):
     submit(store, _cmd(store, key="k1"))
     with pytest.raises(StaleVersion):
-        submit(store, _cmd(store, name="submit_plan", version=0, key="k2"))
+        submit(store, _cmd(store, name="park", version=0, key="k2", reason="gate"))
     assert "command_rejected" in [f.kind for f in store.facts_for("r")]
 
 

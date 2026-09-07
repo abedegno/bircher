@@ -18,13 +18,16 @@ from kernel.dispatch import Role, dispatch
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
+from tests.kernel.front import Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 
 
 def _store():
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    # Through the driver, so the run has the frozen policy the front half's
+    # guards read; `base_sha` is the one every review below binds.
+    Front(s, "r", base_sha=BASE)
     return s
 
 
@@ -35,6 +38,10 @@ def _sub(s, name, key, actor, role, **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # Every review here is of an implementation output, and a review must
+        # name the phase of the state it is recorded from.
+        payload.setdefault("phase", "implementation")
     return submit(s, Command(
         name=name, run_id="r", expected_version=s.run_version("r"),
         idempotency_key=key,
@@ -44,9 +51,10 @@ def _sub(s, name, key, actor, role, **payload):
 
 
 def _to_implementing(s, implementer="claude"):
+    # `planned` is the driver's to reach: a submit lands at *_submitted and
+    # only a reviewer's accept of the current hash moves the run on.
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
     spec = put_artifact(s, b"# spec")
-    _sub(s, "submit_spec", "k1", implementer, Role.IMPLEMENTER, spec_sha256=spec)
-    _sub(s, "submit_plan", "k2", implementer, Role.IMPLEMENTER, plan_sha256=spec)
     _sub(s, "start_implementation", "k3", implementer, Role.IMPLEMENTER)
     _sub(s, "record_implementation_output", "k3o", implementer,
          Role.IMPLEMENTER, artifact_hash=spec)
@@ -72,7 +80,7 @@ def test_a_command_carrying_an_actor_field_is_refused(field):
         submit(s, Command(
             name="submit_spec", run_id="r", expected_version=0,
             idempotency_key=f"k-{field}", generation=gen,
-            payload={field: "anyone", "spec_sha256": "a" * 64},
+            payload={field: "anyone", "artifact_hash": "a" * 64},
         ))
 
 
@@ -87,10 +95,18 @@ def test_the_accepted_fact_records_the_dispatched_actor():
     s = _store()
     _to_implementing(s, implementer="gpt")
     accepted = [f for f in s.facts_for("r") if f.kind == "command_accepted"]
-    assert {f.actor for f in accepted} == {"gpt"}, (
+    dispatched = {d["generation"]: d["actor"] for d in s.dispatches_for("r")}
+    assert accepted
+    # The front half is the author's and the reviewer's work, so a single
+    # expected actor is no longer the property. The property is that EVERY
+    # accepted fact carries the actor the kernel dispatched for its
+    # generation -- and that none of them says "kernel".
+    assert all(f.actor == dispatched[f.payload["generation"]] for f in accepted), (
         "the accepted facts attribute the work to the kernel, so the audit "
         "trail cannot say who did it"
     )
+    assert {f.actor for f in accepted
+            if f.payload["command_name"] == "start_implementation"} == {"gpt"}
 
 
 def test_a_rejection_records_who_was_refused():
@@ -110,7 +126,7 @@ def test_an_undispatched_generation_cannot_submit():
         submit(s, Command(
             name="submit_spec", run_id="r", expected_version=0,
             idempotency_key="k", generation=self_fenced,
-            payload={"spec_sha256": "a" * 64},
+            payload={"artifact_hash": "a" * 64},
         ))
 
 
@@ -173,7 +189,8 @@ def test_the_verdict_fact_names_the_dispatched_reviewer():
     _sub(s, "record_review", "rv", "codex", Role.REVIEWER, verdict="accept",
          artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
          policy_version=1)
-    verdict = [f for f in s.facts_for("r") if f.kind == "review_verdict"][0]
+    # The LAST verdict: the driver's spec and plan accepts are verdicts too.
+    verdict = [f for f in s.facts_for("r") if f.kind == "review_verdict"][-1]
     assert verdict.payload["reviewer_identity"] == "codex"
     assert verdict.actor == "codex"
 

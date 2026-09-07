@@ -3,6 +3,7 @@
 import pytest
 
 from kernel import canon
+from kernel.artifacts import put_artifact
 from kernel.canon import CANON_VERSION, canonical_bytes, canonical_hash
 from kernel.commands import Command, submit
 from conftest import valid_argv
@@ -75,25 +76,27 @@ def test_the_same_key_in_two_runs_is_not_a_replay():
     """Global scope silently returns one run's result to another run's
     command -- a misattribution of authority, not a replay."""
     s = _store("runA", "runB")
-    gA = dispatch(s, "runA", actor="a", role=Role.IMPLEMENTER).generation
+    gA = dispatch(s, "runA", actor="a", role=Role.AUTHOR).generation
     submit(s, Command(name="submit_spec", run_id="runA", expected_version=0,
-                      idempotency_key="shared", generation=gA, payload={}))
-    gB = dispatch(s, "runB", actor="b", role=Role.IMPLEMENTER).generation
+                      idempotency_key="shared", generation=gA,
+                      payload={"artifact_hash": put_artifact(s, b"spec A")}))
+    gB = dispatch(s, "runB", actor="b", role=Role.AUTHOR).generation
     # submit_spec on runB: same key, same name, different run. Uses a command
     # legal from `queued` so the test exercises key scoping rather than
     # tripping the state check.
     res = submit(s, Command(name="submit_spec", run_id="runB", expected_version=0,
                             idempotency_key="shared", generation=gB,
-                            payload={"spec_sha256": "b" * 64}))
+                            payload={"artifact_hash": put_artifact(s, b"spec B")}))
     assert not res.replayed, "runB's command was answered with runA's result"
     assert res.result["name"] == "submit_spec"
 
 
 def test_reusing_a_key_for_a_different_command_in_one_run_is_refused():
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
-                      idempotency_key="k", generation=g, payload={}))
+                      idempotency_key="k", generation=g,
+                      payload={"artifact_hash": put_artifact(s, b"spec")}))
     with pytest.raises(ValueError, match="idempotency"):
         submit(s, Command(name="submit_plan", run_id="r", expected_version=1,
                           idempotency_key="k", generation=g, payload={}))
@@ -130,7 +133,8 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
     import kernel.commands as commands
 
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
+    spec = put_artifact(s, b"spec")
     v_before = s.run_version("r")
 
     real_record = s.record_command
@@ -141,7 +145,8 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
     monkeypatch.setattr(s, "record_command", boom)
     with pytest.raises(RuntimeError):
         submit(s, Command(name="submit_spec", run_id="r", expected_version=v_before,
-                          idempotency_key="k", generation=g, payload={}))
+                          idempotency_key="k", generation=g,
+                          payload={"artifact_hash": spec}))
     monkeypatch.setattr(s, "record_command", real_record)
 
     assert s.run_version("r") == v_before, (
@@ -156,16 +161,19 @@ def test_submit_is_atomic_across_its_three_writes(monkeypatch):
 def test_a_retry_after_a_crashed_submit_succeeds():
     """The point of the transaction: the retry must be able to succeed."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
+    spec = put_artifact(s, b"spec")
     v = s.run_version("r")
     real_record = s.record_command
     s.record_command = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash"))
     with pytest.raises(RuntimeError):
         submit(s, Command(name="submit_spec", run_id="r", expected_version=v,
-                          idempotency_key="k", generation=g, payload={}))
+                          idempotency_key="k", generation=g,
+                          payload={"artifact_hash": spec}))
     s.record_command = real_record
     assert submit(s, Command(name="submit_spec", run_id="r", expected_version=v,
-                             idempotency_key="k", generation=g, payload={})).accepted
+                             idempotency_key="k", generation=g,
+                             payload={"artifact_hash": spec})).accepted
 
 
 # --- 5b. COMMAND_REQUESTED is part of the spec's event stream -----------------
@@ -175,9 +183,10 @@ def test_command_requested_is_recorded():
     Recording only outcomes means the audit cannot distinguish no retry from
     forty retries."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
     submit(s, Command(name="submit_spec", run_id="r", expected_version=0,
-                      idempotency_key="k", generation=g, payload={}))
+                      idempotency_key="k", generation=g,
+                      payload={"artifact_hash": put_artifact(s, b"spec")}))
     kinds = [f.kind for f in s.facts_for("r")]
     assert "command_requested" in kinds
     assert kinds.index("command_requested") < kinds.index("command_accepted")
@@ -187,9 +196,10 @@ def test_a_replayed_command_still_records_the_request():
     """A replay mutates nothing, but a fact is an observation, not a mutation:
     without it the audit cannot see the retry happened at all."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
     c = Command(name="submit_spec", run_id="r", expected_version=0,
-                idempotency_key="k", generation=g, payload={})
+                idempotency_key="k", generation=g,
+                payload={"artifact_hash": put_artifact(s, b"spec")})
     submit(s, c)
     before = len([f for f in s.facts_for("r") if f.kind == "command_requested"])
     submit(s, c)
@@ -203,10 +213,11 @@ def test_a_payload_key_cannot_shadow_the_command_name():
     """Splatting the payload alongside the command's own keys let a payload
     field silently overwrite the recorded command name."""
     s = _store()
-    g = dispatch(s, "r", actor="a", role=Role.IMPLEMENTER).generation
+    g = dispatch(s, "r", actor="a", role=Role.AUTHOR).generation
     submit(s, Command(
         name="submit_spec", run_id="r", expected_version=0, idempotency_key="k",
-        generation=g, payload={"command_name": "request_merge", "generation": 999},
+        generation=g, payload={"command_name": "request_merge", "generation": 999,
+                               "artifact_hash": put_artifact(s, b"spec")},
     ))
     fact = [f for f in s.facts_for("r") if f.kind == "command_accepted"][0]
     assert fact.payload["command_name"] == "submit_spec", (

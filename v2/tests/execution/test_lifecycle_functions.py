@@ -135,7 +135,11 @@ assert not (REPO_ROOT / "kernel").exists(), (
 from kernel.events import EventKind  # noqa: E402
 from kernel.store import Store  # noqa: E402
 
-BASE_SHA = "a" * 40
+#: The base sha the front-half driver creates its runs with
+#: (v2/tests/kernel/front.py). Every review binds the base the KERNEL
+#: recorded, and the front half is reached through the driver now, so the
+#: value the lifecycle's own reviews carry has to be the one the run has.
+BASE_SHA = "0" * 40
 HEAD_SHA = "b" * 40
 
 # Same enforcing `_net_run` stand-in test_kernel_client.py uses: run-queue.sh's
@@ -177,6 +181,31 @@ def _run(script, env=None, net_run=_NET_RUN_STUB):
 
 def _db_env(db):
     return {"BIRCHER_KERNEL_DB": str(db)}
+
+
+def _reach_planned(db, run_id):
+    """Create the run and drive it to `planned` through the kernel's own
+    front-half driver (`v2/tests/kernel/front.py`).
+
+    `_kernel_run_start` + `_kernel_submit_spec` + `_kernel_submit_plan` no
+    longer gets there. A submit lands at `spec_submitted` and only a
+    reviewer's accept of the current hash moves the run on, and the accept
+    binds the run's frozen policy -- which `create_run` writes and
+    `store.create_run` (what `_kernel_run_start` calls) does not. So the run
+    is created by the driver too, not adopted from `_kernel_run_start`.
+
+    Returns the journal seq of the last fact the front half wrote, so a
+    caller can assert on what IT added rather than on the whole history.
+    """
+    r = subprocess.run(
+        [sys.executable, "-m", "tests.kernel.front", "--db", str(db),
+         "--run-id", run_id, "--to", "planned"],
+        capture_output=True, text=True, cwd=str(V2_DIR),
+        env={"PATH": "/usr/bin:/bin:/usr/local/bin",
+             "BIRCHER_KERNEL_MODE": "enforce"})
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert Store.open(db).run_state(run_id) == "planned", r.stdout
+    return Store.open(db).facts_for(run_id)[-1].seq
 
 
 def _sleepy_python(tmp_path):
@@ -310,12 +339,23 @@ def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
     already-PUT hash as an argument (the same PUT-before-reference contract
     record_implementation_output has), and run_item PUTs the prompt ONCE and
     passes that one hash to both -- proven here by putting it once and
-    feeding the same hash to both functions, then checking the artifact
-    really is held and both commands were requested."""
+    feeding the same hash to both functions.
+
+    WHERE THE TWO CALLS LAND HAS MOVED. A submission is no longer its own
+    acceptance: `submit_spec` lands at `spec_submitted` and becomes the spec
+    phase's current artefact, and `submit_plan` is legal only from
+    `specified`, which a reviewer's accept reaches. So the second call is
+    refused here and the run stops short of `planned`. The client still makes
+    both calls until Task 20 rewrites it; this records what they do, and the
+    PUT-before-reference contract -- the hash the kernel accepts is one it
+    holds -- is what survives unchanged.
+
+    Dispatched as AUTHOR: a submission must come from an author seat.
+    """
     db = tmp_path / "kernel.db"
     run_id = "run-spec"
     _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
-    r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
+    r = _run('g=$(_kernel_dispatch claude_code author); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
     assert gen == "1", (r.stdout, r.stderr)
@@ -336,8 +376,17 @@ def test_submit_spec_and_plan_reuse_the_same_put_artifact(tmp_path):
     accepted = {
         f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
     }
-    assert {"submit_spec", "submit_plan"} <= accepted, accepted
-    assert store.run_state(run_id) == "planned"
+    assert accepted == {"submit_spec"}, accepted
+    assert store.phase_artifact(run_id, "spec") == expected_hash, (
+        "the hash the function was given did not become the spec phase's "
+        "current artefact"
+    )
+    rejected = {
+        (f.payload["command_name"], f.payload["reason"])
+        for f in facts if f.kind == EventKind.COMMAND_REJECTED
+    }
+    assert ("submit_plan", "NotAuthorized") in rejected, rejected
+    assert store.run_state(run_id) == "spec_submitted"
 
 
 def test_start_implementation_needs_the_implementer_role(tmp_path):
@@ -347,17 +396,13 @@ def test_start_implementation_needs_the_implementer_role(tmp_path):
     must be refused, not silently accepted."""
     db = tmp_path / "kernel.db"
     run_id = "run-wrong-role"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _reach_planned(db, run_id)
     r = _run('g=$(_kernel_dispatch codex reviewer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
-    assert gen == "1", (r.stdout, r.stderr)
+    assert gen.isdigit(), (r.stdout, r.stderr)
 
-    _run(f'h=$(_kernel_put_artifact "x"); '
-         f'_kernel_submit_spec {run_id} {gen} "$h"; '
-         f'_kernel_submit_plan {run_id} {gen} "$h"; '
-         f'_kernel_start_implementation {run_id} {gen}',
-         env=_db_env(db))
+    _run(f'_kernel_start_implementation {run_id} {gen}', env=_db_env(db))
 
     store = Store.open(db)
     assert store.run_state(run_id) == "planned", (
@@ -379,18 +424,19 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     through the named shell functions: run start, implementer dispatch,
     submit_spec, submit_plan, start_implementation, output, CI, reviewer
     dispatch, review, implementer redispatch, merge request, outcome.
-    Returns the three generations observed on stdout."""
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+
+    The front half is the DRIVER's: run start, submit_spec and submit_plan no
+    longer reach `planned` on their own. Returns the three generations
+    observed on stdout, plus the journal seq the front half ended at.
+    """
+    front_seq = _reach_planned(db, run_id)
 
     r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen1 = r.stdout.strip().strip("[]")
-    assert gen1 == "1", (r.stdout, r.stderr)
+    assert gen1.isdigit(), (r.stdout, r.stderr)
 
-    r = _run(f'h=$(_kernel_put_artifact {prompt!r}); '
-             f'_kernel_submit_spec {run_id} {gen1} "$h"; '
-             f'_kernel_submit_plan {run_id} {gen1} "$h"; printf %s "$h"',
-             env=_db_env(db))
+    r = _run(f'_kernel_put_artifact {prompt!r}', env=_db_env(db))
     spec_hash = r.stdout.strip()
     _run(f"_kernel_start_implementation {run_id} {gen1}", env=_db_env(db))
 
@@ -407,7 +453,7 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     r = _run('g=$(_kernel_dispatch codex reviewer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen2 = r.stdout.strip().strip("[]")
-    assert gen2 == "2", (r.stdout, r.stderr)
+    assert gen2 == str(int(gen1) + 1), (r.stdout, r.stderr)
 
     _run(f"_kernel_record_review {run_id} {gen2} codex:pass "
          f"{out_hash} {BASE_SHA} {spec_hash}", env=_db_env(db))
@@ -415,12 +461,12 @@ def _drive_full_lifecycle(db, run_id, prompt="do the thing"):
     r = _run('g=$(_kernel_dispatch claude_code implementer); echo "[$g]"',
               env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen3 = r.stdout.strip().strip("[]")
-    assert gen3 == "3", (r.stdout, r.stderr)
+    assert gen3 == str(int(gen2) + 1), (r.stdout, r.stderr)
 
     _run(f"_kernel_request_merge {run_id} {gen3} 42 abedegno/muesli {HEAD_SHA} "
          f"{out_hash} {BASE_SHA} {spec_hash}", env=_db_env(db))
     _run(f"_kernel_record_outcome {run_id} {gen3} merged", env=_db_env(db))
-    return gen1, gen2, gen3
+    return gen1, gen2, gen3, front_seq
 
 
 def test_every_stage_actually_reaches_the_kernel(tmp_path):
@@ -432,17 +478,19 @@ def test_every_stage_actually_reaches_the_kernel(tmp_path):
     fake."""
     db = tmp_path / "kernel.db"
     run_id = "run-full"
-    _drive_full_lifecycle(db, run_id)
+    *_gens, front_seq = _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
-    facts = store.facts_for(run_id)
+    # What the LIFECYCLE added: the front half is the driver's and has its own
+    # commands, so the whole journal is no longer this test's subject.
+    facts = [f for f in store.facts_for(run_id) if f.seq > front_seq]
     requested_names = {
         f.payload.get("name") for f in facts if f.kind == EventKind.COMMAND_REQUESTED
     }
     assert requested_names == {
-        "submit_spec", "submit_plan", "start_implementation",
-        "record_implementation_output", "record_ci_observation",
-        "record_review", "request_merge", "record_merge_outcome",
+        "start_implementation", "record_implementation_output",
+        "record_ci_observation", "record_review", "request_merge",
+        "record_merge_outcome",
     }, requested_names
 
     dispatched = [f for f in facts if f.kind == EventKind.ATTEMPT_DISPATCHED]
@@ -463,7 +511,7 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     state, not because of anything wrong with THEM -- are now accepted too."""
     db = tmp_path / "kernel.db"
     run_id = "run-advances"
-    _drive_full_lifecycle(db, run_id)
+    *_gens, front_seq = _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
     assert store.run_state(run_id) == "merge_requested", (
@@ -475,13 +523,20 @@ def test_the_three_missing_transitions_are_now_accepted(tmp_path):
     )
     facts = store.facts_for(run_id)
     accepted_names = {
-        f.payload["command_name"] for f in facts if f.kind == EventKind.COMMAND_ACCEPTED
+        f.payload["command_name"] for f in facts
+        if f.kind == EventKind.COMMAND_ACCEPTED and f.seq > front_seq
     }
     assert accepted_names == {
-        "submit_spec", "submit_plan", "start_implementation",
-        "record_implementation_output", "record_ci_observation",
-        "record_review", "request_merge",
+        "start_implementation", "record_implementation_output",
+        "record_ci_observation", "record_review", "request_merge",
     }, accepted_names
+    # The two submits are still accepted -- in the front half, where they now
+    # live, and where a reviewer's accept is what moves the run on from each.
+    front_accepted = {
+        f.payload["command_name"] for f in facts
+        if f.kind == EventKind.COMMAND_ACCEPTED and f.seq <= front_seq
+    }
+    assert {"submit_spec", "submit_plan"} <= front_accepted, front_accepted
 
     expected_hash = hashlib.sha256(b"do the thing").hexdigest()
     assert store.has_artifact(expected_hash)
@@ -508,12 +563,13 @@ def test_the_one_remaining_refusal_is_the_evidence_check_not_a_gap(tmp_path):
     """
     db = tmp_path / "kernel.db"
     run_id = "run-refusals"
-    _drive_full_lifecycle(db, run_id)
+    *_gens, front_seq = _drive_full_lifecycle(db, run_id)
 
     store = Store.open(db)
     rejected = {
         f.payload["command_name"]: f.payload["detail"]
-        for f in store.facts_for(run_id) if f.kind == EventKind.COMMAND_REJECTED
+        for f in store.facts_for(run_id)
+        if f.kind == EventKind.COMMAND_REJECTED and f.seq > front_seq
     }
     assert set(rejected) == {"record_merge_outcome"}, rejected
     assert "no confirmed merge effect" in rejected["record_merge_outcome"], rejected
@@ -538,15 +594,12 @@ def test_an_escalated_run_actually_reaches_a_terminal_state(tmp_path):
     """
     db = tmp_path / "kernel.db"
     run_id = "run-escalated"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _reach_planned(db, run_id)
     r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
-    assert gen == "1", (r.stdout, r.stderr)
+    assert gen.isdigit(), (r.stdout, r.stderr)
 
-    _run(f'h=$(_kernel_put_artifact "do the thing"); '
-         f'_kernel_submit_spec {run_id} {gen} "$h"; '
-         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
 
     store = Store.open(db)
@@ -588,15 +641,16 @@ def test_a_bogus_outcome_is_refused_rather_than_recorded(tmp_path):
 # unbound.
 
 def _reviewed_run(db, run_id, verdict, terminal=""):
-    """Drive a run to `implementing`, then record a review with *verdict*."""
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    """Drive a run to `implementing`, then record a review with *verdict*.
+
+    `planned` is the driver's to reach; everything from `start_implementation`
+    on is still driven through the shell functions, which is what these tests
+    are about."""
+    _reach_planned(db, run_id)
     r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
-    out = _run(f'h=$(_kernel_put_artifact "prompt"); '
-               f'_kernel_submit_spec {run_id} {gen} "$h"; '
-               f'_kernel_submit_plan {run_id} {gen} "$h"; printf %s "$h"',
-               env=_db_env(db))
+    out = _run('_kernel_put_artifact "prompt"', env=_db_env(db))
     spec = out.stdout.strip()
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
     o = _run(f"_kernel_record_output {run_id} {gen} 'body'", env=_db_env(db))
@@ -638,8 +692,11 @@ def test_a_TERMINAL_fail_records_a_rejection_not_a_revision_request(tmp_path):
     s = _reviewed_run(str(tmp_path / "k.db"), "r-term", "codex:fail",
                       terminal="terminal")
     assert s.run_state("r-term") == "reviewing", s.run_state("r-term")
+    # The IMPLEMENTATION verdict: the front half's spec and plan accepts are
+    # review_verdict facts too, and neither is what this test is about.
     verdicts = [f.payload.get("verdict") for f in s.facts_for("r-term")
-                if f.kind == "review_verdict"]
+                if f.kind == "review_verdict"
+                and f.payload.get("phase") == "implementation"]
     assert verdicts == ["reject"], verdicts
 
 
@@ -703,19 +760,23 @@ def test_an_unknown_ci_status_cannot_authorize_a_merge(tmp_path):
     authorizing merges on `ci=pending` and `ci=na`."""
     db = tmp_path / "k.db"
     run_id = "r-ci"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _reach_planned(db, run_id)
     r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
-    _run(f'h=$(_kernel_put_artifact "p"); _kernel_submit_spec {run_id} {gen} "$h"; '
-         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
     _run(f"_kernel_record_ci {run_id} {gen} pending {HEAD_SHA}", env=_db_env(db))
 
+    st = Store.open(db)
     from kernel.authz import _ci_is_green
-    assert not _ci_is_green(Store.open(db), run_id, HEAD_SHA), (
+    assert not _ci_is_green(st, run_id, HEAD_SHA), (
         "a 'pending' CI observation reads as green, so a merge can be "
         "authorized on CI that never reported")
+    # The observation must have been RECORDED as unmapped, not lost: "not
+    # green" is also true of a command that never reached the kernel.
+    accepted = [f for f in st.facts_for(run_id)
+                if (f.payload or {}).get("command_name") == "record_ci_observation"]
+    assert accepted, "the ci observation was lost rather than recorded"
 
 
 # --- adoption hands back a USABLE run -----------------------------------------
@@ -914,12 +975,10 @@ def test_a_ci_status_that_STRIPS_into_success_cannot_authorize(tmp_path, ci):
     """
     db = tmp_path / "k.db"
     run_id = "r-ci-collide"
-    _run(f'_kernel_run_start {run_id} abedegno/muesli {BASE_SHA}', env=_db_env(db))
+    _reach_planned(db, run_id)
     r = _run('g=$(_kernel_dispatch codex implementer); echo "[$g]"',
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
-    _run(f'h=$(_kernel_put_artifact "p"); _kernel_submit_spec {run_id} {gen} "$h"; '
-         f'_kernel_submit_plan {run_id} {gen} "$h"', env=_db_env(db))
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
     _run(f"_kernel_record_ci {run_id} {gen} {ci!r} {HEAD_SHA}", env=_db_env(db))
 

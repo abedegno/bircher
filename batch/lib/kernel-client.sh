@@ -647,6 +647,11 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # the fact carries the key as its causal id. Deriving that key on the shell side
 # instead would rebuild `kernel.cli`'s default-key format in a second language,
 # and two subsystems that rebuild the same string eventually disagree about it.
+#
+# `phase` is `implementation` because every review this client records is of an
+# implementation output; the kernel refuses a review whose phase is not the
+# phase of the state it is recorded from. The front half's spec and plan
+# reviews do not come through here.
 _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
   local key="${7:-}" terminal="${8:-}"
@@ -666,12 +671,12 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
   if [ -n "$key" ]; then
     _kernel command --run-id "$run_id" --generation "$generation" \
       --name record_review --idempotency-key "$key" \
-      --payload-json "{\"verdict\":\"$verdict\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
+      --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
     return 0
   fi
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_review \
-    --payload-json "{\"verdict\":\"$verdict\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
+    --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
 }
 
 # _kernel_request_merge <run_id> <generation> <pr> <repo> <head_git_sha>

@@ -1,5 +1,6 @@
 import pytest
 
+from kernel.artifacts import put_artifact
 from kernel.commands import Command, StaleVersion, submit
 from conftest import valid_argv
 from kernel.effects import (
@@ -160,10 +161,11 @@ def test_unrelated_runs_continue(store):
     unconfirmed attempt holds that run's resources and nothing else."""
     _fail(store)
     assert not is_halted(store, "other")
-    gen = dispatch(store, "other", actor="claude", role=Role.IMPLEMENTER).generation
+    gen = dispatch(store, "other", actor="claude", role=Role.AUTHOR).generation
     assert submit(store, Command(
         name="submit_spec", run_id="other", expected_version=0,
-        idempotency_key="ok", generation=gen, payload={},
+        idempotency_key="ok", generation=gen,
+        payload={"artifact_hash": put_artifact(store, b"spec")},
     )).accepted
 
 

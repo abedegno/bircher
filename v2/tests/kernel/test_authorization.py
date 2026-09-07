@@ -20,15 +20,21 @@ from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.projection import project
 from kernel.store import Store
+from tests.kernel.front import SPEC_BYTES, Front
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
 SPEC = PLAN = None  # set per-store: a review may only bind artifacts the kernel holds
+#: The front-half driver for the run these tests share. The front half is no
+#: longer reachable by submitting: only a reviewer's accept of the current
+#: hash moves a run past `spec_submitted`, so the run is created and advanced
+#: through the driver, and `_submit` is left to the back half.
+FRONT = None
 
 
 def _store():
-    global SPEC, PLAN
+    global SPEC, PLAN, FRONT
     s = Store.open(":memory:", clock=Clock(start_us=1))
-    s.create_run(run_id="r", base_repo="o/r", base_sha=BASE)
+    FRONT = Front(s, "r", base_sha=BASE)
     SPEC = put_artifact(s, b"# spec")
     PLAN = put_artifact(s, b"# plan")
     return s
@@ -47,6 +53,10 @@ def _submit(s, name, key, actor=None, **payload):
         # itself is asserted in test_effect_contract.py.
         payload.setdefault("pr", 42)
         payload.setdefault("repo", "abedegno/muesli")
+    if name == "record_review":
+        # The phase a review names must equal the phase of the state it is
+        # recorded from; every review here is of an implementation output.
+        payload.setdefault("phase", "implementation")
     role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
     if actor is None:
         actor = "codex" if role == Role.REVIEWER else "claude"
@@ -59,8 +69,7 @@ def _submit(s, name, key, actor=None, **payload):
 
 
 def _advance_to_reviewing(s):
-    _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
-    _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
+    FRONT.to_planned()
     _submit(s, "start_implementation", "k3", actor="claude")
     _submit(s, "record_implementation_output", "k3o", actor="claude",
             artifact_hash=SPEC)
@@ -100,7 +109,7 @@ def test_the_full_lifecycle_advances_to_a_terminal_state():
 def test_a_command_out_of_order_is_refused():
     s = _store()
     with pytest.raises(NotAuthorized, match="submit_plan"):
-        _submit(s, "submit_plan", "k", plan_sha256=PLAN)
+        _submit(s, "submit_plan", "k", artifact_hash=PLAN)
 
 
 @pytest.mark.parametrize("reach", ["queued", "specified", "planned",
@@ -111,11 +120,15 @@ def test_cancel_run_is_legal_from_every_nonterminal_state(reach):
     `queued` alone left it green -- it asserted the name of the property and
     exercised one case of it."""
     s = _store()
+    # The front half belongs to the driver now: `specified` and `planned` are
+    # reached by an author round and a reviewer's accept, not by a submit.
+    if reach == "specified":
+        FRONT.to_specified()
+    elif reach != "queued":
+        FRONT.to_planned()
     # request_merge needs CI evidence, so it is supplied up front rather than
     # as a step -- record_ci_observation does not transition.
     steps = [
-        ("specified", "submit_spec", {"spec_sha256": SPEC}),
-        ("planned", "submit_plan", {"plan_sha256": PLAN}),
         ("implementing", "start_implementation", {}),
         (None, "record_implementation_output", {"artifact_hash": SPEC}),
         ("reviewing", "record_review", {"verdict": "accept",
@@ -159,6 +172,9 @@ def test_every_command_declares_its_legal_states():
             # Records what the implementation produced; the run stays in
             # `implementing` until a review moves it.
             "record_implementation_output",
+            # The front half's two observations: the end of a turn and the
+            # reason a pass stopped. Neither moves the run.
+            "record_turn_ended", "park",
         )
 
 
@@ -231,8 +247,7 @@ def test_the_projection_matches_the_stored_aggregate():
 
 def test_a_run_can_end_from_implementing_without_merging():
     s = _store()
-    _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
-    _submit(s, "submit_plan", "k2", plan_sha256=PLAN)
+    FRONT.to_planned()
     _submit(s, "start_implementation", "k3", actor="claude")
     assert s.run_state("r") == "implementing"
 
@@ -269,10 +284,10 @@ def test_a_merged_outcome_without_a_confirmed_merge_effect_is_refused():
     assertion the kernel cannot check, which is a limitation to state, not to
     hide."""
     s = _store()
-    _submit(s, "submit_spec", "k1", spec_sha256=SPEC)
+    FRONT.author_round(SPEC_BYTES)
     with pytest.raises(NotAuthorized, match="what the mechanism observed"):
         _submit(s, "record_run_outcome", "k2", actor="claude", outcome="merged")
-    assert s.run_state("r") == "specified", "the refusal must not have moved it"
+    assert s.run_state("r") == "spec_submitted", "the refusal must not have moved it"
 
 
 def test_a_second_terminal_record_is_refused():

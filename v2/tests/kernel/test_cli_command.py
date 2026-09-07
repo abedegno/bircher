@@ -29,12 +29,14 @@ def _gen(db, actor, role):
 def test_a_command_is_accepted(db, capsys):
     s = Store.open(db, clock=Clock(start_us=1))
     spec = put_artifact(s, b"# spec")
-    g = _gen(db, "claude", Role.IMPLEMENTER)
+    g = _gen(db, "claude", Role.AUTHOR)
     rc = main(["command", "--db", db, "--run-id", "r", "--generation", str(g),
                "--name", "submit_spec",
-               "--payload-json", json.dumps({"spec_sha256": spec})])
+               "--payload-json", json.dumps({"artifact_hash": spec})])
     assert rc == 0
-    assert Store.open(db, clock=Clock(start_us=1)).run_state("r") == "specified"
+    # A submission lands at `spec_submitted`: only a reviewer's accept of this
+    # hash reaches `specified`.
+    assert Store.open(db, clock=Clock(start_us=1)).run_state("r") == "spec_submitted"
 
 
 def test_an_illegal_command_is_refused(db):
@@ -84,9 +86,9 @@ def test_the_idempotency_key_defaults_to_run_name_generation(db):
     stable default every retry is a new command."""
     s = Store.open(db, clock=Clock(start_us=1))
     spec = put_artifact(s, b"# spec")
-    g = _gen(db, "claude", Role.IMPLEMENTER)
+    g = _gen(db, "claude", Role.AUTHOR)
     args = ["command", "--db", db, "--run-id", "r", "--generation", str(g),
-            "--name", "submit_spec", "--payload-json", json.dumps({"spec_sha256": spec})]
+            "--name", "submit_spec", "--payload-json", json.dumps({"artifact_hash": spec})]
     assert main(args) == 0
     assert main(args) == 0
     s = Store.open(db, clock=Clock(start_us=1))
