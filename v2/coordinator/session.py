@@ -17,7 +17,9 @@ The transport is injectable so tests need no network.
 from __future__ import annotations
 
 import json
+import pathlib
 import subprocess
+import time
 from dataclasses import dataclass
 
 #: Matches the bash these replace. The session-state poll ran with a 10s cap;
@@ -58,14 +60,16 @@ def _fetch(url: str) -> str:
 class State:
     status: str = "unknown"
     error_code: str = ""
+    agent_id: str = ""
 
 
 def state(server: str, conv_id: str, *, fetch=_fetch) -> State:
-    """The session's status and last task error code.
+    """The session's status, last task error code, and agent_id.
 
     An unreachable or unparseable server is `unknown`, never a guess. The
     caller counts consecutive unknowns and keeps waiting rather than recovering
-    while blind -- see run_item's teardown.
+    while blind -- see run_item's teardown. `agent_id` is `""` there too, so an
+    unknown read compares as nothing rather than a mismatch (wait_turn).
     """
     try:
         d = json.loads(fetch(f"{server}/v1/sessions/{conv_id}"))
@@ -77,7 +81,33 @@ def state(server: str, conv_id: str, *, fetch=_fetch) -> State:
     return State(
         status=d.get("status") or "",
         error_code=(labels or {}).get("omnigent.last_task_error_code") or "",
+        agent_id=str(d.get("agent_id") or ""),
     )
+
+
+def list_items(server: str, conv_id: str, *, fetch=_fetch) -> list[dict]:
+    """Every item of the session, oldest first, as `{id, role, text}`.
+
+    `text` is the concatenation of that item's `content[*].text` for
+    `input_text`/`output_text` parts -- a tool call carries no text and
+    contributes none. Unlike `state`, a bad lookup here is not a hidden
+    `unknown`: the caller (list_items has no caller yet in the front half)
+    would otherwise be unable to tell "no items" from "could not read".
+    """
+    try:
+        d = json.loads(fetch(f"{server}/v1/sessions/{conv_id}/items"))
+    except ValueError as exc:
+        raise LookupFailed(f"items: {exc}") from exc
+    raw = d.get("items", d) if isinstance(d, dict) else d
+    if not isinstance(raw, list):
+        raise LookupFailed("items: not a list")
+    out = []
+    for it in raw:
+        parts = it.get("content") or []
+        text = "".join(p.get("text", "") for p in parts
+                       if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"))
+        out.append({"id": str(it.get("id")), "role": str(it.get("role") or ""), "text": text})
+    return out
 
 
 def died(status: str, error_code: str) -> bool:
@@ -96,6 +126,77 @@ def died(status: str, error_code: str) -> bool:
     if error_code.strip():
         return True
     return status in ("failed", "error", "cancelled")
+
+
+@dataclass(frozen=True)
+class TurnEnd:
+    """How a waited turn ended, and whether its watched output exists.
+
+    `ended` is one of `file`, `dead`, `cap`, `displaced` -- never `unknown`:
+    `wait_turn` does not return until one of the five checks fires.
+    """
+    ended: str
+    file_present: bool
+
+
+class AgentMismatch(Exception):
+    """The session answered with an `agent_id` other than the create's
+    snapshot -- spec §11: an attacker or a redeployed server could otherwise
+    have `wait_turn` read (and a caller act on) another session's output
+    under this run's name. Nothing past `state()` is read once this fires."""
+
+    def __init__(self, session_id: str, expected: str, observed: str) -> None:
+        super().__init__(f"session {session_id} reports agent_id {observed!r}, "
+                         f"its create's snapshot said {expected!r}")
+        self.session_id, self.expected, self.observed = session_id, expected, observed
+
+
+def wait_turn(store, run_id: str, generation: int, server: str, session_id: str,
+              watched: list[pathlib.Path], deadline_us: int, *, agent_id_expected: str,
+              fetch=_fetch, clock=time.time, sleep=time.sleep, poll_s: float = 15.0) -> TurnEnd:
+    """spec §3 *The turn's end is a fact*: the five checks, each poll.
+
+    (1) a human_direction newer than this generation's dispatch ends the turn
+    `displaced` before anything is fetched; (2) the session's `state()`, whose
+    `agent_id` must match `agent_id_expected` (else `AgentMismatch` -- an
+    `unknown` read has `agent_id == ""` and compares nothing); (3) a watched
+    path present ends it `file`, whatever the status; (4) the deadline passed
+    ends it `cap`; (5) `died()` ends it `dead`; else sleep and poll again.
+
+    Task 14's brief text ordered these last two the other way (`died` before
+    the deadline). Its own `test_turn_end_matrix` proves that ordering wrong:
+    a `failed` status read after the deadline has already passed is `cap`
+    (`stub.polls <= 1`, no recovery attempted), not `dead` -- a stale read
+    of a session's status carries less weight than the wall clock once the
+    run is out of time. This function follows the test.
+
+    Reads nothing the turn wrote and records nothing: the caller records the
+    end and stops the session.
+
+    A generation with no `attempt_dispatched` fact makes `dispatch_seq` return
+    `None`; there is then no seq to order a human_direction against, so the
+    displaced check is skipped for the life of this call rather than raised --
+    `wait_turn` only reads, and a read that cannot decide "newer than what"
+    should not fail the turn it is watching.
+    """
+    from kernel import front
+    watched = [pathlib.Path(p) for p in watched]
+    d_seq = front.dispatch_seq(store, run_id, generation)
+    while True:
+        present = any(p.exists() for p in watched)
+        if d_seq is not None and front.direction_after(store, run_id, d_seq) is not None:
+            return TurnEnd("displaced", present)
+        st = state(server, session_id, fetch=fetch)
+        if st.agent_id and st.agent_id != agent_id_expected:
+            raise AgentMismatch(session_id, agent_id_expected, st.agent_id)
+        present = any(p.exists() for p in watched)
+        if present:
+            return TurnEnd("file", True)
+        if int(clock() * 1_000_000) >= deadline_us:
+            return TurnEnd("cap", any(p.exists() for p in watched))
+        if died(st.status, st.error_code):
+            return TurnEnd("dead", False)
+        sleep(poll_s)
 
 
 def last_assistant_text(server: str, conv_id: str, n: int = 3, *, fetch=_fetch) -> str:
