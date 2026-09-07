@@ -25,7 +25,7 @@ from kernel.bundle import snapshot as bundle_snapshot
 from kernel.canon import canonical_bytes, canonical_hash, content_hash
 from kernel.effects import NotReplayable
 from kernel.events import EventKind
-from kernel.policy import freeze, policy_of, to_payload
+from kernel.policy import derive, freeze, policy_of, to_payload
 
 
 class NotApproved(Exception):
@@ -121,11 +121,17 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
     earlier `enqueue` recomputed its answer from the RETRY's arguments and
     reported success for a policy the journal did not hold.
     """
+    labels = sorted(set(issue.get("labels", [])))
+    # Validate BEFORE touching the store or hashing: `derive` raises for any
+    # non-dict `project_config` that isn't `None`. Called here, ahead of the
+    # transaction, so a malformed config never gets a run row written for it
+    # to begin with -- not merely rolled back afterward.
+    derive(labels, project_config)
+
     snap = bundle_snapshot(issue)
     raw = canonical_bytes(snap)
     bhash = content_hash(raw)
-    cfg_hash = canonical_hash(project_config or {})
-    labels = sorted(set(issue.get("labels", [])))
+    cfg_hash = canonical_hash({} if project_config is None else project_config)
 
     if _run_exists(store, run_id):
         started = store.newest_fact(run_id, EventKind.RUN_STARTED)

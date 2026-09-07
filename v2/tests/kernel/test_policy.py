@@ -2,7 +2,7 @@ import pytest
 
 from kernel import policy
 from kernel.effects import NotReplayable
-from kernel.enqueue import create_run
+from kernel.enqueue import _run_exists, create_run
 from kernel.events import EventKind
 from kernel.store import Store
 
@@ -35,6 +35,9 @@ def test_labels_override_project_config():
 @pytest.mark.parametrize("cfg", [
     {"grill": "robot"}, {"gates": ["impl"]}, {"max_rounds": 0}, {"max_rounds": 6},
     {"max_seats": 3}, {"max_seats": 41}, {"max_rounds": "3"}, {"gates": "spec"},
+    # Falsy non-dicts: only `None` means "unset". `project_config or {}` would
+    # coerce these to `{}` and silently accept a wrong type.
+    [], "", 0, False,
 ])
 def test_out_of_range_config_is_refused(cfg):
     with pytest.raises(ValueError):
@@ -84,6 +87,14 @@ def test_create_run_replays_identical_and_refuses_different(tmp_path):
     with pytest.raises(NotReplayable):
         create_run(s, run_id="r-1", base_repo="o/r", base_sha="1" * 40,
                    issue=ISSUE, project_config={})
+
+
+def test_create_run_refuses_a_non_dict_project_config_and_leaves_no_run_row(tmp_path):
+    s = _store(tmp_path)
+    with pytest.raises(ValueError):
+        create_run(s, run_id="r-1", base_repo="o/r", base_sha="0" * 40,
+                   issue=ISSUE, project_config=[])
+    assert _run_exists(s, "r-1") is False
 
 
 def test_second_policy_frozen_is_refused(tmp_path):

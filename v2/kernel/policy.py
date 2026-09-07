@@ -38,9 +38,16 @@ def _int(cfg: dict, key: str, default: int, allowed: range) -> int:
 
 
 def derive(labels: Iterable[str], project_config: dict) -> Policy:
-    cfg = project_config or {}
-    if not isinstance(cfg, dict):
+    # Only `None` means "unset". A falsy non-dict (`[]`, `""`, `0`, `False`)
+    # is a caller error, not an empty config -- `project_config or {}` would
+    # coerce it to `{}` and silently accept a wrong type, and only a truthy
+    # wrong type would ever reach the isinstance check below.
+    if project_config is None:
+        cfg = {}
+    elif not isinstance(project_config, dict):
         raise ValueError("project config must be an object")
+    else:
+        cfg = project_config
     grill = cfg.get("grill", "model")
     if grill not in GRILLS:
         raise ValueError(f"policy grill must be one of {GRILLS}, got {grill!r}")
@@ -80,12 +87,13 @@ def freeze(store, run_id: str, *, labels: Iterable[str], project_config: dict) -
     if store.newest_fact(run_id, EventKind.POLICY_FROZEN) is not None:
         raise PolicyFrozen(f"run {run_id} already has a policy_frozen fact")
     labels = sorted(set(labels))
-    p = derive(labels, project_config)
+    p = derive(labels, project_config)  # raises ValueError before any hash is taken
+    cfg_hash = canonical_hash({} if project_config is None else project_config)
     store.append_fact(
         run_id=run_id, kind=EventKind.POLICY_FROZEN, actor="kernel",
         causal_command_id=None,
         payload={"policy": to_payload(p), "labels": labels,
-                 "project_config_hash": canonical_hash(project_config or {})},
+                 "project_config_hash": cfg_hash},
     )
     return p
 
