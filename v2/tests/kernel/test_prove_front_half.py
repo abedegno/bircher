@@ -12,6 +12,16 @@ either, so the clean run needs at least one round with the session and
 findings a real reviewer would actually receive and write.
 `_accept` only fixes the findings -- the tests that use it never check
 `assert_sessions`, so their sessions can stay the driver's placeholder.
+
+`_store_with_confirmed_stops` exists for the same reason, for a third §8
+check: the turn-ordering assertion reads the `effect_confirmed` fact a real
+stop carries (`kernel/effects.py` `perform`), but `Front._journal` marks a
+session-control effect 'confirmed' by writing straight to the effects table
+(`store.mark_effect`), never appending that fact at all. Backfilling it after
+the fact would place it after every real output fact and fail a clean run on
+the very check meant to catch a genuine ordering defect, so this appends it
+at the moment a stop is actually marked confirmed -- the same moment
+`perform()` would have.
 """
 import json
 
@@ -100,8 +110,31 @@ def _fake_fetch_for(s, run_id: str = "r-1"):
     return fetch, sessions, listed
 
 
+def _store_with_confirmed_stops(path) -> Store:
+    """A Store whose stop confirmations also append the `effect_confirmed`
+    fact a real stop carries -- see the module docstring. Wraps the instance's
+    `mark_effect`, not the class's: every `Front` method reaches the store
+    through `self.store`, which is this same wrapped object."""
+    store = Store.open(path)
+    real_mark_effect = store.mark_effect
+
+    def mark_effect(idempotency_key, state, external_object_id, *, run_id):
+        real_mark_effect(idempotency_key, state, external_object_id, run_id=run_id)
+        if state == "confirmed" and idempotency_key.startswith("sess-stop:"):
+            store.append_fact(
+                run_id=run_id, kind=EventKind.EFFECT_CONFIRMED, actor="kernel",
+                causal_command_id=idempotency_key,
+                payload={"effect_id": f"eff-{idempotency_key}",
+                         "external_object_id": external_object_id,
+                         "effect_class": "session_control"},
+            )
+
+    store.mark_effect = mark_effect
+    return store
+
+
 def test_a_clean_autonomous_run_passes(tmp_path):
-    s = Store.open(tmp_path / "k.db")
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
     f = Front(s, "r-1")
     f.ask_round([("q1", "?")], rulings={"q1": "yes"})
     f.author_round(SPEC_BYTES, resume=f._newest_author_session())
@@ -114,7 +147,7 @@ def test_a_clean_autonomous_run_passes(tmp_path):
 
 
 def test_each_assertion_fails_on_its_defect(tmp_path):
-    s = Store.open(tmp_path / "k.db")
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
     f = Front(s, "r-1", labels=())
     spec_hash = f.author_round(SPEC_BYTES); _accept(f); f.approve()
     f.author_round(PLAN_BYTES); _accept(f)
@@ -132,7 +165,7 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
     # A human fact outside {approve, gate} fails approval mode specifically --
     # a separate run, since "r-1" is already past the states
     # record_human_answer allows by this point.
-    s2 = Store.open(tmp_path / "k2.db")
+    s2 = _store_with_confirmed_stops(tmp_path / "k2.db")
     f2 = Front(s2, "r-2", labels=())
     f2.author_round(SPEC_BYTES); _accept(f2); f2.approve()
     f2.answer("noted")
@@ -183,3 +216,36 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
                            "findings_hash": None, "ruling": "review_ruling", "binding_hash": None,
                            "reviewer_identity": "mallory", "generation": g1})
     assert any("has no brief in its epoch" in x for x in prove.assert_journal(s, "r-1", mode="human"))
+
+    # An output fact recorded before its own turn's stop was confirmed -- a
+    # fresh run, since a real command would refuse to record output before
+    # the round's stop is satisfied (the OUTPUT_COMMANDS guard,
+    # kernel/authz.py); only a fact forged straight into the store, ahead of
+    # the turn actually ending, can misorder them. `causal_command_id` binds
+    # the forged output fact to the forged command_accepted fact that names
+    # its generation, exactly as a real command's would.
+    s3 = _store_with_confirmed_stops(tmp_path / "k3.db")
+    f3 = Front(s3, "r-3")
+    g7 = f3._dispatch(Role.AUTHOR, f3.author)
+    sid7 = f3._session(g7, f3._newest_id())
+    forged_key = f"forged-output-{g7}"
+    s3.append_fact(run_id="r-3", kind=EventKind.COMMAND_ACCEPTED, actor=f3.author, causal_command_id=forged_key,
+                   payload={"command_name": "record_author_empty", "generation": g7, "payload": {}})
+    s3.append_fact(run_id="r-3", kind=EventKind.AUTHOR_EMPTY, actor=f3.author, causal_command_id=forged_key,
+                   payload={"session": sid7, "phase": f3.phase(), "epoch": f3.epoch(), "generation": g7})
+    f3._end_turn(g7, sid7)  # the stop's effect_confirmed fact lands AFTER the forged output above
+    assert any("is not newer than its turn's stop confirmation" in x
+              for x in prove.assert_journal(s3, "r-3", mode="human"))
+
+    # A reviewer orphan (no satisfied prompt) stopped twice over.
+    g8 = f._dispatch(Role.REVIEWER, f.reviewer)
+    sid8 = f._create(g8, f._newest_id())
+    for i in range(2):
+        f._journal(g8, f"sess-stop:{sid8}:{g8}:{i}", {
+            "argv": ["curl", "-sSf", "-X", "POST", f"http://srv/v1/sessions/{sid8}/events",
+                     "-H", "content-type: application/json"],
+            "obligation": {"kind": "sess-stop", "session": sid8, "cause": f"displaced-{i}"},
+            "body": {"event": "stop_session"},
+        }, "")
+    fetch4, sessions4, listed4 = _fake_fetch_for(s)
+    assert any(sid8 in x and "satisfied stops" in x for x in prove.assert_sessions(s, "r-1", fetch=fetch4))

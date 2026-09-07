@@ -10,13 +10,15 @@ answers everything the kernel's own facts and effects settle: no human fact
 outside what the run's mode admits, at least one `model_ruling`, the two
 front-half artefacts submitted with different hashes, every seat's snapshot
 naming its dispatched vendor, every `review_ruling` tracing to a brief that
-still re-renders byte for byte, no duplicate session obligation, and every
-session either prompted through to a stopped turn or stopped as an orphan.
-`assert_sessions` answers what only the server can: that a session the
-journal says it created still exists there under the agent the create's
-snapshot named, and that nothing but a recorded prompt or brief ever reached
-it as a user-role item -- the check that a human did not type into the run
-without parking it first.
+still re-renders byte for byte, no duplicate session obligation, every
+session either prompted through to a stopped turn or stopped as an orphan,
+and no output fact of a turn recorded before that turn's stop was actually
+confirmed. `assert_sessions` answers what only the server can: that a session
+the journal says it created still exists there under the agent the create's
+snapshot named, that nothing but a recorded prompt or brief ever reached it
+as a user-role item -- the check that a human did not type into the run
+without parking it first -- and that an unprompted (orphan) reviewer session
+was stopped exactly once, not left open or stopped twice over.
 """
 
 from __future__ import annotations
@@ -105,12 +107,62 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         if sid not in prompted and sid not in stopped:
             fails.append(f"session {sid} was neither prompted nor stopped")
 
+    # The generation a fact was recorded under, read from the paired
+    # command_accepted fact (same causal_command_id): artifact_submitted,
+    # model_question and model_ruling carry no `generation` of their own in
+    # their payload, but every command_accepted fact does (kernel/commands.py
+    # `_submit`), and it shares the output fact's causal_command_id because
+    # both are written under the same command.
+    accepted_generation = {
+        c.causal_command_id: c.payload.get("generation")
+        for c in store.facts_of_kind(run_id, EventKind.COMMAND_ACCEPTED)
+    }
+    output_facts = [
+        f for f in store.facts_of_kind(
+            run_id, EventKind.ARTIFACT_SUBMITTED, EventKind.AUTHOR_EMPTY,
+            EventKind.MODEL_QUESTION, EventKind.MODEL_RULING, EventKind.REVIEW_VERDICT,
+        )
+        if f.kind != EventKind.REVIEW_VERDICT or f.payload.get("ruling") == "review_ruling"
+    ]
+
     for row in prompts:
         te = front.turn_ended_for(store, run_id, row["idempotency_key"])
         if te is None:
             fails.append(f"prompt {row['idempotency_key']} has no turn_ended")
-        elif not front.stop_satisfied_for(store, run_id, te.id):
+            continue
+        if not front.stop_satisfied_for(store, run_id, te.id):
             fails.append(f"turn_ended {te.id} has no satisfied stop")
+            continue
+        # The stop's own satisfaction is a fact with a seq of its own:
+        # performing an effect appends `effect_confirmed` (or, on a delayed
+        # reconciliation, `effect_reconciled`), bound to the effect by
+        # `causal_command_id == the effect's idempotency_key` -- neither
+        # payload carries the key itself (kernel/effects.py `perform`).
+        # Comparing seqs, not `at_us`: two facts' ORDER in the journal is
+        # what the guard they came from actually enforced; wall-clock time
+        # is not.
+        stop_row = next(
+            r for r in stops if r["intent"]["obligation"].get("cause") == te.id
+        )
+        stop_key = stop_row["idempotency_key"]
+        confirmation = next(
+            (f for f in store.facts_of_kind(run_id, EventKind.EFFECT_CONFIRMED, EventKind.EFFECT_RECONCILED)
+             if f.causal_command_id == stop_key),
+            None,
+        )
+        if confirmation is None:
+            fails.append(
+                f"stop {stop_key} has no effect_confirmed/effect_reconciled fact to "
+                "bind the turn's output ordering to"
+            )
+            continue
+        gen = row["generation"]
+        for f in output_facts:
+            if accepted_generation.get(f.causal_command_id) == gen and f.seq <= confirmation.seq:
+                fails.append(
+                    f"{f.kind} (seq {f.seq}) of generation {gen} is not newer than its "
+                    f"turn's stop confirmation {stop_key} (seq {confirmation.seq})"
+                )
 
     for v in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT):
         if v.payload.get("ruling") != "review_ruling" or v.payload.get("phase") not in front.FRONT_PHASES:
@@ -159,8 +211,10 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
     prompts_by_session: dict[str, list[dict]] = {}
     for r in front.satisfied_effects(store, run_id, "sess-prompt"):
         prompts_by_session.setdefault(r["intent"]["obligation"]["session"], []).append(r)
-    stops = {r["intent"]["obligation"]["session"]
-             for r in front.satisfied_effects(store, run_id, "sess-stop")}
+    stop_counts: dict[str, int] = {}
+    for r in front.satisfied_effects(store, run_id, "sess-stop"):
+        stop_sid = r["intent"]["obligation"].get("session")
+        stop_counts[stop_sid] = stop_counts.get(stop_sid, 0) + 1
 
     for row in front.satisfied_effects(store, run_id, "sess-create"):
         snap = json.loads(row["external_object_id"])
@@ -204,8 +258,12 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
                         f"reviewer session {sid}: first user item is not the brief of generation {gen}"
                     )
             else:
-                if users or sid not in stops:
-                    fails.append(f"reviewer session {sid}: unprompted, yet has items or no stop")
+                stop_count = stop_counts.get(sid, 0)
+                if users or stop_count != 1:
+                    fails.append(
+                        f"reviewer session {sid}: unprompted, yet has items or "
+                        f"{stop_count} satisfied stops (want exactly 1)"
+                    )
 
     return fails
 
