@@ -201,26 +201,153 @@ def test_a_human_message_before_the_park_means_no_park(world):
 
 
 def test_no_fact_carries_a_cursor_past_an_unrecorded_human_item(world):
-    """Asserted over every fact the loop wrote, against the fake's full list."""
+    """The §4 invariant, over every cursor-bearing fact a real pass wrote.
+
+    A fact's WINDOW is what it claims to have consumed: the items after the
+    previous cursor and at or before its own. Every user item in a window has
+    to be accounted for -- one of the coordinator's own prompts, or the human
+    message this very fact is the record of. A `parked` fact is the record of
+    no human message, so its window must hold none: a park carrying a cursor
+    past a message nobody read is the human being ignored.
+    """
+    s, f, fake, ctx = world(labels=())
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    from coordinator.session import list_items
+
+    def take():
+        return human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch))
+
+    fake.add_user_message(sid, "use sqlite")
+    assert take() == "direction"                                     # a human_direction
+    f.author_round(SPEC_BYTES, resume=sid)
+    ctx.generation = f._dispatch(Role.OPERATOR, "runner")            # the author round superseded ours
+    fake.add_user_message(sid, "approve")                            # illegal at spec_submitted
+    assert take() == "dismissed"                                     # a human_item_dismissed
+    assert len(human.reply_refusals(ctx)) == 1
+    f.review_round("accept")
+    ctx.generation = f._dispatch(Role.OPERATOR, "runner")
+    assert phases.stall(ctx, "gate", session_id=sid, findings_hash=None,
+                        verdict=None, reviewer=None) == "parked"     # a parked
+    park = front.current_park(s, "r-1")
+    fake.add_user_message(sid, "approve")
+    assert human.human_pass(ctx, park) == "taken"                    # a human_ruling
+    assert s.run_state("r-1") == "specified"
+
+    items = fake.sessions[sid]["items"]
+    order = {it["id"]: n for n, it in enumerate(items)}
+    ours = {p.payload["item_id"] for p in s.facts_of_kind("r-1", EventKind.PROMPT_ITEM)}
+    #: The four kinds that ARE the record of a human message (spec §4). A
+    #: `parked` fact is not one of them.
+    records_a_message = {EventKind.HUMAN_ANSWER, EventKind.HUMAN_DIRECTION,
+                         EventKind.HUMAN_RULING, EventKind.HUMAN_ITEM_DISMISSED}
+    examined, kinds, prev = 0, set(), -1
+    for x in s.facts_for("r-1"):
+        c = x.payload.get("cursor_item_id")
+        if not c or c not in order:
+            continue
+        examined += 1
+        kinds.add(x.kind)
+        for it in items:
+            if it["role"] != "user" or not (prev < order[it["id"]] <= order[c]):
+                continue
+            assert it["id"] in ours or x.kind in records_a_message, (x.kind, x.payload, it)
+        prev = max(prev, order[c])
+    assert examined >= 3, f"the scan examined {examined} facts: it is asserting nothing"
+    assert kinds >= {EventKind.PARKED, EventKind.HUMAN_DIRECTION,
+                     EventKind.HUMAN_ITEM_DISMISSED, EventKind.HUMAN_RULING}, kinds
+
+
+def test_an_approval_moves_the_cursor_past_the_item_it_was_read_from(world):
+    """spec §4: the cursor rides the rulings too. Without it the approval's own
+    message stays ahead of the cursor and the next listing reads it again."""
     s, f, fake, ctx = world(labels=())
     sid, g = _session_with_prompt(s, f, fake, ctx)
     f.author_round(SPEC_BYTES, resume=sid); f.review_round("accept")
-    fake.add_user_message(sid, "first")
-    fake.add_user_message(sid, "second")
+    fake.add_user_message(sid, "approve")
+    from coordinator.session import list_items
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+    assert human.take_listing(ctx, sid, listing) == "approve"
+    assert s.run_state("r-1") == "specified"
+    ruling = s.newest_fact("r-1", EventKind.HUMAN_RULING)
+    assert ruling.payload["cursor_item_id"] == listing[-1]["id"]
+    assert human.unread_human_items(ctx, sid, listing) == []
+    assert human.take_listing(ctx, sid, listing) is None
+
+
+def test_an_item_read_twice_replays_and_takes_nothing(world):
+    """The same item under the same key REPLAYS: the earlier result comes
+    back, no fact is written, and nothing was taken. Reporting the kind for a
+    replay would tell the loop a human fact landed when none did."""
+    s, f, fake, ctx = world()
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    fake.add_user_message(sid, "use sqlite")
+    from coordinator.session import list_items
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+    assert human.take_listing(ctx, sid, listing) == "direction"
+    n = len(s.facts_of_kind("r-1", EventKind.HUMAN_DIRECTION))
+    f.direct("typed at the shell", cursor=listing[0]["id"])     # the cursor moves BACK
+    logged = []
+    ctx.log = logged.append
+    assert human.take_listing(ctx, sid, listing) is None
+    assert len(s.facts_of_kind("r-1", EventKind.HUMAN_DIRECTION)) == n + 1   # only the shell's
+    assert any("replayed" in m for m in logged), logged
+
+
+def test_a_dismissals_reply_goes_to_its_own_session_and_is_owed_once(world):
+    """spec §4: the reply goes back to the session the refused token was read
+    from, and stays satisfied. Both are derived from the dismissal's own fact
+    -- its session, phase and epoch -- so a newer session does not steal the
+    reply and a later phase does not make it owed all over again."""
+    s, f, fake, ctx = world(labels=())
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    f.author_round(SPEC_BYTES, resume=sid)
+    ctx.generation = f._dispatch(Role.OPERATOR, "runner")       # the author round superseded ours
+    fake.add_user_message(sid, "approve")                       # illegal at spec_submitted
+    from coordinator.session import list_items
+    assert human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch)) == "dismissed"
+    d = s.newest_fact("r-1", EventKind.HUMAN_ITEM_DISMISSED)
+    assert d.payload["session_id"] == sid and d.payload["phase"] == "spec" and d.payload["epoch"] == 0
+    newer, _ = _session_with_prompt(s, f, fake, ctx, text=b"a newer session")
+    assert newer != sid
+    assert len(human.reply_refusals(ctx)) == 1
+    assert "not legal from state 'spec_submitted'" in fake.sessions[sid]["items"][-1]["content"][0]["text"]
+    assert not any("Bircher refused" in it["content"][0]["text"] for it in fake.sessions[newer]["items"])
+    # The run moves on to the plan phase: the reply is not owed a second time.
+    f.review_round("accept"); f.approve()
+    assert s.run_state("r-1") == "specified" and ctx.phase() == "plan"
+    n_items = len(fake.sessions[sid]["items"])
+    assert human.reply_refusals(ctx) == []
+    assert len(fake.sessions[sid]["items"]) == n_items
+
+
+def test_an_unreadable_confirm_listing_parks(world):
+    """The second listing is guarded exactly as the first: the prompt is
+    already sent and the park already recorded, so a server that goes away
+    between the two reads leaves the pass parked, not crashed."""
+    s, f, fake, ctx = world(labels=())
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    f.author_round(SPEC_BYTES, resume=sid); f.review_round("accept")
     ctx.generation = f._dispatch(Role.OPERATOR, "runner")
-    phases.stall(ctx, "gate", session_id=sid, findings_hash=None, verdict=None, reviewer=None)
-    items = fake.sessions[sid]["items"]
-    order = {it["id"]: n for n, it in enumerate(items)}
-    recorded_text = " ".join(x.payload.get("text", "") + x.payload.get("findings", "") + x.payload.get("answer", "")
-                             for x in s.facts_for("r-1"))
-    for x in s.facts_for("r-1"):
-        c = x.payload.get("cursor_item_id")
-        if not c:
-            continue
-        for it in items:
-            if it["role"] == "user" and order[it["id"]] <= order[c] and it["text"] not in ("the brief",):
-                assert it["text"] in recorded_text or any(
-                    p.payload["item_id"] == it["id"] for p in s.facts_of_kind("r-1", EventKind.PROMPT_ITEM)), it
+    seat.command(ctx, "park", {"reason": "gate", "session_id": sid, "cursor_item_id": None,
+                               "findings_hash": None, "verdict": None, "reviewer": None})
+    park = front.current_park(s, "r-1")
+    reads = {"n": 0}
+    real_fetch = fake.fetch
+
+    def failing_fetch(url):
+        # The first two reads are human_pass's own listing and the one
+        # `_record_prompt_item` takes after the prompt; the third is the
+        # confirm listing, and that is the one that goes away.
+        if url.endswith("/items"):
+            reads["n"] += 1
+            if reads["n"] > 2:
+                raise __import__("coordinator.session", fromlist=["LookupFailed"]).LookupFailed("gone")
+        return real_fetch(url)
+    ctx.fetch = failing_fetch
+    logged = []
+    ctx.log = logged.append
+    assert human.human_pass(ctx, park) == "parked"
+    assert any("confirm listing unreadable" in m for m in logged), logged
 
 
 def test_grill_park_with_a_carrier_session(world):

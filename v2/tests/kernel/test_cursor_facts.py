@@ -28,26 +28,46 @@ def test_dismiss_names_a_human_rejection_once(tmp_path):
     s = _store(tmp_path)
     f = Front(s, "r-1")
     f.author_round(SPEC_BYTES)
+    sid = f._newest_author_session()
     rej = _refused_human_approve(s, f)
     assert rej.actor == "human"
     g = f._dispatch(Role.OPERATOR, "runner")
     with pytest.raises(NotAuthorized, match="command_rejected"):
-        f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-5", "rejection": "not-a-fact"})
+        f._cmd(g, "dismiss_human_item", {"session_id": sid, "cursor_item_id": "i-5",
+                                         "rejection": "not-a-fact"})
     # A rejection attributed to a dispatched actor is not a human token.
     with pytest.raises(NotAuthorized):
         f._cmd(g, "approve_artifact", {"artifact_hash": "0" * 64})
     model_rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
     with pytest.raises(NotAuthorized, match="human"):
-        f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-5", "rejection": model_rej.id})
+        f._cmd(g, "dismiss_human_item", {"session_id": sid, "cursor_item_id": "i-5",
+                                         "rejection": model_rej.id})
     park_before = front.current_park(s, "r-1")
-    f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-5", "rejection": rej.id})
+    f._cmd(g, "dismiss_human_item", {"session_id": sid, "cursor_item_id": "i-5", "rejection": rej.id})
     d = s.newest_fact("r-1", EventKind.HUMAN_ITEM_DISMISSED)
-    assert d.payload == {"epoch": 0, "cursor_item_id": "i-5", "rejection": rej.id}
+    assert d.payload == {"phase": "spec", "epoch": 0, "session_id": sid,
+                         "cursor_item_id": "i-5", "rejection": rej.id}
     assert d.actor == "runner"
     assert front.dismissed_rejection_ids(s, "r-1") == {rej.id}
     assert front.current_park(s, "r-1") == park_before      # not a human fact
     with pytest.raises(NotAuthorized, match="already"):
-        f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-6", "rejection": rej.id})
+        f._cmd(g, "dismiss_human_item", {"session_id": sid, "cursor_item_id": "i-6", "rejection": rej.id})
+
+
+@pytest.mark.parametrize("bad_session", ["s-never-created", "", None, 7])
+def test_dismiss_names_a_session_this_run_created(tmp_path, bad_session):
+    """spec §4: the reply goes back to the session the token was read from, so
+    the fact has to name one the run can reach. An unbound value would send
+    the reply somewhere the human is not looking, or nowhere at all."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.author_round(SPEC_BYTES)
+    rej = _refused_human_approve(s, f)
+    g = f._dispatch(Role.OPERATOR, "runner")
+    with pytest.raises(NotAuthorized, match="session"):
+        f._cmd(g, "dismiss_human_item", {"session_id": bad_session, "cursor_item_id": "i-5",
+                                         "rejection": rej.id})
+    assert s.facts_of_kind("r-1", EventKind.HUMAN_ITEM_DISMISSED) == []
 
 
 @pytest.mark.parametrize("bad_rejection", [["a", "b"], None])
@@ -60,7 +80,8 @@ def test_dismiss_refuses_a_malformed_rejection(tmp_path, bad_rejection):
     f.author_round(SPEC_BYTES)
     g = f._dispatch(Role.OPERATOR, "runner")
     with pytest.raises(NotAuthorized, match="command_rejected fact"):
-        f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-5", "rejection": bad_rejection})
+        f._cmd(g, "dismiss_human_item", {"session_id": f._newest_author_session(),
+                                         "cursor_item_id": "i-5", "rejection": bad_rejection})
 
 
 def test_dismiss_does_not_consume_a_park(tmp_path):
@@ -71,7 +92,8 @@ def test_dismiss_does_not_consume_a_park(tmp_path):
     f._cmd(g, "park", {"reason": "no_verdict", "session_id": "s-x", "cursor_item_id": "i-1",
                        "findings_hash": None, "verdict": None, "reviewer": "codex"})
     rej = _refused_human_approve(s, f)
-    f._cmd(g, "dismiss_human_item", {"cursor_item_id": "i-2", "rejection": rej.id})
+    f._cmd(g, "dismiss_human_item", {"session_id": f._newest_author_session(),
+                                     "cursor_item_id": "i-2", "rejection": rej.id})
     assert front.current_park(s, "r-1") is not None
 
 

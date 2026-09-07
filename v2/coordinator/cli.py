@@ -258,7 +258,15 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
 
     if a.mode == "phases":
-        if a.turn_timeout is None or not str(a.turn_timeout).isdigit() or int(a.turn_timeout) <= 0:
+        try:
+            # `int()`, not `isdigit()`: `isdigit` is true for superscripts and
+            # other unicode digits that `int()` then refuses, so the two
+            # disagree about what a number is -- and the disagreement lands as
+            # a ValueError from a validator that had just approved the value.
+            turn_timeout = int(a.turn_timeout)
+        except (TypeError, ValueError):
+            turn_timeout = 0
+        if turn_timeout <= 0:
             print("phases: --turn-timeout must be a positive integer (seconds)", file=sys.stderr)
             return RC_USAGE
         from kernel.store import Store
@@ -267,7 +275,7 @@ def main(argv=None) -> int:
         ctx = _phases.Ctx(store=Store.open(a.db), run_id=a.run_id, server=a.server, repo=a.repo,
                           issue_number=a.issue, repo_dir=a.repo_dir, workspaces_root=a.workspaces_root,
                           bundle_dir=a.bundle_dir, agent_ids={"claude": a.agent_claude, "codex": a.agent_codex},
-                          host_id=a.host_id, turn_timeout_s=int(a.turn_timeout), default_author=a.default_author,
+                          host_id=a.host_id, turn_timeout_s=turn_timeout, default_author=a.default_author,
                           env=dict(os.environ, BIRCHER_KERNEL_DB=a.db, BIRCHER_RUN_ID=a.run_id), fetch=_fetch,
                           log=lambda m: print(m, file=sys.stderr))
         return _phases.run_loop(ctx)

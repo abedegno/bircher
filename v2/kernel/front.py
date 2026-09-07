@@ -132,6 +132,17 @@ def satisfied_effects(store, run_id: str, kind: str) -> list[dict]:
     return out
 
 
+def created_sessions(store, run_id: str) -> set[str]:
+    """Every session a satisfied `sess-create` of this run delivered.
+
+    The binding a payload that NAMES a session is checked against: a run
+    cannot have read a human's message from, or reply into, a session it
+    never created.
+    """
+    return {json.loads(row["external_object_id"])["id"]
+            for row in satisfied_effects(store, run_id, "sess-create")}
+
+
 def _roles(store, run_id: str) -> dict[int, str]:
     return {d["generation"]: d["role"] for d in store.dispatches_for(run_id)}
 

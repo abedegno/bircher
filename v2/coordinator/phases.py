@@ -256,11 +256,10 @@ def stall(ctx: Ctx, reason: str, *, session_id, findings_hash, verdict, reviewer
 def _last_cursor(ctx: Ctx):
     """The run's newest recorded cursor, for a park with no session to list:
     the park must not claim to have read past anything this pass could not
-    see."""
-    for f in reversed(ctx.store.facts_for(ctx.run_id)):
-        if f.payload.get("cursor_item_id"):
-            return f.payload["cursor_item_id"]
-    return None
+    see. `human.cursor`'s own scan, with no listing to fall back to -- one
+    scan, so the two cannot answer differently."""
+    from coordinator import human
+    return human.cursor(ctx.store, ctx.run_id, None, [])
 
 
 def run_loop(ctx: Ctx) -> int:
@@ -349,6 +348,13 @@ def run_loop(ctx: Ctx) -> int:
         return Exit.FAILED
     except (WorktreeExists, AgentMismatch) as exc:
         ctx.log(f"failed: {exc}")
+        return Exit.FAILED
+    except ValueError as exc:
+        # A bug in the coordinator's own reading -- a batch with nothing in
+        # it, an idempotency key reused for different work. It must not
+        # escape as a traceback: the caller distinguishes PARKED from FAILED
+        # by the exit code, and an exception loses that distinction entirely.
+        ctx.log(f"coordinator error: {exc}")
         return Exit.FAILED
 
 

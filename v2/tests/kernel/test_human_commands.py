@@ -62,7 +62,8 @@ def test_approve_moves_accepted_on_and_binds_the_hash(tmp_path):
     assert s.run_state("r-1") == "specified"
     ruling = s.newest_fact("r-1", EventKind.HUMAN_RULING)
     assert ruling.actor == "human"
-    assert ruling.payload == {"ruling": "approve", "phase": "spec", "epoch": 0, "artifact_hash": h}
+    assert ruling.payload == {"ruling": "approve", "phase": "spec", "epoch": 0, "artifact_hash": h,
+                              "cursor_item_id": None}
     accepted = [x for x in s.facts_of_kind("r-1", EventKind.COMMAND_ACCEPTED)
                 if x.payload["command_name"] == "approve_artifact"]
     assert accepted[-1].actor == "human" and accepted[-1].payload["generation"] == HUMAN_GENERATION
@@ -97,7 +98,8 @@ def test_human_request_revision_needs_only_four_fields(tmp_path):
     assert v.payload["findings_hash"] == content_hash(b"missing the API")
     assert s.has_artifact(v.payload["findings_hash"])
     r = s.newest_fact("r-1", EventKind.HUMAN_RULING)
-    assert r.payload == {"ruling": "request_revision", "phase": "spec", "epoch": 0, "artifact_hash": h}
+    assert r.payload == {"ruling": "request_revision", "phase": "spec", "epoch": 0, "artifact_hash": h,
+                         "cursor_item_id": None}
     # From *_submitted too, and to the plan's submitting state.
     f.author_round(SPEC_BYTES + b"\n## API\n"); f.review_round("accept")
     _human(s, "r-1", "approve_artifact", {"artifact_hash": s.phase_artifact("r-1", "spec")})
@@ -130,7 +132,8 @@ def test_grant_round_needs_a_current_park_and_consumes_it(tmp_path):
     _human(s, "r-1", "grant_round", {})
     assert front.grants(s, "r-1") == 1
     r = s.newest_fact("r-1", EventKind.HUMAN_RULING)
-    assert r.payload == {"ruling": "grant_round", "phase": "spec", "epoch": 0, "park_seq": park.seq}
+    assert r.payload == {"ruling": "grant_round", "phase": "spec", "epoch": 0, "park_seq": park.seq,
+                         "cursor_item_id": None}
     assert front.current_park(s, "r-1") is None
     with pytest.raises(NotAuthorized, match="park"):
         _human(s, "r-1", "grant_round", {})
@@ -243,3 +246,62 @@ def test_human_record_review_needs_non_empty_findings(tmp_path):
     assert s.run_state("r-1") == state_before
     assert len(s.facts_of_kind("r-1", EventKind.REVIEW_VERDICT)) == verdicts_before
     assert len(s.facts_of_kind("r-1", EventKind.HUMAN_RULING)) == rulings_before
+
+
+def test_the_cursor_rides_the_three_rulings(tmp_path):
+    """spec §4: every fact the coordinator records from a listing carries the
+    cursor it had read to, and `human_ruling` is one of the four named kinds.
+    `grant_round` is the case that makes it load-bearing -- it transitions
+    nothing and starts no session, so without the cursor the item it was read
+    from is still ahead of it and the next listing reads the same message
+    again."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES)
+    # A grant, at a park.
+    g = f._dispatch(Role.REVIEWER, "codex")
+    f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id": "i-0",
+                       "findings_hash": None, "verdict": None, "reviewer": "codex"})
+    _human(s, "r-1", "grant_round", {"cursor_item_id": "i-1"})
+    assert s.newest_fact("r-1", EventKind.HUMAN_RULING).payload["cursor_item_id"] == "i-1"
+    # A human's request_revision.
+    f.review_round("accept")
+    h = s.phase_artifact("r-1", "spec")
+    _human(s, "r-1", "record_review", {"phase": "spec", "artifact_hash": h, "verdict": "request_revision",
+                                       "findings": "no", "cursor_item_id": "i-2"})
+    assert s.newest_fact("r-1", EventKind.HUMAN_RULING).payload["cursor_item_id"] == "i-2"
+    # An approval.
+    f.author_round(SPEC_BYTES + b"\n## API\n"); f.review_round("accept")
+    _human(s, "r-1", "approve_artifact", {"artifact_hash": s.phase_artifact("r-1", "spec"),
+                                          "cursor_item_id": "i-3"})
+    assert s.newest_fact("r-1", EventKind.HUMAN_RULING).payload["cursor_item_id"] == "i-3"
+    assert s.run_state("r-1") == "specified"
+
+
+@pytest.mark.parametrize("name,payload,reach", [
+    ("grant_round", {}, "parked"),
+    ("approve_artifact", {"artifact_hash": None}, "accepted"),
+    ("record_review", {"phase": "spec", "artifact_hash": None, "verdict": "request_revision",
+                       "findings": "no"}, "accepted"),
+    ("record_human_answer", {"question_ids": [], "answer": "x"}, "queued"),
+    ("record_human_direction", {"text": "x"}, "queued"),
+])
+def test_a_cursor_that_is_not_a_string_is_refused(tmp_path, name, payload, reach):
+    """The shape check, on all five: the value is the coordinator's reading of
+    a listing (a declared residual), so a string or null is all the kernel can
+    require -- and it must require that, or a fact carries a cursor nothing
+    can compare an item id against."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1", labels=())
+    if reach == "accepted":
+        f.author_round(SPEC_BYTES); f.review_round("accept")
+    elif reach == "parked":
+        f.author_round(SPEC_BYTES)
+        g = f._dispatch(Role.OPERATOR, "runner")
+        f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id": None,
+                           "findings_hash": None, "verdict": None, "reviewer": None})
+    payload = dict(payload, cursor_item_id=7)
+    if "artifact_hash" in payload:
+        payload["artifact_hash"] = s.phase_artifact("r-1", "spec")
+    with pytest.raises(NotAuthorized, match="cursor_item_id must be a string or null"):
+        _human(s, "r-1", name, payload)

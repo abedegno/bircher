@@ -13,6 +13,15 @@ def _common(db):
     return ["--db", str(db), "--run-id", "r-1"]
 
 
+def test_the_cli_and_the_loop_agree_on_the_exit_codes():
+    """`phases` returns `phases.Exit` values straight to the shell, so the
+    constants the CLI publishes have to BE those values -- two tables naming
+    the same codes eventually disagree, and the caller reads the wrong one."""
+    from coordinator import cli, phases
+    assert (cli.RC_OK, cli.RC_FAILED, cli.RC_USAGE, cli.RC_PARKED) == (
+        phases.Exit.OK, phases.Exit.FAILED, phases.Exit.USAGE, phases.Exit.PARKED)
+
+
 def test_phases_requires_a_positive_integer_turn_timeout(tmp_path, capsys):
     db = tmp_path / "k.db"
     Front(Store.open(db), "r-1")

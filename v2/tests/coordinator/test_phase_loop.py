@@ -234,3 +234,57 @@ def test_retire_stops_every_session_of_a_cancelled_run(world):
     assert keys == [f"sess-stop:{sid2}:{ctx.generation}"]
     cancelled = [t for t in s.facts_of_kind("r-1", EventKind.TRANSITION) if t.payload["to"] == "cancelled"][-1]
     assert s.effect_by_key(keys[0], run_id="r-1")["intent"]["obligation"]["cause"] == cancelled.id
+
+
+def test_a_retry_at_a_no_verdict_park_is_read_once(world, monkeypatch):
+    """The reviewer's spin reproduction (spec §4, the cursor).
+
+    `grant_round` transitions nothing and starts no session, so the pass that
+    takes it leaves the run where it was. Without a cursor on the ruling the
+    `retry` the human typed is STILL ahead of the cursor on the next listing,
+    and the next stall reads the same message again -- refusing it this time,
+    because no park is current by then, and answering the human with a
+    refusal for a retry they already spent. Bounded so a genuine spin fails
+    the test rather than hanging it.
+    """
+    s, f, fake, ctx = world()
+    monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    reasons = []
+    real_stall = phases.stall
+
+    def counting_stall(ctx_, reason, **kw):
+        reasons.append(reason)
+        assert len(reasons) <= 4, f"the loop is spinning: {reasons}"
+        return real_stall(ctx_, reason, **kw)
+    monkeypatch.setattr("coordinator.phases.stall", counting_stall)
+
+    def on_prompt(sid, text):
+        ws = fake.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        if "author brief" in text:
+            open(os.path.join(ws, seat.ARTIFACT_OUT), "wb").write(SPEC)
+        # The reviewer writes no review.md at all: every review round is a
+        # no_verdict, which is the path that parks without moving the run.
+    fake.on_prompt = on_prompt
+
+    assert phases.run_loop(ctx) == phases.Exit.PARKED
+    park = front.current_park(s, "r-1")
+    assert park.payload["reason"] == "no_verdict"
+    sid = park.payload["session_id"]
+
+    retry = fake.add_user_message(sid, "retry")
+    logged = []
+    ctx.log = logged.append
+    assert phases.run_loop(ctx) in (phases.Exit.PARKED, phases.Exit.OK)
+    assert len(reasons) <= 2, reasons
+    # The grant carries the cursor of the listing it was read from, so the
+    # retry is behind it...
+    grant = s.newest_fact("r-1", EventKind.HUMAN_RULING)
+    assert grant.payload["ruling"] == "grant_round" and grant.payload["cursor_item_id"] == retry
+    # ...and no later listing reads it again.
+    assert not any("read twice" in m for m in logged), logged
+    # Taken once: one grant, and no dismissal, so the human was never
+    # answered with a refusal for a retry they had already spent.
+    assert front.grants(s, "r-1") == 1
+    assert [x.payload["ruling"] for x in s.facts_of_kind("r-1", EventKind.HUMAN_RULING)] == ["grant_round"]
+    assert s.facts_of_kind("r-1", EventKind.HUMAN_ITEM_DISMISSED) == []

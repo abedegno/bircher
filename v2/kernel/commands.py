@@ -210,7 +210,8 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"ruling": "approve", "phase": phase, "epoch": epoch_n,
-                     "artifact_hash": cmd.payload["artifact_hash"]},
+                     "artifact_hash": cmd.payload["artifact_hash"],
+                     "cursor_item_id": cmd.payload.get("cursor_item_id")},
         )
     elif cmd.name == "grant_round":
         park = front.current_park(store, cmd.run_id)
@@ -218,14 +219,16 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"ruling": "grant_round", "phase": phase, "epoch": epoch_n,
-                     "park_seq": park.seq},
+                     "park_seq": park.seq,
+                     "cursor_item_id": cmd.payload.get("cursor_item_id")},
         )
     elif cmd.name == "record_review" and actor == HUMAN_ACTOR:
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"ruling": "request_revision", "phase": phase, "epoch": epoch_n,
-                     "artifact_hash": cmd.payload["artifact_hash"]},
+                     "artifact_hash": cmd.payload["artifact_hash"],
+                     "cursor_item_id": cmd.payload.get("cursor_item_id")},
         )
     elif cmd.name == "record_model_question":
         store.append_fact(
@@ -246,7 +249,8 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.HUMAN_ITEM_DISMISSED, actor=actor,
             causal_command_id=cmd.idempotency_key,
-            payload={"epoch": epoch_n, "cursor_item_id": cmd.payload["cursor_item_id"],
+            payload={"phase": phase, "epoch": epoch_n, "session_id": cmd.payload["session_id"],
+                     "cursor_item_id": cmd.payload["cursor_item_id"],
                      "rejection": cmd.payload["rejection"]},
         )
     elif cmd.name == "record_prompt_item":

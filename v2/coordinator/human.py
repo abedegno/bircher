@@ -7,7 +7,7 @@ import json
 from coordinator import seat, sessions
 from coordinator.session import LookupFailed, list_items
 from kernel import front
-from kernel.authz import NotAuthorized
+from kernel.authz import NotAuthorized, phase_of
 from kernel.canon import content_hash
 from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
 from kernel.events import EventKind
@@ -15,7 +15,7 @@ from kernel.events import EventKind
 APPROVE, RETRY = "approve", "retry"
 
 
-def cursor(store, run_id: str, session_id: str, listing: list) -> str | None:
+def cursor(store, run_id: str, session_id: str | None, listing: list) -> str | None:
     """The newest item the coordinator has listed (spec §4).
 
     The RUN's, not the session's: every fact that moves the cursor carries
@@ -80,6 +80,12 @@ def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, s
     message, trimmed and case-folded -- `approve?` is a question and
     `approve.` is prose, and neither of them is a ruling.
     """
+    if not items:
+        # A batch with no messages in it is not a fact of any kind. Raised
+        # rather than answered with a default, because every caller reaches
+        # here only after finding something unread: an empty batch is a bug
+        # in the discriminator, and `run_loop` turns it into RC_FAILED.
+        raise ValueError("classify_batch needs at least one message: an empty batch is not a fact")
     texts = [it["text"].strip() for it in items]
     joined = "\n\n".join(texts)
     if grill_open:
@@ -104,16 +110,24 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     """Record what the human said in *listing*, or None if they said nothing.
 
     Every listing is discriminated (spec §4), and the batch becomes one fact.
-    The two cursor-bearing shapes carry `cursor_item_id = listing[-1]["id"]`
-    -- the last item of the listing that was READ, not of the batch, so an
-    assistant item written after the human's message is behind the cursor
-    too. The three ruling shapes carry no cursor (Task 8): each transitions
-    the run or grants a round, so the next listing belongs to a new park or a
-    new turn and takes its cursor from there.
+    ALL FIVE shapes carry `cursor_item_id = listing[-1]["id"]` -- the last
+    item of the listing that was READ, not of the batch, so an assistant item
+    written after the human's message is behind the cursor too. The three
+    ruling shapes carry it as much as the other two: `grant_round`
+    transitions nothing and starts no session, so without a cursor the item
+    it was read from is still ahead on the next listing, and the pass after
+    it reads the same message again.
+
+    Reading the same item twice reaches the kernel under the same
+    idempotency key, which REPLAYS: the earlier result comes back, no fact is
+    written, and nothing was taken. That is reported as `None` -- a caller
+    told "taken" for a replay parks nothing and loops -- and logged, because
+    a replay here means the cursor did not move when it should have.
 
     A token the kernel refuses is DISMISSED rather than retried: the
-    dismissal moves the cursor past it and names the refusal, and the reply
-    it owes is sent by `reply_refusals`.
+    dismissal moves the cursor past it, names the refusal and names the
+    session it was read from, and the reply it owes is sent by
+    `reply_refusals`.
     """
     store, run_id = ctx.store, ctx.run_id
     items = unread_human_items(ctx, session_id, listing)
@@ -126,32 +140,48 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     kind, text = classify_batch(items, state=state, grill_open=bool(newer_q))
     cur = listing[-1]["id"]
     key = f"human:{run_id}:{items[-1]['id']}"
-    phase = front.FRONT_PHASES[0] if state in ("queued", "spec_submitted", "spec_accepted") else "plan"
+    phase = phase_of(state)
     try:
         if kind == "answer":
-            _human(ctx, "record_human_answer", {"question_ids": [q.payload["question_id"] for q in newer_q],
-                                                "answer": text, "cursor_item_id": cur}, key)
+            result = _human(ctx, "record_human_answer",
+                            {"question_ids": [q.payload["question_id"] for q in newer_q],
+                             "answer": text, "cursor_item_id": cur}, key)
         elif kind == "approve":
-            _human(ctx, "approve_artifact", {"artifact_hash": store.phase_artifact(run_id, phase)}, key)
+            result = _human(ctx, "approve_artifact", {"artifact_hash": store.phase_artifact(run_id, phase),
+                                                      "cursor_item_id": cur}, key)
         elif kind == "retry":
-            _human(ctx, "grant_round", {}, key)
+            result = _human(ctx, "grant_round", {"cursor_item_id": cur}, key)
         elif kind == "revision":
-            _human(ctx, "record_review", {"phase": phase, "artifact_hash": store.phase_artifact(run_id, phase),
-                                          "verdict": "request_revision", "findings": text}, key)
+            result = _human(ctx, "record_review", {"phase": phase, "artifact_hash": store.phase_artifact(run_id, phase),
+                                                   "verdict": "request_revision", "findings": text,
+                                                   "cursor_item_id": cur}, key)
         else:
-            _human(ctx, "record_human_direction", {"text": text, "cursor_item_id": cur}, key)
+            result = _human(ctx, "record_human_direction", {"text": text, "cursor_item_id": cur}, key)
     except NotAuthorized:
         rej = store.newest_fact(run_id, EventKind.COMMAND_REJECTED)
-        seat.command(ctx, "dismiss_human_item", {"cursor_item_id": cur, "rejection": rej.id})
+        seat.command(ctx, "dismiss_human_item", {"session_id": session_id, "cursor_item_id": cur,
+                                                 "rejection": rej.id})
         return "dismissed"
+    if result.replayed:
+        ctx.log(f"session {session_id}: item {items[-1]['id']} was read twice; "
+                f"{key} replayed and recorded nothing")
+        return None
     return kind
 
 
-def _send(ctx, session_id: str, cause: str, text: bytes) -> None:
+def _send(ctx, session_id: str, cause: str, text: bytes, *, phase: str = None, epoch: int = None) -> None:
     """One prompt, by obligation: sent only where the journal owes it, and its
     `prompt_item` recorded either way -- the crash window between a confirmed
-    prompt and its record is closed by finding the item by hash."""
-    phase, n = ctx.phase(), ctx.epoch()
+    prompt and its record is closed by finding the item by hash.
+
+    *phase* and *epoch* default to the run's current ones, which is right for
+    a prompt this pass is sending about the run's current situation. A reply
+    that answers a fact of its own (a dismissal) passes THAT fact's phase and
+    epoch instead, so the obligation it satisfies stays the same one however
+    far the run has moved since.
+    """
+    phase = ctx.phase() if phase is None else phase
+    n = ctx.epoch() if epoch is None else epoch
     ob = {"kind": "sess-prompt", "session": session_id, "phase": phase, "epoch": n, "cause": cause}
     if sessions.satisfied(ctx.store, ctx.run_id, ob) is None:
         sessions.prompt_session(ctx.store, run_id=ctx.run_id, generation=ctx.generation, server=ctx.server,
@@ -162,6 +192,14 @@ def _send(ctx, session_id: str, cause: str, text: bytes) -> None:
 
 def reply_refusals(ctx) -> list[str]:
     """One reply per dismissal, once (spec §4: the refusal is answered).
+
+    EVERY value of the obligation comes from the dismissal's own fact -- the
+    session the token was read from, and the phase and epoch it was read in
+    -- never the run's current ones. Two properties follow, and neither holds
+    if the pass supplies its own: the reply goes back where the human typed,
+    even after the run has opened newer sessions; and once sent it stays
+    satisfied, so a dismissal from the spec phase is not owed again when the
+    run reaches the plan.
 
     The obligation is derived from the journal, not from when the dismissal
     happened: a dismissal whose reply never went out is still owed on every
@@ -179,23 +217,16 @@ def reply_refusals(ctx) -> list[str]:
     rejections = {f.id: f for f in front.human_rejections(store, run_id)}
     for d in store.facts_of_kind(run_id, EventKind.HUMAN_ITEM_DISMISSED):
         rej = rejections.get(d.payload["rejection"])
-        sid = _session_for_reply(ctx, d)
+        sid, phase, n = d.payload.get("session_id"), d.payload.get("phase"), d.payload.get("epoch")
         if rej is None or sid is None or sid not in listed:
             continue
-        ob = {"kind": "sess-prompt", "session": sid, "phase": ctx.phase(), "epoch": ctx.epoch(), "cause": rej.id}
+        ob = {"kind": "sess-prompt", "session": sid, "phase": phase, "epoch": n, "cause": rej.id}
         if sessions.satisfied(store, run_id, ob) is not None:
             continue
         text = f"Bircher refused that: {rej.payload.get('detail', '')}".encode()
-        _send(ctx, sid, rej.id, text)
+        _send(ctx, sid, rej.id, text, phase=phase, epoch=n)
         sent.append(rej.id)
     return sent
-
-
-def _session_for_reply(ctx, dismissal) -> str | None:
-    """The session the dismissed item was read from: the newest session the
-    run prompted before the dismissal."""
-    rows = front.satisfied_effects(ctx.store, ctx.run_id, "sess-prompt")
-    return rows[-1]["intent"]["obligation"]["session"] if rows else None
 
 
 def _park_session(ctx, park) -> str | None:
@@ -254,7 +285,15 @@ def human_pass(ctx, park) -> str:
     if text:
         _send(ctx, sid, park.id, text)
     reply_refusals(ctx)
-    listing = list_items(ctx.server, sid, fetch=ctx.fetch)
+    try:
+        listing = list_items(ctx.server, sid, fetch=ctx.fetch)
+    except LookupFailed as exc:
+        # The same guard as the first listing, and for the same reason: the
+        # prompt is already sent and the park already recorded, so a server
+        # that goes away between the two reads leaves the pass parked -- the
+        # next pass discriminates this listing instead.
+        ctx.log(f"session {sid}: confirm listing unreadable ({exc}); parked")
+        return "parked"
     if take_listing(ctx, sid, listing) not in (None, "dismissed"):
         return "taken"
     return "parked"

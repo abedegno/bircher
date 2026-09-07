@@ -350,6 +350,7 @@ def validate_review(store, cmd, actor: str, *, ruling: str = "review_ruling") ->
         findings = cmd.payload.get("findings")
         if not isinstance(findings, str) or not findings.strip():
             raise NotAuthorized("a human record_review carries non-empty findings")
+        _check_cursor(cmd)
         return None
 
     binding = _binding_from(cmd.payload)
@@ -623,6 +624,27 @@ def _check_turn_ended(store, cmd, state: str) -> None:
         raise NotAuthorized(f"session {sid}'s awaited turn already ended: one end per turn")
 
 
+def _check_cursor(cmd) -> None:
+    """spec §4: every fact the coordinator records FROM A LISTING carries the
+    cursor it had read to -- `human_answer`, `human_ruling`,
+    `record_human_direction`, `parked`. The three ruling shapes
+    (`approve_artifact`, `grant_round`, the human's `record_review`) write
+    `human_ruling` facts and so carry it too. Without it a ruling that starts
+    no new session and no new park -- `grant_round` is one; it transitions
+    nothing -- leaves the item it was read from still ahead of the cursor,
+    and the next listing reads that item again.
+
+    Shape only. The value is the coordinator's own reading of a listing, a
+    declared residual in the provenance table; what the kernel can check is
+    that it is a string or absent. ONE literal `cmd.payload.get(...)` read
+    shared by all five commands: the provenance extractor matches the literal
+    syntactically, and five copies would be five chances to spell it
+    differently.
+    """
+    if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
+        raise NotAuthorized("cursor_item_id must be a string or null")
+
+
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
     of the six the loop has, not free text the coordinator invents."""
@@ -634,8 +656,7 @@ def _check_park(store, cmd) -> None:
     # to the source that actually reads them.
     if cmd.payload.get("session_id") is not None and not isinstance(cmd.payload.get("session_id"), str):
         raise NotAuthorized("park session_id must be a string or null")
-    if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
-        raise NotAuthorized("park cursor_item_id must be a string or null")
+    _check_cursor(cmd)
     if cmd.payload.get("reviewer") is not None and not isinstance(cmd.payload.get("reviewer"), str):
         raise NotAuthorized("park reviewer must be a string or null")
     if cmd.payload.get("findings_hash") is not None and not store.has_artifact(cmd.payload.get("findings_hash")):
@@ -753,6 +774,20 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         from kernel import front
         if not isinstance(cmd.payload.get("cursor_item_id"), str) or not cmd.payload.get("cursor_item_id"):
             raise NotAuthorized("dismiss_human_item carries the cursor to move past")
+        # WHICH SESSION the refused token was read from (spec §4: the reply
+        # goes back to that session, once). Bound to a session this run
+        # actually created, so the fact cannot name a session the reply could
+        # never reach -- `reply_refusals` derives its obligation from this
+        # fact alone, and an unbound value would send the reply somewhere the
+        # human is not looking, or nowhere at all.
+        sid = cmd.payload.get("session_id")
+        if not isinstance(sid, str) or not sid:
+            raise NotAuthorized("dismiss_human_item names the session the item was read from")
+        if sid not in front.created_sessions(store, cmd.run_id):
+            raise NotAuthorized(
+                f"dismiss_human_item names session {sid!r}, which no satisfied sess-create of "
+                "this run delivered"
+            )
         rej = cmd.payload.get("rejection")
         if not isinstance(rej, str) or not rej:
             raise NotAuthorized("dismiss_human_item names the command_rejected fact it dismisses")
@@ -871,15 +906,13 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized("record_human_answer question_ids must be a list of ids")
         if not isinstance(cmd.payload.get("answer"), str) or not cmd.payload.get("answer").strip():
             raise NotAuthorized("record_human_answer carries a non-empty answer")
-        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
-            raise NotAuthorized("cursor_item_id must be a string or null")
+        _check_cursor(cmd)
         return None
 
     if cmd.name == "record_human_direction":
         if not isinstance(cmd.payload.get("text"), str) or not cmd.payload.get("text").strip():
             raise NotAuthorized("record_human_direction carries non-empty text")
-        if cmd.payload.get("cursor_item_id") is not None and not isinstance(cmd.payload.get("cursor_item_id"), str):
-            raise NotAuthorized("cursor_item_id must be a string or null")
+        _check_cursor(cmd)
         return None
 
     if cmd.name == "approve_artifact":
@@ -891,6 +924,7 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 f"the {phase} phase's current artefact is {str(held)[:12]}...: the kernel holds "
                 "the hash; the caller can only supply the right answer"
             )
+        _check_cursor(cmd)
         return "specified" if phase == "spec" else "planned"
 
     if cmd.name == "grant_round":
@@ -900,6 +934,7 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 "grant_round needs a current park: nothing is stalled, and a grant "
                 "at a running seat would displace it"
             )
+        _check_cursor(cmd)
         return None
 
     if cmd.name == "record_implementation_output":
