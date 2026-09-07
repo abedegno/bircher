@@ -6,6 +6,7 @@ import pytest
 
 from coordinator import sessions
 from coordinator.effects import KERNEL
+from coordinator.session import LookupFailed
 from kernel.dispatch import Role
 from kernel.events import EventKind
 from kernel.store import Store
@@ -136,3 +137,20 @@ def test_satisfied_matches_on_the_obligation_alone(run, tmp_path, monkeypatch):
     # A different body under the same obligation is the same obligation.
     assert sessions.satisfied(s, "r-1", dict(ob)) is not None
     assert sessions.satisfied(s, "r-1", dict(ob, cause="f-2")) is None
+
+
+def test_list_sessions_reads_omnigents_paginated_list():
+    """omnigent's GET /v1/sessions returns a PaginatedList/SessionList --
+    {"object": "list", "data": [...], "first_id", "last_id", "has_more"} --
+    not a bare "sessions" list (omnigent/server/routes/sessions/routes_core.py,
+    SessionList in omnigent/server/schemas.py)."""
+    body = json.dumps({"object": "list",
+                       "data": [{"id": "s-1"}, {"id": "s-2"}],
+                       "first_id": "s-1", "last_id": "s-2", "has_more": False})
+    assert sessions.list_sessions("http://srv", fetch=lambda u: body) == {"s-1", "s-2"}
+
+
+def test_list_sessions_without_any_list_raises_lookup_failed():
+    body = json.dumps({"object": "list", "first_id": None, "last_id": None, "has_more": False})
+    with pytest.raises(LookupFailed):
+        sessions.list_sessions("http://srv", fetch=lambda u: body)

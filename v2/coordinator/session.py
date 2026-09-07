@@ -93,12 +93,19 @@ def list_items(server: str, conv_id: str, *, fetch=_fetch) -> list[dict]:
     contributes none. Unlike `state`, a bad lookup here is not a hidden
     `unknown`: the caller (list_items has no caller yet in the front half)
     would otherwise be unable to tell "no items" from "could not read".
+
+    omnigent's real route returns a `PaginatedList`: `{"object": "list",
+    "data": [...], "first_id", "last_id", "has_more"}`
+    (omnigent/server/routes/sessions/routes_items.py, `PaginatedList` in
+    omnigent/server/schemas.py) -- `data` is read first. `items`/a bare list
+    stay as fallbacks for a stub shaped some other way, not because the real
+    server ever sends them.
     """
     try:
         d = json.loads(fetch(f"{server}/v1/sessions/{conv_id}/items"))
     except ValueError as exc:
         raise LookupFailed(f"items: {exc}") from exc
-    raw = d.get("items", d) if isinstance(d, dict) else d
+    raw = d.get("data", d.get("items", d)) if isinstance(d, dict) else d
     if not isinstance(raw, list):
         raise LookupFailed("items: not a list")
     out = []

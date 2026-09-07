@@ -72,8 +72,17 @@ def stop_session(store, *, run_id: str, generation: int, server: str, session_id
 
 
 def list_sessions(server: str, *, fetch=_fetch) -> set[str]:
+    """The ids `GET {server}/v1/sessions` lists.
+
+    omnigent's real route returns a `PaginatedList`/`SessionList`:
+    `{"object": "list", "data": [...], "first_id", "last_id", "has_more"}`
+    (omnigent/server/routes/sessions/routes_core.py, `SessionList` in
+    omnigent/server/schemas.py) -- `data` is read first. `sessions`/`items`/a
+    bare list stay as fallbacks for a stub shaped some other way, not because
+    the real server ever sends them.
+    """
     d = json.loads(fetch(f"{server}/v1/sessions"))
-    raw = d.get("sessions", d.get("items", d)) if isinstance(d, dict) else d
+    raw = d.get("data", d.get("sessions", d.get("items", d))) if isinstance(d, dict) else d
     if not isinstance(raw, list):
         raise LookupFailed("sessions: not a list")
     return {str(x.get("id")) for x in raw if isinstance(x, dict)}

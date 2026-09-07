@@ -143,3 +143,12 @@ def test_list_items_projects_id_role_text():
     assert items == [{"id": "i1", "role": "user", "text": "hello"},
                      {"id": "i2", "role": "assistant", "text": "hi"},
                      {"id": "i3", "role": "user", "text": ""}]
+    # omnigent's real route returns a PaginatedList -- {"object": "list",
+    # "data": [...], "first_id", "last_id", "has_more"} -- not a bare "items"
+    # list (omnigent/server/routes/sessions/routes_items.py, PaginatedList in
+    # omnigent/server/schemas.py).
+    paginated = json.dumps({"object": "list", "data": [
+        {"id": "i1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    ], "first_id": "i1", "last_id": "i1", "has_more": False})
+    assert list_items("http://srv", "s-1", fetch=lambda u: paginated) == [
+        {"id": "i1", "role": "user", "text": "hello"}]
