@@ -74,9 +74,11 @@ def test_turn_end_matrix(tmp_path):
         out.unlink()
     stub = Stub(["failed"])
     assert _wait(s, g, sid, stub, [out]) == TurnEnd("dead", False)
-    for status in ("idle", "failed", "running"):
+    # Deadline already expired (deadline_us=5): both ends are "at once" --
+    # died() outranks the cap when a poll observes both at once.
+    for status, expected in (("idle", "cap"), ("failed", "dead"), ("running", "cap")):
         stub = Stub([status])
-        assert _wait(s, g, sid, stub, [out], deadline_us=5, clock=lambda: 1.0) == TurnEnd("cap", False)
+        assert _wait(s, g, sid, stub, [out], deadline_us=5, clock=lambda: 1.0) == TurnEnd(expected, False)
         assert stub.polls <= 1
     # A file planted between the poll and the cap is still the turn's output.
     out.write_text("late")

@@ -160,15 +160,13 @@ def wait_turn(store, run_id: str, generation: int, server: str, session_id: str,
     `displaced` before anything is fetched; (2) the session's `state()`, whose
     `agent_id` must match `agent_id_expected` (else `AgentMismatch` -- an
     `unknown` read has `agent_id == ""` and compares nothing); (3) a watched
-    path present ends it `file`, whatever the status; (4) the deadline passed
-    ends it `cap`; (5) `died()` ends it `dead`; else sleep and poll again.
+    path present ends it `file`, whatever the status; (4) `died()` ends it
+    `dead`; (5) the deadline passed ends it `cap`; else sleep and poll again.
 
-    Task 14's brief text ordered these last two the other way (`died` before
-    the deadline). Its own `test_turn_end_matrix` proves that ordering wrong:
-    a `failed` status read after the deadline has already passed is `cap`
-    (`stub.polls <= 1`, no recovery attempted), not `dead` -- a stale read
-    of a session's status carries less weight than the wall clock once the
-    run is out of time. This function follows the test.
+    A dead session read past its own deadline is still `dead`, not `cap`:
+    both are stopped and read the same way once the turn is over, and the
+    fact records what this poll actually observed first, not which cause
+    would have been reached had the session kept quiet a little longer.
 
     Reads nothing the turn wrote and records nothing: the caller records the
     end and stops the session.
@@ -192,10 +190,10 @@ def wait_turn(store, run_id: str, generation: int, server: str, session_id: str,
         present = any(p.exists() for p in watched)
         if present:
             return TurnEnd("file", True)
-        if int(clock() * 1_000_000) >= deadline_us:
-            return TurnEnd("cap", any(p.exists() for p in watched))
         if died(st.status, st.error_code):
             return TurnEnd("dead", False)
+        if int(clock() * 1_000_000) >= deadline_us:
+            return TurnEnd("cap", any(p.exists() for p in watched))
         sleep(poll_s)
 
 
