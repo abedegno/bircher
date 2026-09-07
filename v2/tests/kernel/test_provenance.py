@@ -179,6 +179,14 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['cost_if_wrong']",
         # A per-session identity the kernel cannot see.
         "cmd.payload['item_id']",
+        # The front half's own three (docs/design/provenance-table.md's
+        # "Front half" section, spec §9): prose rows with no single
+        # store.X or payload[...] the AST walk could find, added by hand
+        # because the same discipline applies to a claim regardless of
+        # whether authz.py is what makes it.
+        "policy inputs: issue labels, Project config",
+        "the stop's teardown",
+        "the runner's lock",
     }
 
 
@@ -236,7 +244,11 @@ def test_the_spec_and_the_table_agree_on_the_count():
              # Task 9 pushed the count past twenty: the model's five grill
              # words are new asserted-permanent rows and the prompt item's
              # item_id is a new asserted residual.
-             "twenty-one": 21, "twenty-two": 22, "twenty-three": 23}
+             "twenty-one": 21, "twenty-two": 22, "twenty-three": 23,
+             # Task 21: the front half's own three (policy inputs, the
+             # stop's teardown, the runner's lock) push the count to
+             # twenty-five.
+             "twenty-four": 24, "twenty-five": 25}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")

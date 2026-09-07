@@ -99,7 +99,7 @@ Key functions by size: `run_item` (522), `merge_ready_pr` (330),
 
 ### 3.2 The coordinator — `v2/coordinator/`
 
-Python, twelve modules, invoked as `python3 -m coordinator.cli derive`. **A
+Python, seventeen modules, invoked as `python3 -m coordinator.cli derive`. **A
 one-shot subprocess, not a service.** This matters: it starts after the lead
 session has settled and exits when the tuple is printed.
 
@@ -115,6 +115,11 @@ session has settled and exits when the tuple is printed.
 | `effects.py`, `effect_mode.py` | performing an effect from Python, mode-aware |
 | `wiring.py` | real dependencies for `derive` |
 | `cli.py` | the command line, mirroring `kernel.cli` |
+| `sessions.py` | session effects: every create, prompt and stop is a `SESSION_CONTROL` effect with an obligation |
+| `seat.py` | one waited turn of a seat, shared by the author, the reviewer and the human pass |
+| `author.py` | the author round: dispatch, worktree, brief, submission |
+| `human.py` | human interaction: the cursor, the discriminator, the batch rules, dismissals and their replies |
+| `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption |
 
 It returns an eight-field pipe-delimited tuple:
 
@@ -230,74 +235,90 @@ path.**
 ## 4. One item, end to end
 
 1. **Queue.** The runner reads `bircher:queued` issues and writes `queue/*.md`.
-2. **Run start.** `run_item` mints a run id `<item>-<epoch>` and records the
-   work repo's HEAD as the run's `base_sha`.
-3. **Dispatch, THEN label.** The kernel issues a generation (a monotonic
-   fence) *before* the session exists. Only then is `bircher:running` applied,
-   because it is a routed effect and every routed effect needs a generation.
-   **This order is load-bearing and was arrived at by a bug:** labelling
-   earlier meant the effect was either silently dropped (`${BIRCHER_GENERATION:?}`
-   aborts in kernel mode, and its `|| true` swallowed the failure) or — worse,
-   on the second item of a run — attributed to the PREVIOUS item's stale
-   exported generation.
-4. **Session.** The runner creates the lead session (`session_control` effect)
-   and sends the item plus a vendor directive naming implementer and opposite
-   reviewer.
-5. **Implementation.** The lead session dispatches a coding sub-agent, opens a
+2. **Run start.** `create_run` with the fetched issue and the Project config:
+   in one transaction the kernel snapshots the issue, PUTs its canonical bytes
+   to the store under `bundle_hash`, and freezes the policy derived from the
+   issue's labels and the config as `policy_frozen`.
+3. **Operator fence, then label.** The kernel fences a generation — dispatched
+   as `runner`/`operator`, the resume fence rather than a seat — *before* any
+   session exists. Only then is `bircher:running` applied, because it is a
+   routed effect and every routed effect needs a generation. **This order is
+   load-bearing and was arrived at by a bug:** labelling earlier meant the
+   effect was either silently dropped (`${BIRCHER_GENERATION:?}` aborts in
+   kernel mode, and its `|| true` swallowed the failure) or — worse, on the
+   second item of a run — attributed to the PREVIOUS item's stale exported
+   generation.
+4. **The front half.** `phases` runs the loop: author rounds and review seats
+   as sessions under the `v2_author_*` bundles, every session an effect with
+   an obligation, every turn's end a fact. Parks for the human (grill, gate,
+   stall) exit `RC_PARKED`, and the next pass resumes. `specified` and
+   `planned` are reached only through a reviewer's accept, and published to
+   the issue.
+5. **Implementer, after `planned`.** Dispatched afresh: `start_implementation`,
+   the state read back before any session exists, then the session.
+6. **Implementation.** The lead session dispatches a coding sub-agent, opens a
    branch and a PR, dispatches its own reviewer, may run fix rounds, posts a
    summary, and stops.
-6. **Settle detection.** The runner polls: session idle AND item count stable
+7. **Settle detection.** The runner polls: session idle AND item count stable
    AND a PR open, held for N polls. Then it cancels the session.
-7. **Derivation.** The runner invokes the coordinator, which selects the PR,
+8. **Derivation.** The runner invokes the coordinator, which selects the PR,
    waits out CI, dispatches an INDEPENDENT reviewer, and returns the tuple.
-8. **Repair, if the reviewer blocked and rounds remain.** The runner records
+9. **Repair, if the reviewer blocked and rounds remain.** The runner records
    `request_revision`, CONFIRMS the kernel journalled it by causal id, dispatches
    a fresh implementer session briefed on the reviewer's verbatim findings,
-   settles it, and goes back to step 7. Bounded by `BIRCHER_MAX_REVISIONS`
+   settles it, and goes back to step 8. Bounded by `BIRCHER_MAX_REVISIONS`
    (default 2); 0 disables it and restores the pre-loop behaviour exactly.
-9. **Lifecycle recording.** The runner replays the derived facts into the
+10. **Lifecycle recording.** The runner replays the derived facts into the
    kernel: output, CI observation, review verdict, then `request_merge`.
-10. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
+11. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
    `mergeStateStatus == CLEAN`, merges pinned to the reviewed head, watches
    main CI, and reverts on a confirmed red.
-11. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
+12. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
 
 The same thing as a picture, because the repair step turns a line into a loop
 and that is hard to see in a numbered list:
 
     bircher:queued issues ──▶ queue/*.md
        │
-       ├─ 2. run start: mint run id, record the work repo's base_sha
-       ├─ 3. kernel mints a generation ──▶ THEN label bircher:running
+       ├─ 2. run start: create_run from the fetched issue + Project config
+       │        (the kernel snapshots the issue, PUTs it, freezes the policy)
+       ├─ 3. operator fence ──▶ THEN label bircher:running
        │        (this order is load-bearing — see step 3 above)
-       ├─ 4. create the lead session, send the item + vendor directive
-       ├─ 5. lead session: sub-agent implements, opens a PR,
+       ├─ 4. THE FRONT HALF: phases runs author rounds and review seats as
+       │        sessions; parks for the human exit RC_PARKED and resume;
+       │        specified/planned reached only by a reviewer's accept,
+       │        published to the issue
+       ├─ 5. implementer, after planned: start_implementation, state read
+       │        back, THEN the session
+       ├─ 6. lead session: sub-agent implements, opens a PR,
        │        runs its OWN review + up to 3 fix rounds, stops
-       ├─ 6. settle detection: poll until idle AND item count stable AND a PR
+       ├─ 7. settle detection: poll until idle AND item count stable AND a PR
        │
-       ├─ 7. DERIVATION (coordinator): select the PR, wait out CI,
+       ├─ 8. DERIVATION (coordinator): select the PR, wait out CI,
        │        dispatch an INDEPENDENT reviewer, return the 8-field tuple
        │             │
-       │             └─ blocked, with rounds left? ──▶ 8. REPAIR
+       │             └─ blocked, with rounds left? ──▶ 9. REPAIR
        │                   record request_revision → confirm it journalled
        │                   → dispatch a repair session with the findings
        │                   → settle ──────────────────┐
        │                                              │
        │             ┌────────────────────────────────┘
-       │             ▼  (back to 7, allowance re-read FROM THE JOURNAL)
+       │             ▼  (back to 8, allowance re-read FROM THE JOURNAL)
        │
-       ├─ 9. replay the derived facts into the kernel
-       ├─ 10. merge pinned to the reviewed head, watch main CI, revert on red
-       └─ 11. issue comment, labels, scorecard row, record_run_outcome
+       ├─ 10. replay the derived facts into the kernel
+       ├─ 11. merge pinned to the reviewed head, watch main CI, revert on red
+       └─ 12. issue comment, labels, scorecard row, record_run_outcome
 
-> **GAP — steps 5 and 7 both review.** Step 6 exists only because the
-> orchestrator is a separate process from the session: it has to *detect* that
-> the model stopped rather than being told. Step 9's replay-into-the-kernel
-> exists only because the derivation happened out-of-process. Step 8 dispatches
-> a session from bash for the same reason — `v2/coordinator/session.py` is
-> read-only and cannot create one.
+> **GAP — steps 6 and 8 both review.** The front half above has landed: spec
+> and plan review are now sessions the kernel dispatches and validates itself.
+> What remains is the back half's own duplication, untouched by it — see §5.
+> Step 7 exists only because the orchestrator is a separate process from the
+> session: it has to *detect* that the model stopped rather than being told.
+> Step 10's replay-into-the-kernel exists only because the derivation happened
+> out-of-process. Step 9 dispatches a session from bash for the same reason —
+> `v2/coordinator/session.py` is read-only and cannot create one.
 >
-> **TARGET —** steps 5–9 collapse. The coordinator dispatches the implementer,
+> **TARGET —** steps 6–10 collapse. The coordinator dispatches the implementer,
 > observes it directly, reviews once, repairs if needed, and records as it goes
 > rather than replaying afterwards.
 
@@ -412,14 +433,17 @@ container.
       BIRCHER_KERNEL_DB=/workspaces/bircher-v2/.run/kernel-muesli.db \
       bash batch/launch.sh --source issues --log .run/<name>.log
 
-**None of those three is required.** All are deployment overrides of shipped
-defaults, and an earlier version of this document said otherwise:
+**None of those five is required.** All are deployment overrides of shipped
+defaults, and an earlier version of this document said otherwise (of the
+first three):
 
 | variable | shipped default | why override it |
 |---|---|---|
 | `BIRCHER_REPO` | `abedegno/muesli` | targeting a different repo (e.g. `bircher-smoke`) |
 | `WORKDIR` | `/workspaces/muesli` | the matching work checkout |
 | `BIRCHER_KERNEL_DB` | `$BUNDLE_DIR/.run/kernel.db` (set in `run_item`) | keeping a repo's journal separate |
+| `BIRCHER_PROJECT_ID` | unset (no project default: `create_run` sees `{}`) | naming the omnigent Project whose `config.bircher` supplies the policy default a run's labels then override |
+| `BIRCHER_WORKSPACES_ROOT` | `/workspaces` | a NAS laid out differently from the deployment table above |
 
 `BIRCHER_KERNEL_DB` does carry a `:?` guard, but in `effect-adapter.sh` — which
 runs long after `run_item` has already defaulted it, so it never fires in
@@ -536,9 +560,10 @@ of the runner/coordinator split and should NOT be patched in place.
 | 10 | ~~kernel availability is unmonitored in `kernel` effect mode~~ | **PARTIAL** | `preflight_kernel` refuses to start a run whose kernel is unusable; nothing watches it DURING a run | in-run monitoring needs a design — a mid-run kernel failure is still silent |
 | 11 | nothing schedules a wave | operational | a decision | ~~gap 1~~ — **unblocked**: repair works, so unattended waves no longer just multiply escalations. Blocked instead on a groomed backlog: every wave-sized muesli issue is closed |
 | 13 | ~~the kernel's revision loop is never used by any path~~ | **CLOSED** | the repair loop uses it; the kernel needed no change | — |
-| 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running |
+| 15 | implementer sessions are reaped by omnigent's 480s per-turn IDLE watchdog mid-work | **operational, and probably the biggest lever on repair convergence** | raising `HARNESS_TURN_TIMEOUT_S` for `omnigent-runner-bircher` | a container restart, so not while a wave is running; raised to 5400 in E1 (Task 22) |
 | 14 | ~~an exhausted allowance records `request_revision`~~ | **CLOSED** | a bound-exhausted failure records `reject`, so the run ends in `reviewing` and `recover` calls it terminal | — |
 | 12 | v1 checkout 277 commits behind (measured 2026-08-31) — and **nothing schedules either version**, so there is no live v1 to cut over FROM | operational | a decision to start running v2 on a schedule | gap 11 is the same decision |
+| 16 | author worktrees accumulate under `/workspaces/<run>/<gen>`; nothing prunes them | low, a cost rather than a correctness residual — no later turn reads a stale one | the operator, by hand | Out of scope |
 
 ### The repair loop, as of 2026-08-31
 

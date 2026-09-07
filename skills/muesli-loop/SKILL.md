@@ -32,9 +32,10 @@ an independent different-vendor reviewer. Work in /workspaces/muesli.
 
 ## 2. Confidence gate
 
-- If the item is under-specified or has more than one reasonable interpretation,
-  write a short spec and STOP: surface it for human approval (post the spec or
-  open a draft) instead of guessing.
+- Ambiguity is the front half's job: you are implementing a plan the kernel
+  holds as accepted. Do not stop to re-specify. If the plan cannot be carried
+  out for a reason it did not foresee — a dependency missing, a test that
+  cannot be made to pass without changing the design — escalate as below.
 - ESCALATING WITHOUT A PR (confidence gate fired, or a declared dependency is
   not yet merged): there is no PR to carry your marker, so the batch runner
   cannot see the escalation and would wait out its full timeout. Signal it:
