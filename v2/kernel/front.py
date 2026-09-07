@@ -211,6 +211,13 @@ def dismissed_rejection_ids(store, run_id: str) -> set[str]:
             for f in store.facts_of_kind(run_id, EventKind.HUMAN_ITEM_DISMISSED)}
 
 
+def brief_for(store, run_id: str, generation: int):
+    for f in store.facts_of_kind(run_id, EventKind.REVIEW_BRIEF_ISSUED):
+        if f.payload.get("generation") == generation:
+            return f
+    return None
+
+
 def prompt_hashes_of(store, run_id: str, session_id: str) -> set[str]:
     out = set()
     for row in satisfied_effects(store, run_id, "sess-prompt"):

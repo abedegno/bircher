@@ -171,16 +171,16 @@ class Front:
     def review_round(self, verdict: str = "accept", findings: bytes = b"ok", **override) -> None:
         cause = self._newest_id()
         g = self._dispatch(Role.REVIEWER, self.reviewer)
-        # Task 11 inserts issue_review_brief here, before the session.
+        self._cmd(g, "issue_review_brief", {"phase": self.phase()})
         sid = self._session(g, cause)
         self._end_turn(g, sid)
         phase = self.phase()
+        issued = fq.brief_for(self.store, self.run_id, g).payload
         payload = {
             "phase": phase, "verdict": verdict,
-            "artifact_hash": self.store.phase_artifact(self.run_id, phase),
-            "base_sha": self.base_sha,
-            "context_bundle_hash": fq.bundle_hash(self.store, self.run_id),
-            "policy_version": fq.policy_version(self.store, self.run_id),
+            "artifact_hash": issued["artifact_hash"], "base_sha": issued["base_sha"],
+            "context_bundle_hash": issued["context_bundle_hash"],
+            "policy_version": issued["policy_version"],
             "findings_hash": put_artifact(self.store, findings),
         }
         payload.update(override)

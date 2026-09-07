@@ -96,6 +96,9 @@ COMMAND_NAMES = frozenset({
     # A relevant issue change resets the run to `queued` and opens a new
     # epoch; the kernel refuses an irrelevant one (ruling 13).
     "revise_bundle",
+    # The kernel's own rendering of the reviewer's brief (spec §2 *Brief*): a
+    # front-half review_ruling is refused unless its generation carries one.
+    "issue_review_brief",
 })
 
 
@@ -252,6 +255,28 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             run_id=cmd.run_id, kind=EventKind.PROMPT_ITEM, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"session_id": p["session_id"], "item_id": p["item_id"], "sha256": p["sha256"]},
+        )
+    elif cmd.name == "issue_review_brief":
+        from kernel import brief as _brief
+        from kernel.policy import policy_of, policy_version
+        artifact_hash = store.phase_artifact(cmd.run_id, phase)
+        bundle_h = front.bundle_hash(store, cmd.run_id)
+        spec_hash = store.phase_artifact(cmd.run_id, "spec") if phase == "plan" else None
+        rendered = _brief.render(
+            phase=phase, artefact=store.read_blob(artifact_hash), bundle=store.read_blob(bundle_h),
+            spec=None if spec_hash is None else store.read_blob(spec_hash),
+            policy=policy_of(store, cmd.run_id), base_sha=store.run_base_sha(cmd.run_id),
+            template=_brief.TEMPLATE_VERSION,
+        )
+        brief_hash = put_artifact(store, rendered)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.REVIEW_BRIEF_ISSUED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"phase": phase, "epoch": epoch_n, "generation": cmd.generation,
+                     "brief_hash": brief_hash, "brief_template": _brief.TEMPLATE_VERSION,
+                     "artifact_hash": artifact_hash, "context_bundle_hash": bundle_h,
+                     "policy_version": policy_version(store, cmd.run_id),
+                     "base_sha": store.run_base_sha(cmd.run_id), "spec_hash": spec_hash},
         )
     elif cmd.name == "revise_bundle":
         import json
@@ -479,6 +504,10 @@ def _submit(store, cmd: Command, actor: str | None, *, fenced: bool, ruling: str
                         # From the dispatch record, not the binding: the
                         # binding says WHAT was approved, this says WHO.
                         "reviewer_identity": actor,
+                        # The generation this ruling came from, so the §8
+                        # proof can pair a ruling with its seat's brief
+                        # (front.brief_for reads this).
+                        "generation": cmd.generation,
                     },
                 )
             _side_fact(store, cmd, actor)

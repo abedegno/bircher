@@ -92,6 +92,10 @@ def test_the_command_interface_is_closed_and_explicit():
         # opens a new epoch; the kernel refuses an irrelevant one.
         "record_model_question", "record_model_ruling",
         "dismiss_human_item", "record_prompt_item", "revise_bundle",
+        # The kernel's own rendering of the reviewer's brief (spec §2
+        # *Brief*): a front-half review_ruling is refused unless its
+        # generation carries one.
+        "issue_review_brief",
     ])
 
 

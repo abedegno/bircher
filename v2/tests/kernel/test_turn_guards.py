@@ -80,10 +80,12 @@ def test_review_ruling_needs_the_reviewers_turn_ended_and_stopped(tmp_path):
     f = Front(s, "r-1")
     f.author_round(SPEC_BYTES)
     g = f._dispatch(Role.REVIEWER, "codex")
+    f._cmd(g, "issue_review_brief", {"phase": "spec"})
     sid = f._session(g, f._newest_id())
+    issued = front.brief_for(s, "r-1", g).payload
     payload = {"phase": "spec", "verdict": "accept", "artifact_hash": s.phase_artifact("r-1", "spec"),
-               "base_sha": f.base_sha, "context_bundle_hash": front.bundle_hash(s, "r-1"),
-               "policy_version": front.policy_version(s, "r-1"),
+               "base_sha": issued["base_sha"], "context_bundle_hash": issued["context_bundle_hash"],
+               "policy_version": issued["policy_version"],
                "findings_hash": put_artifact(s, b"ok")}
     with pytest.raises(NotAuthorized, match="turn_ended"):
         f._cmd(g, "record_review", payload)
@@ -101,11 +103,13 @@ def test_output_guard_reads_the_sessions_own_prompt(tmp_path):
     a_sid = f._session(a_gen, f._newest_id()); f._end_turn(a_gen, a_sid)
     f._cmd(a_gen, "submit_spec", {"artifact_hash": put_artifact(s, SPEC_BYTES)})
     g = f._dispatch(Role.REVIEWER, "codex")
+    f._cmd(g, "issue_review_brief", {"phase": "spec"})
     r_sid = f._session(g, f._newest_id()); f._end_turn(g, r_sid)
     f._prompt(g, a_sid, f._newest_id())                    # a newer prompt to the author session
+    issued = front.brief_for(s, "r-1", g).payload
     payload = {"phase": "spec", "verdict": "accept", "artifact_hash": s.phase_artifact("r-1", "spec"),
-               "base_sha": f.base_sha, "context_bundle_hash": front.bundle_hash(s, "r-1"),
-               "policy_version": front.policy_version(s, "r-1"), "findings_hash": put_artifact(s, b"ok")}
+               "base_sha": issued["base_sha"], "context_bundle_hash": issued["context_bundle_hash"],
+               "policy_version": issued["policy_version"], "findings_hash": put_artifact(s, b"ok")}
     f._cmd(g, "record_review", payload)
     assert s.run_state("r-1") == "specified"
 

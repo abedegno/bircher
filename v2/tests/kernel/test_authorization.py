@@ -190,6 +190,9 @@ def test_every_command_declares_its_legal_states():
             # at `queued`, so its next_state is never None.
             "record_model_question", "record_model_ruling",
             "dismiss_human_item", "record_prompt_item",
+            # The kernel's own rendering of the reviewer's brief: an
+            # observation, not a move.
+            "issue_review_brief",
         )
 
 

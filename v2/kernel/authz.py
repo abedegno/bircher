@@ -148,6 +148,10 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # A relevant issue change resets the run to `queued` and opens a new
     # epoch (ruling 13); an irrelevant one is refused in authorize() below.
     "revise_bundle": (FRONT_HALF_STATES, "queued"),
+    # The kernel renders the reviewer's brief (spec §2 *Brief*): legal only
+    # from the two states a reviewer seat is dispatched into. Does not
+    # transition -- it is an artefact the seat reads, not a move.
+    "issue_review_brief": (frozenset({"spec_submitted", "plan_submitted"}), None),
 }
 
 #: Verdicts `record_review` may carry. A closed set: arbitrary strings were
@@ -373,6 +377,19 @@ def validate_review(store, cmd, actor: str, *, ruling: str = "review_ruling") ->
         raise NotAuthorized(
             f"review binds policy_version {binding.policy_version}, but this run's "
             f"policy_frozen is journal seq {expected_policy}"
+        )
+    issued = front.brief_for(store, cmd.run_id, cmd.generation)
+    if issued is None:
+        raise NotAuthorized(
+            f"generation {cmd.generation} carries no review_brief_issued: a front-half "
+            "review_ruling binds the brief the kernel rendered for its seat"
+        )
+    bp = issued.payload
+    if (bp["phase"], bp["artifact_hash"], bp["context_bundle_hash"], bp["policy_version"], bp["base_sha"]) != (
+            phase, binding.artifact_hash, binding.context_bundle_hash, binding.policy_version, binding.base_sha):
+        raise NotAuthorized(
+            "review_ruling differs from its generation's review_brief_issued in phase, "
+            "artifact_hash, context_bundle_hash, policy_version or base_sha"
         )
     findings = cmd.payload.get("findings_hash")
     if not isinstance(findings, str) or not store.has_artifact(findings):
@@ -772,6 +789,19 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 "revise_bundle: no relevant change -- the frozen fields hash as the current bundle"
             )
         return next_state
+
+    if cmd.name == "issue_review_brief":
+        from kernel import front
+        if role_for(store, cmd.run_id, cmd.generation) != Role.REVIEWER:
+            raise NotAuthorized("issue_review_brief must come from an attempt dispatched in the reviewer role")
+        if cmd.payload.get("phase") != phase_of(current):
+            raise NotAuthorized(
+                f"issue_review_brief names phase {cmd.payload.get('phase')!r}, but the run is at "
+                f"{current!r} ({phase_of(current)})"
+            )
+        if front.brief_for(store, cmd.run_id, cmd.generation) is not None:
+            raise NotAuthorized(f"generation {cmd.generation} already carries a review_brief_issued")
+        return None
 
     if cmd.name in ("submit_spec", "submit_plan"):
         _check_submit(store, cmd, current)
