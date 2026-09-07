@@ -1,4 +1,6 @@
 """Task 1: front-half fact kinds, phase artefacts and journal readers."""
+import pytest
+
 from kernel.events import SCHEMA_VERSIONS, EventKind
 from kernel.store import Store
 
@@ -104,3 +106,10 @@ def test_open_run_ids_filters_prefix_and_state(tmp_path):
     s.set_run_state("muesli-711-2", "ended")
     assert s.open_run_ids("muesli-711", frozenset({"queued"})) == ["muesli-711-1"]
     assert s.open_run_ids("muesli-711", frozenset({"ended"})) == ["muesli-711-2"]
+
+
+@pytest.mark.parametrize("prefix", ["muesli-%", "muesli-_11"])
+def test_open_run_ids_rejects_like_wildcards_in_prefix(tmp_path, prefix):
+    s = Store.open(tmp_path / "k.db")
+    with pytest.raises(ValueError):
+        s.open_run_ids(prefix, frozenset({"queued"}))
