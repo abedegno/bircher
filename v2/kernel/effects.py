@@ -389,6 +389,7 @@ def _strip_host(h) -> str:
 def _delivered_value(store, run_id: str, key: str, value: str | None) -> str:
     """What a delivered obligation stores, validated by its kind (spec §3)."""
     from kernel.cli import session_projection
+    from kernel.contract import ContractViolation
 
     row = store.effect_by_key(key, run_id=run_id)
     intent = row["intent"]
@@ -408,7 +409,17 @@ def _delivered_value(store, run_id: str, key: str, value: str | None) -> str:
             raise ValueError(f"{key}: a delivered sess-create needs the session snapshot JSON") from exc
         if not isinstance(snap, dict) or not snap.get("id") or not snap.get("agent_name"):
             raise ValueError(f"{key}: snapshot must name id and agent_name")
-        body = create_body(intent["argv"])
+        try:
+            body = create_body(intent["argv"])
+        except ContractViolation as exc:
+            # `check()` at journal time validates the ARGV shape -- one `-d`,
+            # as its own token -- but never parses the JSON inside it, so a
+            # malformed-but-present `-d` journals as `uncertain` and is only
+            # discovered here, at reconcile time. A ContractViolation escaping
+            # uncaught is not a ValueError, so `_do_reconcile`'s `except
+            # ValueError` would miss it and the CLI would exit on a traceback
+            # instead of RC_REFUSED.
+            raise ValueError(f"{key}: the journaled create body is not a JSON object: {exc}") from exc
         if snap.get("agent_id") != body.get("agent_id"):
             raise ValueError(f"{key}: snapshot agent_id {snap.get('agent_id')!r} != create's {body.get('agent_id')!r}")
         want, got = _strip_host(body.get("host_id")), _strip_host(snap.get("host_id"))

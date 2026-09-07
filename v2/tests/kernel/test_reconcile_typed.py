@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from kernel.cli import main
+from kernel.cli import RC_REFUSED, main
 from kernel.dispatch import Role, dispatch
 from kernel.effects import (EffectClass, Resolution, _perform_unhalted,
                             is_halted, reconcile_many, reconcile_typed)
@@ -154,6 +154,26 @@ def test_reconcile_create_without_id_refused(run, tmp_path):
         reconcile_typed(s, "r-1", [Resolution(body["title"], True, "s1")], s.run_version("r-1"))
 
 
+def test_reconcile_create_malformed_journaled_body_refused(run):
+    """`check()` validates the ARGV shape at journal time -- one `-d`, as its
+    own token -- but never parses what's inside it, so a malformed-but-present
+    `-d` journals fine and is only discovered here. `create_body` raises
+    `ContractViolation`, a bare `Exception`, not a `ValueError`; uncaught, that
+    would escape `reconcile_typed` and `_do_reconcile`'s `except ValueError`
+    would miss it entirely."""
+    s, gen = run
+    key = "sess-create:r-1:bad"
+    argv = ["curl", "-sSf", "-X", "POST", "-d", "{not valid json", "http://srv/v1/sessions"]
+    intent = {"argv": argv, "obligation": {"kind": "sess-create", "run": "r-1", "phase": "spec",
+                                           "epoch": 0, "cause": "f1"}}
+    _uncertain(s, gen, key, intent)
+    snap = json.dumps({"id": "s1", "agent_id": "ag_1", "agent_name": "v2_author_claude",
+                       "host_id": "h1", "workspace": "/tmp/whatever", "title": key})
+    with pytest.raises(ValueError):
+        reconcile_typed(s, "r-1", [Resolution(key, True, snap)], s.run_version("r-1"))
+    assert s.effect_by_key(key, run_id="r-1")["state"] == "uncertain"
+
+
 def test_reconcile_stop_without_id(run):
     s, gen = run
     intent = {"argv": EVENTS, "body": {"event": "stop_session"},
@@ -245,3 +265,44 @@ def test_cli_typed_form(run, tmp_path, capsys):
     assert out["halted"] is False and out["pending"] == []
     assert main(["reconcile", "--db", db, "--run-id", "r-1", "--expected-version", "1",
                  "--delivered", "k", "--idempotency-key", "k", "--resolution", "x"]) == 2
+
+
+def test_cli_delivered_at_file_missing_is_refused(run, tmp_path, capsys):
+    """`open()` on a missing/unreadable `@file` raises OSError, not ValueError
+    -- uncaught, that would crash main() with a traceback instead of the
+    RC_REFUSED every other reconcile refusal returns."""
+    s, gen = run
+    body = _body(tmp_path)
+    key = body["title"]
+    _uncertain(s, gen, key, _create_intent(body))
+    db = str(tmp_path / "k.db")
+    missing = str(tmp_path / "nonexistent-snapshot.json")
+    rc = main(["reconcile", "--db", db, "--run-id", "r-1",
+               "--expected-version", str(s.run_version("r-1")),
+               "--delivered", f"{key}=@{missing}"])
+    assert rc == RC_REFUSED
+    err = capsys.readouterr().err
+    assert missing in err
+    assert s.effect_by_key(key, run_id="r-1")["state"] == "uncertain"
+
+
+def test_cli_delivered_at_file_snapshot_is_accepted(run, tmp_path, capsys):
+    """The plumbing `@file` exists for (Task 20's runner hands a snapshot this
+    way rather than on the command line): a real file holding the session
+    snapshot JSON is read and its content reconciles the create."""
+    s, gen = run
+    body = _body(tmp_path)
+    key = body["title"]
+    _uncertain(s, gen, key, _create_intent(body))
+    snap_path = tmp_path / "snapshot.json"
+    snap_path.write_text(json.dumps(_snap(body)))
+    db = str(tmp_path / "k.db")
+    rc = main(["reconcile", "--db", db, "--run-id", "r-1",
+               "--expected-version", str(s.run_version("r-1")),
+               "--delivered", f"{key}=@{snap_path}"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["halted"] is False and out["pending"] == []
+    row = s.effect_by_key(key, run_id="r-1")
+    assert row["state"] == "reconciled"
+    assert json.loads(row["external_object_id"])["id"] == "s1"

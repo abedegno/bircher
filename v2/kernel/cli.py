@@ -316,7 +316,15 @@ def _do_reconcile(a) -> int:
                     # The runner hands a session snapshot this way (Task 20):
                     # the shell composes it to a file rather than a command
                     # line, which has its own length limit and quoting rules.
-                    value = open(value[1:]).read()
+                    path = value[1:]
+                    try:
+                        value = open(path).read()
+                    except OSError as exc:
+                        # Missing, unreadable or a directory -- all OSError,
+                        # none of them ValueError, so left uncaught this
+                        # crashed main() with a traceback instead of the
+                        # RC_REFUSED every other reconcile refusal returns.
+                        raise ValueError(f"{key}: cannot read {path!r}: {exc}") from exc
                 items.append(Resolution(key, True, value if sep else None))
             items += [Resolution(k, False) for k in a.not_delivered]
             reconcile_typed(store, a.run_id, items, a.expected_version)
