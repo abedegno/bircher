@@ -220,6 +220,10 @@ _NO_KERNEL_OUTCOME = {
     "beyond the front half; this pass drives nothing":
         "same: the run is the BACK half's, still live, and this pass is "
         "reporting that it cannot drive it -- not deciding how it ended",
+    "the back half owns it and this pass drives nothing":
+        "the third of the same shape. The STATE says `planned` and the "
+        "JOURNAL says implementation already started, so the run is the back "
+        "half's exactly as the row above is -- reported, not ended",
 }
 
 #: Scorecard rows whose run is NOT OVER. A distinct exemption from the one

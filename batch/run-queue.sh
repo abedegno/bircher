@@ -4290,7 +4290,18 @@ run_item() {
          return 0 ;;
     esac
     if [ "$_st" = planned ] && _kernel_implementation_started "$_open"; then
-      echo "[batch] $item: run $_open already started implementation; skipping" >&2; return 0
+      # THE THIRD OF THE SAME SHAPE, and the least obvious. `planned` is
+      # reachable twice -- before implementation, and again when a review
+      # requests a revision -- so the state name alone cannot say which side of
+      # the seam this run is on; the journal can, and it says the back half
+      # already has it. From here that is the same situation as the branch
+      # above: the queue file stays, this pass drives nothing, and a run whose
+      # repair loop then died would be skipped on every later pass with nothing
+      # on the channel a human reads.
+      echo "[batch] $item: run $_open already started implementation; skipping" >&2
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at 'planned' but its implementation has already started; the back half owns it and this pass drives nothing" "n/a" >> "$SCORECARD"
+      return 0
     fi
     if [ "${BIRCHER_HAVE_LOCK:-0}" != 1 ]; then
       echo "[batch] $item: refusing to resume $_open without the batch lock" >&2; return 0

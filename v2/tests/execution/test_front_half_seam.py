@@ -614,14 +614,44 @@ def test_a_run_beyond_the_front_half_is_skipped_not_relaunched(tmp_path):
 def test_planned_with_an_accepted_start_implementation_is_skipped(tmp_path):
     """`planned` is reachable twice: before implementation, and again after a
     request_revision. The journal is asked which one this is, because the
-    aggregate row cannot say."""
+    aggregate row cannot say.
+
+    And it ESCALATES, for the same reason its two siblings do. The state name
+    puts this run inside the front half while the journal puts it in the back,
+    so it is the one skip where nothing about the run's own state says a human
+    is needed -- and a run whose repair loop died would be skipped on every
+    later pass, silently, with the queue file still sitting there.
+    """
     d = _drive(tmp_path, env_extra={
         "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
         "T_PENDING": json.dumps({"halted": False, "pending": []}),
         "T_STATE_RESUME": "planned", "T_IMPL_STARTED": "0",
     })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     assert d.args_of("_kernel_implementation_started") == [OPEN_RUN]
     assert "_kernel_dispatch" not in d.names, d.names
+    assert "_kernel_run_start" not in d.names, "it minted a second run"
+    assert d.outcomes == ["escalated"], d.calls
+    note = d.args_of("json_row")[7]
+    assert OPEN_RUN in note and "implementation has already started" in note, note
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+
+
+def test_planned_WITHOUT_a_start_implementation_is_resumed_not_escalated(tmp_path):
+    """The other half of the journal question. A run that reached `planned` and
+    stopped there is exactly what this pass exists to carry forward -- and a
+    guard that escalated on the state name alone would strand every one of
+    them one step short of an implementer."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "planned", "T_IMPL_STARTED": "1",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_implementation_started") == [OPEN_RUN]
+    assert "escalated" not in d.outcomes, d.calls
+    assert d.args_of("_kernel_start_implementation")[0] == OPEN_RUN, d.calls
 
 
 def test_leak_guard_never_mints_over_an_open_run(tmp_path):
