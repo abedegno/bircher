@@ -49,9 +49,6 @@ answer, and the value that survives is the kernel's.
 | `cmd.payload['hash']` | `_check_submit` | observed | read from the kernel's own `artifact_submitted` facts |
 | `cmd.payload['author']` | `validate_review` | observed | read from the kernel's own `artifact_submitted` facts |
 | `cmd.payload['ended']` | `record_turn_ended` | observed | refused unless one of `TURN_ENDS` |
-| `cmd.payload['session']` | `record_turn_ended` | observed | Task 10 binds it to the newest satisfied `sess-create`/`sess-prompt`; until then a shape check |
-| `cmd.payload['session_id']` | `park` | observed | Task 10 binds it; a string-or-null check here |
-| `cmd.payload['reviewer']` | `park` | observed | Task 12 binds it; a string-or-null check here |
 | `cmd.payload['base_sha']` | `record_review` | observed | refused unless equal to `store.run_base_sha` |
 | `cmd.payload['outcome']` | `record_merge_outcome` | observed | `merged` refused unless `store.has_confirmed_effect` |
 | `authorized['artifact_hash']` | `revalidate_merge` | observed | read from the kernel's own `merge_authorized` fact |
@@ -81,3 +78,6 @@ for a check.
 | `payload['policy_version']` | `_binding_from` | asserted | **Residual, M1-4.** Type-checked (`type(...) is int`, so no float or bool coerces in) but not compared against any policy the kernel holds. |
 | `cmd.payload['reason']` | `park` | asserted | **Residual, §4.** The coordinator's reading of a park and of a listing: `reason` is bounded to `PARK_REASONS`, `cursor_item_id` to the §4 cursor invariant test (Task 19), neither to a kernel object. |
 | `cmd.payload['cursor_item_id']` | `park` | asserted | **Residual, §4.** The coordinator's reading of a park and of a listing: `reason` is bounded to `PARK_REASONS`, `cursor_item_id` to the §4 cursor invariant test (Task 19), neither to a kernel object. |
+| `cmd.payload['session']` | `record_turn_ended` | asserted | **Residual, Task 10.** Shape-checked only — a non-empty string. Task 10 binds `session` to the newest satisfied `sess-create`/`sess-prompt` of the phase and epoch; until then the caller names which session's turn ended and the kernel takes its word. |
+| `cmd.payload['session_id']` | `park` | asserted | **Residual, Task 10.** Shape-checked only — a string or null. Task 10 binds `session_id` to the newest satisfied `sess-create`/`sess-prompt`, the same object `session` is bound to; until then it is the coordinator's claim about which session it parked on. |
+| `cmd.payload['reviewer']` | `park` | asserted | **Residual, Task 12.** Shape-checked only — a string or null. Task 12 binds `reviewer` to the seat's vendor, read from the dispatch record; until then a park may name any reviewer, including one the kernel never dispatched. |

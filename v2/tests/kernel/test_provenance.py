@@ -150,6 +150,14 @@ def test_the_residuals_are_the_ones_we_know_about():
         # rather than by any object the kernel holds.
         "cmd.payload['reason']",
         "cmd.payload['cursor_item_id']",
+        # Shape-checked, not bound: a non-empty string for the turn's session,
+        # a string-or-null for the park's session and reviewer. Task 10 binds
+        # the two session names to the newest satisfied sess-create/sess-prompt
+        # and Task 12 binds the reviewer to the seat's vendor; until then the
+        # kernel takes the caller's word for all three.
+        "cmd.payload['session']",
+        "cmd.payload['session_id']",
+        "cmd.payload['reviewer']",
     }
 
 

@@ -765,6 +765,11 @@ def test_an_unknown_ci_status_cannot_authorize_a_merge(tmp_path):
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+    # record_ci_observation is legal only from `implementing`, so the state is
+    # a PRECONDITION of the assertion below, not an incidental detail: from
+    # anywhere else the command is refused and "not green" holds for a reason
+    # this test is not about.
+    assert Store.open(db).run_state(run_id) == "implementing", "precondition"
     _run(f"_kernel_record_ci {run_id} {gen} pending {HEAD_SHA}", env=_db_env(db))
 
     st = Store.open(db)
@@ -772,10 +777,14 @@ def test_an_unknown_ci_status_cannot_authorize_a_merge(tmp_path):
     assert not _ci_is_green(st, run_id, HEAD_SHA), (
         "a 'pending' CI observation reads as green, so a merge can be "
         "authorized on CI that never reported")
-    # The observation must have been RECORDED as unmapped, not lost: "not
-    # green" is also true of a command that never reached the kernel.
+    # The observation must have been ACCEPTED and recorded as unmapped, not
+    # lost: "not green" is also true of a command that never reached the
+    # kernel. `command_name` alone is not enough -- a rejection fact carries
+    # it too, so filtering on the payload key would be satisfied by the
+    # refusal this assertion exists to rule out.
     accepted = [f for f in st.facts_for(run_id)
-                if (f.payload or {}).get("command_name") == "record_ci_observation"]
+                if f.kind == EventKind.COMMAND_ACCEPTED
+                and (f.payload or {}).get("command_name") == "record_ci_observation"]
     assert accepted, "the ci observation was lost rather than recorded"
 
 
@@ -980,6 +989,10 @@ def test_a_ci_status_that_STRIPS_into_success_cannot_authorize(tmp_path, ci):
              env={**_db_env(db), "BIRCHER_RUN_ID": run_id})
     gen = r.stdout.strip().strip("[]")
     _run(f"_kernel_start_implementation {run_id} {gen}", env=_db_env(db))
+    # A precondition, not a detail: record_ci_observation is legal only from
+    # `implementing`, and from anywhere else "not green" is true of a refusal
+    # rather than of the normalisation this test is about.
+    assert Store.open(db).run_state(run_id) == "implementing", "precondition"
     _run(f"_kernel_record_ci {run_id} {gen} {ci!r} {HEAD_SHA}", env=_db_env(db))
 
     from kernel.authz import _ci_is_green
@@ -993,8 +1006,13 @@ def test_a_ci_status_that_STRIPS_into_success_cannot_authorize(tmp_path, ci):
     # (`ci=a"b` broke the JSON, so no fact was recorded and the observation
     # vanished). A negative-only assertion cannot tell "recorded as unmapped"
     # from "lost", so it would pass for both the fix and the defect.
+    #
+    # ACCEPTED, not merely named: `_record_rejection` writes `command_name`
+    # into the rejection fact too, so a filter on the payload key alone is
+    # satisfied by the refusal this half exists to distinguish from success.
     accepted = [f for f in st.facts_for(run_id)
-                if (f.payload or {}).get("command_name") == "record_ci_observation"]
+                if f.kind == EventKind.COMMAND_ACCEPTED
+                and (f.payload or {}).get("command_name") == "record_ci_observation"]
     assert accepted, (
         f"{ci!r} produced NO ci observation at all -- the payload was rejected "
         "and the observation was lost rather than recorded as unmapped")
