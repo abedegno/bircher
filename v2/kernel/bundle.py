@@ -15,6 +15,9 @@ silently, and every approval bound to it drifts with it.
 
 from __future__ import annotations
 
+import difflib
+import json
+
 from kernel.canon import canonical_bytes, content_hash
 
 #: Version 2 drops what bircher itself writes to an issue. Version 1 froze
@@ -74,6 +77,22 @@ def bundle_hash(snap: dict) -> str:
     return content_hash(canonical_bytes(snap))
 
 
+DIFF_CAP = 65536
+
+
+def snapshot_diff(old: dict, new: dict) -> dict:
+    """What changed between two snapshots, for the next author's findings."""
+    changed = sorted(k for k in FROZEN_FIELDS if old.get(k) != new.get(k))
+    if not changed:
+        return {"changed": [], "unified": ""}
+    a = json.dumps(old, indent=1, sort_keys=True, ensure_ascii=False).splitlines()
+    b = json.dumps(new, indent=1, sort_keys=True, ensure_ascii=False).splitlines()
+    text = "\n".join(difflib.unified_diff(a, b, "before", "after", lineterm=""))
+    if len(text) > DIFF_CAP:
+        text = text[:DIFF_CAP] + "\n... truncated"
+    return {"changed": changed, "unified": text}
+
+
 # --- Decision 3: what counts as a relevant change ----------------------------
 
 def is_relevant_change(old_issue: dict, new_issue: dict) -> bool:
@@ -123,9 +142,12 @@ def revise_bundle(store, run_id: str, *, new_snapshot: dict, reason: str) -> str
     already relies on. That is why `actor="human"` here is a record rather
     than a claim: there is no code path a model can call that reaches it.
     """
+    from kernel.artifacts import put_artifact
+    from kernel.canon import canonical_bytes
     from kernel.events import EventKind
 
-    h = bundle_hash(new_snapshot)
+    h = put_artifact(store, canonical_bytes(new_snapshot))
+    assert h == bundle_hash(new_snapshot)
     store.append_fact(
         run_id=run_id, kind=EventKind.BUNDLE_REVISED, actor="human",
         causal_command_id=None, payload={"bundle_hash": h, "reason": reason},

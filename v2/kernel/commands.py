@@ -83,6 +83,15 @@ COMMAND_NAMES = frozenset({
     # The human's commands (spec §2 Commands), reachable only through
     # `execute_as_human`.
     "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
+    # The model's questions and rulings (spec §2 Commands): the author's side
+    # of the grill.
+    "record_model_question", "record_model_ruling",
+    # The coordinator's dismissal of a refused human token, and its record of
+    # an omnigent prompt item it has already sent -- either role.
+    "dismiss_human_item", "record_prompt_item",
+    # A relevant issue change resets the run to `queued` and opens a new
+    # epoch; the kernel refuses an irrelevant one (ruling 13).
+    "revise_bundle",
 })
 
 
@@ -203,6 +212,49 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             causal_command_id=cmd.idempotency_key,
             payload={"ruling": "request_revision", "phase": phase, "epoch": epoch_n,
                      "artifact_hash": cmd.payload["artifact_hash"]},
+        )
+    elif cmd.name == "record_model_question":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.MODEL_QUESTION, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "phase": phase,
+                     "question_id": cmd.payload["question_id"], "question": cmd.payload["question"]},
+        )
+    elif cmd.name == "record_model_ruling":
+        p = cmd.payload
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.MODEL_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "question_id": p["question_id"], "ruling": p["ruling"],
+                     "reasoning": p["reasoning"], "cost_if_wrong": p["cost_if_wrong"]},
+        )
+    elif cmd.name == "dismiss_human_item":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_ITEM_DISMISSED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "cursor_item_id": cmd.payload["cursor_item_id"],
+                     "rejection": cmd.payload["rejection"]},
+        )
+    elif cmd.name == "record_prompt_item":
+        p = cmd.payload
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.PROMPT_ITEM, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"session_id": p["session_id"], "item_id": p["item_id"], "sha256": p["sha256"]},
+        )
+    elif cmd.name == "revise_bundle":
+        import json
+        from kernel import bundle as _bundle
+        from kernel.canon import canonical_bytes
+        prior_hash = front.bundle_hash(store, cmd.run_id)
+        old = json.loads(store.read_blob(prior_hash))
+        new = _bundle.snapshot(cmd.payload["issue"])
+        new_hash = put_artifact(store, canonical_bytes(new))
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.BUNDLE_REVISED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"bundle_hash": new_hash, "prior_bundle_hash": prior_hash,
+                     "reason": "issue changed", "diff": _bundle.snapshot_diff(old, new)},
         )
 
 

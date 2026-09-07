@@ -116,6 +116,23 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_run_outcome": (_ALL_ACTIVE | frozenset({"merged", "cancelled"}), "ended"),
     # Cancellation is legal from anywhere: a run must always be stoppable.
     "cancel_run": (_ALL_ACTIVE, "cancelled"),
+    # The model's questions and rulings (spec §2 Commands): every front-half
+    # state, since a grill can happen at any point before planned. Neither
+    # transitions; a question and a ruling are facts about the epoch, not
+    # moves in it.
+    "record_model_question": (FRONT_HALF_STATES, None),
+    "record_model_ruling": (FRONT_HALF_STATES, None),
+    # The coordinator's dismissal of a refused human token (spec §2 Commands):
+    # every front-half state, any role. Does not transition -- it is a reply
+    # to a rejection, not a move.
+    "dismiss_human_item": (FRONT_HALF_STATES, None),
+    # The coordinator's record of an omnigent prompt item it has already sent
+    # (spec §2 Commands): every front-half state, any role. Does not
+    # transition -- it is an observation of what was sent.
+    "record_prompt_item": (FRONT_HALF_STATES, None),
+    # A relevant issue change resets the run to `queued` and opens a new
+    # epoch (ruling 13); an irrelevant one is refused in authorize() below.
+    "revise_bundle": (FRONT_HALF_STATES, "queued"),
 }
 
 #: Verdicts `record_review` may carry. A closed set: arbitrary strings were
@@ -485,6 +502,11 @@ def _check_submit(store, cmd, state: str) -> None:
     from kernel import front
     if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
         raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
+    if cmd.name == "submit_spec" and front.grill_open(store, cmd.run_id):
+        raise NotAuthorized(
+            "the grill is open: under grill=human the spec waits for a human_answer "
+            "in this epoch newer than the newest model_question"
+        )
     h = cmd.payload.get("artifact_hash")
     if not isinstance(h, str) or not store.has_artifact(h):
         raise NotAuthorized(f"{cmd.name} names an artefact the kernel does not hold: {h!r}")
@@ -543,6 +565,76 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             f"{cmd.name} is not legal from state {current!r}; "
             f"legal from {sorted(allowed)}"
         )
+
+    if cmd.name in ("record_model_question", "record_model_ruling"):
+        from kernel import front
+        if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
+            raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
+        qid = cmd.payload.get("question_id")
+        if not isinstance(qid, str) or not qid:
+            raise NotAuthorized(f"{cmd.name} names a question_id")
+        if cmd.name == "record_model_question":
+            if not isinstance(cmd.payload.get("question"), str) or not cmd.payload.get("question").strip():
+                raise NotAuthorized("record_model_question carries a non-empty question")
+            return None
+        for key in ("ruling", "reasoning", "cost_if_wrong"):
+            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key).strip():
+                raise NotAuthorized(f"record_model_ruling carries a non-empty {key}")
+        n = front.epoch(store, cmd.run_id)
+        asked = {q.payload["question_id"] for q in front.epoch_facts(store, cmd.run_id, EventKind.MODEL_QUESTION, n)}
+        if qid not in asked:
+            raise NotAuthorized(
+                f"record_model_ruling names question_id {qid!r}, which no "
+                f"model_question of epoch {n} asked"
+            )
+        return None
+
+    if cmd.name == "dismiss_human_item":
+        from kernel import front
+        if not isinstance(cmd.payload.get("cursor_item_id"), str) or not cmd.payload.get("cursor_item_id"):
+            raise NotAuthorized("dismiss_human_item carries the cursor to move past")
+        rej = cmd.payload.get("rejection")
+        human = {f.id: f for f in front.human_rejections(store, cmd.run_id)}
+        if rej not in human:
+            raise NotAuthorized(
+                f"dismiss_human_item names {rej!r}, which is not a command_rejected fact "
+                "of this run attributed to human"
+            )
+        if rej in front.dismissed_rejection_ids(store, cmd.run_id):
+            raise NotAuthorized(f"rejection {rej!r} is already dismissed: one reply per refusal")
+        return None
+
+    if cmd.name == "record_prompt_item":
+        from kernel import front
+        for key in ("session_id", "item_id", "sha256"):
+            if not isinstance(cmd.payload.get(key), str) or not cmd.payload.get(key):
+                raise NotAuthorized(f"record_prompt_item carries {key}")
+        sid, item, sha = cmd.payload.get("session_id"), cmd.payload.get("item_id"), cmd.payload.get("sha256")
+        if sha not in front.prompt_hashes_of(store, cmd.run_id, sid):
+            raise NotAuthorized(
+                f"record_prompt_item: no satisfied sess-prompt of session {sid!r} carries body.artifact {sha[:12]}..."
+            )
+        # Per session: omnigent's item ids are not shown to be unique across sessions.
+        if any(f.payload["item_id"] == item and f.payload["session_id"] == sid
+               for f in store.facts_of_kind(cmd.run_id, EventKind.PROMPT_ITEM)):
+            raise NotAuthorized(f"item {item!r} of session {sid!r} is already recorded as a prompt_item")
+        return None
+
+    if cmd.name == "revise_bundle":
+        from kernel import bundle as _bundle
+        from kernel import front
+        issue = cmd.payload.get("issue")
+        if not isinstance(issue, dict):
+            raise NotAuthorized("revise_bundle carries the fetched issue as an object")
+        try:
+            new_hash = _bundle.bundle_hash(_bundle.snapshot(issue))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NotAuthorized(f"revise_bundle: malformed issue: {exc}") from exc
+        if new_hash == front.bundle_hash(store, cmd.run_id):
+            raise NotAuthorized(
+                "revise_bundle: no relevant change -- the frozen fields hash as the current bundle"
+            )
+        return next_state
 
     if cmd.name in ("submit_spec", "submit_plan"):
         _check_submit(store, cmd, current)

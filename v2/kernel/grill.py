@@ -76,3 +76,31 @@ def unanswered(store, run_id: str) -> list[str]:
 
 def packet_hash(store, run_id: str) -> str:
     return content_hash(canonical_bytes(decision_packet(store, run_id)))
+
+
+FRONT_PACKET_VERSION = 2
+
+
+def front_packet(store, run_id: str) -> dict:
+    """The front half's decision ledger, from facts, grouped by epoch: every
+    model_question, every model_ruling, every human_answer, in journal order.
+    The §8 proof reads this to require at least one ruling per run."""
+    epochs: dict[int, dict] = {}
+
+    def bucket(n: int) -> dict:
+        return epochs.setdefault(n, {"questions": [], "rulings": [], "answers": []})
+
+    for fact in store.facts_for(run_id):
+        p = fact.payload
+        if fact.kind == EventKind.MODEL_QUESTION and "epoch" in p:
+            bucket(p["epoch"])["questions"].append(
+                {"question_id": p["question_id"], "question": p["question"],
+                 "phase": p["phase"], "seq": fact.seq})
+        elif fact.kind == EventKind.MODEL_RULING:
+            bucket(p["epoch"])["rulings"].append(
+                {"question_id": p["question_id"], "ruling": p["ruling"],
+                 "reasoning": p["reasoning"], "cost_if_wrong": p["cost_if_wrong"], "seq": fact.seq})
+        elif fact.kind == EventKind.HUMAN_ANSWER:
+            bucket(p["epoch"])["answers"].append(
+                {"question_ids": list(p["question_ids"]), "answer": p["answer"], "seq": fact.seq})
+    return {"canon_version": FRONT_PACKET_VERSION, "epochs": epochs}

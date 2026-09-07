@@ -142,3 +142,39 @@ def newest_prompt(store, run_id: str, phase: str, epoch_n: int) -> dict | None:
                  "cause": ob.get("cause"), "session_id": ob.get("session"),
                  "at_us": row["at_us"]}
     return found
+
+
+def epoch_facts(store, run_id: str, kind: str, epoch_n: int) -> list:
+    return [f for f in store.facts_of_kind(run_id, kind) if f.payload.get("epoch") == epoch_n]
+
+
+def grill_open(store, run_id: str) -> bool:
+    """spec §2 Refusals, submit_spec: under grill=human, no human_answer in
+    the epoch, or a model_question of the epoch newer than its last answer."""
+    if policy_of(store, run_id).grill != "human":
+        return False
+    n = epoch(store, run_id)
+    answers = epoch_facts(store, run_id, EventKind.HUMAN_ANSWER, n)
+    if not answers:
+        return True
+    questions = epoch_facts(store, run_id, EventKind.MODEL_QUESTION, n)
+    return bool(questions) and questions[-1].seq > answers[-1].seq
+
+
+def human_rejections(store, run_id: str) -> list:
+    return [f for f in store.facts_of_kind(run_id, EventKind.COMMAND_REJECTED)
+            if f.actor == "human"]
+
+
+def dismissed_rejection_ids(store, run_id: str) -> set[str]:
+    return {f.payload["rejection"]
+            for f in store.facts_of_kind(run_id, EventKind.HUMAN_ITEM_DISMISSED)}
+
+
+def prompt_hashes_of(store, run_id: str, session_id: str) -> set[str]:
+    out = set()
+    for row in satisfied_effects(store, run_id, "sess-prompt"):
+        if row["intent"]["obligation"].get("session") == session_id:
+            out.add(row["intent"].get("body", {}).get("artifact"))
+    out.discard(None)
+    return out

@@ -59,6 +59,9 @@ answer, and the value that survives is the kernel's.
 | `fact.payload['reviewer_identity']` | `_reviewer_of` | observed | written by the kernel from the dispatch record |
 | `fact.payload['command_name']` | `_implementer_of`, `_ci_is_green` | observed | written by the kernel |
 | `fact.payload['payload']` | `_ci_is_green` | observed | the envelope is kernel-written; its CONTENTS are the CI residual below |
+| `cmd.payload['rejection']` | `dismiss_human_item` | observed | refused unless it names a `command_rejected` fact of this run attributed to `human`, and unless it is not already dismissed (one reply per refusal) |
+| `cmd.payload['sha256']` | `record_prompt_item` | observed | refused unless a satisfied `sess-prompt` of the named session carries it as `body.artifact` |
+| `cmd.payload['issue']` | `revise_bundle` | observed | refused unless its snapshot hashes differently from the current bundle -- the kernel observes only that COMPARISON; the fetched issue's content is asserted by the runner adapter (§9), named as a residual below |
 
 ## Asserted — declared residuals
 
@@ -85,3 +88,9 @@ for a check.
 | `cmd.payload['answer']` | `record_human_answer` | asserted | **Intentional and permanent.** The human's words. The kernel binds who (the `execute_as_human` path, no dispatched generation can reach it) and when (the epoch, the cursor); the content is the human's to say. |
 | `cmd.payload['text']` | `record_human_direction` | asserted | **Intentional and permanent.** The human's words. The kernel binds who (the `execute_as_human` path, no dispatched generation can reach it) and when (the epoch, the cursor); the content is the human's to say. |
 | `cmd.payload['findings']` | `record_review` (human ruling) | asserted | **Intentional and permanent.** The human's words. The kernel binds who (the `execute_as_human` path, no dispatched generation can reach it) and when (the epoch, the cursor); the content is the human's to say. |
+| `cmd.payload['question_id']` | `record_model_question`, `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['question']` | `record_model_question` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['ruling']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['reasoning']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['cost_if_wrong']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['item_id']` | `record_prompt_item` | asserted | **Residual, §4.** A per-session identity the kernel cannot see: omnigent's item ids are checked for uniqueness within the named session, but the kernel has no way to confirm the id names the item the coordinator means. |

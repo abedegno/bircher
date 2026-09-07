@@ -183,6 +183,12 @@ def test_every_command_declares_its_legal_states():
             # destination.
             "record_human_answer", "record_human_direction",
             "approve_artifact", "grant_round",
+            # Task 9's four observations: a model question, a model ruling, a
+            # dismissal of a refused human token and a recorded prompt item --
+            # none moves the run. revise_bundle is not here: it always lands
+            # at `queued`, so its next_state is never None.
+            "record_model_question", "record_model_ruling",
+            "dismiss_human_item", "record_prompt_item",
         )
 
 

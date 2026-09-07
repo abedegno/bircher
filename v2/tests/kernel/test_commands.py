@@ -65,6 +65,13 @@ def test_the_command_interface_is_closed_and_explicit():
         # is already listed above -- reachable through both submit and
         # execute_as_human, with `ruling` telling which.
         "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
+        # Task 9: the author's side of the grill (a question, a ruling), the
+        # coordinator's dismissal of a refused human token, its record of an
+        # omnigent prompt item already sent, and bundle revision as a
+        # command -- a relevant issue change resets the run to `queued` and
+        # opens a new epoch; the kernel refuses an irrelevant one.
+        "record_model_question", "record_model_ruling",
+        "dismiss_human_item", "record_prompt_item", "revise_bundle",
     ])
 
 

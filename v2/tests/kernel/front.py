@@ -104,11 +104,9 @@ class Front:
         seat = fq.newest_seat(self.store, self.run_id, Role.AUTHOR, self.phase(), self.epoch())
         return None if seat is None else seat["session"]["id"]
 
-    def _session(self, generation: int, cause: str, *, actor: str | None = None) -> str:
-        """A satisfied sess-create and sess-prompt under *generation*."""
-        sid = self._create(generation, cause, actor=actor)
+    def _prompt(self, generation: int, sid: str, cause: str) -> None:
         phase, epoch = self.phase(), self.epoch()
-        prompt_hash = put_artifact(self.store, f"prompt for {sid}".encode())
+        prompt_hash = put_artifact(self.store, f"prompt for {sid} caused by {cause}".encode())
         pkey = f"sess-prompt:{sid}:{generation}:{cause}"
         self._journal(generation, pkey, {
             "argv": ["curl", "-sSf", "-X", "POST", f"http://srv/v1/sessions/{sid}/events",
@@ -116,7 +114,12 @@ class Front:
             "obligation": {"kind": "sess-prompt", "session": sid,
                            "phase": phase, "epoch": epoch, "cause": cause},
             "body": {"artifact": prompt_hash},
-        }, f"item-{sid}-1")
+        }, f"item-{sid}-{generation}")
+
+    def _session(self, generation: int, cause: str, *, actor: str | None = None) -> str:
+        """A satisfied sess-create and sess-prompt under *generation*."""
+        sid = self._create(generation, cause, actor=actor)
+        self._prompt(generation, sid, cause)
         return sid
 
     def _end_turn(self, generation: int, sid: str, ended: str = "file") -> None:
@@ -132,15 +135,38 @@ class Front:
 
     # -- rounds ----------------------------------------------------------------
 
-    def author_round(self, artefact: bytes, *, ended: str = "file") -> str:
+    def author_round(self, artefact: bytes, *, ended: str = "file",
+                     resume: str | None = None) -> str:
         cause = self._newest_id()
         g = self._dispatch(Role.AUTHOR, self.author)
-        sid = self._session(g, cause)
+        if resume is None:
+            sid = self._session(g, cause)
+        else:
+            sid = resume
+            self._prompt(g, sid, cause)
         self._end_turn(g, sid, ended)
         h = put_artifact(self.store, artefact)
         name = "submit_spec" if self.phase() == "spec" else "submit_plan"
         self._cmd(g, name, {"artifact_hash": h})
         return h
+
+    def ask_round(self, questions, rulings=None) -> str:
+        """An author turn that ends with questions rather than an artefact."""
+        cause = self._newest_id()
+        g = self._dispatch(Role.AUTHOR, self.author)
+        sid = self._session(g, cause)
+        self._end_turn(g, sid)
+        for qid, text in questions:
+            self._cmd(g, "record_model_question", {"question_id": qid, "question": text})
+            if rulings and qid in rulings:
+                self._cmd(g, "record_model_ruling",
+                          {"question_id": qid, "ruling": rulings[qid],
+                           "reasoning": "reasoned", "cost_if_wrong": "low"})
+        return sid
+
+    def revise(self, issue: dict) -> None:
+        g = self._dispatch(Role.OPERATOR, "runner")
+        self._cmd(g, "revise_bundle", {"issue": issue})
 
     def review_round(self, verdict: str = "accept", findings: bytes = b"ok", **override) -> None:
         cause = self._newest_id()

@@ -167,6 +167,18 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['answer']",
         "cmd.payload['text']",
         "cmd.payload['findings']",
+        # The model's words: what it asked, and what it ruled. Intentional and
+        # permanent -- the kernel binds the epoch and phase they were asked
+        # in, and refuses a ruling on a question no model_question of the
+        # epoch asked; the content of the question and the ruling is the
+        # model's to say.
+        "cmd.payload['question_id']",
+        "cmd.payload['question']",
+        "cmd.payload['ruling']",
+        "cmd.payload['reasoning']",
+        "cmd.payload['cost_if_wrong']",
+        # A per-session identity the kernel cannot see.
+        "cmd.payload['item_id']",
     }
 
 
@@ -215,12 +227,16 @@ def test_the_spec_and_the_table_agree_on_the_count():
     """
     spec = (REPO_ROOT / "docs" / "design"
             / "2026-08-23-v2-kernel-design.md").read_text()
-    m = re.search(r"\*\*(\w+) rows are asserted after Milestone 1\*\*", spec)
+    m = re.search(r"\*\*([\w-]+) rows are asserted after Milestone 1\*\*", spec)
     assert m, "the spec no longer states the asserted-row count"
     words = {"four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
              "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
              "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
-             "eighteen": 18, "nineteen": 19, "twenty": 20}
+             "eighteen": 18, "nineteen": 19, "twenty": 20,
+             # Task 9 pushed the count past twenty: the model's five grill
+             # words are new asserted-permanent rows and the prompt item's
+             # item_id is a new asserted residual.
+             "twenty-one": 21, "twenty-two": 22, "twenty-three": 23}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")
