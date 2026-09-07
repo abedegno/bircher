@@ -59,6 +59,16 @@ def routed_calls():
         argv = next((toks[i:] for i, tk in enumerate(toks) if tk in BINARIES), None)
         if argv is None:
             continue
+        # `$SERVER` (`SERVER="${OMNIGENT_SERVER:-http://omnigent:8000}"`) is a
+        # shell variable this static extractor cannot evaluate, so a
+        # session_control call's URL operand arrives here as the literal,
+        # unexpanded text. The old SESSION_CONTROL rule's unanchored
+        # `/v1/sessions` matched that text as a substring regardless; the
+        # anchored rules (Task 2) match the PATH after the scheme and host,
+        # which the raw token never has. Substituted with a placeholder
+        # scheme+host so this test sees the same path a real, expanded curl
+        # invocation would.
+        argv = [tok.replace("$SERVER", "http://srv") for tok in argv]
         out.append((n, cls, argv))
     return out
 

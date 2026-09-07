@@ -33,6 +33,19 @@ class EffectClass:
     })
 
 
+# `create_body` and `parse` are bound onto this module by kernel.contract,
+# near the bottom of that file, once both are defined -- NOT by a top-level
+# `from kernel.contract import create_body, parse` here. kernel.contract
+# imports EffectClass from this module at ITS top, so the reverse import at
+# module-execution time is a genuine cycle: whichever of the two modules is
+# imported first hits the other before it has finished defining anything.
+# `kernel.cli` has no such cycle (kernel.contract never imports kernel.cli)
+# and imports these two plainly. The executor and the future reconciler
+# (Tasks 3/4) call them as `parse(...)` / `create_body(...)` from this
+# module; test_one_parse_three_readers binds all three call sites to one
+# function by identity.
+
+
 class NotReplayable(Exception):
     """A resolved effect's idempotency key cannot carry a fresh attempt."""
 

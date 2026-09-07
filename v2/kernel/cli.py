@@ -27,6 +27,10 @@ from kernel.effects import (
     EffectClass, UncertainEffect, is_halted, pending_reconciliation,
     perform, reconcile, reconcile_many,
 )
+# Re-exported so `create_body` / `parse` are the SAME functions `check` uses
+# to admit an argv in the first place, not a second reading of it. Tasks 3
+# and 4 call these as `create_body(...)` / `parse(...)` from this module.
+from kernel.contract import create_body, parse
 from kernel.ownership import OwnershipLost
 from kernel.store import Store
 

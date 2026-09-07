@@ -59,7 +59,7 @@ def test_session_control_is_permitted_but_still_journalled():
     s.create_run(run_id="r", base_repo="o/r", base_sha="a" * 40)
     gen = dispatch(s, "r", actor="coordinator", role=Role.OPERATOR).generation
     perform(s, "r", gen, EffectClass.SESSION_CONTROL, "stop:1",
-            {"argv": ["curl", "-X", "DELETE", "http://srv/v1/sessions/1"]},
+            {"argv": ["curl", "-sf", "-X", "DELETE", "http://srv/v1/sessions/1"]},
             lambda *a: "stopped")
     kinds = [f.kind for f in s.facts_for("r") if f.kind.startswith("effect_")]
     assert "effect_intended" in kinds and "effect_confirmed" in kinds
@@ -79,7 +79,7 @@ def test_an_uncertain_session_stop_halts_the_run():
     gen = dispatch(s, "r", actor="coordinator", role=Role.OPERATOR).generation
     with _pt.raises(UncertainEffect):
         perform(s, "r", gen, EffectClass.SESSION_CONTROL, "stop:1",
-                {"argv": ["curl", "-X", "DELETE", "http://srv/v1/sessions/1"]},
+                {"argv": ["curl", "-sf", "-X", "DELETE", "http://srv/v1/sessions/1"]},
                 lambda *a: (_ for _ in ()).throw(TimeoutError("no response")))
     assert is_halted(s, "r")
 
