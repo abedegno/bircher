@@ -136,15 +136,23 @@ def test_agent_id_mismatch_at_poll_rc_failed(tmp_path):
 
 def test_list_items_projects_id_role_text():
     body = json.dumps({"items": [
-        {"id": "i1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        {"id": "i1", "role": "user", "response_id": "turn_a",
+         "content": [{"type": "input_text", "text": "hello"}]},
         {"id": "i2", "role": "assistant", "content": [{"type": "output_text", "text": "hi"},
                                                     {"type": "tool_call", "name": "x"}]},
         {"id": "i3", "role": "user", "content": []},
+        # The server's own item, written in the user's voice when a turn is
+        # cancelled. Only `response_id` tells it from a person's message, so
+        # the projection has to carry that field through.
+        {"id": "i4", "role": "user", "response_id": "cancel_b",
+         "content": [{"type": "input_text", "text": "[System: interrupted]"}]},
     ]})
     items = list_items("http://srv", "s-1", fetch=lambda u: body)
-    assert items == [{"id": "i1", "role": "user", "text": "hello"},
-                     {"id": "i2", "role": "assistant", "text": "hi"},
-                     {"id": "i3", "role": "user", "text": ""}]
+    assert items == [{"id": "i1", "role": "user", "text": "hello", "response_id": "turn_a"},
+                     {"id": "i2", "role": "assistant", "text": "hi", "response_id": ""},
+                     {"id": "i3", "role": "user", "text": "", "response_id": ""},
+                     {"id": "i4", "role": "user", "text": "[System: interrupted]",
+                      "response_id": "cancel_b"}]
     # omnigent's real route returns a PaginatedList -- {"object": "list",
     # "data": [...], "first_id", "last_id", "has_more"} -- not a bare "items"
     # list (omnigent/server/routes/sessions/routes_items.py, PaginatedList in
@@ -153,7 +161,7 @@ def test_list_items_projects_id_role_text():
         {"id": "i1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
     ], "first_id": "i1", "last_id": "i1", "has_more": False})
     assert list_items("http://srv", "s-1", fetch=lambda u: paginated) == [
-        {"id": "i1", "role": "user", "text": "hello"}]
+        {"id": "i1", "role": "user", "text": "hello", "response_id": ""}]
 
 
 def _long_session(fake, n_assistant: int, tail: str):
@@ -179,7 +187,8 @@ def test_list_items_pages_past_the_routes_default_limit():
     last = _long_session(fake, 100, "approve")
     items = list_items("http://srv", "s-1", fetch=fake.fetch)
     assert len(items) == 101
-    assert items[-1] == {"id": last, "role": "user", "text": "approve"}
+    assert items[-1] == {"id": last, "role": "user", "text": "approve",
+                         "response_id": f"turn_{last}"}
     # In order, and each item once: a paging loop that re-read a page or
     # dropped one would still end on the human's message.
     assert [it["id"] for it in items] == [it["id"] for it in fake.sessions["s-1"]["items"]]

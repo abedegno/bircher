@@ -67,7 +67,33 @@ def unread_human_items(ctx, session_id: str, listing: list) -> list:
     if not seen:
         after = listing
     return [it for it in after if it["role"] == "user" and it["id"] not in ids
+            and not _is_cancellation_notice(it)
             and content_hash(it["text"].encode()) not in hashes]
+
+
+def _is_cancellation_notice(item) -> bool:
+    """A user-role item the SERVER wrote, not a person.
+
+    Stopping a session that is still working is normal here -- spec section 3
+    says a session that wrote its file and kept working is interrupted rather
+    than left running -- and the harness then adds an item in the USER's voice:
+    role `user`, type `message`, text beginning "[System: interrupted] The user
+    interrupted and abandoned their previous request". Nothing about its shape
+    says it is synthetic except its `response_id`, which is `cancel_...` where
+    every real message is `turn_...`.
+
+    Read as the human, it is a direction: the round is displaced, the artefact
+    that was already written is never read, and the next pass does the same
+    thing again until the seats run out. That happened live on 2026-09-08 --
+    the run reached `budget_exhausted` twice with a finished plan sitting
+    unread in the worktree.
+
+    A denylist, not an allowlist. Missing a human's message is the failure
+    section 4 forbids outright ("not never"), so an unfamiliar response_id is
+    still read as a person; only the shape the server is known to write in
+    someone else's voice is dropped.
+    """
+    return str(item.get("response_id", "")).startswith("cancel_")
 
 
 def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, str]:

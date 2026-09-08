@@ -380,3 +380,46 @@ def test_the_humans_message_past_the_first_page_is_still_unread(world):
     listing = list_items("http://srv", sid, fetch=fake.fetch)
     assert listing[-1]["id"] == approve
     assert [it["id"] for it in human.unread_human_items(ctx, sid, listing)] == [approve]
+
+
+def test_the_servers_cancellation_notice_is_not_the_human(world):
+    """THE DEFECT, live on 2026-09-08. Stopping a session that is still
+    working is normal (spec section 3: a session that wrote its file and kept
+    working is interrupted rather than left running), and the harness then
+    adds an item in the USER's voice -- role `user`, text beginning
+    "[System: interrupted] The user interrupted and abandoned their previous
+    request". The coordinator read its own stop as a direction from the
+    human: the round was displaced, the finished plan sitting in the worktree
+    was never read, and the run repeated that until its seats ran out.
+
+    Only `response_id` tells them apart: `cancel_...` for the server's item,
+    `turn_...` for every real message.
+    """
+    from coordinator.session import list_items
+    s, f, fake, ctx = world()
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    fake.add_user_message(
+        sid,
+        "[System: interrupted]\nThe user interrupted and abandoned their previous request "
+        "(the user message immediately before this one). Do not resume or act on it.",
+        response_id="cancel_9f1")
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+
+    assert human.unread_human_items(ctx, sid, listing) == []
+    assert human.take_listing(ctx, sid, listing) is None
+    assert s.newest_fact("r-1", EventKind.HUMAN_DIRECTION) is None, \
+        "the server's own notice must not become a human_direction"
+
+
+def test_a_real_message_in_the_same_session_is_still_read(world):
+    """The guard is a denylist for one known shape, not an allowlist: missing
+    a person's message is the failure section 4 forbids outright."""
+    from coordinator.session import list_items
+    s, f, fake, ctx = world()
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    fake.add_user_message(sid, "[System: interrupted]\nignore me", response_id="cancel_9f1")
+    mine = fake.add_user_message(sid, "stop and rethink the approach")
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+
+    unread = human.unread_human_items(ctx, sid, listing)
+    assert [it["id"] for it in unread] == [mine]

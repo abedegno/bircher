@@ -167,7 +167,15 @@ def list_items(server: str, conv_id: str, *, fetch=_fetch) -> list[dict]:
             parts = it.get("content") or []
             text = "".join(p.get("text", "") for p in parts
                            if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"))
-            out.append({"id": str(it.get("id")), "role": str(it.get("role") or ""), "text": text})
+            # `response_id` rides along: it is what tells a person's message
+            # from one the SERVER wrote in their voice. A cancelled turn adds a
+            # user-role item beginning "[System: interrupted]" whose
+            # response_id is `cancel_...`, where every real message -- the
+            # coordinator's prompts and the human's replies alike -- is
+            # `turn_...`. Without it the coordinator reads its own stop as the
+            # human speaking (see `human.unread_human_items`).
+            out.append({"id": str(it.get("id")), "role": str(it.get("role") or ""), "text": text,
+                        "response_id": str(it.get("response_id") or "")})
     return out
 
 

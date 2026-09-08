@@ -140,20 +140,30 @@ class FakeOmnigent:
             return r
         text = body["data"]["content"][0]["text"]
         item_id = f"it-{next(self._ids)}"
-        s["items"].append({"id": item_id, "role": "user", "content": [{"type": "input_text", "text": text}]})
+        s["items"].append({"id": item_id, "role": "user", "response_id": f"turn_{item_id}",
+                           "content": [{"type": "input_text", "text": text}]})
         s["status"] = "running"
         self.on_prompt(sid, text)
         r.stdout = json.dumps({"item_id": item_id})
         return r
 
-    def add_user_message(self, sid, text):
+    def add_user_message(self, sid, text, *, response_id=None):
+        """A message in the user's voice.
+
+        *response_id* defaults to a `turn_` id, which is what the server gives
+        a real message -- the coordinator's prompt or the human's reply. Pass
+        a `cancel_` one to model the item the server itself writes when a turn
+        is cancelled; `human._is_cancellation_notice` tells them apart.
+        """
         item_id = f"it-{next(self._ids)}"
         self.sessions[sid]["items"].append(
-            {"id": item_id, "role": "user", "content": [{"type": "input_text", "text": text}]})
+            {"id": item_id, "role": "user", "response_id": response_id or f"turn_{item_id}",
+             "content": [{"type": "input_text", "text": text}]})
         return item_id
 
     def add_assistant_text(self, sid, text):
         item_id = f"it-{next(self._ids)}"
         self.sessions[sid]["items"].append(
-            {"id": item_id, "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+            {"id": item_id, "role": "assistant", "response_id": f"resp_{item_id}",
+             "content": [{"type": "output_text", "text": text}]})
         return item_id
