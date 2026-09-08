@@ -8763,6 +8763,35 @@ plugins (python) gate|in_progress||'
   rm -rf "$bdt"
   echo "_bundle_dir OK"
 
+  # --- the queue generator works the repo the wave was aimed at ---------------
+  # run-queue.sh resolves REPO from BIRCHER_REPO for itself, but the generator
+  # is a separate process reading its own REPO. While that variable was not
+  # exported, a wave aimed at abedegno/bircher-smoke queued abedegno/muesli's
+  # issues instead: no error, no empty queue to notice, just the wrong backlog.
+  # Both ends are pinned here -- the child's default chain, and the parent's
+  # call passing what it resolved.
+  local qdir; qdir=$(mktemp -d)
+  cat > "$qdir/gh" <<'SH'
+#!/usr/bin/env bash
+# Record the --repo it was asked for; answer every query with an empty list.
+for i in $(seq 1 $#); do
+  eval "a=\${$i}"
+  if [ "$a" = "--repo" ]; then j=$((i+1)); eval "echo \${$j}" >> "$GH_REPO_LOG"; fi
+done
+echo '[]'
+SH
+  chmod +x "$qdir/gh"
+  ( cd "$qdir" && GH_REPO_LOG="$qdir/repos" QUEUE="$qdir/queue" PATH="$qdir:$PATH" \
+      BIRCHER_REPO=abedegno/bircher-smoke bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 )
+  grep -qx "abedegno/bircher-smoke" "$qdir/repos" 2>/dev/null || {
+    echo "FAIL issues-to-queue: BIRCHER_REPO ignored (asked for: $(tr '\n' ' ' < "$qdir/repos" 2>/dev/null))"; exit 1; }
+  grep -qx "abedegno/muesli" "$qdir/repos" 2>/dev/null && {
+    echo "FAIL issues-to-queue: fell back to the default repo"; exit 1; }
+  grep -q 'REPO="\$REPO" bash "\$BUNDLE_DIR/batch/issues-to-queue.sh"' "$BUNDLE_DIR/batch/run-queue.sh" || {
+    echo "FAIL issues-to-queue: run-queue no longer passes REPO to the generator"; exit 1; }
+  rm -rf "$qdir"
+  echo "issues-to-queue repo targeting OK"
+
   # --- _pr_is_abandoned: only a CLOSED-and-never-merged PR is abandoned --------
   # The i506 case: a scratch PR opened to PROVE a CI gate fails, then closed,
   # while the real PR is opened separately. Tracking the scratch one to the cap
@@ -8986,7 +9015,12 @@ __HELP__
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then
     echo "[batch] source=issues: generating queue from bircher:queued issues" >&2
-    bash "$BUNDLE_DIR/batch/issues-to-queue.sh" || { echo "[batch] issue->queue generation failed" >&2; exit 3; }
+    # REPO travels with the call. It is a plain shell variable here, and the
+    # generator reads its own REPO from the environment -- so an unexported one
+    # left the child on its default while this process worked the repo the
+    # operator named. The failure is silent and the wrong way round: a wave
+    # aimed at a throwaway smoke repo drained the real backlog's queued issues.
+    REPO="$REPO" bash "$BUNDLE_DIR/batch/issues-to-queue.sh" || { echo "[batch] issue->queue generation failed" >&2; exit 3; }
   fi
   local items
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ] && [ -f "$QUEUE/.manifest" ]; then

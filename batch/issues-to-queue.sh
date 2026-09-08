@@ -4,7 +4,10 @@
 # Usage: issues-to-queue.sh [--dry-run]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="${REPO:-abedegno/muesli}"
+# BIRCHER_REPO is what an operator sets for a whole wave; REPO is what a
+# caller passes to this script. Honour both, so a direct run and a run under
+# run-queue.sh cannot disagree about which backlog they are working.
+REPO="${REPO:-${BIRCHER_REPO:-abedegno/muesli}}"
 QUEUE="${QUEUE:-$HERE/../queue}"
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
 # shellcheck source=/dev/null
