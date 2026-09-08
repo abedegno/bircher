@@ -225,3 +225,25 @@ def test_the_brief_tells_a_grill_human_author_to_ask_before_it_writes(world):
 def test_a_grill_model_author_is_not_told_to_ask_first(world):
     s, f, fake, ctx = world()
     assert "ask, do not write the spec" not in author.author_brief(ctx, phase="spec").decode()
+
+
+def test_the_resume_prompt_says_the_previous_draft_is_gone(world, tmp_path):
+    """Live on 2026-09-08. Under grill=human the author wrote questions AND a
+    spec on the same turn, against its instruction. The coordinator moved both
+    aside before re-prompting with the answers -- it must, or a draft written
+    before the human spoke would be submitted as though it answered them --
+    and the author, whose own context said it had written the spec, replied
+    "the spec is already complete" and ended the turn. No file appeared and
+    the coordinator polled the empty path for the whole cap.
+    """
+    s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
+    _writes(fake, seat.QUESTIONS_OUT, b"### Q1: db?\nRecommended: sqlite\n")
+    assert author.author_round(ctx) == "questions"
+    sid = list(fake.sessions)[0]
+    f.answer("sqlite", question_ids=("Q1",), cursor=fake.sessions[sid]["items"][-1]["id"])
+
+    answer = s.newest_fact("r-1", EventKind.HUMAN_ANSWER)
+    brief = author.author_brief(ctx, phase="spec", resume_answer=answer).decode()
+    assert "moved aside" in brief and seat.ARTIFACT_OUT in brief
+    assert "again from scratch" in brief
+    assert "sqlite" in brief, "the answers still have to reach the author"

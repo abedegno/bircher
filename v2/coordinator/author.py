@@ -90,7 +90,23 @@ def _findings_for(ctx) -> bytes:
 def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     store, run_id = ctx.store, ctx.run_id
     if resume_answer is not None:
-        return ("Answered; continue.\n\n" + resume_answer.payload["answer"]).encode()
+        # Say that the previous turn's files are gone. The coordinator moves
+        # them aside before every re-prompt (spec section 2: a file at the
+        # watched path is this turn's only if no earlier turn left it), and an
+        # artefact written before the human answered must never be submitted
+        # as though it answered them. But the session's own context still says
+        # it wrote one. Live on 2026-09-08 an author replied "the spec is
+        # already complete" and ended its turn without writing anything: no
+        # file appeared, and the coordinator polled the empty path for the
+        # whole 90-minute cap. What the coordinator does to the worktree, the
+        # prompt has to say.
+        return ("Answered; continue.\n\n"
+                "Your previous draft has been moved aside and no longer exists at "
+                f"`{seat.ARTIFACT_OUT}`. Write the {phase} there again from scratch, "
+                "incorporating the answers below, however complete you believe an "
+                "earlier draft was. A turn that ends with no file at that path "
+                "counts as an empty turn.\n\n"
+                + resume_answer.payload["answer"]).encode()
     parts = [f"# Bircher {phase} author brief\n"]
     parts.append((SKILLS / f"{phase}-author" / "SKILL.md").read_text())
     parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
