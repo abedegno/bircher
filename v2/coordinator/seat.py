@@ -131,7 +131,26 @@ def _adopt_or_create(ctx, role: str, vendor: str, ob: dict, resume_session: str 
 
 
 def _record_prompt_item(ctx, session_id: str, prompt_hash: str) -> list[dict]:
-    items = list_items(ctx.server, session_id, fetch=ctx.fetch)
+    # The same guard as its siblings -- `phases.stall`, both of
+    # `human.human_pass`'s listings and `run_turn`'s end-of-turn one -- and
+    # for a sharper reason. This listing runs after EVERY prompt the loop
+    # sends, so an unguarded LookupFailed here escapes `run_turn`, escapes
+    # the author or review round, is in no catch list of `run_loop`, and the
+    # runner records `failed` and discards everything the run had accepted --
+    # over a read that failed once.
+    #
+    # An empty listing is safe to return: the `prompt_item` fact self-heals,
+    # because `_record_prompt_item` is called again on the next pass whether
+    # or not the prompt was owed, and the crash-window hash exclusion in
+    # `unread_human_items` covers the gap until it does. Logged, because a
+    # listing the caller then discriminates as "nothing was said" must not be
+    # silent.
+    try:
+        items = list_items(ctx.server, session_id, fetch=ctx.fetch)
+    except LookupFailed as exc:
+        ctx.log(f"session {session_id}: listing after the prompt unreadable ({exc}); "
+                "no prompt_item this pass, and nothing discriminated from it")
+        return []
     # Per session, as the kernel's own duplicate rule is: omnigent's item ids
     # are not shown to be unique across sessions, so a bare id set could read
     # another session's item as this one's and skip the record.
@@ -184,13 +203,26 @@ def run_turn(ctx, *, role: str, vendor: str, session_obligation: dict, prompt_ca
                                 session_id=sid, phase=phase, epoch=epoch, cause=prompt_cause,
                                 text=prompt_text, env=ctx.effect_env())
     listing = _record_prompt_item(ctx, sid, prompt_hash)
-    prompt = front.newest_prompt(ctx.store, ctx.run_id, phase, epoch)
+    # THIS SESSION's newest prompt, not the phase's -- the same quantifier the
+    # kernel's output guard uses (`authz._require_turn_recorded`, spec §2:
+    # "its newest satisfied sess-prompt"). The two agree whenever the prompt
+    # above was owed and sent, which is why they looked interchangeable; on
+    # the crash-window path nothing is sent, and a prompt to ANOTHER session
+    # of the same phase and epoch -- a human-pass prompt to the author while
+    # this seat is the reviewer -- is then the phase's newest and would hand
+    # this seat that session's window and that session's key.
+    prompt = front.newest_prompt_of(ctx.store, ctx.run_id, sid, phase, epoch)
     deadline_us = prompt["at_us"] + ctx.turn_timeout_s * 1_000_000
     paths = [os.path.join(workspace, w) for w in watched]
     ended = front.turn_ended_for(ctx.store, ctx.run_id, prompt["key"])
     if ended is None:
         end = wait_turn(ctx.store, ctx.run_id, ctx.generation, ctx.server, sid, paths, deadline_us,
                         agent_id_expected=snap["agent_id"], fetch=ctx.fetch, clock=ctx.clock, sleep=ctx.sleep)
+        # The kernel keys the fact it writes to the PHASE's newest satisfied
+        # sess-prompt (ruling 15), and the SAME lookup finds it here, because
+        # `_check_turn_ended` refuses a record naming any session but the one
+        # that prompt names: past an accepted record the phase's newest prompt
+        # IS this session's, so the two quantifiers coincide again.
         command(ctx, "record_turn_ended", {"session": sid, "ended": end.ended})
         ended = front.turn_ended_for(ctx.store, ctx.run_id, prompt["key"])
     if not front.stop_satisfied_for(ctx.store, ctx.run_id, ended.id):

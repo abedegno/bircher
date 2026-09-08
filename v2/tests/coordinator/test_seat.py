@@ -8,6 +8,7 @@ from coordinator import phases, seat
 from coordinator.effects import KERNEL
 from coordinator.session import AgentMismatch
 from kernel import front
+from kernel.authz import NotAuthorized
 from kernel.dispatch import Role
 from kernel.events import EventKind
 from kernel.store import Store
@@ -309,3 +310,143 @@ def test_resuming_a_session_the_journal_never_recorded_is_refused(world):
         seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
                       prompt_cause=cause, prompt_text=b"go", watched=[seat.ARTIFACT_OUT],
                       resume_session="s-nobody")
+
+
+def test_an_unreadable_listing_after_the_prompt_does_not_burn_the_turn(world):
+    """THE DEFECT: `_record_prompt_item`'s listing was the ONE listing site
+    with no `LookupFailed` guard -- `phases.stall`, `human.human_pass` twice
+    and `run_turn`'s end-of-turn listing all degrade. It runs after every
+    prompt the loop sends, so one transient failure in that window escaped
+    `run_turn`, escaped the author or review round, is in no catch list of
+    `run_loop`, and the runner recorded `failed` and discarded hours of
+    accepted work over a read.
+
+    The fact SELF-HEALS: `_record_prompt_item` is called again on the next
+    pass whether or not the prompt was owed, so the second turn records it.
+    """
+    from coordinator.session import LookupFailed
+    s, f, fake, ctx, clock = world
+    cause = phases.round_cause(ctx).id
+
+    def on_prompt(sid, text):
+        ws = fake.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        with open(os.path.join(ws, seat.ARTIFACT_OUT), "wb") as fh:
+            fh.write(b"# the spec")
+    fake.on_prompt = on_prompt
+
+    real, reads = fake.fetch, {"n": 0}
+
+    def flaky(url):
+        if "/items" in url:
+            reads["n"] += 1
+            if reads["n"] == 1:                       # exactly the record listing
+                raise LookupFailed("connection reset by peer")
+        return real(url)
+    ctx.fetch = flaky
+    logged = []
+    ctx.log = logged.append
+
+    t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                      prompt_cause=cause, prompt_text=b"write the spec", watched=[seat.ARTIFACT_OUT])
+    assert t.ended == "file" and t.files == {seat.ARTIFACT_OUT: b"# the spec"}
+    assert any("unreadable" in m for m in logged), logged
+    assert s.newest_fact("r-1", EventKind.PROMPT_ITEM) is None    # nothing to record it from
+
+    # The next pass over the same prompt reads the listing and records it.
+    ctx.fetch = real
+    seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
+                  prompt_cause=cause, prompt_text=b"write the spec", watched=[seat.ARTIFACT_OUT])
+    pi = s.newest_fact("r-1", EventKind.PROMPT_ITEM)
+    assert pi is not None and pi.payload["session_id"] == t.session_id
+
+
+def _created_and_prompted(s, f, fake, ctx, cause, text=b"go"):
+    """A session this run created AND prompted under *cause*, in spec/epoch 0."""
+    from coordinator import sessions
+    g = f._dispatch(Role.AUTHOR, "claude")
+    ctx.generation = g
+    ws = os.path.join(ctx.workspaces_root, "r-1", str(g))
+    os.makedirs(ws)
+    snap = sessions.create_session(s, run_id="r-1", generation=g, server="http://srv",
+                                   agent_id="ag_claude", host_id="host_h",
+                                   workspace=os.path.realpath(ws), phase="spec", epoch=0,
+                                   cause=cause, env=ctx.effect_env())
+    sessions.prompt_session(s, run_id="r-1", generation=g, server="http://srv",
+                            session_id=snap["id"], phase="spec", epoch=0, cause=cause,
+                            text=text, env=ctx.effect_env())
+    return snap, g
+
+
+def test_the_seats_deadline_comes_from_its_own_sessions_prompt(world, monkeypatch):
+    """THE DIVERGENCE: `run_turn` took the deadline from the PHASE's newest
+    satisfied sess-prompt while the kernel's output guard
+    (`authz._require_turn_recorded`) takes it from the SESSION's. They agree
+    only because `run_turn` normally sends the seat's prompt immediately
+    before reading; on the crash-window path the prompt is already satisfied
+    and nothing is sent, so a prompt to another session of the same phase and
+    epoch is the phase's newest and hands the seat that session's window."""
+    from coordinator.session import TurnEnd
+    s, f, fake, ctx, clock = world
+    cause_a = phases.round_cause(ctx).id
+    snap_a, _ = _created_and_prompted(s, f, fake, ctx, cause_a)
+    f.answer("carry on")
+    cause_b = s.newest_fact("r-1", EventKind.HUMAN_ANSWER).id
+    snap_b, _ = _created_and_prompted(s, f, fake, ctx, cause_b)
+
+    a_at = front.newest_prompt_of(s, "r-1", snap_a["id"], "spec", 0)["at_us"]
+    b_at = front.newest_prompt_of(s, "r-1", snap_b["id"], "spec", 0)["at_us"]
+    assert b_at > a_at                                   # the two are distinguishable
+    assert front.newest_prompt(s, "r-1", "spec", 0)["session_id"] == snap_b["id"]
+
+    seen = {}
+
+    def spy(store, run_id, generation, server, session_id, watched, deadline_us, **kw):
+        seen.update(session=session_id, deadline=deadline_us)
+        return TurnEnd("cap", False)
+    monkeypatch.setattr("coordinator.seat.wait_turn", spy)
+
+    # The kernel refuses the record that follows -- `_check_turn_ended` allows
+    # only the session the PHASE's newest prompt names (ruling 15), and here
+    # that is B. It refuses this call before and after the fix; what changes
+    # is the window the seat was given to wait in.
+    with pytest.raises(NotAuthorized):
+        seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause_a),
+                      prompt_cause=cause_a, prompt_text=b"go", watched=[seat.ARTIFACT_OUT])
+    assert seen["session"] == snap_a["id"]
+    assert seen["deadline"] == a_at + ctx.turn_timeout_s * 1_000_000
+    assert seen["deadline"] != b_at + ctx.turn_timeout_s * 1_000_000
+
+
+def test_the_turn_ended_lookup_is_the_seats_so_an_ended_turn_is_not_awaited_again(world, monkeypatch):
+    """The other half of the same divergence: the seat's turn had already
+    ended and been recorded, and a later prompt to another session of the
+    phase made the phase's newest key a different one -- so the lookup found
+    nothing and the seat waited out a turn that was over."""
+    s, f, fake, ctx, clock = world
+    cause_a = phases.round_cause(ctx).id
+
+    def on_prompt(sid, text):
+        ws = fake.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        with open(os.path.join(ws, seat.ARTIFACT_OUT), "wb") as fh:
+            fh.write(b"# the spec")
+    fake.on_prompt = on_prompt
+    t = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause_a),
+                      prompt_cause=cause_a, prompt_text=b"go", watched=[seat.ARTIFACT_OUT])
+    assert t.ended == "file"
+    ended_before = len(s.facts_of_kind("r-1", EventKind.TURN_ENDED))
+
+    fake.on_prompt = lambda sid, text: None
+    f.answer("carry on")
+    cause_b = s.newest_fact("r-1", EventKind.HUMAN_ANSWER).id
+    snap_b, _ = _created_and_prompted(s, f, fake, ctx, cause_b)
+    assert front.newest_prompt(s, "r-1", "spec", 0)["session_id"] == snap_b["id"]
+
+    def never(*a, **k):
+        raise AssertionError("the seat's turn had already ended; it must not be awaited again")
+    monkeypatch.setattr("coordinator.seat.wait_turn", never)
+    t2 = seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause_a),
+                       prompt_cause=cause_a, prompt_text=b"go", watched=[seat.ARTIFACT_OUT])
+    assert t2.session_id == t.session_id and t2.ended == "file"
+    assert len(s.facts_of_kind("r-1", EventKind.TURN_ENDED)) == ended_before
