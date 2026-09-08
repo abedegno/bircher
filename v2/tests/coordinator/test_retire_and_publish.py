@@ -202,6 +202,7 @@ def test_notify_owed_comments_once_per_park_and_names_what_is_needed(world, monk
         assert "approve" in body, "the notice says what to type"
         assert "https://omni.example/c/sess-7" in body, "and where to type it"
         assert ctx.run_id in body
+        assert "read by the next wave" in body, "the notice says WHEN a reply is acted on"
 
         # Owed once: a second pass over the same park sends nothing.
         ctx.generation = f._dispatch(Role.OPERATOR, "runner")

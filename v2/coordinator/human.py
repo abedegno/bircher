@@ -10,6 +10,7 @@ from kernel import front
 from kernel.authz import NotAuthorized, phase_of
 from kernel.canon import content_hash
 from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
+from kernel.policy import policy_of
 from kernel.events import EventKind
 
 APPROVE, RETRY = "approve", "retry"
@@ -160,7 +161,16 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     if not items:
         return None
     state, n = store.run_state(run_id), front.epoch(store, run_id)
-    questions = front.epoch_facts(store, run_id, EventKind.MODEL_QUESTION, n)
+    # Open ONLY under grill=human. Under grill=model the author records its own
+    # questions and rules them itself, so `model_question` facts pile up that no
+    # human_answer will ever follow -- and taking the bare fact as "the grill is
+    # open" made every later message an answer to them. Live on 2026-09-08 that
+    # ate a gate approval on the default policy: the person replied `approve`,
+    # the coordinator recorded a `human_answer` naming twelve questions the
+    # model had already answered, and parked at the same gate again. The gate
+    # was unreachable for the policy every run uses by default.
+    grill_open = policy_of(store, run_id).grill == "human"
+    questions = front.epoch_facts(store, run_id, EventKind.MODEL_QUESTION, n) if grill_open else []
     answers = front.epoch_facts(store, run_id, EventKind.HUMAN_ANSWER, n)
     newer_q = [q for q in questions if not answers or q.seq > answers[-1].seq]
     kind, text = classify_batch(items, state=state, grill_open=bool(newer_q))

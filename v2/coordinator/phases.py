@@ -239,7 +239,8 @@ def park_notice_body(ctx: Ctx, park) -> str:
             f"This run is waiting for you at the **{park.payload.get('phase')}** phase.\n\n"
             f"{PARK_NEEDS.get(reason, 'Open the session below and reply.')}\n\n"
             f"{where}\n\n"
-            f"Run `{ctx.run_id}`. It makes no further progress until you reply.")
+            f"Run `{ctx.run_id}`. Your reply is read by the next wave, not the moment "
+            "you send it, so nothing appears to happen until one runs.")
 
 
 def notify_owed(ctx: Ctx) -> list[str]:

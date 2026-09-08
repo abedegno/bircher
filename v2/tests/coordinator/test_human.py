@@ -423,3 +423,34 @@ def test_a_real_message_in_the_same_session_is_still_read(world):
 
     unread = human.unread_human_items(ctx, sid, listing)
     assert [it["id"] for it in unread] == [mine]
+
+
+def test_a_gate_approval_is_not_eaten_by_the_models_own_questions(world):
+    """THE DEFECT, live on 2026-09-08 on the DEFAULT policy (grill=model,
+    gates={spec}). Under grill=model the author records its own questions and
+    rules them itself, so `model_question` facts accumulate that no
+    human_answer will ever follow. `take_listing` read those raw facts as "the
+    grill is open" and classified every later message as an answer -- so the
+    person's `approve` at the gate became a `human_answer` naming twelve
+    questions the model had already ruled on, and the run parked at the same
+    gate again. The gate was unreachable for the policy every run uses.
+    """
+    from coordinator.session import list_items
+    s, f, fake, ctx = world(labels=())             # default policy: grill=model, gates={spec}
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    # The author's own questions, ruled by the model, never answered by anyone.
+    f.ask_round([("Q1", "sqlite or postgres?"), ("Q2", "which port?")],
+                rulings={"Q1": "sqlite", "Q2": "8080"})
+    f.author_round(SPEC_BYTES, resume=sid)
+    f.review_round("accept")
+    assert s.run_state("r-1") == "spec_accepted"
+    ctx.generation = f._dispatch(Role.OPERATOR, "runner")
+    fake.add_user_message(sid, "approve")
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+
+    kind = human.take_listing(ctx, sid, listing)
+    assert s.newest_fact("r-1", EventKind.HUMAN_ANSWER) is None, \
+        "an approval must not be recorded as an answer to the model's own questions"
+    assert kind == "approve"
+    assert s.newest_fact("r-1", EventKind.HUMAN_RULING).payload["ruling"] == "approve"
+    assert s.run_state("r-1") == "specified", "the gate is passed, not parked at again"
