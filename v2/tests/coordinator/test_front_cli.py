@@ -35,6 +35,35 @@ def test_phases_requires_a_positive_integer_turn_timeout(tmp_path, capsys):
     assert s.dispatches_for("r-1") == []                       # nothing happened
 
 
+def _phases_argv(db, tmp_path):
+    return ["phases", *_common(db), "--server", "http://srv", "--repo", "o/r", "--issue", "1",
+            "--repo-dir", str(tmp_path), "--workspaces-root", str(tmp_path / "ws"),
+            "--bundle-dir", str(tmp_path), "--host-id", "h", "--agent-claude", "a",
+            "--agent-codex", "b", "--turn-timeout", "1"]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enfroce"])
+def test_phases_refuses_to_run_outside_enforce_mode(tmp_path, monkeypatch, capsys, mode):
+    """The loop's ENTIRE control flow is "a refusal raises": `take_listing`
+    catches NotAuthorized to dismiss, `author_round` catches it to choose
+    re-author versus stall, `review_round` catches it for `no_brief`. Under
+    shadow `shadow_or_raise` records and RETURNS, `_submit` gives back
+    `Result(accepted=False)`, and every one of those reads a refusal as a
+    success -- a refused `approve` reported "taken", a refused `submit_spec`
+    returning "submitted", `front.brief_for(...)` returning None for an
+    AttributeError. So the loop does not run at all outside enforce, and it
+    refuses before it opens the store or performs anything. A mode that is not
+    a mode at all is refused here too, rather than raising out of the first
+    guard that happens to ask."""
+    db = tmp_path / "k.db"
+    Front(Store.open(db), "r-1")
+    monkeypatch.setenv("BIRCHER_KERNEL_MODE", mode)
+    assert main(_phases_argv(db, tmp_path)) == RC_USAGE
+    err = capsys.readouterr().err
+    assert "phases" in err and mode in err, err
+    assert Store.open(db).dispatches_for("r-1") == []           # nothing happened
+
+
 def test_approve_grant_direct_revise_and_parked(tmp_path, capsys):
     db = tmp_path / "k.db"
     s = Store.open(db)

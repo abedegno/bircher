@@ -269,6 +269,33 @@ def main(argv=None) -> int:
         if turn_timeout <= 0:
             print("phases: --turn-timeout must be a positive integer (seconds)", file=sys.stderr)
             return RC_USAGE
+        # ENFORCE OR NOTHING, and refused HERE -- before the store is opened,
+        # before a generation is fenced, before anything is performed.
+        #
+        # The loop's entire control flow is "a refusal raises":
+        # `human.take_listing` catches NotAuthorized to dismiss the token,
+        # `author.author_round` catches it to choose re-author versus stall,
+        # `review.review_round` catches it for `no_brief`. Under shadow,
+        # `kernel.mode.shadow_or_raise` records the refusal and RETURNS, and
+        # `_submit` hands back `Result(accepted=False)` -- so every one of
+        # those sites reads a refusal as a success: a refused `approve`
+        # reported "taken", a refused `submit_spec` returning "submitted",
+        # `front.brief_for(...)` returning None for an AttributeError. A loop
+        # that cannot tell a refusal from an acceptance must not run at all.
+        #
+        # A value that is no mode at all is refused the same way rather than
+        # raising out of whichever guard asks first, so "a mode we do not run
+        # under" and "a typo" both answer RC_USAGE, naming what was set.
+        from kernel.mode import ENFORCE, kernel_mode
+        try:
+            kmode = kernel_mode()
+        except ValueError as exc:
+            print(f"phases: {exc}", file=sys.stderr)
+            return RC_USAGE
+        if kmode != ENFORCE:
+            print(f"phases: refuses to run under BIRCHER_KERNEL_MODE={kmode!r}: outside "
+                  f"{ENFORCE!r} the loop reads a refusal as a success", file=sys.stderr)
+            return RC_USAGE
         from kernel.store import Store
 
         from coordinator import phases as _phases
