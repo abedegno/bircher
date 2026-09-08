@@ -2,9 +2,11 @@ import json
 
 import pytest
 
-from coordinator.session import AgentMismatch, State, TurnEnd, list_items, state, wait_turn
+from coordinator.session import (AgentMismatch, LookupFailed, State, TurnEnd, list_items,
+                                 state, wait_turn)
 from kernel.dispatch import Role
 from kernel.store import Store
+from tests.coordinator.fake_omnigent import FakeOmnigent
 from tests.kernel.front import Front
 
 
@@ -152,3 +154,66 @@ def test_list_items_projects_id_role_text():
     ], "first_id": "i1", "last_id": "i1", "has_more": False})
     assert list_items("http://srv", "s-1", fetch=lambda u: paginated) == [
         {"id": "i1", "role": "user", "text": "hello"}]
+
+
+def _long_session(fake, n_assistant: int, tail: str):
+    """A session of *n_assistant* assistant items with the human's message
+    last -- the shape a real author session has when the person answers."""
+    fake.sessions["s-1"] = {"id": "s-1", "status": "idle", "agent_id": "ag_claude",
+                            "agent_name": "v2_author_claude", "host_id": "h",
+                            "workspace": "/ws", "title": "t", "items": [], "labels": {}}
+    fake.listed.add("s-1")
+    for i in range(n_assistant):
+        fake.add_assistant_text("s-1", f"turn {i}")
+    return fake.add_user_message("s-1", tail)
+
+
+def test_list_items_pages_past_the_routes_default_limit():
+    """THE DEFECT: `GET /v1/sessions/{id}/items` answers at most `limit` items
+    and defaults to the OLDEST 100 (routes_items.py: limit=100, order=asc).
+    A reader that took one page and ignored `has_more` never saw the newest
+    item of a session past that -- and in a parked session the newest item is
+    exactly the human's `approve`, so `human_pass` parked forever while the
+    approval sat unread in the UI."""
+    fake = FakeOmnigent(page_size=25)          # five pages for 101 items
+    last = _long_session(fake, 100, "approve")
+    items = list_items("http://srv", "s-1", fetch=fake.fetch)
+    assert len(items) == 101
+    assert items[-1] == {"id": last, "role": "user", "text": "approve"}
+    # In order, and each item once: a paging loop that re-read a page or
+    # dropped one would still end on the human's message.
+    assert [it["id"] for it in items] == [it["id"] for it in fake.sessions["s-1"]["items"]]
+
+
+def test_list_items_asks_for_the_order_it_returns():
+    """`order=asc` is IN the query, not assumed from the route's default:
+    everything downstream (the cursor, `unread_human_items`, the reviewer's
+    first user item) reads this listing as oldest-first."""
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return json.dumps({"object": "list", "data": [], "first_id": None,
+                           "last_id": None, "has_more": False})
+
+    assert list_items("http://srv", "s-1", fetch=fetch) == []
+    assert seen == ["http://srv/v1/sessions/s-1/items?order=asc&limit=1000"]
+
+
+def test_list_items_refuses_a_server_that_never_stops_paging():
+    """A bounded loop, so a server answering `has_more: true` forever is a
+    failed lookup rather than a hung coordinator."""
+    def fetch(url):
+        return json.dumps({"object": "list",
+                           "data": [{"id": "i1", "role": "user", "content": []}],
+                           "first_id": "i1", "last_id": "i1", "has_more": True})
+
+    with pytest.raises(LookupFailed, match="200 pages"):
+        list_items("http://srv", "s-1", fetch=fetch)
+
+
+def test_list_items_refuses_a_page_that_claims_more_but_names_no_cursor():
+    body = json.dumps({"object": "list", "data": [], "first_id": None,
+                       "last_id": None, "has_more": True})
+    with pytest.raises(LookupFailed, match="no cursor"):
+        list_items("http://srv", "s-1", fetch=lambda u: body)

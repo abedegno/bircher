@@ -26,6 +26,16 @@ from dataclasses import dataclass
 #: keeping it means a hung server degrades a poll rather than the run.
 _TIMEOUT = 10
 
+#: Both omnigent list routes are `limit`-capped at 1000 and cursor-paginated
+#: (`after`), so the readers below ask for the largest page the server will
+#: give and follow `has_more`.
+PAGE_LIMIT = 1000
+#: The bound on the paging loop. 200 pages of 1000 is 200_000 rows -- orders of
+#: magnitude past any real session or server -- so reaching it means the server
+#: is answering `has_more: true` forever, and a lookup that cannot terminate is
+#: a failed lookup, not a hung coordinator.
+MAX_PAGES = 200
+
 
 class LookupFailed(Exception):
     """The server could not be read, or answered with something unusable.
@@ -85,35 +95,79 @@ def state(server: str, conv_id: str, *, fetch=_fetch) -> State:
     )
 
 
+def pages(url: str, what: str, keys: tuple[str, ...], *, fetch=_fetch):
+    """Each page's raw row list from a cursor-paginated omnigent list route.
+
+    *url* already carries the query's `order` and `limit`; this follows
+    `has_more` by appending `after=<the page's last id>` until the server says
+    there is no more. `first_id`/`last_id`/`has_more` are the `PaginatedList`
+    fields both routes answer with (omnigent/server/schemas.py).
+
+    *keys* are the body keys tried in order for the rows, and the last resort
+    is the body itself: `data` is what the real routes send, and the others
+    stay as fallbacks for a stub shaped some other way. A body with no rows
+    list at all is `LookupFailed`, as is one that claims `has_more` while
+    naming no cursor to follow -- both are unusable, and a reader that
+    returned what it did have would report a truncation as a complete answer.
+
+    A page with no `has_more` at all ends the loop: the fallback shapes carry
+    no pagination, so a stub that answers one flat body is read exactly once,
+    as it was before this paged.
+    """
+    after = None
+    for _ in range(MAX_PAGES):
+        try:
+            d = json.loads(fetch(url if after is None else f"{url}&after={after}"))
+        except ValueError as exc:
+            raise LookupFailed(f"{what}: {exc}") from exc
+        raw = d
+        if isinstance(d, dict):
+            for k in keys:
+                if k in d:
+                    raw = d[k]
+                    break
+        if not isinstance(raw, list):
+            raise LookupFailed(f"{what}: not a list")
+        yield raw
+        if not (isinstance(d, dict) and d.get("has_more")):
+            return
+        last = d.get("last_id") or (raw[-1].get("id") if raw and isinstance(raw[-1], dict) else None)
+        if not last:
+            raise LookupFailed(f"{what}: has_more is true but the page names no cursor to follow")
+        after = str(last)
+    raise LookupFailed(f"{what}: the server is still paginating after {MAX_PAGES} pages")
+
+
 def list_items(server: str, conv_id: str, *, fetch=_fetch) -> list[dict]:
-    """Every item of the session, oldest first, as `{id, role, text}`.
+    """EVERY item of the session, oldest first, as `{id, role, text}`.
 
     `text` is the concatenation of that item's `content[*].text` for
     `input_text`/`output_text` parts -- a tool call carries no text and
     contributes none. Unlike `state`, a bad lookup here is not a hidden
-    `unknown`: the caller (list_items has no caller yet in the front half)
-    would otherwise be unable to tell "no items" from "could not read".
+    `unknown`: the caller would otherwise be unable to tell "no items" from
+    "could not read".
 
-    omnigent's real route returns a `PaginatedList`: `{"object": "list",
-    "data": [...], "first_id", "last_id", "has_more"}`
-    (omnigent/server/routes/sessions/routes_items.py, `PaginatedList` in
-    omnigent/server/schemas.py) -- `data` is read first. `items`/a bare list
-    stay as fallbacks for a stub shaped some other way, not because the real
-    server ever sends them.
+    EVERY item, and it PAGES to get them. The route defaults to the OLDEST 100
+    (`limit=100, order=asc`, routes_items.py), and a session that authors a
+    spec passes 100 items in the ordinary case -- two per tool call. A reader
+    that took one page and ignored `has_more` therefore never saw the newest
+    item of a working session, and the newest item is exactly the human's:
+    `unread_human_items` read every user item after the cursor out of a page
+    that stopped before the person's `approve`, so `human_pass` parked forever
+    while the approval sat in the UI.
+
+    `order=asc` is asked for rather than assumed, because everything
+    downstream -- the cursor, the discriminator, the reviewer's first user
+    item -- reads this listing as oldest-first.
     """
-    try:
-        d = json.loads(fetch(f"{server}/v1/sessions/{conv_id}/items"))
-    except ValueError as exc:
-        raise LookupFailed(f"items: {exc}") from exc
-    raw = d.get("data", d.get("items", d)) if isinstance(d, dict) else d
-    if not isinstance(raw, list):
-        raise LookupFailed("items: not a list")
     out = []
-    for it in raw:
-        parts = it.get("content") or []
-        text = "".join(p.get("text", "") for p in parts
-                       if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"))
-        out.append({"id": str(it.get("id")), "role": str(it.get("role") or ""), "text": text})
+    url = f"{server}/v1/sessions/{conv_id}/items?order=asc&limit={PAGE_LIMIT}"
+    for raw in pages(url, "items", ("data", "items"), fetch=fetch):
+        for it in raw:
+            parts = it.get("content") or []
+            text = "".join(p.get("text", "") for p in parts
+                           if isinstance(p, dict) and p.get("type") in ("input_text", "output_text"))
+            out.append({"id": str(it.get("id")), "role": str(it.get("role") or ""), "text": text})
     return out
 
 

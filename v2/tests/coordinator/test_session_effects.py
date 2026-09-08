@@ -154,3 +154,49 @@ def test_list_sessions_without_any_list_raises_lookup_failed():
     body = json.dumps({"object": "list", "first_id": None, "last_id": None, "has_more": False})
     with pytest.raises(LookupFailed):
         sessions.list_sessions("http://srv", fetch=lambda u: body)
+
+
+def _listing_of(n: int, page_size: int):
+    """A server holding *n* sessions, oldest first -- `s-1` is the oldest run's."""
+    from tests.coordinator.fake_omnigent import FakeOmnigent
+    fake = FakeOmnigent(page_size=page_size)
+    for i in range(1, n + 1):
+        sid = f"s-{i}"
+        fake.sessions[sid] = {"id": sid, "status": "idle", "agent_id": "ag_claude",
+                              "agent_name": "v2_author_claude", "host_id": "h",
+                              "workspace": "/ws", "title": sid, "items": [], "labels": {}}
+        fake.listed.add(sid)
+    return fake
+
+
+def test_list_sessions_pages_past_the_routes_default_limit():
+    """THE DEFECT: `GET /v1/sessions` answers the 20 NEWEST sessions by
+    default (routes_core.py: limit=20, order=desc). A reader that took one
+    page saw only those, so a 16-seat run reported most of itself "not
+    listed" and `reply_refusals` dropped the reply owed to a dismissal whose
+    session had aged out."""
+    fake = _listing_of(50, page_size=7)
+    got = sessions.list_sessions("http://srv", fetch=fake.fetch)
+    assert got == {f"s-{i}" for i in range(1, 51)}
+    assert "s-1" in got, "the oldest run's session is missing from the listing"
+
+
+def test_list_sessions_asks_for_an_explicit_limit():
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return json.dumps({"object": "list", "data": [{"id": "s-1"}],
+                           "first_id": "s-1", "last_id": "s-1", "has_more": False})
+
+    assert sessions.list_sessions("http://srv", fetch=fetch) == {"s-1"}
+    assert seen == ["http://srv/v1/sessions?order=asc&limit=1000"]
+
+
+def test_list_sessions_refuses_a_server_that_never_stops_paging():
+    def fetch(url):
+        return json.dumps({"object": "list", "data": [{"id": "s-1"}],
+                           "first_id": "s-1", "last_id": "s-1", "has_more": True})
+
+    with pytest.raises(LookupFailed, match="200 pages"):
+        sessions.list_sessions("http://srv", fetch=fetch)

@@ -99,7 +99,9 @@ def _fake_fetch_for(s, run_id: str = "r-1"):
                                                  "content": [{"type": "input_text", "text": text}]})
 
     def fetch(url):
-        tail = url.partition("/v1/")[2]  # "sessions", "sessions/<sid>", "sessions/<sid>/items"
+        # The query is stripped: the readers page, so the URL carries an
+        # `order`/`limit` and an `after` on every page after the first.
+        tail = url.partition("/v1/")[2].partition("?")[0]  # "sessions", "sessions/<sid>", ".../items"
         parts = tail.split("/")
         if parts == ["sessions"]:
             return json.dumps({"object": "list", "data": [{"id": k} for k in sessions if k in listed]})

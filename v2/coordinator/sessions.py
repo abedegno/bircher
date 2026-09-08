@@ -8,7 +8,7 @@ import os
 import subprocess
 
 from coordinator.effects import perform_effect
-from coordinator.session import LookupFailed, _fetch
+from coordinator.session import PAGE_LIMIT, _fetch, pages
 from kernel.artifacts import put_artifact
 
 SESSION_CONTROL = "session_control"
@@ -72,7 +72,7 @@ def stop_session(store, *, run_id: str, generation: int, server: str, session_id
 
 
 def list_sessions(server: str, *, fetch=_fetch) -> set[str]:
-    """The ids `GET {server}/v1/sessions` lists.
+    """The ids `GET {server}/v1/sessions` lists -- ALL of them, not one page.
 
     omnigent's real route returns a `PaginatedList`/`SessionList`:
     `{"object": "list", "data": [...], "first_id", "last_id", "has_more"}`
@@ -80,12 +80,20 @@ def list_sessions(server: str, *, fetch=_fetch) -> set[str]:
     omnigent/server/schemas.py) -- `data` is read first. `sessions`/`items`/a
     bare list stay as fallbacks for a stub shaped some other way, not because
     the real server ever sends them.
+
+    It PAGES, because the route's default is the 20 NEWEST sessions on the
+    whole server (`limit=20, order=desc`). One page is not a listing of a run:
+    `reply_refusals` silently skipped every dismissal whose session had aged
+    out of those 20 and never sent the reply it owed, and the §8 proof
+    reported most of a 16-seat run "not listed". Only the SET of ids is
+    wanted, so the order is asked for rather than inherited from the route,
+    and every page is followed to the end.
     """
-    d = json.loads(fetch(f"{server}/v1/sessions"))
-    raw = d.get("data", d.get("sessions", d.get("items", d))) if isinstance(d, dict) else d
-    if not isinstance(raw, list):
-        raise LookupFailed("sessions: not a list")
-    return {str(x.get("id")) for x in raw if isinstance(x, dict)}
+    out: set[str] = set()
+    url = f"{server}/v1/sessions?order=asc&limit={PAGE_LIMIT}"
+    for raw in pages(url, "sessions", ("data", "sessions", "items"), fetch=fetch):
+        out.update(str(x.get("id")) for x in raw if isinstance(x, dict))
+    return out
 
 
 def satisfied(store, run_id: str, obligation: dict) -> dict | None:

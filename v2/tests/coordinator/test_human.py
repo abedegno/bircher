@@ -338,7 +338,7 @@ def test_an_unreadable_confirm_listing_parks(world):
         # The first two reads are human_pass's own listing and the one
         # `_record_prompt_item` takes after the prompt; the third is the
         # confirm listing, and that is the one that goes away.
-        if url.endswith("/items"):
+        if "/items" in url:            # the listing URL carries a paging query
             reads["n"] += 1
             if reads["n"] > 2:
                 raise __import__("coordinator.session", fromlist=["LookupFailed"]).LookupFailed("gone")
@@ -361,3 +361,22 @@ def test_grill_park_with_a_carrier_session(world):
     park = front.current_park(s, "r-1")
     assert park.payload["session_id"] == sid                       # the run's most recent session
     assert "single word `retry`" in fake.sessions[sid]["items"][-1]["content"][0]["text"]
+
+
+def test_the_humans_message_past_the_first_page_is_still_unread(world):
+    """THE DEFECT the fake used to hide: a spec-authoring session passes 100
+    items in the ordinary case (two per tool call), and the items route's
+    first page is the OLDEST 100. The human's `approve` is always the newest
+    item, so it was never in the page the discriminator read, and `human_pass`
+    parked forever while the approval sat in the UI."""
+    s, f, fake, ctx = world()
+    fake.page_size = 25                                   # several pages, not one
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    for i in range(120):
+        fake.add_assistant_text(sid, f"thinking {i}")
+    approve = fake.add_user_message(sid, "approve")
+
+    from coordinator.session import list_items
+    listing = list_items("http://srv", sid, fetch=fake.fetch)
+    assert listing[-1]["id"] == approve
+    assert [it["id"] for it in human.unread_human_items(ctx, sid, listing)] == [approve]
