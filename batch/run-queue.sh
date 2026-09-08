@@ -8833,6 +8833,11 @@ _install_work_git_config() {
 }
 
 main() {
+  # Sourcing guard: `source batch/run-queue.sh --source-only` loads every
+  # function and returns without working a queue. The Part E live probes drive
+  # single helpers (_upload_bundle, _get_agent_id) from a shell this way, and a
+  # source that fell through to a wave would work the real backlog.
+  if [ "${1:-}" = "--source-only" ]; then return 0; fi
   if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'__HELP__'
 run-queue.sh — the Bircher batch runner.
