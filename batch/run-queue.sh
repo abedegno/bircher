@@ -3064,10 +3064,13 @@ def is_bircher_status(body):
     # by its predecessor. Retiring a channel means never writing one again; it
     # does not mean forgetting how to read the archive.
     #
-    # FIVE prefixes, the same five kernel/bundle.py holds. The new one,
-    # "bircher: published ", is the publication comment the coordinator writes:
-    # bircher reading its own output back as human discussion is exactly what
-    # this filter exists to prevent. The two copies are driven against
+    # SIX prefixes, the same six kernel/bundle.py holds. The newest two,
+    # "bircher: published " and "bircher: parked ", are comments the
+    # coordinator writes about the run itself -- the published artefact and the
+    # notice that a park is waiting for a person: bircher reading its own
+    # output back as human discussion is exactly what this filter exists to
+    # prevent, and a park notice inside the bundle would revise it and start a
+    # fresh epoch on every park. The two copies are driven against
     # tests/fixtures/bircher_status_comments.tsv by
     # v2/tests/execution/test_bircher_status_bash.py, which EXTRACTS this
     # function from this file and executes it. That is why each `or` sits at the
@@ -3081,7 +3084,8 @@ def is_bircher_status(body):
             head.startswith("bircher-status:") or
             head.startswith("Outcome derived from the repository") or
             head.startswith("Cross-vendor review (outcome derived") or
-            head.startswith("bircher: published "))
+            head.startswith("bircher: published ") or
+            head.startswith("bircher: parked "))
 
 kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
 maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])

@@ -165,3 +165,59 @@ def test_publication_body_is_capped():
     assert body.rstrip().endswith("under " + "a" * 64)
     small = phases.publication_body("spec", b"# S", "b" * 64)
     assert small == "bircher: published spec bbbbbbbb\n\n# S"
+
+
+def test_notify_owed_comments_once_per_park_and_names_what_is_needed(world, monkeypatch):
+    """spec section 4. A parked run is indistinguishable from an idle one in
+    omnigent -- the inbox counts elicitations, which nothing here raises -- so
+    the question sat in a transcript nobody watched and an overnight park
+    looked exactly like a hang. The notice goes where the backlog already is.
+    """
+    s, f, fake, ctx = world
+    posted = []
+
+    def gh(argv, **kw):
+        posted.append(argv)
+        class R: returncode, stdout, stderr = 0, "https://github.com/o/r/issues/1#issuecomment-9", ""
+        return R()
+    import kernel.cli
+    real = kernel.cli.subprocess.run
+    kernel.cli.subprocess.run = (
+        lambda argv, **kw: gh(argv, **kw) if os.path.basename(argv[0]) == "gh" else real(argv, **kw))
+    monkeypatch.setenv("BIRCHER_OMNIGENT_UI", "https://omni.example/")
+    try:
+        ctx.generation = f._dispatch(Role.OPERATOR, "runner")
+        assert phases.notify_owed(ctx) == [], "no park, no notice"
+
+        g = f._dispatch(Role.OPERATOR, "runner")
+        f._cmd(g, "park", {"reason": "gate", "session_id": "sess-7", "cursor_item_id": None,
+                           "findings_hash": None, "verdict": None, "reviewer": None})
+        ctx.generation = f._dispatch(Role.OPERATOR, "runner")
+        park = front.current_park(s, "r-1")
+        keys = phases.notify_owed(ctx)
+        assert keys == [f"park-notice:r-1:{park.id}:{ctx.generation}"]
+
+        body = posted[-1][posted[-1].index("--body") + 1]
+        assert body.startswith("bircher: parked gate\n"), "the prefix keeps it out of the bundle"
+        assert "approve" in body, "the notice says what to type"
+        assert "https://omni.example/c/sess-7" in body, "and where to type it"
+        assert ctx.run_id in body
+
+        # Owed once: a second pass over the same park sends nothing.
+        ctx.generation = f._dispatch(Role.OPERATOR, "runner")
+        assert phases.notify_owed(ctx) == []
+        assert len(posted) == 1
+    finally:
+        kernel.cli.subprocess.run = real
+
+
+def test_the_park_notice_is_not_frozen_into_the_bundle():
+    from kernel import bundle
+    assert bundle.is_bircher_status("bircher: parked gate\n\nThis run is waiting for you.")
+    assert not bircher_status_of_a_person()
+
+
+def bircher_status_of_a_person() -> bool:
+    from kernel import bundle
+    # A person may reasonably open a comment this way; it must still be frozen.
+    return bundle.is_bircher_status("bircher parked the run again, annoyingly")

@@ -206,6 +206,73 @@ def publish_owed(ctx: Ctx) -> list[str]:
     return done
 
 
+#: What each park reason needs from the person, in their words. The reason
+#: alone is jargon; "budget_exhausted" does not tell anyone what to type.
+PARK_NEEDS = {
+    "grill": "Answer the author's questions in the session below. Plain prose is fine.",
+    "gate": "Reply with the single word `approve` in the session below, or give corrections.",
+    "bound_exhausted": "Reply with the single word `retry` in the session below, or give corrections.",
+    "budget_exhausted": "Reply with the single word `retry` in the session below, or give corrections.",
+    "no_verdict": "Reply with the single word `retry` in the session below, or give corrections.",
+    "identical_resubmission": "Reply with the single word `retry` in the session below, or give corrections.",
+}
+
+
+def park_notice_body(ctx: Ctx, park) -> str:
+    """The comment a parked run leaves on its issue (spec section 4).
+
+    The first line carries the `bircher: parked ` prefix, which is what keeps
+    it out of the frozen bundle (`kernel.bundle.BIRCHER_STATUS_PREFIXES`); a
+    notice about the run's own state is not something the issue's author said.
+
+    A link only when `BIRCHER_OMNIGENT_UI` is set: the coordinator knows the
+    server's API address, which is reachable from the runner and typically not
+    from a person's browser, and a link that does not open is worse than an id
+    that can be searched for.
+    """
+    import os
+    reason = park.payload.get("reason", "")
+    sid = park.payload.get("session_id")
+    ui = os.environ.get("BIRCHER_OMNIGENT_UI", "").rstrip("/")
+    where = f"{ui}/c/{sid}" if (ui and sid) else (f"session `{sid}`" if sid else "the run's newest session")
+    return (f"bircher: parked {reason}\n\n"
+            f"This run is waiting for you at the **{park.payload.get('phase')}** phase.\n\n"
+            f"{PARK_NEEDS.get(reason, 'Open the session below and reply.')}\n\n"
+            f"{where}\n\n"
+            f"Run `{ctx.run_id}`. It makes no further progress until you reply.")
+
+
+def notify_owed(ctx: Ctx) -> list[str]:
+    """One comment per park, by obligation (spec section 4).
+
+    Section 4 used to make notification the operator's job, on the reasoning
+    that a morning summary would list parked runs. In practice a parked
+    session is indistinguishable from an idle one -- omnigent's inbox counts
+    elicitations, which nothing here raises -- so the question sat in a
+    transcript nobody was watching, and an overnight park was
+    indistinguishable from a hang. The issue is where the backlog already
+    lives, so that is where the notice goes.
+
+    Owed, not sent inline at the park: a crash between the `parked` fact and
+    the comment leaves the obligation unsatisfied and the next pass sends it.
+    Keyed on the park's own fact id, so a second park -- a later gate, a
+    later stall -- earns its own notice and a re-read of the same one does
+    not.
+    """
+    park = front.current_park(ctx.store, ctx.run_id)
+    if park is None:
+        return []
+    ob = {"kind": "park-notice", "run": ctx.run_id, "park": park.id}
+    if sessions.satisfied(ctx.store, ctx.run_id, ob) is not None:
+        return []
+    key = f"park-notice:{ctx.run_id}:{park.id}:{ctx.generation}"
+    perform_effect(EffectClass.COMMENT, key,
+                   ["gh", "issue", "comment", str(ctx.issue_number), "--repo", ctx.repo,
+                    "--body", park_notice_body(ctx, park)],
+                   timeout=60, env=ctx.effect_env(), obligation=ob)
+    return [key]
+
+
 class Exit:
     """The loop's exit codes (spec §3): `planned` is 0, a park is 4, and
     anything the loop cannot act on itself is 1. USAGE is the CLI's, kept
@@ -248,6 +315,12 @@ def stall(ctx: Ctx, reason: str, *, session_id, findings_hash, verdict, reviewer
     seat.command(ctx, "park", {"reason": reason, "session_id": session_id, "cursor_item_id": cur,
                                "findings_hash": findings_hash, "verdict": verdict, "reviewer": reviewer})
     park = front.current_park(store, run_id)
+    # Tell the person NOW, not on the next pass. `notify_owed` at the top of
+    # the loop is the crash-repair half; without this call the notice waits
+    # for a wave that may not come until morning, which is precisely the case
+    # it exists for -- a run that parks overnight and is never announced is
+    # indistinguishable from one that hung.
+    notify_owed(ctx)
     if session_id is None:
         return "parked"
     return human.human_pass(ctx, park)
@@ -293,6 +366,10 @@ def run_loop(ctx: Ctx) -> int:
             ctx.generation = dispatch(store, run_id, actor="coordinator", role=Role.OPERATOR).generation
             retire_owed(ctx)
             publish_owed(ctx)
+            # Before anything else this pass might do: a park recorded last
+            # pass owes the person a notice, and the pass that owes it may be
+            # the one that clears the park.
+            notify_owed(ctx)
             state = ctx.state()
             if state == "planned":
                 return Exit.OK

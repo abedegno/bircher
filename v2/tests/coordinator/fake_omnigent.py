@@ -21,6 +21,7 @@ force several pages without inventing hundreds of rows.
 """
 import itertools
 import json
+import os.path
 import urllib.parse
 
 from coordinator.session import LookupFailed
@@ -48,6 +49,7 @@ class FakeOmnigent:
         self.on_stop = lambda sid: None
         self._ids = itertools.count(1)
         self.posts = []
+        self.gh = []          # every `gh` argv, newest last
 
     # -- read side ------------------------------------------------------------
     def _listing_order(self) -> list[str]:
@@ -108,6 +110,17 @@ class FakeOmnigent:
     def run(self, argv, **kw):
         class R:
             returncode, stdout, stderr = 0, "", ""
+        # `gh`, not curl: the coordinator posts issue comments (the published
+        # artefact, and the park notice of spec section 4) through it. Answered
+        # here so a test that drives the loop to a park does not have to know
+        # that a comment goes out -- an unhandled one used to surface as a
+        # StopIteration from the url search below, reported as an uncertain
+        # effect, which says nothing about what was missing.
+        if os.path.basename(str(argv[0])) == "gh":
+            self.gh.append(list(argv))
+            r = R()
+            r.stdout = f"https://github.com/o/r/issues/1#issuecomment-{next(self._ids)}"
+            return r
         url = next(a for a in argv if a.startswith("http"))
         path = url.split("//", 1)[-1].split("/", 1)[1]
         if "--data-binary" in argv:

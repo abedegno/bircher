@@ -1536,8 +1536,33 @@ is a **deployment residual, listed as asserted** in the provenance table.
 Enabling omnigent accounts mode would make `created_by` observed; it is a
 deployment change outside this spec.
 
-Notification that a run has parked is the operator's job. The morning summary
-lists parked runs with their reason.
+**A park announces itself on the issue.** When the coordinator records a
+`parked` fact it posts one comment to the run's issue: the reason, the phase,
+what the person has to type, a link to the session, and the run id. One per
+park, by obligation, keyed on the `parked` fact's own id -- so a crash between
+the park and the comment is repaired by the next pass, a second park earns its
+own notice, and re-reading the same one sends nothing. The comment is sent
+where the park is recorded, not only at the top of the next pass: a run that
+parks at three in the morning and waits for the next wave to announce itself
+is a run nobody was told about. Its first line is `bircher: parked <reason>`,
+which is what keeps it out of the frozen bundle (§2 Bundle revision) -- a
+notice about the run's own state is not something the issue's author said, and
+inside the bundle every park would revise it and open a fresh epoch.
+
+The link needs `BIRCHER_OMNIGENT_UI`, the address a person's browser reaches
+omnigent at; unset, the notice names the session id instead. The coordinator
+knows only the API address, which is reachable from the runner and usually not
+from a browser, and a link that does not open is worse than an id that can be
+searched for.
+
+An earlier draft made notification the operator's job, on the reasoning that a
+morning summary would list parked runs with their reason. That is wrong for
+this design and was corrected after the first live run: omnigent's inbox
+counts elicitations, which nothing here raises, so a parked session is
+indistinguishable from an idle one -- the question sits in a transcript nobody
+is watching, and a park is indistinguishable from a hang. The rule above (§4:
+the human is told, "not never") needs a channel the person already watches,
+and for this system that is the issue.
 
 ## §5 Parking and resumption
 

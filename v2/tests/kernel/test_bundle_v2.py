@@ -29,12 +29,17 @@ def test_fixture_drives_is_bircher_status():
         assert bundle.is_bircher_status(body) is (verdict == "drop"), body
 
 
-def test_prefixes_are_exactly_five_and_not_the_generic_one():
+def test_prefixes_are_exactly_six_and_not_the_generic_one():
+    """Pinned as a list, not a membership check: the point is that the set is
+    small and deliberate. `bircher: ` on its own must never be in it -- the
+    author of an issue may reasonably write a comment beginning that way, and
+    a prefix that broad would silently drop it from the frozen bundle."""
     assert bundle.BIRCHER_STATUS_PREFIXES == (
         "bircher: outcome=", "bircher-status:",
         "Outcome derived from the repository",
         "Cross-vendor review (outcome derived",
         "bircher: published ",
+        "bircher: parked ",
     )
     assert "bircher: " not in bundle.BIRCHER_STATUS_PREFIXES
 

@@ -46,6 +46,12 @@ PY_DIRS = [REPO_ROOT / "v2" / "coordinator", REPO_ROOT / "v2" / "kernel"]
 CONTRACT = {
     "BIRCHER_CI_IGNORE_CHECKS": "operator",
     "BIRCHER_KERNEL_MODE": "operator",
+    # Where a person's browser reaches omnigent, for the link in a park notice
+    # (spec section 4). Operator-supplied and optional: the coordinator knows
+    # only the API address, which is reachable from the runner and usually not
+    # from a browser, so unset means the notice names the session id instead of
+    # linking it. Nothing in shell assigns it.
+    "BIRCHER_OMNIGENT_UI": "operator",
     "BIRCHER_REVIEW_LOG": "operator",
     "MAIN_BRANCH": "operator",
     "BIRCHER_GH_REPO": "self",

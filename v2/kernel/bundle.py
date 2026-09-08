@@ -44,6 +44,11 @@ BIRCHER_STATUS_PREFIXES: tuple[str, ...] = (
     "Outcome derived from the repository",
     "Cross-vendor review (outcome derived",
     "bircher: published ",
+    # The park notice (spec section 4). Like every other status comment it must
+    # not enter the frozen bundle: a notice about the run's own state is not
+    # something the issue's author said, and letting it in would make every
+    # park revise the bundle and start a fresh epoch.
+    "bircher: parked ",
 )
 
 

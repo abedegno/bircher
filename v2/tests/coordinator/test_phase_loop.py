@@ -109,6 +109,8 @@ def test_default_policy_parks_at_the_gate_and_resumes_on_approve(world, monkeypa
     s, f, fake, ctx = world(labels=())
     fake.on_prompt = Script(fake, s)
     monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    # Both owed comments need a real `gh`; the park notice has its own test.
+    monkeypatch.setattr("coordinator.phases.notify_owed", lambda c: [])
     assert phases.run_loop(ctx) == phases.Exit.PARKED
     assert s.run_state("r-1") == "spec_accepted"
     park = front.current_park(s, "r-1")
@@ -127,6 +129,8 @@ def test_default_policy_parks_at_the_gate_and_resumes_on_approve(world, monkeypa
 def test_grill_human_parks_on_questions_and_continues_in_the_same_session(world, monkeypatch):
     s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
     monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    # Both owed comments need a real `gh`; the park notice has its own test.
+    monkeypatch.setattr("coordinator.phases.notify_owed", lambda c: [])
     asked = {"n": 0}
 
     def on_prompt(sid, text):
@@ -162,6 +166,8 @@ def test_grill_human_parks_on_questions_and_continues_in_the_same_session(world,
 def test_bound_exhausted_parks_and_retry_grants(world, monkeypatch):
     s, f, fake, ctx = world(cfg={"max_rounds": 1})
     monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    # Both owed comments need a real `gh`; the park notice has its own test.
+    monkeypatch.setattr("coordinator.phases.notify_owed", lambda c: [])
 
     def on_prompt(sid, text):
         ws = fake.sessions[sid]["workspace"]
@@ -188,6 +194,8 @@ def test_revise_bundle_on_resume_restarts_the_epoch(world, monkeypatch):
     s, f, fake, ctx = world(labels=(), issue={"number": 1, "title": "T", "body": "B", "labels": [], "comments": []})
     fake.on_prompt = Script(fake, s)
     monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    # Both owed comments need a real `gh`; the park notice has its own test.
+    monkeypatch.setattr("coordinator.phases.notify_owed", lambda c: [])
     assert phases.run_loop(ctx) == phases.Exit.PARKED
     ctx.generation = f._dispatch(__import__("kernel.dispatch", fromlist=["Role"]).Role.OPERATOR, "runner")
     seat.command(ctx, "revise_bundle", {"issue": {"number": 1, "title": "T", "body": "B and C",
@@ -254,6 +262,8 @@ def test_a_retry_at_a_no_verdict_park_is_read_once(world, monkeypatch):
     """
     s, f, fake, ctx = world()
     monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    # Both owed comments need a real `gh`; the park notice has its own test.
+    monkeypatch.setattr("coordinator.phases.notify_owed", lambda c: [])
     reasons = []
     real_stall = phases.stall
 
@@ -293,3 +303,37 @@ def test_a_retry_at_a_no_verdict_park_is_read_once(world, monkeypatch):
     assert front.grants(s, "r-1") == 1
     assert [x.payload["ruling"] for x in s.facts_of_kind("r-1", EventKind.HUMAN_RULING)] == ["grant_round"]
     assert s.facts_of_kind("r-1", EventKind.HUMAN_ITEM_DISMISSED) == []
+
+
+def test_the_loop_itself_posts_the_park_notice(world, monkeypatch):
+    """The other loop tests stub `notify_owed` out, so without this one nothing
+    asserts the loop calls it at all -- removing the call from `run_loop` would
+    leave the whole suite green while every park went unannounced.
+    """
+    s, f, fake, ctx = world(labels=())
+    fake.on_prompt = Script(fake, s)
+    monkeypatch.setattr("coordinator.phases.publish_owed", lambda c: [])
+    posted = []
+    import kernel.cli
+    real = kernel.cli.subprocess.run
+
+    def routed(argv, **kw):
+        if os.path.basename(argv[0]) == "gh":
+            posted.append(argv)
+            class R: returncode, stdout, stderr = 0, "https://github.com/o/r/issues/1#issuecomment-3", ""
+            return R()
+        return real(argv, **kw)
+    kernel.cli.subprocess.run = routed
+    try:
+        assert phases.run_loop(ctx) == phases.Exit.PARKED
+        park = front.current_park(s, "r-1")
+        assert park.payload["reason"] == "gate"
+        bodies = [a[a.index("--body") + 1] for a in posted if "--body" in a]
+        assert any(b.startswith("bircher: parked gate") for b in bodies), \
+            f"the loop sent no park notice; it sent {len(posted)} comment(s)"
+        # Once. A second pass over the same park re-sends nothing.
+        before = len(posted)
+        assert phases.run_loop(ctx) == phases.Exit.PARKED
+        assert len(posted) == before
+    finally:
+        kernel.cli.subprocess.run = real
