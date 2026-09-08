@@ -220,6 +220,25 @@ class AgentMismatch(Exception):
         self.session_id, self.expected, self.observed = session_id, expected, observed
 
 
+def _landed(p: pathlib.Path) -> bool:
+    """A watched file counts as present only with bytes in it.
+
+    A session that creates the file and then writes it -- a write-probe, an
+    editor's touch-then-fill, a truncate-then-append -- makes the path exist
+    while it is still empty. Read as "present" that ends the turn and stops
+    the session before the content lands; for a review that is `no_verdict`
+    and a park. Live on 2026-09-08: a codex reviewer with a real finding in
+    its last message left a 0-byte review.md beside a `.write-check`, and an
+    unattended run stopped to ask a human about it. The spec asks the session
+    to write elsewhere and rename into place; this is the coordinator not
+    depending on that instruction being obeyed.
+    """
+    try:
+        return p.exists() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def wait_turn(store, run_id: str, generation: int, server: str, session_id: str,
               watched: list[pathlib.Path], deadline_us: int, *, agent_id_expected: str,
               fetch=_fetch, clock=time.time, sleep=time.sleep, poll_s: float = 15.0) -> TurnEnd:
@@ -250,19 +269,19 @@ def wait_turn(store, run_id: str, generation: int, server: str, session_id: str,
     watched = [pathlib.Path(p) for p in watched]
     d_seq = front.dispatch_seq(store, run_id, generation)
     while True:
-        present = any(p.exists() for p in watched)
+        present = any(_landed(p) for p in watched)
         if d_seq is not None and front.direction_after(store, run_id, d_seq) is not None:
             return TurnEnd("displaced", present)
         st = state(server, session_id, fetch=fetch)
         if st.agent_id and st.agent_id != agent_id_expected:
             raise AgentMismatch(session_id, agent_id_expected, st.agent_id)
-        present = any(p.exists() for p in watched)
+        present = any(_landed(p) for p in watched)
         if present:
             return TurnEnd("file", True)
         if died(st.status, st.error_code):
             return TurnEnd("dead", False)
         if int(clock() * 1_000_000) >= deadline_us:
-            return TurnEnd("cap", any(p.exists() for p in watched))
+            return TurnEnd("cap", any(_landed(p) for p in watched))
         sleep(poll_s)
 
 

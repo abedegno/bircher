@@ -226,3 +226,31 @@ def test_list_items_refuses_a_page_that_claims_more_but_names_no_cursor():
                        "last_id": None, "has_more": True})
     with pytest.raises(LookupFailed, match="no cursor"):
         list_items("http://srv", "s-1", fetch=lambda u: body)
+
+
+def test_an_empty_watched_file_is_not_present(tmp_path):
+    """Live on 2026-09-08: a codex reviewer created review.md (0 bytes, beside
+    a `.write-check` probe) and was still composing when the poll saw the path
+    exist, ended the turn `file`, and stopped it. An empty review is
+    `no_verdict`, and an unattended run parked to ask a human about a file the
+    session had not finished writing. Present means bytes, not a path."""
+    s, f, g, sid = _seat(tmp_path)
+    out = tmp_path / "wt" / "bircher" / "review.md"
+    out.parent.mkdir(parents=True)
+
+    def plant(n, p=out):
+        if n == 1:
+            p.write_bytes(b"")            # the probe / the touch-then-fill
+        if n == 4:
+            p.write_text("findings\n\nVERDICT: FAIL deadbeef\n")
+    stub = Stub(["idle", "running", "idle", "idle", "idle"], on_poll=plant)
+    assert _wait(s, g, sid, stub, [out]) == TurnEnd("file", True)
+    assert stub.polls == 4, "three polls saw an empty path and kept waiting"
+    out.unlink()
+
+    # An empty file at death is no output either: the end is `dead`, and the
+    # present flag the read-side trusts is False.
+    out.write_bytes(b"")
+    stub = Stub(["failed"])
+    end = _wait(s, g, sid, stub, [out])
+    assert end.ended == "dead" and end.file_present is False
