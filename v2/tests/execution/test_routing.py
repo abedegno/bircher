@@ -291,6 +291,10 @@ _GH_SUBCOMMANDS = {
     # READ-ONLY. `run_item` fetches the issue with it to build the run's frozen
     # input bundle (kernel.enqueue.create_run); nothing about the issue changes.
     ("issue", "view"): False,
+    # READ-ONLY. Preflight lists the target repo's labels to refuse a repo that
+    # lacks one the pipeline sets; it never creates one, because that would be
+    # an externally visible mutation outside the journal.
+    ("label", "list"): False,
     ("pr", "checks"): False,
     ("pr", "close"): True,
     ("pr", "create"): True,

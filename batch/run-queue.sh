@@ -3917,7 +3917,34 @@ preflight_auth() {
     tail -n 3 /tmp/preflight-codex.txt >&2 2>/dev/null; ok=0
   fi
   [ "$ok" = 1 ] || { echo "[batch] preflight FAILED -> refusing to start the queue; fix auth then re-run" >&2; return 1; }
+  _preflight_labels || return 1
   echo "[batch] preflight OK -> both providers healthy"
+}
+
+# The label vocabulary the pipeline SETS must already exist on the target repo.
+# gh applies a multi-label edit one operation at a time, so a missing label
+# fails the command AFTER the removal has landed: the effect goes uncertain,
+# the run halts, and the issue is left carrying neither label -- a partial
+# mutation someone has to unpick by hand. Seen on 2026-09-08 launching against
+# a fresh abedegno/bircher-smoke.
+#
+# Refuse, never create. Creating one here would be an externally visible
+# mutation outside the journal, which is the one thing the kernel exists to
+# prevent; the operator creates them once per repo.
+_preflight_labels() {
+  local missing="" have l
+  have=$(gh label list --repo "$REPO" --limit 200 --json name --jq '.[].name' 2>/dev/null) || {
+    echo "[batch] preflight: cannot list labels on $REPO -- refusing to start" >&2; return 1; }
+  for l in bircher:running bircher:escalated; do
+    printf '%s\n' "$have" | grep -qx -- "$l" || missing="$missing $l"
+  done
+  [ -z "$missing" ] || {
+    echo "[batch] preflight FAILED: $REPO is missing the label(s):$missing" >&2
+    echo "        The pipeline sets these; a missing one halts the run mid-edit with the" >&2
+    echo "        issue carrying neither label. Create them, then re-run:" >&2
+    for l in $missing; do echo "          gh label create '$l' --repo $REPO" >&2; done
+    return 1; }
+  echo "[batch] preflight: label vocabulary present on $REPO"
 }
 
 # The model codex workers must be dispatched with. Kept in step with the
@@ -8791,6 +8818,38 @@ SH
     echo "FAIL issues-to-queue: run-queue no longer passes REPO to the generator"; exit 1; }
   rm -rf "$qdir"
   echo "issues-to-queue repo targeting OK"
+
+  # --- _preflight_labels: refuse a repo that lacks a label the pipeline sets --
+  local ldir; ldir=$(mktemp -d)
+  cat > "$ldir/gh" <<'SH'
+#!/usr/bin/env bash
+cat "$GH_LABELS"
+SH
+  chmod +x "$ldir/gh"
+  printf 'bircher:queued\nbircher:running\nbircher:escalated\n' > "$ldir/all"
+  printf 'bircher:queued\nbircher:running\n' > "$ldir/partial"
+  printf '' > "$ldir/none"
+  ( PATH="$ldir:$PATH" GH_LABELS="$ldir/all" REPO=o/r _preflight_labels >/dev/null 2>&1 ) || {
+    echo "FAIL _preflight_labels: refused a repo that has every label"; exit 1; }
+  ( PATH="$ldir:$PATH" GH_LABELS="$ldir/partial" REPO=o/r _preflight_labels >/dev/null 2>&1 ) && {
+    echo "FAIL _preflight_labels: accepted a repo missing bircher:escalated"; exit 1; }
+  ( PATH="$ldir:$PATH" GH_LABELS="$ldir/none" REPO=o/r _preflight_labels >/dev/null 2>&1 ) && {
+    echo "FAIL _preflight_labels: accepted a repo with no labels at all"; exit 1; }
+  # The message names what is missing: an operator who cannot see which label
+  # is absent has to diff two lists by hand.
+  #
+  # Captured, not piped. Under `set -o pipefail` a pipeline takes the LAST
+  # non-zero status, so `_preflight_labels 2>&1 | grep -q` reports the
+  # refusal's own 1 however well grep matched -- the assertion could never
+  # pass. (This case found that in itself on 2026-09-08.)
+  local lmsg
+  lmsg=$( PATH="$ldir:$PATH" GH_LABELS="$ldir/partial" REPO=o/r _preflight_labels 2>&1 ) || true
+  case "$lmsg" in
+    *bircher:escalated*) ;;
+    *) echo "FAIL _preflight_labels: the refusal does not name the missing label: $lmsg"; exit 1 ;;
+  esac
+  rm -rf "$ldir"
+  echo "_preflight_labels OK"
 
   # --- _pr_is_abandoned: only a CLOSED-and-never-merged PR is abandoned --------
   # The i506 case: a scratch PR opened to PROVE a CI gate fails, then closed,
