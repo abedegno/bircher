@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 
@@ -63,6 +64,28 @@ def choose_author_vendor(ctx) -> str:
                 if v.payload.get("ruling") == "review_ruling"]
     same_phase = [v for v in verdicts if v.payload["phase"] == phase and v.payload["epoch"] == n]
     if same_phase:
+        # THE EXPERIMENT (2026-09-08). `BIRCHER_AUTHOR_ROTATION=fixed` keeps the
+        # phase's author across its rounds instead of handing the revision to
+        # the vendor that just reviewed it.
+        #
+        # Why it is worth measuring: three live runs rotated both roles every
+        # round and the findings per round stayed flat (4, 2, 5, 2, 4) with no
+        # downward trend, while consecutive drafts differed by 20-30% and swung
+        # from 11KB to 25KB -- each vendor rewriting to its own taste rather
+        # than refining what it was given. Nothing accumulated. The loops other
+        # people run (chaseai-yt/claudex-loop) fix the author and resume ONE
+        # reviewer session across rounds, and forbid rotation outright.
+        #
+        # The default stays `rotate`, which is what the spec says and what the
+        # scar behind it earned: a reviewer grading its own prescriptions once
+        # accepted a defect two lines from the text under review. With two
+        # vendors and author != reviewer, fixing the author fixes the reviewer
+        # too, so this trades that guarantee for accumulation. Measure before
+        # believing either.
+        if os.environ.get("BIRCHER_AUTHOR_ROTATION") == "fixed":
+            subs = front.submissions(store, run_id, phase, n)
+            if subs:
+                return subs[0].payload["author"]
         return same_phase[-1].payload["reviewer_identity"]
     if phase == "plan":
         spec_accepts = [v for v in verdicts if v.payload["phase"] == "spec" and v.payload["verdict"] == "accept"]

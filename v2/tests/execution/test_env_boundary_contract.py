@@ -52,6 +52,10 @@ CONTRACT = {
     # from a browser, so unset means the notice names the session id instead of
     # linking it. Nothing in shell assigns it.
     "BIRCHER_OMNIGENT_UI": "operator",
+    # The rotation experiment (2026-09-08). Unset or anything but "fixed" is
+    # the spec's rotation; "fixed" keeps the phase's author across its rounds.
+    # Operator-supplied; nothing in shell assigns it.
+    "BIRCHER_AUTHOR_ROTATION": "operator",
     "BIRCHER_REVIEW_LOG": "operator",
     "MAIN_BRANCH": "operator",
     "BIRCHER_GH_REPO": "self",
