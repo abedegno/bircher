@@ -178,3 +178,50 @@ def test_seats_exhausted_is_budget(world):
         f._dispatch(Role.AUTHOR, "claude"); f._dispatch(Role.REVIEWER, "codex")
     assert author.author_round(ctx) == "budget"
     assert s.newest_fact("r-1", EventKind.ATTEMPT_DISPATCHED).payload["role"] == "reviewer"
+
+
+def test_an_artefact_before_the_grill_is_answered_reauthors_then_stalls(world):
+    """Live on 2026-09-08: under grill=human the author wrote the spec instead
+    of questions, the kernel refused the submit (the author MUST ask at least
+    once), and the loop discarded the run as an unexpected refusal. The
+    refusal is expected: it becomes the next round's findings and the author
+    asks. A second one is the author ignoring that, which is a park."""
+    s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    assert author.author_round(ctx) == "reauthor"
+    rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
+    assert rej.payload["command_name"] == "submit_spec"
+    assert "the grill is open" in rej.payload["detail"]
+    # Nothing was submitted, so the phase has no artefact to review.
+    assert front.newest_submission(s, "r-1", "spec", 0) is None
+    assert author.author_round(ctx) == "stall"
+    assert front.newest_seat(s, "r-1", Role.AUTHOR, "spec", 0)["cause"] == rej.id
+
+
+def test_the_refusal_is_the_next_briefs_findings(world):
+    s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    author.author_round(ctx)
+    brief = author.author_brief(ctx, phase="spec").decode()
+    assert "the grill is open" in brief, "the kernel's reason must reach the author"
+
+
+def test_the_brief_tells_a_grill_human_author_to_ask_before_it_writes(world):
+    s, f, fake, ctx = world(labels=("bircher:grill", "bircher:autonomous"))
+    brief = author.author_brief(ctx, phase="spec").decode()
+    assert "ask, do not write the spec" in brief
+    assert seat.QUESTIONS_OUT in brief
+
+    # Once the human has answered, the instruction is gone: the same text on
+    # the resumed turn would tell the author not to write the spec it is now
+    # being asked for.
+    _writes(fake, seat.QUESTIONS_OUT, b"### Q1: db?\nRecommended: sqlite\n")
+    assert author.author_round(ctx) == "questions"
+    sid = list(fake.sessions)[0]
+    f.answer("sqlite", question_ids=("Q1",), cursor=fake.sessions[sid]["items"][-1]["id"])
+    assert "ask, do not write the spec" not in author.author_brief(ctx, phase="spec").decode()
+
+
+def test_a_grill_model_author_is_not_told_to_ask_first(world):
+    s, f, fake, ctx = world()
+    assert "ask, do not write the spec" not in author.author_brief(ctx, phase="spec").decode()

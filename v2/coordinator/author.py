@@ -94,7 +94,22 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     parts = [f"# Bircher {phase} author brief\n"]
     parts.append((SKILLS / f"{phase}-author" / "SKILL.md").read_text())
     parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
-    parts.append("\n## Policy\n\n```json\n%s\n```\n" % json.dumps(to_payload(policy_of(store, run_id)), indent=1))
+    pol = policy_of(store, run_id)
+    parts.append("\n## Policy\n\n```json\n%s\n```\n" % json.dumps(to_payload(pol), indent=1))
+    # The policy as an instruction, not as data. The skill describes both
+    # grills and the JSON above states which one is in force, and a spec
+    # author read that as permission to skip the asking: under grill=human it
+    # wrote the artefact on the first turn, the kernel refused the submit
+    # (spec section 1 -- the author MUST ask at least once), and the run was
+    # discarded. What the kernel enforces, the brief says in the imperative.
+    if phase == "spec" and pol.grill == "human" and front.grill_open(store, run_id):
+        parts.append(
+            "\n## This turn: ask, do not write the spec\n\n"
+            "This run is `grill: human` and the human has not answered yet. End this\n"
+            "turn with `%s` and NO `%s`. The kernel refuses a spec submitted before\n"
+            "the human has answered, so a spec written now is a turn thrown away. You\n"
+            "will be prompted again in this same session with the answers, and you\n"
+            "write the spec then.\n" % (seat.QUESTIONS_OUT, seat.ARTIFACT_OUT))
     parts.append("\n## Issue snapshot\n\n```json\n%s\n```\n" % store.read_blob(front.bundle_hash(store, run_id)).decode())
     if phase == "plan":
         parts.append("\n## The accepted spec\n\n%s\n" % store.read_blob(store.phase_artifact(run_id, "spec")).decode())
@@ -187,7 +202,17 @@ def author_round(ctx) -> str:
         msg = str(exc)
         if "human_direction" in msg:
             return "direction"
-        if "identical" in msg or "### Task" in msg or "current spec" in msg:
+        # "the grill is open" -- under grill=human the kernel refuses a spec
+        # submitted before the human has answered (spec section 1: the author
+        # MUST ask at least once). An author that wrote the artefact instead
+        # of questions is not a failed run: the refusal becomes the next
+        # round's findings through `_findings_for`, which reads a
+        # `command_rejected` cause, and the author asks. Found live on
+        # 2026-09-08, when it took the unexpected-refusal path and discarded
+        # a run that had done nothing wrong except be told "may" where the
+        # kernel meant "must".
+        if ("identical" in msg or "### Task" in msg or "current spec" in msg
+                or "the grill is open" in msg):
             seat_row = front.newest_seat(store, run_id, Role.AUTHOR, phase, n)
             cause_kind = next((x.kind for x in store.facts_for(run_id) if x.id == seat_row["cause"]), None)
             return "stall" if cause_kind == EventKind.COMMAND_REJECTED else "reauthor"

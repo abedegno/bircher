@@ -24,16 +24,21 @@ write it elsewhere first, then rename it into place, so a partial file is
 never read. Then end your turn. Do not commit, push, open anything, or write
 outside your worktree.
 
-## If you must ask
+## Asking
 
-Under `grill: human` you may end the turn with questions instead of an
-artefact. Write them to `bircher/questions.md`, one block per question:
+Under `grill: human` you MUST ask before you write anything. Your first turn
+ends with questions and NO artefact: the kernel refuses a spec submitted
+before the human has answered, so a spec written on that turn is thrown away.
+Write the questions to `bircher/questions.md`, one block per question:
 
     ### Q<n>: <the question>
     Recommended: <your recommended answer, one line>
 
 and end your turn without `bircher/artifact.md`. You will be prompted again
 with the human's answers in this same session; then write the spec.
+
+Ask what you would actually want settled before designing: the questions are
+the point of this policy, not a formality to get past.
 
 Under `grill: model` you rule yourself: write the same blocks with a third
 line `Ruling: <your decision> — <reasoning> — <cost if wrong>` to
