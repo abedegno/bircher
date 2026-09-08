@@ -1,3 +1,8 @@
+---
+name: plan-author
+description: Write the implementation plan for an accepted spec, from the frozen issue snapshot, the spec verbatim and any reviewer findings. Loaded by a Bircher v2 author session in the plan phase.
+---
+
 # plan-author
 
 You are writing the implementation plan for an accepted spec. You have the

@@ -1,3 +1,8 @@
+---
+name: spec-author
+description: Write the design spec for one GitHub issue from its frozen snapshot, the run's policy and any reviewer findings. Loaded by a Bircher v2 author session in the spec phase.
+---
+
 # spec-author
 
 You are writing the design spec for one GitHub issue. You have the frozen
