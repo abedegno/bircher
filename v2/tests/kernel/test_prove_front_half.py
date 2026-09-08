@@ -173,6 +173,15 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
     f2.answer("noted")
     assert any("beyond the approval" in x for x in prove.assert_journal(s2, "r-2", mode="approval"))
 
+    # A DIRECTION typed into a live author session at `queued`. It writes no
+    # park and no ruling -- the one human fact that leaves no other trace --
+    # so the journal half has to count it as a touch, or the zero-touch proof
+    # is blind to exactly the touch that is hardest to see any other way.
+    s3 = _store_with_confirmed_stops(tmp_path / "k3.db")
+    Front(s3, "r-3").direct("use postgres")
+    assert any("human_direction" in x for x in prove.assert_journal(s3, "r-3", mode="zero"))
+    assert any("human_direction" in x for x in prove.assert_journal(s3, "r-3", mode="approval"))
+
     # Two sess-creates sharing an obligation (same cause, same phase and
     # epoch): the first names a vendor its dispatch never claimed, and
     # neither is ever prompted or stopped. Checked under mode="human" to

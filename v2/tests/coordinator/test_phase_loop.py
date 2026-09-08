@@ -93,10 +93,15 @@ def test_model_no_gates_reaches_planned_untouched(world, monkeypatch):
     assert [v.payload["reviewer_identity"] for v in verdicts] == ["codex", "codex"]
     assert all(v.payload["reviewer_identity"] != x.payload["author"] for v, x in zip(verdicts, subs))
     assert [a[3] for a in gh] == ["1", "1"] and all("bircher: published" in a[-1] for a in gh)
-    # Every session prompted, ended, stopped.
+    # Every session prompted, ended, stopped -- and ENDED is asserted, not
+    # only claimed: the stop's cause is a turn_ended fact, so a run whose
+    # sessions were stopped without one is a run that read output before the
+    # turn was observed over.
+    ended_sessions = {x.payload["session"] for x in s.facts_of_kind("r-1", EventKind.TURN_ENDED)}
     for row in front.satisfied_effects(s, "r-1", "sess-create"):
         sid = __import__("json").loads(row["external_object_id"])["id"]
         assert any(r["intent"]["obligation"]["session"] == sid for r in front.satisfied_effects(s, "r-1", "sess-prompt"))
+        assert sid in ended_sessions, (sid, ended_sessions)
         assert any(r["intent"]["obligation"]["session"] == sid for r in front.satisfied_effects(s, "r-1", "sess-stop"))
 
 

@@ -40,7 +40,13 @@ from kernel.store import Store
 #: `zero` admits none, `approval` admits exactly the human's own approval and
 #: the gate it answers, `human` admits any of them and checks everything else
 #: unchanged.
-HUMAN = {EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING, EventKind.PARKED}
+#: HUMAN_DIRECTION is IN this set. A direction typed into a live author
+#: session at `queued` writes no park and no ruling -- it is the one human
+#: fact that leaves no other trace -- so leaving it out made the journal
+#: half of the zero-touch proof blind to exactly the touch that is hardest
+#: to see any other way.
+HUMAN = {EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING, EventKind.PARKED,
+         EventKind.HUMAN_DIRECTION}
 MODES = ("zero", "approval", "human")
 
 
