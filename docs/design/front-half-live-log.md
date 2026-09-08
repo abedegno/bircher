@@ -83,3 +83,143 @@ and a run URL, which is the opposite of vague.
 E3 takes issue 11, a design question about smart lists against folders. E4 takes
 issue 12, the workspaces and teams boundary. Both are one-sentence design prompts
 whose deliverable is a document, which keeps the first unattended merges small.
+
+## E2 — `abedegno/bircher-smoke` under `(human, {spec})`
+
+*2026-09-08. Issue #20, one deliberately vague sentence asking for a way to see
+what has been exercised.*
+
+Two runs. The first reached the grill, the gate and the plan phase and was
+cancelled at `budget_exhausted` after its journal filled with the consequences
+of a defect since fixed: three `human_direction` facts that were not the
+human's, a dozen seats spent on rounds nobody reviewed, and two grants I made
+on a false reading of what had happened. Evidence contaminated by a bug is
+worth less than a clean second attempt, so it was cancelled through the
+operator command and the database removed.
+
+The second run reached the grill park and stopped there when attention moved
+to E3 and E4. What both runs together demonstrated, live, is most of the front
+half's machinery:
+
+| Mechanism | Observed |
+|---|---|
+| The grill asks | six questions from a one-sentence issue, each recorded as a fact |
+| The human answers | one `human_answer` naming every open question id |
+| The conversation continues | the SAME session re-prompted, not a fresh one |
+| Cross-vendor rotation | claude authored, codex reviewed, codex authored the revision |
+| The spec gate | parked at `spec_accepted`, approved, advanced to `specified` |
+| Publication | the accepted spec posted to the issue as a comment |
+| A direction displaces | a direction typed into a live turn ended it and started a fresh round |
+| Four kinds of park | grill, gate, `budget_exhausted`, `identical_resubmission` |
+| The loop spinning | a plan resubmitted verbatim was refused, not accepted |
+| Cancellation | the operator command retired the run and its sessions |
+
+The questions were the interesting part. A one-sentence issue produced: what
+counts as one exercise, where the file lives, whether it absorbs the existing
+marker files, which fields each row needs, whether to backfill by inference,
+and whether automatic appending is in scope. The reviewer then caught an
+inconsistency in the ANSWERS: a "date merged" column cannot describe an
+abandoned run. That correction is in the accepted spec.
+
+## E3 — muesli under `(model, {spec})`
+
+*2026-09-08. Issue #11, "Design: lists-vs-folders mental model", one sentence,
+no file named. Run `i11-design-lists-vs-folders-mental-model-1788863221`.*
+
+| | |
+|---|---|
+| Policy | `grill=model`, `gates={spec}`, `max_rounds=3`, `max_seats=16` |
+| Spec | 3 rounds: rejected by codex, rejected by claude, accepted by codex |
+| Gate | parked; approved by the human; advanced to `specified` |
+| Plan | 5 rounds, 4 rejections, parked `bound_exhausted` |
+| Human facts | 1 answer (misfiled, see finding 11), 2 rulings, 0 directions, 4 parks |
+
+The spec converged with no questions asked of anyone: under `grill=model` the
+author ruled its own. The plan did not converge. The rejections were not
+nitpicks — the last one traced three muesli source files and showed that the
+plan's focus-restore behaviour would steal focus from the create buttons and
+overflow menus sitting in the same row, because it exempted only the two
+disclosure triggers it knew about.
+
+## E4 — muesli under `(model, {})`, unattended
+
+*2026-09-08. Issue #12, "Design: workspaces/teams boundary", one sentence.
+Run `i12-design-workspaces-teams-boundary-default-1788871358`.*
+
+| | |
+|---|---|
+| Policy | `grill=model`, `gates={}`, `max_rounds=5`, `max_seats=40` |
+| Spec | 2 rounds: rejected by codex, accepted by claude |
+| Plan | 6 rounds, 5 rejections, parked `bound_exhausted` |
+| Human facts | **zero** answers, rulings and directions; 1 park |
+
+The raised bounds came from a Project config created for this run, after E2
+and E3 both stopped at three rounds. They did not change the outcome: the plan
+failed at five rounds as it had at three.
+
+**This is the run that answers the claim, and the answer is half.** A vague
+issue reached an accepted, published, cross-vendor-reviewed spec with no human
+in the loop at all. It did not reach `planned`, so it did not reach a merged
+pull request. The front half's spec phase works unattended; its plan phase
+does not.
+
+## What the plan phase does
+
+Three runs, two repositories, two policies, two round limits:
+
+| Run | Spec rounds to accept | Plan rounds | Plan accepted |
+|---|---|---|---|
+| E2 (smoke, human grill) | 2 (first run) | 4 | no |
+| E3 (muesli, 3-round bound) | 3 | 5 | no |
+| E4 (muesli, 5-round bound) | 2 | 6 | no |
+
+Specs converge in two or three rounds every time. Plans converge never. Since
+raising the bound changed nothing, "plans need a little more room" is ruled
+out. Three hypotheses remain, and they are distinguishable by reading the
+rounds: reviewers hold plans to a standard no author reaches; authors do not
+absorb findings between rounds (E2 resubmitted a plan verbatim, including the
+defect it had just been told about); or the plan format demanded of a design
+issue is wrong for the work, since the plan skill asks for a failing test, the
+code and the commit, and a design document has none of those.
+
+That is the first thing to settle before the front half is claimed to work.
+
+## What the live runs found
+
+Twelve defects, none reachable from a test suite of 1427 tests, because the
+tests were written from the same assumptions as the code. Nine fixed, three
+open.
+
+| # | Finding | State |
+|---|---|---|
+| 1 | The coordinator read its own stop as a human direction: every interrupted turn's "[System: interrupted]" notice was a user-role item | fixed |
+| 2 | Two skill files lacked YAML frontmatter, so every bundle upload 400'd and no wave could start | fixed |
+| 3 | The runner never passed the target repo to its queue generator: a wave aimed at the smoke repo would have drained muesli's backlog | fixed |
+| 4 | The skill said the author MAY ask under `grill=human` where the kernel says it MUST; the loop had no handler for the refusal | fixed |
+| 5 | A missing label halted a run mid-edit, leaving the issue with neither label | fixed |
+| 6 | Preflight did not check the label vocabulary it would set | fixed |
+| 7 | A resumed author was not told its draft had been moved aside, so it wrote nothing and the coordinator polled an empty path for the full cap | fixed |
+| 8 | A park is invisible: omnigent's inbox counts elicitations, which nothing raises | fixed — the park now comments on its issue |
+| 9 | The notice did not say a reply is read by the next wave, not when it is sent | fixed |
+| 10 | Under `grill=model` the model's own questions made every human message an "answer", so a gate approval was eaten and the gate was unreachable on the DEFAULT policy | fixed |
+| 11 | A not-delivered effect is never retried: its key names the run and the label, so it can only ever be attempted once | open |
+| 12 | A parked run can become unreachable from the runner — the queue file is consumed and the issue loses its label, so neither source finds it | open |
+| 13 | The human's control channel is a live agent session: every reply wakes a model, which echoes, costs a turn, and could act | open |
+
+Four of them are one shape: a condition testing a proxy rather than the thing
+it meant. Unanswered questions stood in for "the human owes an answer". The
+phase's newest prompt stood in for "the awaited turn". A live process stood in
+for "work is happening". A user-role message stood in for "a person spoke".
+Each was right in the case it was written against and wrong in a neighbour.
+
+## Verdict
+
+The kernel did its job throughout. Every refusal in these runs was correct,
+including the ones that cost hours: the spec submitted before the human had
+answered, the plan resubmitted unchanged, the outcome the runner tried to
+write over a run the coordinator owned. Nothing was corrupted, and every
+recovery was possible from the journal.
+
+The front half is not finished. Its spec half works unattended, which is the
+harder and more valuable half. Its plan half does not converge, and until it
+does the claim of *The claim* is not met.

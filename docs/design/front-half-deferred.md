@@ -85,3 +85,30 @@ untested branches, duplicated work, and naming the next change should tidy.
   round only when no park is current. A guard against the divergence was written, found to starve
   the replies it was meant to protect, and reverted; the invariant is stated in the sender's
   docstring instead. Any change that sends a prompt outside a park has to re-establish it.
+
+## Raised by the live runs (2026-09-08)
+
+Three findings from E2 to E4 that were not fixed. The full record, including
+the nine that were, is in `front-half-live-log.md`.
+
+- **A not-delivered effect is never retried.** `running:20` carries no
+  generation in its key, so once reconciled the key is spent and the label swap
+  the run intended never happens. Harmless where it was seen, but it is a key
+  that says "this run's running label" and can therefore only ever be attempted
+  once. Decide whether a reconciled-as-not-delivered effect should be
+  re-attempted under a fresh generation.
+- **A parked run can become unreachable from the runner.** Taking an item
+  consumes the queue file and swaps the issue's queued label for running. If
+  the run then parks, launching from issues skips it and launching from the
+  queue finds no file, while the run sits alive in the journal with a current
+  park. Recovery needs a human to re-add the label. Resumption should be driven
+  by the journal — an open run with a current park is exactly what the next
+  wave should pick up — not by two pieces of external state that can both be
+  gone.
+- **The human's control channel is a live agent session.** The park prompt goes
+  into the author's own session, so a reply wakes a model: it echoes the word
+  back, which makes a working reply look like a no-op, it costs a turn, and it
+  has a shell and a worktree. Nothing bad has happened, but an agent woken by a
+  reply could write to the watched artefact path. Either stop the session
+  before parking, so a reply sits unread until a wave reads it, or tell the
+  agent in the park prompt that replies are addressed to the coordinator.
