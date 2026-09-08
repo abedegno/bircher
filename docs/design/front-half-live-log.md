@@ -163,15 +163,86 @@ in the loop at all. It did not reach `planned`, so it did not reach a merged
 pull request. The front half's spec phase works unattended; its plan phase
 does not.
 
+## E5 — the rotation experiment, muesli issue 12 again
+
+*2026-09-08, evening. `BIRCHER_AUTHOR_ROTATION=fixed`: the phase keeps its
+author; the reviewer, being the other vendor, is therefore fixed too.
+Run `i12-design-workspaces-teams-boundary-default-1788882864`.*
+
+| Spec round | Author | Draft | Reviewer | Verdict | Findings |
+|---|---|---|---|---|---|
+| 1 | claude | 19 KB | codex | revise | 3.7 KB |
+| 2 | claude | 36 KB | codex | revise | 3.9 KB |
+| 3 | claude | 50 KB | codex | revise | 1.8 KB |
+| 4 | claude | 64 KB | codex | revise | 1.8 KB |
+| 5 | claude | 77 KB | codex | revise | 2.0 KB |
+| 6 | claude | 92 KB | codex | — | bound exhausted |
+
+A clean negative. The same issue passed its spec in two rounds at 15 KB under
+rotation; with a fixed author it grew by about 14 KB a round and never passed.
+Every finding became an addition, nothing was ever cut, and a fresh reviewer
+kept finding real contradictions in an ever-larger document — the last review
+found a revocation race and a projection leaking metadata beyond the
+document's own stated grant. Accumulation without a way to refuse a finding is
+a growth spiral, and rotation was doing real work for specs by forcing each
+round to consolidate.
+
+## E6 — the disposition experiment, muesli issue 12 again
+
+*2026-09-08, evening. `BIRCHER_REVIEW_DISPOSITIONS=on`, rotation back on.
+Run `i12-design-workspaces-teams-boundary-default-1788888080`.*
+
+Three changes, borrowed from the loop that works elsewhere
+(chaseai-yt/claudex-loop), none of them to the kernel's rules: findings carry
+a severity and FAIL needs a high or medium one; a revision ends with a
+`## Dispositions` section answering every prior finding by number, accepted
+with what changed or rejected with why, inside the artefact so it is hashed
+and reviewed; and the reviewer's brief carries the previous round's findings
+with the instruction not to re-raise what was resolved, and to re-raise a
+rejection only with new evidence.
+
+| Round | Author | Draft | Reviewer | Blocking (high+medium) | Verdict |
+|---|---|---|---|---|---|
+| spec 1 | claude | 24 KB | codex | 6 | revise |
+| spec 2 | codex | 16 KB | claude | 1 | revise |
+| spec 3 | claude | 19 KB | codex | 1 | revise |
+| spec 4 | codex | 16 KB | claude | 0 | **accept** |
+| plan 1 | codex | 19 KB | claude | 1 | revise |
+| plan 2 | claude | 23 KB | codex | 1 | revise |
+| plan 3 | codex | 19 KB | claude | 2 | revise |
+| plan 4 | claude | 20 KB | codex | 1 | revise |
+| plan 5 | codex | 19 KB | claude | 0, two low | **accept** |
+
+**Both phases converged, with zero human facts in the journal.** No park, no
+answer, no ruling, no direction. Draft sizes stayed between 16 and 24 KB
+throughout. The remaining findings each round were new and specific, not
+relitigation — undefined pagination, then unfiltered soft-deletes — and every
+one was dispositioned as accepted with a concrete change. The last plan
+review carried two low findings and passed, which is the severity rule doing
+what it was written for.
+
+`python -m tools.prove_front_half --issues docs/design/preregistered.txt`
+over this run prints **`PROOF: PASS`** — the done criterion of *The claim* —
+after one fix to the proof itself (finding 13).
+
+**Then the existing back half took over**, implemented the accepted plan,
+pushed branch `i12-team-sharing`, and opened muesli PR #757: 5,297 additions.
+Its session then died with a runner error, the Claude subscription's five-hour
+limit, while watching CI. The Go job on that PR is red and the cross-vendor
+review never ran, so the PR is open and unmerged. That is the v1 pipeline's
+failure, on cost and a failing test, after the v2 front half had done its job.
+
 ## What the plan phase does
 
 Three runs, two repositories, two policies, two round limits:
 
-| Run | Spec rounds to accept | Plan rounds | Plan accepted |
-|---|---|---|---|
-| E2 (smoke, human grill) | 2 (first run) | 4 | no |
-| E3 (muesli, 3-round bound) | 3 | 5 | no |
-| E4 (muesli, 5-round bound) | 2 | 6 | no |
+| Run | Loop | Spec rounds to accept | Plan rounds | Plan accepted |
+|---|---|---|---|---|
+| E2 (smoke, human grill) | rotate | 2 (first run) | 4 | no |
+| E3 (muesli, 3-round bound) | rotate | 3 | 5 | no |
+| E4 (muesli, 5-round bound) | rotate | 2 | 6 | no |
+| E5 (muesli, fixed author) | fixed | never (6, growing) | — | — |
+| E6 (muesli, dispositions) | rotate + dispositions | 4 | 5 | **yes** |
 
 Specs converge in two or three rounds every time. Plans converge never. Since
 raising the bound changed nothing, "plans need a little more room" is ruled
@@ -182,13 +253,17 @@ defect it had just been told about); or the plan format demanded of a design
 issue is wrong for the work, since the plan skill asks for a failing test, the
 code and the commit, and a design document has none of those.
 
-That is the first thing to settle before the front half is claimed to work.
+E5 and E6 settled it. Rounds were not the lever (E4 at five rounds failed
+like E3 at three), and neither was a fixed author (E5 grew without bound).
+The lever was letting an author refuse a finding on the record and telling
+the reviewer not to relitigate what was resolved. With that, the same epic
+issue that failed three times passed both phases in nine rounds unattended.
 
 ## What the live runs found
 
-Twelve defects, none reachable from a test suite of 1427 tests, because the
-tests were written from the same assumptions as the code. Nine fixed, three
-open.
+Thirteen defects, none reachable from a test suite that ended the day at
+1437 tests, because the tests were written from the same assumptions as the
+code. Ten fixed, three open.
 
 | # | Finding | State |
 |---|---|---|
@@ -205,6 +280,7 @@ open.
 | 11 | A not-delivered effect is never retried: its key names the run and the label, so it can only ever be attempted once | open |
 | 12 | A parked run can become unreachable from the runner — the queue file is consumed and the issue loses its label, so neither source finds it | open |
 | 13 | The human's control channel is a live agent session: every reply wakes a model, which echoes, costs a turn, and could act | open |
+| 14 | The proof read the server's cancellation notice as an unrecorded prompt, failing the first run that converged unattended on four sessions | fixed |
 
 Four of them are one shape: a condition testing a proxy rather than the thing
 it meant. Unanswered questions stood in for "the human owes an answer". The
@@ -220,6 +296,9 @@ answered, the plan resubmitted unchanged, the outcome the runner tried to
 write over a run the coordinator owned. Nothing was corrupted, and every
 recovery was possible from the journal.
 
-The front half is not finished. Its spec half works unattended, which is the
-harder and more valuable half. Its plan half does not converge, and until it
-does the claim of *The claim* is not met.
+The claim of *The claim* is met, once, on the last run of the day: a
+pre-registered vague issue to an accepted spec and an accepted plan with zero
+human facts, `PROOF: PASS`, and the existing back half opening a real pull
+request from the result. It took a mechanism the spec did not have — the
+disposition step — and it is a sample of one. The front half is finished
+enough to be argued about; the numbers above are what to argue from.

@@ -88,8 +88,8 @@ untested branches, duplicated work, and naming the next change should tidy.
 
 ## Raised by the live runs (2026-09-08)
 
-Three findings from E2 to E4 that were not fixed. The full record, including
-the nine that were, is in `front-half-live-log.md`.
+Three findings from E2 to E6 that were not fixed. The full record, including
+the ten that were, is in `front-half-live-log.md`.
 
 - **A not-delivered effect is never retried.** `running:20` carries no
   generation in its key, so once reconciled the key is spent and the label swap
