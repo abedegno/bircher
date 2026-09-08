@@ -263,24 +263,38 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
     elif cmd.name == "issue_review_brief":
         from kernel import brief as _brief
         from kernel.policy import policy_of, policy_version
+        import os
         artifact_hash = store.phase_artifact(cmd.run_id, phase)
         bundle_h = front.bundle_hash(store, cmd.run_id)
         spec_hash = store.phase_artifact(cmd.run_id, "spec") if phase == "plan" else None
+        # The disposition experiment (2026-09-08): template 2 attaches the
+        # previous round's findings so the reviewer can honour the author's
+        # dispositions instead of re-deriving every objection against a
+        # fresh read. The fact records the template and the prior hash, so
+        # the proof re-renders exactly what was issued. Off by default.
+        template = _brief.TEMPLATE_VERSION
+        prior_hash = None
+        if os.environ.get("BIRCHER_REVIEW_DISPOSITIONS") == "on":
+            template = _brief.DISPOSITION_TEMPLATE_VERSION
+            prev = front.newest_review_verdict(store, cmd.run_id, phase, epoch_n)
+            prior_hash = prev.payload.get("findings_hash") if prev is not None else None
         rendered = _brief.render(
             phase=phase, artefact=store.read_blob(artifact_hash), bundle=store.read_blob(bundle_h),
             spec=None if spec_hash is None else store.read_blob(spec_hash),
             policy=policy_of(store, cmd.run_id), base_sha=store.run_base_sha(cmd.run_id),
-            template=_brief.TEMPLATE_VERSION,
+            template=template,
+            prior_findings=None if prior_hash is None else store.read_blob(prior_hash),
         )
         brief_hash = put_artifact(store, rendered)
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.REVIEW_BRIEF_ISSUED, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"phase": phase, "epoch": epoch_n, "generation": cmd.generation,
-                     "brief_hash": brief_hash, "brief_template": _brief.TEMPLATE_VERSION,
+                     "brief_hash": brief_hash, "brief_template": template,
                      "artifact_hash": artifact_hash, "context_bundle_hash": bundle_h,
                      "policy_version": policy_version(store, cmd.run_id),
-                     "base_sha": store.run_base_sha(cmd.run_id), "spec_hash": spec_hash},
+                     "base_sha": store.run_base_sha(cmd.run_id), "spec_hash": spec_hash,
+                     "prior_findings_hash": prior_hash},
         )
     elif cmd.name == "revise_bundle":
         import json

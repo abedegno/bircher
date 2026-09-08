@@ -277,3 +277,30 @@ def test_fixed_mode_keeps_the_phases_author(world, monkeypatch):
     # by the author's own vendor, so the cross-vendor guarantee is untouched.
     from coordinator import review
     assert review.choose_reviewer_vendor(ctx) != first
+
+
+def test_a_revision_brief_requires_dispositions_when_on(world, monkeypatch):
+    """The disposition experiment: on a revision the author must answer each
+    finding by number, accepted or rejected with a reason, inside the
+    artefact -- so a wrong finding can be refused on the record and the
+    document stops growing."""
+    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
+    s, f, fake, ctx = world()
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    author.author_round(ctx)
+    f.review_round("request_revision")
+    brief = author.author_brief(ctx, phase="spec").decode()
+    assert "## Findings to address" in brief
+    assert "## Dispositions are required" in brief
+    assert "rejected —" in brief and "accepted —" in brief
+
+
+def test_a_first_draft_and_the_default_mode_ask_for_no_dispositions(world, monkeypatch):
+    monkeypatch.delenv("BIRCHER_REVIEW_DISPOSITIONS", raising=False)
+    s, f, fake, ctx = world()
+    assert "Dispositions" not in author.author_brief(ctx, phase="spec").decode()
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    author.author_round(ctx)
+    f.review_round("request_revision")
+    assert "Dispositions" not in author.author_brief(ctx, phase="spec").decode(), \
+        "off by default: the spec's brief is unchanged"

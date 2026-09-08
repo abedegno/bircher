@@ -94,6 +94,16 @@ def newest_submission(store, run_id: str, phase: str, epoch_n: int):
     return subs[-1] if subs else None
 
 
+def newest_review_verdict(store, run_id: str, phase: str, epoch_n: int):
+    """The newest reviewer verdict of this phase and epoch, or None. Human
+    rulings are not verdicts: a `human_ruling` carries no findings a next
+    round could disposition."""
+    vs = [f for f in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT)
+          if f.payload.get("ruling") == "review_ruling"
+          and f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n]
+    return vs[-1] if vs else None
+
+
 def _newest_seq(store, run_id: str, *kinds: str) -> int:
     facts = store.facts_of_kind(run_id, *kinds)
     return facts[-1].seq if facts else 0

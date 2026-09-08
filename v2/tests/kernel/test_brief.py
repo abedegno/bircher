@@ -40,9 +40,11 @@ def test_render_requires_the_spec_for_a_plan_and_refuses_it_for_a_spec():
     with pytest.raises(ValueError, match="spec"):
         brief.render(phase="spec", artefact=b"# S", bundle=b"{}", spec=b"# S",
                      policy=Policy(), base_sha="0" * 40, template=1)
+    # An unknown template number is refused. 2 exists now (the disposition
+    # experiment), so the unknown one is 99.
     with pytest.raises(ValueError, match="template"):
         brief.render(phase="spec", artefact=b"# S", bundle=b"{}", spec=None,
-                     policy=Policy(), base_sha="0" * 40, template=2)
+                     policy=Policy(), base_sha="0" * 40, template=99)
     out = brief.render(phase="plan", artefact=b"# P", bundle=b"{}", spec=b"# THE SPEC",
                        policy=Policy(), base_sha="0" * 40, template=1)
     assert b"# THE SPEC" in out
@@ -135,3 +137,73 @@ def test_a_brief_from_a_previous_epoch_does_not_bind(tmp_path):
                "policy_version": front.policy_version(s, "r-1"), "findings_hash": put_artifact(s, b"x")}
     with pytest.raises(Exception):          # OwnershipLost: g is superseded
         f._cmd(g, "record_review", payload)
+
+
+def test_template_2_carries_the_prior_round_and_the_verdict_rule():
+    """The disposition experiment. Template 2 differs from the spec's template
+    in exactly three ways: findings carry a severity tag, FAIL needs a high or
+    medium finding, and the previous round's findings ride along with an
+    instruction not to relitigate what the author's Dispositions resolved."""
+    prior = b"1. [medium] the cap is not in the spec\n\nVERDICT: FAIL deadbeef\n"
+    a = brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
+                     policy=Policy(), base_sha="0" * 40, template=2, prior_findings=prior)
+    text = a.decode()
+    assert "[high]" in text and "[medium]" in text and "[low]" in text
+    assert "FAIL only if at least one `[high]` or `[medium]`" in text
+    assert "## The previous round's findings" in text
+    assert content_hash(prior)[:8] in text or content_hash(prior) in text
+    assert "the cap is not in the spec" in text
+    assert "Do not raise it" in text and "NEW evidence" in text
+    # Pure, like template 1: same inputs, same bytes.
+    assert a == brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
+                             policy=Policy(), base_sha="0" * 40, template=2, prior_findings=prior)
+    # A first round has no prior: the section is simply absent.
+    first = brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
+                         policy=Policy(), base_sha="0" * 40, template=2).decode()
+    assert "## The previous round's findings" not in first
+
+
+def test_template_1_is_untouched_and_refuses_a_prior():
+    """The spec's template renders the same bytes it always did; the proof
+    re-renders it over its named objects and it names no prior round."""
+    a = brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
+                     policy=Policy(), base_sha="0" * 40, template=1).decode()
+    assert "[high]" not in a and "previous round" not in a
+    with pytest.raises(ValueError, match="template 1 carries no prior"):
+        brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
+                     policy=Policy(), base_sha="0" * 40, template=1, prior_findings=b"x")
+
+
+def test_issue_review_brief_attaches_the_previous_rounds_findings_when_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.author_round(SPEC_BYTES)
+    f.review_round("request_revision")                   # round 1's findings
+    prev = front.newest_review_verdict(s, "r-1", "spec", 0)
+    assert prev is not None and prev.payload.get("findings_hash")
+    h2 = f.author_round(SPEC_BYTES + b"\nrevised\n")     # round 2's draft
+    g = f._dispatch(Role.REVIEWER, "codex")
+    f._cmd(g, "issue_review_brief", {"phase": "spec"})
+    p = s.newest_fact("r-1", EventKind.REVIEW_BRIEF_ISSUED).payload
+    assert p["brief_template"] == brief.DISPOSITION_TEMPLATE_VERSION
+    assert p["prior_findings_hash"] == prev.payload["findings_hash"]
+    stored = s.read_blob(p["brief_hash"])
+    expected = brief.render(phase="spec", artefact=s.read_blob(h2),
+                            bundle=s.read_blob(front.bundle_hash(s, "r-1")), spec=None,
+                            policy=Policy(gates=frozenset()), base_sha="0" * 40,
+                            template=2, prior_findings=s.read_blob(prev.payload["findings_hash"]))
+    assert stored == expected, "the fact names everything the proof needs to re-render"
+
+
+def test_issue_review_brief_uses_template_1_when_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("BIRCHER_REVIEW_DISPOSITIONS", raising=False)
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    f.author_round(SPEC_BYTES)
+    f.review_round("request_revision")
+    f.author_round(SPEC_BYTES + b"\nrevised\n")
+    g = f._dispatch(Role.REVIEWER, "codex")
+    f._cmd(g, "issue_review_brief", {"phase": "spec"})
+    p = s.newest_fact("r-1", EventKind.REVIEW_BRIEF_ISSUED).payload
+    assert p["brief_template"] == 1 and p["prior_findings_hash"] is None

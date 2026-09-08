@@ -56,6 +56,11 @@ CONTRACT = {
     # the spec's rotation; "fixed" keeps the phase's author across its rounds.
     # Operator-supplied; nothing in shell assigns it.
     "BIRCHER_AUTHOR_ROTATION": "operator",
+    # The disposition experiment (2026-09-08). "on" renders review brief
+    # template 2 and requires a Dispositions section of a revision. Read by
+    # the kernel's issue_review_brief and the coordinator's author_brief from
+    # the same exported operator environment. Nothing in shell assigns it.
+    "BIRCHER_REVIEW_DISPOSITIONS": "operator",
     "BIRCHER_REVIEW_LOG": "operator",
     "MAIN_BRANCH": "operator",
     "BIRCHER_GH_REPO": "self",

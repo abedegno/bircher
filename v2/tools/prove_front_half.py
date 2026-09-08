@@ -185,6 +185,8 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
             bundle=store.read_blob(bp["context_bundle_hash"]),
             spec=None if bp["spec_hash"] is None else store.read_blob(bp["spec_hash"]),
             policy=pol, base_sha=bp["base_sha"], template=bp["brief_template"],
+            prior_findings=(None if bp.get("prior_findings_hash") is None
+                            else store.read_blob(bp["prior_findings_hash"])),
         )
         if data != rendered:
             fails.append(f"brief {bp['brief_hash'][:12]} is not render() over its named objects")

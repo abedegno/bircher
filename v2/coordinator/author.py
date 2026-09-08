@@ -158,6 +158,24 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
         parts.append("\n## Your previous draft\n\n%s\n" % store.read_blob(prior.payload["hash"]).decode())
     if findings:
         parts.append("\n## Findings to address\n\n%s\n" % findings.decode("utf-8", "replace"))
+        if os.environ.get("BIRCHER_REVIEW_DISPOSITIONS") == "on":
+            # The disposition experiment (2026-09-08). Without this an author
+            # can only obey: every finding becomes an addition, the document
+            # grows, and the next reviewer re-derives everything against the
+            # larger surface (a spec went 19KB -> 92KB in six rounds that
+            # way). With it, a wrong finding can be refused on the record,
+            # and the reviewer is told not to relitigate what was resolved.
+            parts.append(
+                "\n## Dispositions are required\n\n"
+                "End the artefact with a section headed `## Dispositions` that answers\n"
+                "EVERY finding above by its number, one line each, in one of two forms:\n\n"
+                "    N. accepted — <what changed, in one sentence>\n"
+                "    N. rejected — <why the finding is wrong or out of scope>\n\n"
+                "Reject when a finding is wrong, adds scope the spec did not decide, or\n"
+                "asks for something the issue rules out; say why. Do not accept a finding\n"
+                "you cannot address in this revision. The reviewer reads this section\n"
+                "first and will not re-raise a finding you resolved or refused with\n"
+                "reasons, so the section is how the document stops growing.\n")
     return "".join(parts).encode()
 
 

@@ -260,3 +260,24 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
         }, "")
     fetch4, sessions4, listed4 = _fake_fetch_for(s)
     assert any(sid8 in x and "satisfied stops" in x for x in prove.assert_sessions(s, "r-1", fetch=fetch4))
+
+
+def test_the_proof_re_renders_a_template_2_brief_over_its_prior_findings(tmp_path, monkeypatch):
+    """The disposition experiment issues template 2 briefs that carry the
+    previous round's findings. The REVIEW_BRIEF_ISSUED fact names that prior
+    by hash, and the proof must re-render with it -- otherwise every brief of
+    an experiment run reads as "not render() over its named objects"."""
+    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    _review_round_with_real_brief(f, verdict="request_revision")   # round 1: findings exist now
+    f.author_round(SPEC_BYTES + b"\n## Dispositions\n\n1. accepted\n")
+    _review_round_with_real_brief(f)                               # round 2's brief carries round 1's findings
+    issued = [x for x in s.facts_for("r-1") if x.kind == EventKind.REVIEW_BRIEF_ISSUED]
+    assert issued[-1].payload["brief_template"] == 2
+    assert issued[-1].payload["prior_findings_hash"] is not None
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    assert prove.assert_journal(s, "r-1", mode="zero") == []
