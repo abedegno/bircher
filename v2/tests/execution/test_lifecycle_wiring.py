@@ -233,6 +233,13 @@ _NO_KERNEL_OUTCOME = {
 #: recording it here would end a run the next pass has to resume, and the
 #: resume would then find a run at `ended` and skip the item forever.
 _RUN_NOT_OVER = {
+    "the run stays open until they are reconciled":
+        "the halt this pass itself caused. `run_loop` returns FAILED when an "
+        "effect goes uncertain, and that HALTS the run rather than ending it: "
+        "the queue file stays, and spec §5's skip-until-reconciled path takes "
+        "the item on every later pass until a human resolves the keys. A "
+        "terminal outcome here would close a run that still holds an effect "
+        "nobody has resolved, and the resume would then skip the item forever",
     '"parked"':
         "the run is waiting on a human. The queue file stays where it is and "
         "the sidecar names the run, so the next pass resumes THIS run rather "

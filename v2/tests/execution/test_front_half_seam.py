@@ -442,6 +442,46 @@ def test_parked_rc_writes_the_sidecar_and_keeps_the_queue_file(tmp_path):
     assert "_kernel_record_run_outcome" not in d.names, d.names
 
 
+def test_a_halt_this_pass_caused_keeps_the_queue_file_and_escalates(tmp_path):
+    """`run_loop` returns Exit.FAILED when an effect goes uncertain and HALTS
+    the run -- so the run is not over, it is waiting to be reconciled. The
+    `*)` branch recorded `failed` and moved the queue file to processed, and
+    spec §5's skip-until-reconciled path could then never see the item again:
+    all three of its `escalated` skip rows fire only for a run still in the
+    queue. The halt stayed, and nothing ever came back to it."""
+    pending = {"halted": True, "pending": ["sess-prompt:s-1:7:f-9"]}
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1",
+        "T_PENDING": json.dumps(pending),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    # A halted run has no terminal outcome: recording one would close a run
+    # that still holds an effect nobody has resolved.
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    note = d.args_of("json_row")[7]
+    assert d.args_of("_kernel_run_start")[0] in note, note      # names the run
+    assert "sess-prompt:s-1:7:f-9" in note, note                # names the pending key
+    assert "_create_session" not in d.names, d.names
+
+
+def test_a_genuine_failure_with_nothing_pending_still_records_failed(tmp_path):
+    """The other side of the same branch, unchanged: `phases` failed and the
+    run holds nothing, so the run IS over -- terminal outcome, `failed` row,
+    queue file consumed."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["failed"], d.calls
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not (d.queue_dir / f"{ITEM}.md").exists()
+
+
 # --- 3. the state read back after start_implementation -----------------------
 
 def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp_path):

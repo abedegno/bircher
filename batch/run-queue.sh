@@ -4374,10 +4374,25 @@ run_item() {
       json_row "$item" "" "parked" "false" "" "" 0 "parked: $(printf '%s' "$_park" | _json_get reason)" "parked" >> "$SCORECARD"
       return 0 ;;                                   # the queue file stays where it is
     *)
-      echo "[batch] $item: phases exited $_prc; recording failed" >&2
-      # Same reason as the refusal above: the run is over, so a sidecar saying
-      # it is parked would outlive what it describes.
+      # Same reason as the refusal below: whichever way this ends, the run is
+      # not PARKED, so a sidecar saying it is would outlive what it describes.
       rm -f "$QUEUE/$code.parked"
+      # A HALT THIS PASS CAUSED MUST NOT CONSUME THE QUEUE FILE (spec §5).
+      # `run_loop` returns Exit.FAILED when an effect goes uncertain, and that
+      # HALTS the run: it is not over, it is waiting to be reconciled.
+      # Recording a terminal `failed` and moving the file to processed put the
+      # item beyond the skip-until-reconciled path above, whose three
+      # `escalated` rows fire only for a run still IN the queue -- so the halt
+      # stayed, and nothing ever came back to it. The row is the handoff, same
+      # as there: it names the run and the keys a human has to resolve.
+      local _ph_pend; _ph_pend=$(_kernel_pending "${BIRCHER_RUN_ID:-}")
+      if _pending_blocks "$_ph_pend"; then
+        echo "[batch] $item: phases exited $_prc and run $BIRCHER_RUN_ID is halted or holds pending effects; keeping the queue file until reconciled: $_ph_pend" >&2
+        mkdir -p "$(dirname "$SCORECARD")"
+        json_row "$item" "" "escalated" "false" "" "" 0 "phases rc=$_prc halted run '$BIRCHER_RUN_ID' or left an effect unresolved; the run stays open until they are reconciled: $_ph_pend" "n/a" >> "$SCORECARD"
+        return 0
+      fi
+      echo "[batch] $item: phases exited $_prc; recording failed" >&2
       _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "failed" "false" "" "" 0 "phases rc=$_prc" "failed" >> "$SCORECARD"
