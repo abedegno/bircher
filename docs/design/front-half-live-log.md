@@ -62,3 +62,24 @@ threaded through it never reaches the harness that reads it.
 `feat/front-half`, fetched from a git bundle copied into the container rather than
 from GitHub: the branch is unpushed, and deploying a test checkout is not a reason to
 publish 53 commits. `/workspaces/bircher` is untouched and still runs v1 from `main`.
+
+## Pre-registered
+
+*Written 2026-09-08, before E3 and E4 ran.*
+
+The vague-issue list exists so the front half cannot be credited for work the issue
+already specified. An issue qualifies only if its body names no file, no function and
+no acceptance test — if the spec phase had nothing to decide, a spec that reads well
+proves nothing.
+
+`docs/design/preregistered.txt` holds the numbers, and the proof script reads it with
+`--issues`, refusing a run whose issue is not on the list. The ten open muesli issues
+that qualify: 1, 4, 5, 6, 7, 8, 9, 10, 11, 12.
+
+Two open issues were excluded on purpose. Issue 565 says in its own body that it is
+not queued for autonomous work. Issue 756 is a build failure naming the failing job
+and a run URL, which is the opposite of vague.
+
+E3 takes issue 11, a design question about smart lists against folders. E4 takes
+issue 12, the workspaces and teams boundary. Both are one-sentence design prompts
+whose deliverable is a document, which keeps the first unattended merges small.
