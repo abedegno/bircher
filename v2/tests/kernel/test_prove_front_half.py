@@ -281,3 +281,27 @@ def test_the_proof_re_renders_a_template_2_brief_over_its_prior_findings(tmp_pat
     f.author_round(PLAN_BYTES)
     _review_round_with_real_brief(f)
     assert prove.assert_journal(s, "r-1", mode="zero") == []
+
+
+def test_the_servers_cancellation_notice_is_not_an_unrecorded_prompt(tmp_path):
+    """A cancelled turn leaves a user-role item the server wrote, response_id
+    `cancel_...`. The coordinator ignores it; the proof must too, or every
+    session stopped mid-work fails the zero-touch assertion. A real message
+    that is no prompt still fails."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    _review_round_with_real_brief(f)
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    fetch, sessions, listed = _fake_fetch_for(s)
+    assert prove.assert_sessions(s, "r-1", fetch=fetch) == []
+    sid = next(iter(sessions))
+    sessions[sid]["items"].append({"id": "it-cancel", "role": "user", "response_id": "cancel_9f1",
+                                   "content": [{"type": "input_text", "text": "[System: interrupted]\nabandoned"}]})
+    assert prove.assert_sessions(s, "r-1", fetch=fetch) == [], "the server's own item is not a touch"
+    sessions[sid]["items"].append({"id": "it-human", "role": "user", "response_id": "turn_abc",
+                                   "content": [{"type": "input_text", "text": "please use postgres"}]})
+    fails = prove.assert_sessions(s, "r-1", fetch=fetch)
+    assert any("it-human" in x and "no prompt_item" in x for x in fails), fails

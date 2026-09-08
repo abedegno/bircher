@@ -27,6 +27,7 @@ import argparse
 import json
 import sys
 
+from coordinator.human import _is_cancellation_notice
 from coordinator.session import _fetch, list_items
 from coordinator.sessions import list_sessions
 from kernel import brief, front
@@ -249,7 +250,14 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
         except Exception as exc:  # noqa: BLE001
             fails.append(f"session {sid}: items could not be read: {exc}")
             continue
-        users = [it for it in items if it["role"] == "user"]
+        # The server writes one user-role item itself: the "[System:
+        # interrupted]" notice a cancelled turn leaves, response_id `cancel_...`
+        # where every real message is `turn_...`. It is not a touch by anyone,
+        # and the coordinator already ignores it (human._is_cancellation_notice);
+        # the proof must use the SAME rule, or every session the coordinator
+        # stopped mid-work reads as an unrecorded prompt -- four of them on the
+        # first run that converged unattended (2026-09-08).
+        users = [it for it in items if it["role"] == "user" and not _is_cancellation_notice(it)]
         for it in users:
             if it["id"] not in prompt_items and content_hash(it["text"].encode()) not in prompt_hashes:
                 fails.append(
