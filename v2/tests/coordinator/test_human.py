@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from coordinator import human, phases, seat, sessions
+from coordinator import human, phases, seat
 from coordinator.effects import KERNEL
 from kernel import front
 from kernel.dispatch import Role
@@ -307,16 +307,8 @@ def test_a_dismissals_reply_goes_to_its_own_session_and_is_owed_once(world):
     assert human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch)) == "dismissed"
     d = s.newest_fact("r-1", EventKind.HUMAN_ITEM_DISMISSED)
     assert d.payload["session_id"] == sid and d.payload["phase"] == "spec" and d.payload["epoch"] == 0
-    newer, g_newer = _session_with_prompt(s, f, fake, ctx, text=b"a newer session")
+    newer, _ = _session_with_prompt(s, f, fake, ctx, text=b"a newer session")
     assert newer != sid
-    # The newer session's turn is RECORDED before the reply is asked for. It
-    # is not what this test is about, but a prompt sent into a phase whose
-    # newest prompt is an awaited turn would displace that turn's record
-    # (spec §3), and `_send` now holds such a reply back -- see
-    # `test_a_reply_owed_to_an_older_session_does_not_displace_the_seats_turn`.
-    ctx.generation = g_newer
-    seat.command(ctx, "record_turn_ended", {"session": newer, "ended": "file"})
-    ctx.generation = f._dispatch(Role.OPERATOR, "runner")
     assert len(human.reply_refusals(ctx)) == 1
     assert "not legal from state 'spec_submitted'" in fake.sessions[sid]["items"][-1]["content"][0]["text"]
     assert not any("Bircher refused" in it["content"][0]["text"] for it in fake.sessions[newer]["items"])
@@ -388,112 +380,3 @@ def test_the_humans_message_past_the_first_page_is_still_unread(world):
     listing = list_items("http://srv", sid, fetch=fake.fetch)
     assert listing[-1]["id"] == approve
     assert [it["id"] for it in human.unread_human_items(ctx, sid, listing)] == [approve]
-
-
-def _session_in_phase(s, f, fake, ctx, cause, text=b"the brief"):
-    """A session this run created AND prompted in spec/epoch 0 under *cause*."""
-    from coordinator import sessions
-    g = f._dispatch(Role.AUTHOR, "claude")
-    ctx.generation = g
-    ws = os.path.join(ctx.workspaces_root, "r-1", str(g)); os.makedirs(ws)
-    snap = sessions.create_session(s, run_id="r-1", generation=g, server="http://srv", agent_id="ag_claude",
-                                   host_id="host_h", workspace=os.path.realpath(ws), phase="spec", epoch=0,
-                                   cause=cause, env=ctx.effect_env())
-    sessions.prompt_session(s, run_id="r-1", generation=g, server="http://srv", session_id=snap["id"],
-                            phase="spec", epoch=0, cause=cause, text=text, env=ctx.effect_env())
-    return snap["id"], g
-
-
-def _dismissed_in(s, f, fake, ctx, sid):
-    """A refused `approve` read from *sid*, dismissed, its reply still owed."""
-    from coordinator.session import list_items
-    fake.add_user_message(sid, "approve")
-    assert human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch)) == "dismissed"
-
-
-def _owed_reply_and_an_awaited_seat(s, f, fake, ctx):
-    """§7's crash-recovery shape. A refusal was dismissed in an OLDER session
-    of the phase and its reply is still owed; a request_revision then opened a
-    NEWER session in the SAME phase and epoch -- the seat -- whose prompt is
-    satisfied and whose turn is not yet recorded. That is the state a pass
-    resumes into after a crash between the seat's prompt and its record."""
-    f.author_round(SPEC_BYTES)                                   # spec_submitted
-    old, _ = _session_with_prompt(s, f, fake, ctx)
-    _dismissed_in(s, f, fake, ctx, old)
-    f.human("record_review", {"phase": "spec", "artifact_hash": s.phase_artifact("r-1", "spec"),
-                              "verdict": "request_revision", "findings": "again"})
-    seat_sid, g = _session_in_phase(s, f, fake, ctx, f._newest_id())
-    assert front.newest_prompt(s, "r-1", "spec", 0)["session_id"] == seat_sid
-    return old, seat_sid, g
-
-
-def test_a_reply_owed_to_an_older_session_does_not_displace_the_seats_turn(world):
-    """THE DEFECT, executed. spec §3 *The turn's end is a fact*:
-    `record_turn_ended` is refused for a session that is not the one the
-    phase and epoch's newest satisfied `sess-prompt` names, and the kernel is
-    right. What is wrong is that the coordinator sends prompts NOBODY AWAITS
-    into the same phase and epoch as an awaited turn: on the crash-recovery
-    pass the seat sends nothing of its own, so a reply still owed to an older
-    session goes out first, becomes the phase's newest, and the seat can no
-    longer record its own turn -- nor submit. §7 claims a crash anywhere in
-    that sequence is repaired from the journal; before this guard it was not,
-    the run merely burned a seat."""
-    s, f, fake, ctx = world(labels=())
-    old, seat_sid, g = _owed_reply_and_an_awaited_seat(s, f, fake, ctx)
-    logged = []
-    ctx.log = logged.append
-    n_items = len(fake.sessions[old]["items"])
-
-    result = human.reply_refusals(ctx)                 # the pass's reply step
-
-    # The seat can still record its own turn: nothing displaced its prompt.
-    ctx.generation = g
-    seat.command(ctx, "record_turn_ended", {"session": seat_sid, "ended": "file"})
-    assert s.newest_fact("r-1", EventKind.TURN_ENDED).payload["session"] == seat_sid
-    # ...because the reply was HELD BACK, not sent, and says so.
-    assert result == []
-    assert len(fake.sessions[old]["items"]) == n_items
-    assert any(seat_sid in m for m in logged), logged
-    # Held back, not dropped: the obligation is still owed.
-    rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
-    assert sessions.satisfied(s, "r-1", {"kind": "sess-prompt", "session": old, "phase": "spec",
-                                         "epoch": 0, "cause": rej.id}) is None
-
-
-def test_the_held_back_reply_goes_out_once_the_turn_is_recorded(world):
-    """It converges: the guard defers, it does not drop."""
-    s, f, fake, ctx = world(labels=())
-    old, seat_sid, g = _owed_reply_and_an_awaited_seat(s, f, fake, ctx)
-    assert human.reply_refusals(ctx) == []
-    ctx.generation = g
-    seat.command(ctx, "record_turn_ended", {"session": seat_sid, "ended": "file"})
-    sent = human.reply_refusals(ctx)
-    assert len(sent) == 1
-    assert "Bircher refused that" in fake.sessions[old]["items"][-1]["content"][0]["text"]
-
-
-def test_a_reply_is_not_held_behind_another_reply_that_nobody_awaits(world):
-    """THE STARVATION the third condition prevents. An unawaited reply never
-    earns a `turn_ended` of its own, so once one is the phase's newest prompt,
-    a guard written as "the newest prompt has no turn_ended" would defer every
-    later reply for the life of the phase. The condition is that the session
-    being waited on is the one the phase's newest satisfied `sess-create`
-    delivered -- a real seat, running a real turn."""
-    s, f, fake, ctx = world(labels=())
-    f.author_round(SPEC_BYTES)                                   # spec_submitted
-    x, _ = _session_with_prompt(s, f, fake, ctx)
-    _dismissed_in(s, f, fake, ctx, x)
-    y, gy = _session_in_phase(s, f, fake, ctx, f._newest_id())
-    _dismissed_in(s, f, fake, ctx, y)
-    # y is the seat, and its turn is over -- so neither reply is behind an
-    # awaited turn, and both are owed.
-    ctx.generation = gy
-    seat.command(ctx, "record_turn_ended", {"session": y, "ended": "file"})
-
-    sent = human.reply_refusals(ctx)
-
-    # BOTH. The reply to x goes out first and becomes the phase's newest
-    # prompt; the reply to y must not defer behind it.
-    assert len(sent) == 2, sent
-    assert "Bircher refused that" in fake.sessions[x]["items"][-1]["content"][0]["text"]
-    assert "Bircher refused that" in fake.sessions[y]["items"][-1]["content"][0]["text"]

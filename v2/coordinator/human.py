@@ -169,84 +169,37 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     return kind
 
 
-def _awaited_seat_blocking(ctx, session_id: str, phase: str, epoch_n: int) -> str | None:
-    """The seat whose awaited turn a prompt to *session_id* would step in
-    front of, or None.
-
-    spec §3 *The turn's end is a fact*: `record_turn_ended` is refused for a
-    session that is not the one the phase and epoch's newest satisfied
-    `sess-prompt` names, and `authz._check_turn_ended` is that rule. The
-    kernel is right. What is wrong is that the coordinator sends prompts
-    NOBODY AWAITS into the same phase and epoch as an awaited turn -- both of
-    `_send`'s callers can: the reply to a refusal dismissed in an older
-    session (`reply_refusals`, filed under the dismissal's own phase and
-    epoch) and the park answer. `human_pass` runs before the seat, and on the
-    crash-recovery pass the seat's prompt obligation is already satisfied so
-    `run_turn` sends nothing of its own -- so the unawaited prompt becomes
-    the phase's newest, and the seat can no longer record its own turn nor
-    submit its artefact. §7 claims a crash anywhere in that sequence is
-    repaired from the journal; without this it was not, the run merely burned
-    a seat.
-
-    THREE conditions, and the third is the one that matters:
-
-    1. the phase and epoch's newest satisfied prompt names ANOTHER session;
-    2. that prompt carries no `turn_ended` -- its turn is still awaited;
-    3. that session is the one the phase and epoch's newest satisfied
-       `sess-create` delivered -- the SEAT.
-
-    Without (3) this starves. An unawaited reply never earns a `turn_ended`
-    of its own, so once one is the phase's newest prompt, a guard written as
-    "the newest prompt has no turn_ended" would defer every later reply for
-    the life of the phase. (3) says the thing being waited on is a real turn.
-    """
-    newest = front.newest_prompt(ctx.store, ctx.run_id, phase, epoch_n)
-    if newest is None or newest["session_id"] == session_id:
-        return None
-    if front.turn_ended_for(ctx.store, ctx.run_id, newest["key"]) is not None:
-        return None
-    seat_sid = None
-    for row in front.satisfied_effects(ctx.store, ctx.run_id, "sess-create"):
-        ob = row["intent"]["obligation"]
-        if ob.get("phase") == phase and ob.get("epoch") == epoch_n:
-            seat_sid = json.loads(row["external_object_id"])["id"]
-    return newest["session_id"] if newest["session_id"] == seat_sid else None
-
-
-def _send(ctx, session_id: str, cause: str, text: bytes, *, phase: str = None, epoch: int = None) -> bool:
+def _send(ctx, session_id: str, cause: str, text: bytes, *, phase: str = None, epoch: int = None) -> None:
     """One prompt, by obligation: sent only where the journal owes it, and its
     `prompt_item` recorded either way -- the crash window between a confirmed
-    prompt and its record is closed by finding the item by hash. Returns
-    whether the prompt stands; `False` means it was held back and is still
-    owed.
+    prompt and its record is closed by finding the item by hash.
 
     *phase* and *epoch* default to the run's current ones, which is right for
     a prompt this pass is sending about the run's current situation. A reply
     that answers a fact of its own (a dismissal) passes THAT fact's phase and
     epoch instead, so the obligation it satisfies stays the same one however
     far the run has moved since.
+
+    Nothing here awaits a turn, and no prompt sent here may become the
+    phase and epoch's newest while a seat's turn is awaited: the kernel keys
+    a `record_turn_ended` to the phase's newest satisfied `sess-prompt`
+    (spec §3, *The turn's end is a fact*) and would refuse the seat's own
+    record. What keeps that from happening is the loop's shape, not a guard
+    here. Both callers of `_send` run inside `human_pass`, `human_pass` runs
+    only where `current_park` is not None (`phases.py:253` and `:304`), and
+    `run_loop` reaches an author or review round only where it IS None -- so
+    a park is never current while a turn is awaited, and neither is this
+    function ever running then. A pass that sends a prompt outside a park
+    breaks that, and would need the guard this comment stands in place of.
     """
     phase = ctx.phase() if phase is None else phase
     n = ctx.epoch() if epoch is None else epoch
     ob = {"kind": "sess-prompt", "session": session_id, "phase": phase, "epoch": n, "cause": cause}
     if sessions.satisfied(ctx.store, ctx.run_id, ob) is None:
-        # Only where the prompt is still OWED: one already sent cannot be
-        # unsent, and its `prompt_item` is still worth recording below.
-        awaited = _awaited_seat_blocking(ctx, session_id, phase, n)
-        if awaited is not None:
-            # HELD BACK, not dropped: the obligation stays owed, so the next
-            # pass sends it once the seat's turn is recorded, and this
-            # converges. `_record_prompt_item` is skipped with it -- there is
-            # no prompt in the session to find.
-            ctx.log(f"session {session_id}: the prompt for {cause} is held back -- session "
-                    f"{awaited} has an awaited turn in {phase}/{n}, and a newer prompt would "
-                    "make the kernel refuse its record_turn_ended; still owed")
-            return False
         sessions.prompt_session(ctx.store, run_id=ctx.run_id, generation=ctx.generation, server=ctx.server,
                                 session_id=session_id, phase=phase, epoch=n, cause=cause, text=text,
                                 env=ctx.effect_env())
     seat._record_prompt_item(ctx, session_id, content_hash(text))
-    return True
 
 
 def reply_refusals(ctx) -> list[str]:
@@ -283,11 +236,8 @@ def reply_refusals(ctx) -> list[str]:
         if sessions.satisfied(store, run_id, ob) is not None:
             continue
         text = f"Bircher refused that: {rej.payload.get('detail', '')}".encode()
-        # Reported as sent only if it WAS: a reply held back behind an awaited
-        # turn is still owed, and a caller told otherwise would believe the
-        # refusal had been answered.
-        if _send(ctx, sid, rej.id, text, phase=phase, epoch=n):
-            sent.append(rej.id)
+        _send(ctx, sid, rej.id, text, phase=phase, epoch=n)
+        sent.append(rej.id)
     return sent
 
 
