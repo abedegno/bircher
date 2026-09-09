@@ -4,9 +4,10 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 13, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+Revision 14, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
 (Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi), 10 (Codex), 11
-(Kimi) and 12 (Codex); the dispositions are the last twelve sections.*
+(Kimi), 12 (Codex) and 13 (Codex again — Kimi's turn was lost to the host's
+memory three times); the dispositions are the last thirteen sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -419,7 +420,7 @@ that slice is in the accepted plan.
 
 | Obligation kind | Refused unless, beyond the common conditions |
 |---|---|
-| `slice_issue` | nothing further |
+| `slice_issue` | no satisfied `issue_create` for this run, epoch and slice exists already (*one satisfied effect per obligation*, below) |
 | `slice_dependency` | the edge `slice ← blocker` is in the plan, and both slices have a `slice_filed` in this epoch |
 | `slice_queue` | every `slice_issue` and `slice_dependency` obligation the plan implies is satisfied — the property §3's third pass depends on, a queued child has every link, refused here rather than discovered at `filing_complete` after the generator has taken the child up |
 | `umbrella`, `umbrella_label` | a `slice_filed` for every slice of the plan |
@@ -463,6 +464,19 @@ carries both number and id; `record_slice_filed` records both. The kernel
 parses the plan and holds every obligation's row and every fact these rows
 name, so each precondition and each binding is a read of what it already
 holds.
+
+**One satisfied effect per obligation.** `perform` replays by *key*, and the
+filing keys carry the generation, so a resumed coordinator that attempted
+an already-satisfied create under its fresh key would pass every
+precondition and binding above and mint a second issue for the slice — a
+refused `slice_filed` afterwards undoes nothing. So `perform` refuses a
+fresh key for **any of the seven kinds** when a satisfied effect — `confirmed`
+or reconciled delivered — already carries the same obligation (same run,
+epoch, kind, and `slice`/`blocker` where the kind has them). A replay of the
+confirmed key still returns the row, as today; a retry after a row
+reconciled *not delivered* is admitted, the obligation being unsatisfied.
+The rule is the obligation's uniqueness, checked where the mutation would
+happen and not after it (ruling 23).
 The coordinator's pass ordering is the behaviour; these refusals are the
 guard (ruling 18), and the first of them — no create outside `sliced`,
 against the accepted hash — is the one that makes "the transition that
@@ -624,8 +638,10 @@ refuse. An uncertain
 effect anywhere halts the run (§3 *Sessions are effects*) for reconciliation,
 which lists the parent's children by the marker line to say what exists. A
 satisfied obligation is never re-performed — `perform` replays a confirmed key
-— which is why nothing in this design depends on a replay to undo a person's
-label edit (§5).
+and refuses a fresh key for an obligation already satisfied (§2, *one
+satisfied effect per obligation*) — which is why nothing in this design
+depends on a replay to undo a person's label edit (§5), and why a resumed
+pass cannot file a slice twice however its keys are minted.
 
 `bircher: sliced ` joins `BIRCHER_STATUS_PREFIXES` in both copies of the
 predicate, so neither the umbrella nor the completion comment (which shares
@@ -795,7 +811,11 @@ holds:
    `slices.render_child` produces for its slice from the parsed plan, the
    parent's number, the hash8 and the siblings' filed numbers — compared
    whole, not by marker and title alone, so a filing that gave every child the
-   first slice's scope, or dropped the non-goals, fails here.
+   first slice's scope, or dropped the non-goals, fails here. And **exactly
+   one delivered `issue_create` carries each slice's obligation, and none
+   carries any other**: a second delivered create for a slice — a child the
+   umbrella and the sweep never see — fails here, as does a delivered create
+   with no `slice_filed`.
 2. **The dependencies are the links.** Every `Depends on:` in the plan is a
    blocked-by link on the child, fetched live, and the child has no other.
 3. **The umbrella names the children.** The parent's `bircher: sliced` comment
@@ -853,6 +873,7 @@ review seats. The children are proved as ordinary runs.
 | A child is itself an epic | its shaper cannot slice it (`policy_frozen` carries `bircher:slice`); it proceeds as one piece and its spec phase does what it can; the reviewer's findings on an oversized spec are the signal a person reads |
 | Crash after `sliced`, anywhere before `filing_complete` | obligations unsatisfied, no park, no `filing_complete`; the generator queues the run; the next pass's `file_owed` performs exactly what is missing — a create, a fact, a link, a queue label, the umbrella or its label — and records completion |
 | Crash between a create's confirmation and its `record_slice_filed` | the effect is confirmed; the next pass's first pass finds it satisfied and records the fact; the later passes check the links and the label |
+| A resumed coordinator attempts an already-satisfied create (or link, label or comment) under its fresh generation's key | `perform` refuses it — one satisfied effect per obligation (§2); the confirmed row is what the pass reads; no second child exists to omit from the umbrella |
 | Crash after the creates, before or during the links | the children exist without `bircher:queued`; the generator does not list them; no child runs before its links; the next pass performs the missing links, then the queue labels |
 | Crash during the queue labels | the labelled children have every link; the unlabelled ones are invisible; the next pass labels the rest |
 | The coordinator dies between two confirmed filing effects and `phases` exits non-zero with nothing pending | `run_item`'s non-zero branch reads `sliced`, records no outcome, keeps the file, writes an `escalated` row; the next pass repairs. `record_run_outcome(failed)` would be refused from `sliced` in any case |
@@ -945,7 +966,12 @@ bircher:sliced`, a comment opening `bircher: sliced ` and `gh issue close`
 on a `sliced` run's issue refused, each with an obligation of another kind
 refused, and the runner's `queued` → `running` swap admitted with none as
 today; a create for a slice whose blocker is unfiled refused, and
-`render_child` raising on the missing number rather than rendering `none`.
+`render_child` raising on the missing number rather than rendering `none`;
+**and uniqueness**: a fresh-key create for a slice whose create is
+`confirmed` refused, one whose earlier create was reconciled delivered
+refused, one whose earlier create was reconciled not-delivered admitted, a
+replay of the confirmed key returning the row, and the same three for a
+link, a queue label and the umbrella comment.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
@@ -991,7 +1017,9 @@ model ruling is `shape` fails the ruling check as a run with none does
 today; a one-piece run with `{slices, spec, plan}` submissions passes the
 phase-set check and one with `{spec}` alone fails it; a parent that
 submitted a spec in epoch 1 and was sliced in epoch 2 passes it, and one
-whose final epoch holds `{slices, spec}` fails it; and the verdict-binding
+whose final epoch holds `{slices, spec}` fails it; assertion 1 red on two
+delivered creates for one slice and on a delivered create with no
+`slice_filed`; and the verdict-binding
 block re-rendering a sliced parent's review brief, red when the planted
 brief names the wrong hash.
 
@@ -1126,6 +1154,12 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     outcome, closing it again would fight a deliberate act; the satisfied
     obligation stands, the outcome is recorded, the parent stays as they
     left it. Costs a person the parent they reopened.
+23. **One satisfied effect per obligation, refused at `perform`.** Replay
+    is by key and the keys carry the generation, so key replay alone lets a
+    resumed pass mint a slice twice; the obligation is the identity that
+    must be unique, and the refusal sits where the mutation would happen.
+    Costs one lookup per filing effect; the alternative was a proof that
+    found the duplicate after it existed.
 
 ## Dispositions — round 1 (Kimi, 2026-09-09)
 
@@ -1374,3 +1408,12 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    epochs hold whatever they reached before being superseded, and the
    binding and session checks still read every epoch (§6, two proof tests
    in §8, round 6's disposition 2 annotated).
+
+## Dispositions — round 13 (Codex, 2026-09-09; Kimi's turn lost to memory)
+
+1. accepted — `perform` refuses a fresh key for any of the seven kinds when
+   a satisfied effect already carries the obligation, preserving
+   confirmed-key replay and the retry after a not-delivered reconciliation
+   (§2, *one satisfied effect per obligation*; §3; a failure-table row;
+   ruling 23; kernel tests), and assertion 1 requires exactly one delivered
+   create per slice with a planted duplicate (§6, §8).
