@@ -4,10 +4,11 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 14, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi), 10 (Codex), 11
-(Kimi), 12 (Codex) and 13 (Codex again — Kimi's turn was lost to the host's
-memory three times); the dispositions are the last thirteen sections.*
+Revision 15. Fourteen cross-vendor rounds with dispositions — 1 (Kimi), 2
+(Codex), 3 (Kimi), 4 (Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9
+(Kimi), 10 (Codex), 11 (Kimi), 12 (Codex), 13 (Codex again — Kimi's turn was
+lost to the host's memory three times), 14 (Kimi: **PASS**, four advisory
+findings folded here); the dispositions are the last fourteen sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -48,8 +49,9 @@ the phase files, and `bircher:sliced`, carried by a parent whose children are
 filed. A child inherits its parent's *policy* labels — `bircher:grill`,
 `bircher:gate-plan`, `bircher:autonomous` — so an autonomous epic yields
 autonomous slices; it does not inherit `bircher:queued`, which the filing step
-gives it last, once its dependency links exist (§3), nor `bircher:running` or
-`bircher:sliced`, which are the runner's.
+gives it last, once its dependency links exist (§3), nor `bircher:running`,
+which is the runner's, nor `bircher:sliced`, which the filing step gives the
+parent.
 
 **The definition of coarse, which this document is the source of.** The brief
 carries it and the reviewer grades against it; it lives here because no other
@@ -131,7 +133,7 @@ stated per command and not inherited:
 | `_review_destination`'s human guard (`authz.py:183`) | admits `SHAPING_STATES` too; its `slices` case returns `shaping` |
 | `_review_destination`'s reviewer clauses (`authz.py:212`, `:216`) | each gains a `slices` case: `request_revision` returns `shaping`; `accept` returns `slices_accepted` **whatever the gates** — the ungated path leaves through `advance_ungated`, not through the accept, because the transition that authorises filing must be its own fact (below). Without the case an accepted slice plan would land in `planned` |
 | `approve_artifact`'s destination (`authz.py:928`, `"specified" if phase == "spec" else "planned"`) | gains a `slices` case returning `sliced`; the same else-branch trap as the two above |
-| `front.FRONT_PHASES` (`front.py:56`) and `projection.FRONT_PHASES` (`projection.py:22`) — the two phase lists that say which verdicts are the front half's | **both gain `slices`.** `projection.is_front_verdict` feeds `observe.revisions_used` and `recover.decide`, which exist so the back half never spends its repair allowance on, or reads its own review from, a front-half verdict; a one-piece run that needed two slice-plan rounds carries `review_verdict {phase: slices}` facts into its back half, and without the entry each would spend a repair round. `front.FRONT_PHASES` gates the proof's verdict-binding block (`prove_front_half.py:185`), and without the entry the slice review — the only review a sliced parent has — would never be re-rendered against its brief, contradicting §6. One list would be better than two; this design does not merge them, and states both |
+| `front.FRONT_PHASES` (`front.py:56`) and `projection.FRONT_PHASES` (`projection.py:22`) — the two phase lists that say which verdicts are the front half's | **both gain `slices`.** `projection.is_front_verdict` feeds `observe.revisions_used` and `recover.decide`, which exist so the back half never spends its repair allowance on, or reads its own review from, a front-half verdict; a one-piece run that needed two slice-plan rounds carries `review_verdict {phase: slices}` facts into its back half, and without the entry each would spend a repair round. `front.FRONT_PHASES` gates the proof's verdict-binding block (`tools/prove_front_half.py:185`), and without the entry the slice review — the only review a sliced parent has — would never be re-rendered against its brief, contradicting §6. One list would be better than two; this design does not merge them, and states both |
 | the reviewer-binding check (`authz.py:738`) | `FRONT_HALF_STATES \| SHAPING_STATES`: the review turn at `slices_submitted` must have ended like any other |
 | `_ALL_ACTIVE` | gains the three shaping states and `sliced`: `cancel_run` and `record_run_outcome` are legal from them, so the runner's `failed` on a non-zero exit in a shaping state and a person's cancel both have a state to act from. From `sliced`, `record_run_outcome` accepts only the outcome `sliced` (below) |
 | `_PHASE_OF_STATE` | the three shaping states and `sliced` map to `slices` |
@@ -839,8 +841,9 @@ front-half design requires of its own.
 
 **What the existing assertions do over a sliced parent.** `assert_journal`
 today requires at least one `model_ruling` and a submission phase set of
-exactly `{spec, plan}` with different hashes (`prove_front_half.py`,
-`assert_journal`); read unchanged, it fails every sliced parent and every
+exactly `{spec, plan}` with different hashes (`tools/prove_front_half.py`,
+`assert_journal` — the one bare name in this document that is not under
+`kernel/`); read unchanged, it fails every sliced parent and every
 one-piece run that submitted a rejected slice plan first. Two amendments:
 the model-ruling check **excludes `question_id: "shape"`** — it means a
 ruling on a question the author raised, and a shape ruling every one-piece
@@ -856,10 +859,11 @@ Earlier epochs hold whatever they reached before they were superseded, and
 this check does not read them; the binding and session checks still read
 every epoch. The parent is exempt from the model-ruling check, its decision being
 `slice_filed`, and from nothing else: the human-fact checks by mode, the
-reconciled-or-halted check and every session check (`assert_sessions`:
-snapshot names the dispatch's vendor, one obligation per create, every
-session prompted or stopped) apply to it as to any run, over its shaping and
-review seats. The children are proved as ordinary runs.
+reconciled-or-halted check, `assert_journal`'s session checks (snapshot
+names the dispatch's vendor, one obligation per create, every session
+prompted or stopped) and `assert_sessions`, the server-side half that checks
+the satisfied creates against the live session listing, apply to it as to
+any run, over its shaping and review seats. The children are proved as ordinary runs.
 
 ## §7 Failure table
 
@@ -885,6 +889,7 @@ review seats. The children are proved as ordinary runs.
 | A closed child is reopened while a sibling is still open | the next sweep observes it open and records `slice_reopened`; its current closure is open; the parent does not close until it is observed closed again |
 | A read fails mid-sweep — a child reopened last week, its read failing this firing while its siblings read closed | the firing ends at the failed read: no `children_observed_closed`, no completion effects, no outcome; the facts recorded before the failure stand; the next firing reads every child again. The kernel holds the order — no outcome without the sweep's same-generation statement — and the statement's truth is the sweep's (§2) |
 | The generator cannot read a child's blockers | the child is skipped this wave, not queued as unblocked; the next wave reads again |
+| A child is deleted on GitHub | its read fails every firing; the parent stays open and each firing logs which child it could not read — a signal in the log, not on the umbrella. A deleted issue can never be observed closed, so the parent's only exit is a person's: `cancel_run` on the parent and a hand close of its issue (§9) |
 | A closed child is reopened after the parent closed | the parent's run has ended; the sweep does not read it; the reopened child is a person's, as an issue reopened under any closed epic is |
 | Crash between the completion comment and the parent's close | the comment's obligation is satisfied and is not re-posted; the close's is not and is performed; the outcome follows |
 | Crash between the parent's close and the outcome, and a person reopens the parent before the next firing | the next completing firing observes `parent: open` beside a satisfied `parent_close`; no second close — a satisfied obligation is never re-performed, and the reopening is the person's; the outcome is recorded and the parent stays open as they left it, exactly as a parent reopened after the run ended |
@@ -1417,3 +1422,15 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    (§2, *one satisfied effect per obligation*; §3; a failure-table row;
    ruling 23; kernel tests), and assertion 1 requires exactly one delivered
    create per slice with a planted duplicate (§6, §8).
+
+## Dispositions — round 14 (Kimi, 2026-09-09) — VERDICT: PASS
+
+Four advisory findings, all accepted and folded:
+
+1. accepted — the three journal-side session checks are `assert_journal`'s;
+   `assert_sessions` is named for what it is.
+2. accepted — `tools/prove_front_half.py`, and the exception to the
+   `kernel/` convention is said once.
+3. accepted — `bircher:sliced` is the filing step's, not the runner's (§1).
+4. accepted — a deleted child is a failure-table row: the signal is in the
+   log, and the parent's exit is the person's.
