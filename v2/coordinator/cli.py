@@ -241,6 +241,9 @@ def main(argv=None) -> int:
     ph.add_argument("--host-id", required=True); ph.add_argument("--agent-claude", required=True)
     ph.add_argument("--agent-codex", required=True); ph.add_argument("--default-author", default="claude")
     ph.add_argument("--turn-timeout", default=None)
+    sw = subs.add_parser("sweep-sliced")
+    sw.add_argument("--db", required=True); sw.add_argument("--server", required=True)
+    sw.add_argument("--repo", required=True)
     for name in ("retire", "cancel"):
         sp = subs.add_parser(name)
         sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
@@ -306,6 +309,17 @@ def main(argv=None) -> int:
                           env=dict(os.environ, BIRCHER_KERNEL_DB=a.db, BIRCHER_RUN_ID=a.run_id), fetch=_fetch,
                           log=lambda m: print(m, file=sys.stderr))
         return _phases.run_loop(ctx)
+
+    if a.mode == "sweep-sliced":
+        from kernel.store import Store
+
+        from coordinator.sweep import sweep_sliced
+        store = Store.open(a.db)
+        for rid in sweep_sliced(store, server=a.server, repo=a.repo,
+                                env=dict(os.environ, BIRCHER_KERNEL_DB=a.db),
+                                log=lambda m: print(m, file=sys.stderr)):
+            print(rid)
+        return RC_OK
 
     if a.mode in ("retire", "cancel"):
         from kernel.dispatch import Role, dispatch
