@@ -4,8 +4,8 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 2, after cross-vendor round 1 (Kimi); the dispositions are the last
-section.*
+Revision 3, after cross-vendor rounds 1 (Kimi) and 2 (Codex); the
+dispositions are the last two sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -83,10 +83,10 @@ against the spec.
 | `slices_accepted` | `record_review(request_revision)` as `human` | `shaping` | **the human's correction at the gate.** `_review_destination`'s human clause (`authz.py:190`) today returns `queued` for `spec` and `specified` otherwise; it gains a `slices` case returning `shaping`, and a test that a correction at the slice gate does not land in `specified` |
 | `slices_accepted` | `approve_artifact` | `sliced` | the human gate, when `slices ∈ gates` |
 | `slices_accepted` | `advance_ungated` | `sliced` | the coordinator's transition when `slices ∉ gates`; refused when it is |
-| `sliced` | `record_slice_filed`, `record_slice_closed` | `sliced` | no transition; the filing and closing facts (below) |
-| `sliced` | `record_run_outcome(sliced)` | `ended` | recorded by the sweep when every slice of the plan is filed and closed (§3) |
+| `sliced` | `record_slice_filed`, `record_filing_complete`, `record_slice_closed` | `sliced` | no transition; the filing and closing facts (below) |
+| `sliced` | `record_run_outcome(sliced)` | `ended` | recorded by the sweep when filing is complete and every slice of the plan is closed (§3) |
 | `shaping`, `slices_submitted`, `slices_accepted` | `revise_bundle` | `shaping`, epoch + 1 | unchanged rule; a revised epic is shaped again |
-| `sliced` | `revise_bundle` | **refused** | its children are the work now (finding 5, below) |
+| `sliced` | `revise_bundle` | **refused** | its children are the work now (ruling 7) |
 | the three shaping states, and `sliced` | `park`, `record_human_direction`, `dismiss_human_item`, `cancel_run` | as today | the front-half vocabulary applies |
 
 **Existing commands whose from-sets gain states.** The front-half design's
@@ -112,14 +112,25 @@ to nothing — the run waits for its children. It is open — not `ended`, not
 `cancelled` — so `_kernel_find_run … open` adopts it rather than minting a
 second run for a re-queued parent. It ends only when its children have.
 
+**Deciding, and changing one's mind, within an epoch.** A rejected slice plan
+returns the run to `shaping`, and the next author — or a person, by `direct`
+— may rule it one piece instead. That is a supported path, not a fault, so
+the rule is stated: `record_one_piece` is legal from `shaping` whether or not
+a slice plan was submitted earlier in the epoch, and refused from any state
+where a slice plan is *accepted* — `slices_accepted` and `sliced` — where the
+decision has been taken. The epoch's final decision is therefore whichever is
+newer: a `shape` ruling newer than every `artifact_submitted` of phase
+`slices` in that epoch, or a `slice_filed`. §6's fourth assertion reads it
+that way.
+
 The outcome set `_RUN_OUTCOMES` (`authz.py:249`, checked at `:971-973`) gains
 **`sliced`**. `record_run_outcome(sliced)` is legal only from `sliced`, under
-an `operator` dispatch, and only when the kernel can see, **for every slice of
-the accepted plan** — the plan it holds under the phase's artefact hash and
-parses as below — one `slice_filed` and one `slice_closed` in the current
-epoch. Iterating the filed children rather than the plan was refused in review
-as a vacuous-truth hole: an epic that crashed before filing anything would
-have closed as complete.
+an `operator` dispatch, and only when the kernel can see a `filing_complete`
+fact for the current epoch and, **for every slice of the accepted plan** — the
+plan it holds under the phase's artefact hash and parses as below — one
+`slice_closed` in that epoch. Iterating the filed children rather than the
+plan was refused in review as a vacuous-truth hole: an epic that crashed
+before filing anything would have closed as complete.
 
 ### The artefact: a slice plan
 
@@ -150,8 +161,9 @@ line), one beginning `Non-goals:`, one beginning `Depends on:` whose value is
 `none` or a comma-separated list of slice numbers. Slice numbers are 1..N in
 order with no gaps. Everything before the first heading is the preamble and is
 not parsed. The parser is one function in the kernel, `slices.parse(bytes)`,
-used by the refusals here, by the outcome guard above, by the filing step and
-by the proof, so there is one reading of a plan and not four.
+used by the refusals here, by the outcome guard above, by the filing step, by
+the child renderer and by the proof, so there is one reading of a plan and not
+five.
 
 `submit_slices(artifact_hash)` is refused when:
 
@@ -177,14 +189,18 @@ sentence count it found.
 A model ruling with a transition. Legal from `shaping` under an `author`
 dispatch whose actor is the vendor of the round's session, after the turn is
 observed ended and its stop satisfied (§3 *The turn's end is a fact* applies to
-this command as to every output-recording command). Refused when either string
-is empty or whitespace: a ruling without its reasoning is the "MUST state"
-placeholder, and its cost-if-wrong is what a person reads when the spec phase
-later shows the issue was an epic after all. Records `model_ruling {question_id:
-"shape", ruling: "one piece", reasoning, cost_if_wrong}` — the existing fact
-and payload shape (`commands.py:240-247`) — and moves the run to `queued`. A
-run may carry at most one such ruling per epoch; a second is refused as an
-identical resubmission is.
+this command as to every output-recording command). Refused when:
+
+| Refused when | Why |
+|---|---|
+| either string is empty or whitespace | a ruling without its reasoning is the "MUST state" placeholder; its cost-if-wrong is what a person reads when the spec phase later shows the issue was an epic after all |
+| a `human_direction` of the run is newer than the calling generation's dispatch | **the same journal-order guard `_check_submit` gives `submit_slices` (`authz.py:582-598`)**; without it an interrupted author's ruling would advance the run to `queued` after a person had directed "slice it along these lines". Human commands do not supersede the author's generation by themselves; the guard is what does |
+| a `shape` ruling already exists in this epoch | one decision per epoch by ruling; a second is an identical resubmission |
+| the state is `slices_accepted` or `sliced` | the decision has been taken (above) |
+
+Records `model_ruling {question_id: "shape", ruling: "one piece", reasoning,
+cost_if_wrong}` — the existing fact and payload shape
+(`commands.py:240-247`) — and moves the run to `queued`.
 
 ### `advance_ungated`
 
@@ -197,29 +213,42 @@ slices, hash}`. The spec phase has no equivalent because its ungated path is
 separates the two because filing children is an effect with an obligation
 (§3), and the transition that authorises it must be its own fact.
 
-### `record_slice_filed(slice, effect_key)` and `record_slice_closed(slice, closed_at)`
+### `record_slice_filed`, `record_filing_complete`, `record_slice_closed`
 
 Every fact has an issuing command with legal states, a role and refusals, and
-these two are no exception.
+these three are no exception.
 
-`record_slice_filed` is legal from `sliced` under the coordinator's `operator`
-dispatch. It names the slice number and the idempotency key of the
-`issue_create` effect that filed it; the kernel reads the created issue's
-number from that effect row's confirmed `external_object_id` — **observed from
-the server's answer, never asserted by the coordinator** — and refuses when the
-slice is not in the accepted plan, when the effect is not confirmed or
-reconciled `delivered`, when its obligation does not name this run, this slice
-and this plan hash, or when this slice already has a `slice_filed` in this
-epoch. Its fact: `slice_filed {epoch, slice, issue, title, parent, plan_hash}`.
+`record_slice_filed(slice, effect_key)` is legal from `sliced` under the
+coordinator's `operator` dispatch. It names the slice number and the
+idempotency key of the `issue_create` effect that filed it; the kernel reads
+the created issue's number from that effect row's confirmed
+`external_object_id` — **observed from the server's answer, never asserted by
+the coordinator** — and refuses when the slice is not in the accepted plan,
+when the effect is not confirmed or reconciled `delivered`, when its
+obligation does not name this run, this epoch, this slice and this plan hash,
+or when this slice already has a `slice_filed` in this epoch. Its fact:
+`slice_filed {epoch, slice, issue, title, parent, plan_hash}`.
 
-`record_slice_closed` is legal from `sliced` under the sweep's `operator`
-dispatch. Refused for a slice with no `slice_filed` in this epoch, or one
-already closed. Its fact: `slice_closed {epoch, slice, issue, closed_at,
-state}` where `state` is `merged` or `closed`, as the sweep observed it.
+`record_filing_complete()` is legal from `sliced` under the coordinator's
+`operator` dispatch, and refused unless the kernel can see, for the current
+epoch, a `slice_filed` for every slice of the accepted plan **and** a
+satisfied effect for every filing obligation the plan implies: one
+`slice_dependency` per dependency edge, the `umbrella` comment and the
+`umbrella_label` swap. It is the kernel's statement that nothing about filing
+is still owed; the generator (§5) queues a `sliced` run until it exists, and
+the sweep touches a run only once it does. Its fact:
+`filing_complete {epoch, plan_hash, children: [numbers]}`. Refused a second
+time in the same epoch.
 
-Both facts carry the epoch. Since `revise_bundle` is refused from `sliced`, a
-run that has filed anything is in its final epoch, and the guards above read
-"this epoch" without ambiguity.
+`record_slice_closed(slice, closed_at, state)` is legal from `sliced` under the
+sweep's `operator` dispatch, only after `filing_complete`. Refused for a slice
+with no `slice_filed` in this epoch, or one already closed. Its fact:
+`slice_closed {epoch, slice, issue, closed_at, state}` where `state` is
+`merged` or `closed`, as the sweep observed it.
+
+All three facts carry the epoch. Since `revise_bundle` is refused from
+`sliced`, a run that has filed anything is in its final epoch, and the guards
+above read "this epoch" without ambiguity.
 
 ### The effect class: `issue_create`
 
@@ -242,10 +271,11 @@ Two more contract changes, stated so they are not discovered as refusals: the
 api -X POST /repos/<repo>/issues/<n>/dependencies/blocked_by -f issue_id=<id>`,
 the write half of the endpoint the queue generator already reads
 (`is_unblocked`, `issues-to-queue.sh:20-24`); and the new obligation kinds —
-`slice_issue`, `slice_dependency`, `umbrella`, `umbrella_close`,
-`parent_close` — each get a delivered-form in `_delivered_value`
-(`effects.py:389-433`), so typed reconciliation of an uncertain one is
-possible; without that, §3's crash row is a promise the kernel cannot keep.
+`slice_issue`, `slice_dependency`, `umbrella`, `umbrella_label`,
+`umbrella_close`, `parent_close`, six in all — each get a delivered-form in
+`_delivered_value` (`effects.py:389-433`), so typed reconciliation of an
+uncertain one is possible; without that, §3's crash rows are promises the
+kernel cannot keep.
 
 The umbrella comment is a `comment` effect; the label swaps and the parent's
 close are `issue_or_label`. None of those is new in kind.
@@ -260,6 +290,7 @@ close are `issue_or_label`. None of those is new in kind.
 | `human_ruling` | `approve_artifact` | as today, `phase: slices` |
 | `artifact_advanced` | `advance_ungated` | `phase: slices`, `hash` |
 | `slice_filed` | `record_slice_filed` | `epoch`, `slice`, `issue`, `title`, `parent`, `plan_hash` |
+| `filing_complete` | `record_filing_complete` | `epoch`, `plan_hash`, `children` |
 | `slice_closed` | `record_slice_closed` | `epoch`, `slice`, `issue`, `closed_at`, `state` |
 | `run_ended` | `record_run_outcome(sliced)` | as today, `outcome: sliced` |
 
@@ -337,42 +368,48 @@ because it held a current park (§5 of the front-half design as extended on
 loop's next iteration — `sliced` being in `_LOOP_STATES` — performs the filing
 below and exits. On the ungated path the same pass continues from
 `advance_ungated` into the filing. In both cases a crash before filing is
-complete leaves a `sliced` run with owed obligations and no park; §5 states
-how the next wave finds it.
+complete leaves a `sliced` run without a `filing_complete` fact and no park;
+§5 states how the next wave finds it.
 
 ### Filing the children
 
 `file_owed(ctx)` runs in the loop beside `publish_owed`, and is the last thing
-a pass at `sliced` does. For each slice of the accepted plan, in dependency
-order (a topological order; ties by slice number), with obligation
-`{kind: slice_issue, run, epoch, slice: n, parent, plan_hash}` and key
-`slice:<run>:<n>:<generation>`:
+a pass at `sliced` does. It is **idempotent per obligation, not per slice**:
+every step below checks its own fact or effect and performs only what is
+missing, so a pass that resumes after any crash repairs exactly the remainder
+and never re-performs or re-records anything. For each slice of the accepted
+plan, in dependency order (a topological order; ties by slice number):
 
-1. If a satisfied `issue_create` with this obligation exists, take its issue
-   number from the confirmed row and continue.
-2. Otherwise compose the child — title: the slice title; body: the marker line
-   `Slice n of #<parent> (bircher shaping <hash8>)`, a blank line, the scope,
-   `Non-goals: …`, and `Depends on: #<x>, #<y>` with the siblings' numbers
-   already filed, or `Depends on: none`; labels: `bircher:queued`,
-   `bircher:slice`, and the parent's inherited policy labels — and perform the
-   `issue_create`.
-3. `record_slice_filed(n, key)`, which the kernel checks against the confirmed
-   row.
-4. For each dependency, an `issue_or_label` effect with obligation
-   `{kind: slice_dependency, run, epoch, slice: n, blocker: m}` posting the
-   blocked-by link.
+1. **The create.** Obligation `{kind: slice_issue, run, epoch, slice: n,
+   parent, plan_hash}`, key `slice:<run>:<n>:<generation>`. If no satisfied
+   `issue_create` carries this obligation, compose the child with
+   `slices.render_child(slice, parent, hash8, sibling_numbers)` — title: the
+   slice title; body: the marker line `Slice n of #<parent> (bircher shaping
+   <hash8>)`, a blank line, the scope, `Non-goals: …`, and `Depends on: #<x>,
+   #<y>` with the siblings' numbers already filed, or `Depends on: none`;
+   labels: `bircher:queued`, `bircher:slice`, and the parent's inherited
+   policy labels — and perform it. The renderer is the one function the proof
+   re-renders with (§6).
+2. **The fact.** If this slice has no `slice_filed` in this epoch,
+   `record_slice_filed(n, key)`, which the kernel checks against the confirmed
+   row. A satisfied create with its fact already recorded is skipped here and
+   *not* skipped for step 3: a crash between a child's dependency links leaves
+   its fact recorded and its links owed.
+3. **The links.** For each dependency, obligation `{kind: slice_dependency,
+   run, epoch, slice: n, blocker: m}`; performed if unsatisfied, as an
+   `issue_or_label` effect posting the blocked-by link.
 
-Then, once, with obligation `{kind: umbrella, run, epoch, plan_hash}`: the
-comment `bircher: sliced <hash8>` followed by one line per child, `- #<number>
-Slice n: <title>`, and the label swap `bircher:running` → `bircher:sliced` on
-the parent, its own `issue_or_label` obligation `{kind: umbrella_label, run,
-epoch}`. Every step is owed: a crash anywhere leaves obligations unsatisfied
-and the next pass performs what is missing; an uncertain create halts the run
-(§3 *Sessions are effects*) for reconciliation, which lists the parent's
-children by the marker line to say what exists. A satisfied obligation is
-never re-performed — `perform` replays a confirmed key — which is why nothing
-in this design depends on a replay to undo a person's label edit (finding 6,
-below).
+Then, each once, if unsatisfied: the umbrella comment, obligation `{kind:
+umbrella, run, epoch, plan_hash}` — `bircher: sliced <hash8>` followed by one
+line per child, `- #<number> Slice n: <title>` — and the label swap
+`bircher:running` → `bircher:sliced` on the parent, obligation `{kind:
+umbrella_label, run, epoch}`. Last, `record_filing_complete()`, which the
+kernel accepts only when every obligation above is satisfied. An uncertain
+effect anywhere halts the run (§3 *Sessions are effects*) for reconciliation,
+which lists the parent's children by the marker line to say what exists. A
+satisfied obligation is never re-performed — `perform` replays a confirmed key
+— which is why nothing in this design depends on a replay to undo a person's
+label edit (§5).
 
 `bircher: sliced ` joins `BIRCHER_STATUS_PREFIXES` in both copies of the
 predicate, so the umbrella never freezes into a bundle.
@@ -380,25 +417,25 @@ predicate, so the umbrella never freezes into a bundle.
 ### The sweep
 
 Each firing of the scheduled wave, before it generates the queue, runs
-`sweep_sliced(ctx)` over every open run in state `sliced` (from the journal,
-by `open_run_ids`), skipping a run that is halted or holds pending effects —
-a dispatch on such a run is refused, and the halt is a person's to reconcile.
-For each such run, under a fresh `operator` dispatch: for each slice in the
-accepted plan with a `slice_filed` and no `slice_closed`, read the issue; if
-closed, `record_slice_closed` with the state the pull request shows. When
-every slice of the plan is filed and closed, three owed effects in order —
-the comment `bircher: sliced complete` naming each child and its final state
-(obligation `{kind: umbrella_close, run, epoch}`), the parent's close
-(obligation `{kind: parent_close, run, epoch}`; a parent a person already
-closed is left as it is, the effect's precondition being the open state the
-sweep observed), then `record_run_outcome(sliced)`. Under the parent run's own
-generation, so the journal holds the story from epic to closure. A child
-abandoned keeps its parent open; that is the honest state, and the notice a
-person sees on the parent is the umbrella comment naming the child that never
-closed. A parent a person closes by hand while children are open stays a
-`sliced` run in the journal and is swept each wave; when its children close,
-the completion comment is posted and the outcome recorded, the close being
-skipped as above.
+`sweep_sliced(ctx)` over every open run in state `sliced` **that carries a
+`filing_complete` fact** (from the journal, by `open_run_ids` and the fact),
+skipping a run that is halted or holds pending effects — a dispatch on such a
+run is refused, and the halt is a person's to reconcile. For each such run,
+under a fresh `operator` dispatch: for each slice in the accepted plan with no
+`slice_closed`, read the issue; if closed, `record_slice_closed` with the
+state the pull request shows. When every slice of the plan is closed, three
+owed effects in order — the comment `bircher: sliced complete` naming each
+child and its final state (obligation `{kind: umbrella_close, run, epoch}`),
+the parent's close (obligation `{kind: parent_close, run, epoch}`; a parent a
+person already closed is left as it is, the effect's precondition being the
+open state the sweep observed), then `record_run_outcome(sliced)`. Under the
+parent run's own generation, so the journal holds the story from epic to
+closure. A child abandoned keeps its parent open; that is the honest state,
+and the notice a person sees on the parent is the umbrella comment naming the
+child that never closed. A parent a person closes by hand while children are
+open stays a `sliced` run in the journal and is swept each wave; when its
+children close, the completion comment is posted and the outcome recorded, the
+close being skipped as above.
 
 ## §4 Human interaction
 
@@ -406,10 +443,13 @@ Nothing new in kind. The gate takes `approve`, corrections, or `cancel`. A
 `direct` at `shaping` displaces a live shaping turn and starts the next round
 with the direction as its findings — "this is one piece, do not slice it" or
 "slice it along these lines" — which is how a person overrides the shaper
-without editing the issue. The park notice names the phase `slices` and says
-what to type, as every notice does. A `grill` park cannot occur in this phase:
-the shaper asks no questions (§3), and `record_model_question` is refused
-under a `slices` generation.
+without editing the issue; the direction guard on both `submit_slices` and
+`record_one_piece` (§2) is what makes the interrupted author's output
+un-recordable, so the direction is not overtaken by the turn it interrupted.
+The park notice names the phase `slices` and says what to type, as every
+notice does. A `grill` park cannot occur in this phase: the shaper asks no
+questions (§3), and `record_model_question` is refused under a `slices`
+generation.
 
 A revised *epic* — a person editing the issue after its children are filed —
 is not re-sliced: `revise_bundle` is refused from `sliced`. What a person does
@@ -417,7 +457,7 @@ instead is stated in §9.
 
 ## §5 Runner
 
-Four changes, one of them to `run_item`:
+Five changes, two of them to `run_item`:
 
 - `_preflight_labels` checks `bircher:slice` and `bircher:sliced` beside
   `running` and `escalated`.
@@ -425,22 +465,32 @@ Four changes, one of them to `run_item`:
   in an explicit list of front-half states and escalates any other as beyond
   the front half. The list gains `shaping`, `slices_submitted`,
   `slices_accepted` and `sliced`; without that, every resume of a parked
-  shaping-phase run is escalated before the loop is called. The self-test
-  pins the list.
+  shaping-phase run is escalated before the loop is called.
+- **`run_item`'s post-loop branch.** After `phases` exits `0` the runner today
+  dispatches an implementer, calls `start_implementation` — legal only from
+  `planned` (`authz.py:86`) — and records `failed` when the state is not
+  `implementing` (`run-queue.sh:4451-4465`). A `sliced` run exiting `0` would
+  take that path and be scored as a failed implementation. The branch gains a
+  case: state `sliced` after the loop records the scorecard row `sliced`,
+  naming the children from `slice_filed`, keeps the queue file out of
+  `processed` as a parked item is kept, and returns without dispatching
+  anything or ending the run. The self-test pins both the resume list and
+  this case.
 - `issues-to-queue.sh`'s journal sweep queues, beside open runs with a current
-  park, **open runs in `sliced` whose accepted plan has a slice with no
-  `slice_filed`** — the crash-before-filing case — so the next wave's pass
-  reaches `file_owed`. A `sliced` run with every slice filed is not queued;
-  it is the sweep's, not the loop's.
+  park, **open runs in `sliced` with no `filing_complete` fact in the current
+  epoch** — the crash-anywhere-during-filing case — so the next wave's pass
+  reaches `file_owed`, which repairs whatever is owed. A `sliced` run with
+  `filing_complete` is not queued; it is the sweep's, not the loop's. Whether
+  a slice *file* exists is never the test; the kernel's fact is.
 - The wave calls `coordinator.cli sweep-sliced --db … --server … --repo …`
   once per firing, before queue generation.
 
 `run_item`'s label effect, `queued` → `running`, fires on every pass that
 resumes a run, generation-keyed; a `sliced` parent that a person re-labelled
 `queued` is therefore adopted, re-labelled `running` beside its `sliced`
-label, worked by a loop that has nothing owed and exits, and left carrying
-both labels until the sweep closes it. Nothing is re-sliced. The scorecard
-gains an outcome row `sliced` naming the children filed.
+label, worked by a loop that has nothing owed and exits through the new
+branch, and left carrying both labels until the sweep closes it. Nothing is
+re-sliced.
 
 ## §6 Proof
 
@@ -449,18 +499,24 @@ together (`--children` reads the `slice_filed` facts and proves each child's
 run as an ordinary run), all through `slices.parse` over the plan the kernel
 holds:
 
-1. **The children are the plan.** The accepted plan's slices and the
-   `slice_filed` facts correspond one to one, in order, in the run's final
-   epoch; each child issue's body, fetched live, opens with the marker naming
-   this run's plan hash8, and its title equals its slice's.
+1. **The children are the plan, body and all.** The accepted plan's slices and
+   the `slice_filed` facts correspond one to one, in order, in the run's final
+   epoch; and each child issue, fetched live, has the title and the body that
+   `slices.render_child` produces for its slice from the parsed plan, the
+   parent's number, the hash8 and the siblings' filed numbers — compared
+   whole, not by marker and title alone, so a filing that gave every child the
+   first slice's scope, or dropped the non-goals, fails here.
 2. **The dependencies are the links.** Every `Depends on:` in the plan is a
    blocked-by link on the child, fetched live, and the child has no other.
 3. **The umbrella names the children.** The parent's `bircher: sliced` comment
    for this plan hash lists exactly the numbers in `slice_filed`, and there is
    exactly one such comment.
-4. **A ruling is not a plan.** A run with a `shape` `model_ruling` in an epoch
-   has no `slices` artefact and no `slice_filed` in that epoch, and the
-   reverse.
+4. **One decision per epoch.** In each epoch, either there is a `slice_filed`
+   and no `shape` ruling newer than the accepted plan's `artifact_submitted`,
+   or there is a `shape` ruling newer than every `artifact_submitted` of phase
+   `slices` in that epoch and no `slice_filed`. A rejected slice plan followed
+   by a one-piece ruling is the second case and passes; a ruling followed by
+   a filing, or a filing beside a newer ruling, fails.
 
 Under mode `zero`, no park at the slice gate; under mode `approval`, exactly
 one `human_ruling {approve}` at it is admitted beside the spec gate's. Every
@@ -474,16 +530,20 @@ front-half design requires of its own.
 | Shaper writes both `shape.md` and `artifact.md` | the ruling is read; the artefact is ignored and moved aside before any re-prompt |
 | Shaper writes a six-slice plan | `submit_slices` refused; the refusal is the next round's findings, as the grill refusal is |
 | Reviewer rejects three times | `bound_exhausted`, the park, the notice: the person grants a round (legal at `slices_submitted` with a park), corrects, or cancels — or directs "one piece" |
+| A slice plan is rejected and the next author rules one piece | legal; the run proceeds to `queued`; the epoch's decision is the newer fact (§2), and the proof reads it so |
+| A person directs during a live shaping turn | the turn is displaced; its ruling or plan is refused by the direction guard whichever it was; the direction is the next round's findings |
 | A child is itself an epic | its shaper cannot slice it (`policy_frozen` carries `bircher:slice`); it proceeds as one piece and its spec phase does what it can; the reviewer's findings on an oversized spec are the signal a person reads |
-| Crash after `sliced`, before or during filing | obligations unsatisfied, no park; the generator queues the run because a slice has no `slice_filed`; the next pass files the rest. An uncertain create halts the run for reconciliation by marker |
-| Crash between a create's confirmation and its `record_slice_filed` | the effect is confirmed; the next pass's step 1 finds it and step 3 records it |
+| Crash after `sliced`, anywhere before `filing_complete` | obligations unsatisfied, no park, no `filing_complete`; the generator queues the run; the next pass's `file_owed` performs exactly what is missing — a create, a fact, a link, the umbrella or its label — and records completion |
+| Crash between a create's confirmation and its `record_slice_filed` | the effect is confirmed; the next pass's step 1 finds it satisfied, step 2 records the fact, step 3 checks the links |
+| Crash between a child's `slice_filed` and its dependency links | the fact exists; step 2 skips; step 3 performs the missing links |
+| Crash between the last link and the umbrella, or between the umbrella and its label | the umbrella or the label is performed; then completion |
 | Crash between the completion comment and the parent's close | the comment's obligation is satisfied and is not re-posted; the close's is not and is performed; the outcome follows |
 | Two runs shape the same parent | impossible by the open-run guard: the parent's run is open in `sliced` |
-| The parent is re-labelled `bircher:queued` by a person | adopted, re-labelled `running` by `run_item`, nothing owed, the loop exits; the parent carries `running` and `sliced` until the sweep closes it. Nothing is re-sliced |
+| The parent is re-labelled `bircher:queued` by a person | adopted, re-labelled `running` by `run_item`, nothing owed, the loop exits through the `sliced` branch; the parent carries `running` and `sliced` until the sweep closes it. Nothing is re-sliced |
 | The parent issue is edited after filing | `revise_bundle` refused from `sliced`; the edit has no effect on the run; §9 says what a person does instead |
 | A child is closed without merging | `slice_closed {state: closed}`; the parent closes when all are; the completion comment names each child's final state, so a closed-not-merged child is visible |
 | A person closes the parent by hand | the run stays `sliced` and is swept; when its children close, the completion comment is posted, the close is skipped, the outcome recorded |
-| The sweep meets a halted parent run | skipped, logged; a halt is reconciled by a person as every halt is |
+| The sweep meets a halted parent run, or one without `filing_complete` | skipped, logged; a halt is reconciled by a person as every halt is, and an incomplete filing is the loop's |
 | `bircher:sliced` or `bircher:slice` missing on the repo | preflight refuses to start, naming it |
 
 ## §8 Tests
@@ -493,28 +553,37 @@ test that reproduces it — the grammar cases (no scope, a two-sentence scope, a
 seven-sentence scope, a missing non-goals line, a dependency on slice 9, a
 self-dependency, a three-slice cycle, six slices, one slice), the
 slice-of-a-slice read from `policy_frozen` and **not** from the bundle, the
-empty ruling strings, the second ruling, the ungated advance under a gated
-policy, the human correction at the gate landing in `shaping` and not
-`specified`, each extended from-set, `record_slice_filed` against an
-unconfirmed effect and against a wrong obligation, `record_slice_closed` for an
-unfiled slice, the outcome with a slice unfiled and with a slice filed but
-open, `revise_bundle` refused from `sliced`.
+empty ruling strings, the second ruling, the ruling after a direction, the
+ruling from `slices_accepted`, the ruling after a rejected plan (legal), the
+ungated advance under a gated policy, the human correction at the gate landing
+in `shaping` and not `specified`, each extended from-set, `record_slice_filed`
+against an unconfirmed effect, a wrong obligation and a duplicate,
+`record_filing_complete` with a link unsatisfied and with the umbrella label
+unsatisfied, `record_slice_closed` before completion and for an unfiled slice,
+the outcome with a slice open and without `filing_complete`, `revise_bundle`
+refused from `sliced`.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
 `slices` brief that carries the coarse paragraph; the gate park and its notice;
 the gated path from approval into filing in one loop; `file_owed` with a crash
-planted after the first create — the second pass files slices two and three
-and not a second slice one; dependency order with a plan whose slice 1 depends
-on slice 2; the umbrella comment's exact text; `sweep_sliced` closing a parent
-whose children are all closed, leaving one whose child is open, skipping a
-halted run, and recording the outcome only in the first case.
+planted at **each** boundary named in §7 — after a create, after a fact, after
+a link, after the umbrella — and the second pass performing exactly the
+remainder, never a duplicate create and never a refused duplicate fact;
+dependency order with a plan whose slice 1 depends on slice 2; the umbrella
+comment's exact text; `render_child`'s exact text; `sweep_sliced` closing a
+parent whose children are all closed, leaving one whose child is open,
+skipping a halted run and one without `filing_complete`, and recording the
+outcome only in the first case.
 
 Runner self-test: the two labels in preflight; the resume gate's list; the
-generator queueing a `sliced` run with an unfiled slice and not one fully
-filed; a blocked child skipped until its blocker closes.
+post-loop `sliced` branch recording `sliced` and dispatching nothing; the
+generator queueing a `sliced` run without `filing_complete` and not one with;
+a blocked child skipped until its blocker closes.
 
-Proof: each of the four assertions reds on its planted defect.
+Proof: each of the four assertions reds on its planted defect, including a
+child whose body carries the wrong slice's scope for assertion 1 and a
+ruling-after-plan run for assertion 4's passing case.
 
 Every new condition's mutation is executed, not argued; the review package for
 each task states which line was mutated and which test went red.
@@ -567,6 +636,16 @@ and closes nothing on GitHub; the issue is what the sweep reads.
 8. **The outcome guard iterates the plan, not the filed set.** The only reading
    under which "every child closed" cannot be vacuously true. Costs the kernel
    one parse of bytes it already holds.
+9. **Filing completion is a kernel fact, not a coordinator inference.**
+   `filing_complete` is what the generator, the sweep and the outcome read;
+   the kernel accepts it only when every obligation the plan implies is
+   satisfied. A fact the coordinator inferred from "every slice has a
+   `slice_filed`" was shown to strand links and the umbrella. Costs one
+   command and one fact.
+10. **Changing one's mind within an epoch is legal until a plan is accepted.**
+    A rejected slice plan followed by a one-piece ruling is a supported path,
+    because a person may direct it; the proof reads the epoch's newer
+    decision. Costs the proof one ordering comparison.
 
 ## Dispositions — round 1 (Kimi, 2026-09-09)
 
@@ -578,10 +657,10 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    gated path's approval continues into filing in the same pass, and the
    crash case is queued by the generator (§5) from the journal.
 3. accepted — `record_run_outcome(sliced)` and the sweep iterate the accepted
-   plan's slices via `slices.parse`, requiring a `slice_filed` and a
-   `slice_closed` per slice; ruling 8 records why.
-4. accepted — `run_item`'s resume gate gains the four states; §5 now names it
-   as the fourth change and the self-test pins the list.
+   plan's slices via `slices.parse`, requiring a `slice_closed` per slice;
+   ruling 8 records why.
+4. accepted — `run_item`'s resume gate gains the four states; §5 names it and
+   the self-test pins the list.
 5. accepted — `revise_bundle` is refused from `sliced` (ruling 7); the
    filing and closing facts carry the epoch; §9 states the human path for a
    changed epic, including that `cancel_run` closes no issue.
@@ -593,15 +672,16 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    with the `_review_destination` clause named and a test that it does not
    land in `specified`.
 8. accepted — `record_slice_filed(slice, effect_key)` and
-   `record_slice_closed(slice, closed_at)` are commands with legal states,
-   roles and refusals; the issue number is read from the confirmed effect row,
-   not the payload.
+   `record_slice_closed(slice, closed_at, state)` are commands with legal
+   states, roles and refusals; the issue number is read from the confirmed
+   effect row, not the payload.
 9. accepted — the definition of coarse is in §1 verbatim; this document is
    its source, and the brief carries it from here.
 10. accepted — the routing table is untouched (no shell site); the effect
     inventory gains the site; the sentence now says which.
 11. accepted — the `ISSUE_OR_LABEL` contract rule for the blocked-by POST and
-    the delivered-forms for the five obligation kinds are stated in §2.
+    the delivered-forms for the obligation kinds are stated in §2 (six kinds
+    as of revision 3; see round 2, finding 7).
 12. accepted — the parent's close has its own obligation, a halted parent is
     skipped, and a hand-closed parent is in the failure table.
 13. accepted — citation corrected to `authz.py:249`, checked at `:971-973`.
@@ -609,3 +689,29 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     of the live log.
 15. accepted — the ruling file is three labelled lines with a stated parse
     rule; `slices.parse_ruling` beside `slices.parse`.
+
+## Dispositions — round 2 (Codex, 2026-09-09)
+
+1. accepted — `run_item` gains a post-loop `sliced` branch (§5, now the fifth
+   runner change): scorecard row `sliced`, the queue file kept, no implementer
+   dispatched, the run not ended; the self-test pins it.
+2. accepted — filing completion is a kernel fact, `filing_complete`, accepted
+   only when every obligation the plan implies is satisfied, links, umbrella
+   and label included; the generator queues a `sliced` run until it exists
+   and the sweep touches a run only once it does (§2, §3, §5, ruling 9).
+3. accepted — `file_owed` is idempotent per obligation: step 2 records the
+   fact only when absent and step 3 checks the links regardless, so a
+   satisfied create with its fact recorded is neither re-recorded nor
+   skipped past its owed links; §7 gains a row per crash boundary and §8 a
+   planted crash at each.
+4. accepted — a rejected slice plan followed by a one-piece ruling is a
+   supported path, stated in §2: `record_one_piece` is legal from `shaping`
+   regardless of an earlier submission and refused once a plan is accepted;
+   assertion 4 reads the epoch's newer decision (ruling 10).
+5. accepted — `record_one_piece` carries the same journal-order direction
+   guard as `submit_slices`, stated in its refusal table and §4.
+6. accepted — assertion 1 compares each child's title and body whole against
+   `slices.render_child` over the parsed plan, the one renderer the filing
+   step uses; a wrong-scope child is a planted defect in §8.
+7. accepted — `umbrella_label` is the sixth obligation kind with a
+   delivered-form; the list in §2 and disposition 11 above say six.
