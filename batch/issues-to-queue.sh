@@ -25,7 +25,15 @@ is_unblocked() {
   blockers=$(gh api "/repos/$REPO/issues/$1/dependencies/blocked_by" \
     --jq '[.[] | select(.state=="open")] | length' 2>/dev/null) || {
     echo "skip #$1 (blockers unreadable; the next wave reads again)" >&2; return 1; }
-  [ "${blockers:-0}" -eq 0 ]
+  # rc 0 IS NOT AN ANSWER on its own. `gh` exits 0 having printed nothing when
+  # the endpoint is unavailable to this token, and jq prints `null` for a body
+  # that is not a list -- and `[ "${blockers:-0}" -eq 0 ]` read both as "no
+  # open blocker", which is the fail-open this function exists to close. A
+  # count is a count; anything else is an unreadable count.
+  case "$blockers" in
+    ''|*[!0-9]*) echo "skip #$1 (blockers unreadable, got [${blockers}]; the next wave reads again)" >&2; return 1 ;;
+  esac
+  [ "$blockers" -eq 0 ]
 }
 
 mkdir -p "$QUEUE"

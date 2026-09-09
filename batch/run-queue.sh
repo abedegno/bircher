@@ -3996,6 +3996,51 @@ _interrupted_sliced_item() {
   json_row "$item" "" "escalated" "false" "" "" 0 "phases rc=$rc at sliced: filing interrupted; run '$run_id' stays open and the next pass repairs it" "n/a" >> "$SCORECARD"
 }
 
+# _unreadable_state_item <item> <run_id> <where>: the phase loop is over and
+# the kernel will not say what state it left the run in.
+#
+# CANNOT TELL IS NOT "NOT SLICED". `_kernel_state` prints the empty string on
+# every failure it has -- an unreadable database, an import error, a timeout --
+# so a bare `[ "$(_kernel_state ...)" = sliced ]` reads all of them as "some
+# other state" and falls through. Both fall-throughs are damaging and neither
+# is recoverable by the next pass: after rc 0 the run takes the planned path,
+# spending an implementer seat on a `start_implementation` the kernel refuses,
+# scoring a successful slicing `failed` and moving the queue file to PROCESSED
+# -- which is the exact outcome the sliced branch exists to prevent (shaping
+# spec §5); after a non-zero rc it takes the escalation that ALSO moves the
+# file to PROCESSED, against the same section's "the queue file stays".
+#
+# So: no outcome, no effect, the queue file untouched, and a row that says a
+# human has to look. The next pass reads the state again.
+_unreadable_state_item() {
+  local item="$1" run_id="$2" where="$3"
+  echo "[batch] $item: cannot read run $run_id's state after $where; recording nothing and leaving the queue file" >&2
+  mkdir -p "$(dirname "$SCORECARD")"
+  json_row "$item" "" "escalated" "false" "" "" 0 "the kernel state of run '$run_id' could not be read after $where, so this pass cannot tell whether it is sliced; nothing is recorded and the queue file stays for the next pass" "n/a" >> "$SCORECARD"
+}
+
+# _refused_mint_row <item> <mint_out>: the scorecard row for a refused
+# `create_run`, whose note is THE REFUSAL and not the wrapper around it.
+#
+# `_kernel_run_start` fails through `_kernel_warn`, so what it prints begins
+# `[batch:kernel] run start FAILED: <run_id> -- ` -- 67 to 113 characters of
+# prefix, the length depending on the item slug, before the first word a human
+# needs. A 200-character cut over that landed INSIDE the previous run's id and
+# the reader never reached "attempted a child create". Everything through the
+# LAST `create_run refused: ` goes (`##*` is greedy, and the fallback when the
+# text is absent is the whole message, which is still better than nothing).
+#
+# `${msg:0:200}` and not `cut -c1-200`: `cut -c` counts BYTES on the coreutils
+# the runner has, and this refusal contains `§` -- a byte cut can split it and
+# put a lone continuation byte into the JSON row.
+_refused_mint_row() {
+  local item="$1" out="$2" msg
+  msg="${out##*create_run refused: }"
+  msg=$(printf '%s' "$msg" | tr '\n' ' ')
+  mkdir -p "$(dirname "$SCORECARD")"
+  json_row "$item" "" "failed" "false" "" "" 0 "create_run refused: ${msg:0:200}" "failed" >> "$SCORECARD"
+}
+
 # The model codex workers must be dispatched with. Kept in step with the
 # DEPLOYMENT PIN directive in config.yaml -- change both together.
 BIRCHER_CODEX_MODEL="${BIRCHER_CODEX_MODEL:-gpt-5.6-sol}"
@@ -4402,10 +4447,9 @@ run_item() {
       # would tell the next pass -- and the human reading the queue directory
       # -- that an item is waiting on them when nothing is.
       rm -f "$QUEUE/$code.parked"
-      mkdir -p "$(dirname "$SCORECARD")"
       # The refusal's own words (shaping spec §5 *The refused mint*): an
       # issue an earlier run sliced says so here, not a bare "see log".
-      json_row "$item" "" "failed" "false" "" "" 0 "create_run refused: $(printf '%s' "$_mint_out" | tr '\n' ' ' | cut -c1-200)" "failed" >> "$SCORECARD"
+      _refused_mint_row "$item" "$_mint_out"
       mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
       return 0
     fi
@@ -4477,7 +4521,15 @@ run_item() {
         json_row "$item" "" "escalated" "false" "" "" 0 "phases rc=$_prc halted run '$BIRCHER_RUN_ID' or left an effect unresolved; the run stays open until they are reconciled: $_ph_pend" "n/a" >> "$SCORECARD"
         return 0
       fi
-      if [ "$(_kernel_state "$BIRCHER_RUN_ID")" = sliced ]; then
+      # READ ONCE, and refuse to guess. Empty means the kernel would not
+      # answer, not "some state other than sliced" -- and guessing here
+      # retires a queue file the shaping spec says must stay.
+      local _st_end; _st_end=$(_kernel_state "$BIRCHER_RUN_ID")
+      if [ -z "$_st_end" ]; then
+        _unreadable_state_item "$item" "$BIRCHER_RUN_ID" "phases exited $_prc"
+        return 0
+      fi
+      if [ "$_st_end" = sliced ]; then
         _interrupted_sliced_item "$item" "$_prc" "$BIRCHER_RUN_ID"
         return 0
       fi
@@ -4494,7 +4546,15 @@ run_item() {
   # exits `phases` 0 at `sliced`. No implementer -- start_implementation is
   # legal only from planned, and taking that path scored a successful
   # slicing as a failed implementation.
-  if [ "$(_kernel_state "$BIRCHER_RUN_ID")" = sliced ]; then
+  # READ ONCE. An unreadable state is not a licence to take the planned path:
+  # that dispatches an implementer seat, is refused by `start_implementation`,
+  # and scores the run `failed` with its queue file retired.
+  local _st_done; _st_done=$(_kernel_state "$BIRCHER_RUN_ID")
+  if [ -z "$_st_done" ]; then
+    _unreadable_state_item "$item" "$BIRCHER_RUN_ID" "the phase loop"
+    return 0
+  fi
+  if [ "$_st_done" = sliced ]; then
     _finish_sliced_item "$item" "$f" "$BIRCHER_RUN_ID"
     return 0
   fi
@@ -9062,6 +9122,21 @@ assert t.startswith('世'*10), 'expected 10 whole chars, got %r' % t[:14]
     || { echo "FAIL _interrupted_sliced_item exited non-zero"; exit 1; }
   [ -f "$sdir/queue/i13-epic.md" ] || { echo "FAIL _interrupted_sliced_item: the queue file must stay"; exit 1; }
   grep -q 'filing interrupted' "$sdir/scorecard.jsonl" || { echo "FAIL _interrupted_sliced_item: the row must say the filing was interrupted"; exit 1; }
+  # Cannot tell is not "not sliced" (fix round 1, ruling 1). The helper both
+  # seams reach when `_kernel_state` answers nothing: a row, no outcome, and
+  # the queue file left alone. (That the SEAMS reach it is bound at the
+  # run_item level, in tests/execution/test_front_half_seam.py, where
+  # `_kernel_state` can be stubbed silent for a whole drive.)
+  printf 'item\n' > "$sdir/queue/i14-epic.md"
+  ( export SCORECARD="$sdir/scorecard.jsonl" PROCESSED="$sdir/processed" QUEUE="$sdir/queue"
+    _unreadable_state_item "i14-epic" "i14-epic-1" "the phase loop" ) \
+    || { echo "FAIL _unreadable_state_item exited non-zero"; exit 1; }
+  [ -f "$sdir/queue/i14-epic.md" ] || { echo "FAIL _unreadable_state_item: the queue file must stay"; exit 1; }
+  [ ! -f "$sdir/processed/i14-epic.md" ] || { echo "FAIL _unreadable_state_item: the queue file must NOT be retired"; exit 1; }
+  grep -q 'could not be read after the phase loop' "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_state_item: the row must say the state could not be read"; exit 1; }
+  grep -q '"outcome": "escalated"' "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_state_item: the row must be escalated"; exit 1; }
   rm -rf "$sdir"
   echo "sliced branches OK"
 
@@ -9074,11 +9149,26 @@ SH
   chmod +x "$sldir/gh"
   printf 'bircher:queued\nbircher:running\nbircher:escalated\nbircher:slice\nbircher:sliced\n' > "$sldir/all"
   printf 'bircher:queued\nbircher:running\nbircher:escalated\nbircher:slice\n' > "$sldir/no-sliced"
+  # ONE FIXTURE PER REQUIRED LABEL (fix round 1, ruling 4). With only an
+  # all-present and a missing-sliced fixture, dropping `bircher:slice` from the
+  # loop left every label case green -- the required list was covered as a set
+  # and not as members, which is how a member goes missing unnoticed.
+  printf 'bircher:queued\nbircher:running\nbircher:escalated\nbircher:sliced\n' > "$sldir/no-slice"
+  printf 'bircher:queued\nbircher:escalated\nbircher:slice\nbircher:sliced\n' > "$sldir/no-running"
   ( PATH="$sldir:$PATH" GH_LABELS="$sldir/all" REPO=o/r _preflight_labels >/dev/null 2>&1 ) || {
     echo "FAIL _preflight_labels: refused a repo with all five labels"; exit 1; }
   local slmsg; slmsg=$( PATH="$sldir:$PATH" GH_LABELS="$sldir/no-sliced" REPO=o/r _preflight_labels 2>&1 ) && {
     echo "FAIL _preflight_labels: accepted a repo missing bircher:sliced"; exit 1; }
   case "$slmsg" in *bircher:sliced*) ;; *) echo "FAIL _preflight_labels: the refusal does not name bircher:sliced"; exit 1 ;; esac
+  # Matched on the QUOTED name from the `gh label create '<l>'` remedy line:
+  # `bircher:slice` is a prefix of `bircher:sliced`, so a bare glob would match
+  # the wrong refusal and this case would pass while naming the other label.
+  slmsg=$( PATH="$sldir:$PATH" GH_LABELS="$sldir/no-slice" REPO=o/r _preflight_labels 2>&1 ) && {
+    echo "FAIL _preflight_labels: accepted a repo missing bircher:slice"; exit 1; }
+  case "$slmsg" in *"'bircher:slice'"*) ;; *) echo "FAIL _preflight_labels: the refusal does not name bircher:slice: $slmsg"; exit 1 ;; esac
+  slmsg=$( PATH="$sldir:$PATH" GH_LABELS="$sldir/no-running" REPO=o/r _preflight_labels 2>&1 ) && {
+    echo "FAIL _preflight_labels: accepted a repo missing bircher:running"; exit 1; }
+  case "$slmsg" in *"'bircher:running'"*) ;; *) echo "FAIL _preflight_labels: the refusal does not name bircher:running: $slmsg"; exit 1 ;; esac
   rm -rf "$sldir"
   echo "shaping labels in preflight OK"
 
@@ -9087,7 +9177,11 @@ SH
   cat > "$gdir/gh" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
-  *"dependencies/blocked_by"*) [ "${GH_BLOCKERS_FAIL:-0}" = 1 ] && exit 1; echo 0 ;;
+  *"dependencies/blocked_by"*)
+    [ "${GH_BLOCKERS_FAIL:-0}" = 1 ] && exit 1
+    [ "${GH_BLOCKERS_EMPTY:-0}" = 1 ] && exit 0          # rc 0, nothing printed
+    [ "${GH_BLOCKERS_JUNK:-0}" = 1 ] && { echo null; exit 0; }
+    echo 0 ;;
   *"issue list"*) echo "" ;;
   *"--json title"*) echo "T" ;;
   *"--json body"*) echo "B" ;;
@@ -9114,6 +9208,15 @@ f.file_all(f._dispatch(Role.OPERATOR, "coordinator"))                 # filing c
   ( cd "$gdir" && eval "$(sed -n '/^is_unblocked()/,/^}/p' "$BUNDLE_DIR/batch/issues-to-queue.sh")" \
       && REPO=o/r PATH="$gdir:$PATH" GH_BLOCKERS_FAIL=1 is_unblocked 5 2>/dev/null ) && {
     echo "FAIL is_unblocked must fail closed when the blockers cannot be read"; exit 1; }
+  # rc 0 is not an answer: nothing printed, and a non-numeric answer, are both
+  # unreadable counts (fix round 1, ruling 3). `${blockers:-0}` read the first
+  # as zero and `-eq` read the second as a shell error that still fell through.
+  ( cd "$gdir" && eval "$(sed -n '/^is_unblocked()/,/^}/p' "$BUNDLE_DIR/batch/issues-to-queue.sh")" \
+      && REPO=o/r PATH="$gdir:$PATH" GH_BLOCKERS_EMPTY=1 is_unblocked 5 2>/dev/null ) && {
+    echo "FAIL is_unblocked must fail closed when gh exits 0 printing nothing"; exit 1; }
+  ( cd "$gdir" && eval "$(sed -n '/^is_unblocked()/,/^}/p' "$BUNDLE_DIR/batch/issues-to-queue.sh")" \
+      && REPO=o/r PATH="$gdir:$PATH" GH_BLOCKERS_JUNK=1 is_unblocked 5 2>/dev/null ) && {
+    echo "FAIL is_unblocked must fail closed on a non-numeric blocker count"; exit 1; }
   ( cd "$gdir" && eval "$(sed -n '/^is_unblocked()/,/^}/p' "$BUNDLE_DIR/batch/issues-to-queue.sh")" \
       && REPO=o/r PATH="$gdir:$PATH" is_unblocked 5 2>/dev/null ) || {
     echo "FAIL is_unblocked must admit an issue with no open blocker"; exit 1; }
@@ -9137,6 +9240,18 @@ f.file_slice(f._dispatch(Role.OPERATOR, "coordinator"), 1, 90, 1090)
   # exception text, so the clause above passes just as green with the catch
   # deleted -- verified by deleting it. This one does not.
   case "$mint" in *"create_run refused:"*) ;; *) echo "FAIL the refused mint must be the caught refusal, not a traceback: $mint"; exit 1 ;; esac
+  # THE ROW is what a human reads, and the row is not `$mint` (fix round 1,
+  # ruling 2). `_kernel_warn`'s prefix used to eat the first 67-113 characters
+  # of a 200-character note, so the sentence ran out inside the previous run's
+  # id. Asserted on the note the scorecard actually carries.
+  ( export SCORECARD="$gdir/mint-scorecard.jsonl"
+    _refused_mint_row "i80-epic" "$mint" ) || { echo "FAIL _refused_mint_row exited non-zero"; exit 1; }
+  local mnote; mnote=$("${BIRCHER_PY:-python3}" -c '
+import json, sys
+print(json.loads(open(sys.argv[1]).read().splitlines()[-1])["note"])' "$gdir/mint-scorecard.jsonl")
+  case "$mnote" in "create_run refused: issue #"*) ;; *) echo "FAIL the refused-mint note must open with the refusal itself, got: $mnote"; exit 1 ;; esac
+  case "$mnote" in *"attempted a child create"*) ;; *) echo "FAIL the refused-mint note must reach the reason, got: $mnote"; exit 1 ;; esac
+  case "$mnote" in *"[batch:kernel]"*) echo "FAIL the refused-mint note must not carry the warn prefix: $mnote"; exit 1 ;; esac
   rm -rf "$gdir"
   echo "generator and refused mint OK"
 
@@ -9324,7 +9439,12 @@ __HELP__
     # The sweep first (shaping spec §3 *The sweep*, §5): every filed epic's
     # children are read and the finished epics ended before the queue is
     # generated, so a parent that ends this wave is not also queued by it.
-    if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
+    # The SAME condition `preflight_kernel` gates its probe on, and for the
+    # same reason: under `legacy` or `deny` the kernel is not on the effect
+    # path, so a sweep that ends runs and closes issues off it would perform
+    # effects the operator turned off. The database file is the second half.
+    if [ "${BIRCHER_EFFECT_MODE:-kernel}" = kernel ] \
+       && [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
       PYTHONPATH="$(_kernel_pythonpath)" "${BIRCHER_PY:-python3}" -m coordinator.cli sweep-sliced \
         --db "$BIRCHER_KERNEL_DB" --server "$SERVER" --repo "$REPO" \
         || echo "[batch] sweep-sliced failed; generating the queue anyway" >&2

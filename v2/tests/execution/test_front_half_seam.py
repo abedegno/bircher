@@ -70,6 +70,12 @@ _NEEDED_REAL_FUNCTIONS = [
     # omitted definition left run_item calling an undefined function -- which
     # bash treats as false, so every resume silently took the escalate branch.
     "_front_half_resumable",
+    # The two rows `run_item` writes through a helper: the refused mint's
+    # (whose note is the refusal itself) and the post-loop "the kernel would
+    # not say what state this run is in". REAL, not stubbed -- an undefined
+    # one writes no row at all, and a test asserting the outcome then reads an
+    # empty scorecard as "it took some other branch".
+    "_refused_mint_row", "_unreadable_state_item",
 ]
 
 
@@ -135,13 +141,21 @@ _kernel_pending()  {{ _log_call _kernel_pending "$@"; printf '%s' "${{T_PENDING:
 _kernel_state() {{
   _log_call _kernel_state "$@"
   local n; n=$(cat "{statecount}"); n=$((n+1)); printf '%s' "$n" > "{statecount}"
-  # On the RESUME path the first read is the run's current state; every later
-  # one is the read-back after start_implementation. On the mint path there is
-  # no resume read, so the first is already the read-back.
+  # On the RESUME path the first read is the run's current state. Every later
+  # read is post-loop: the sliced check the moment `phases` returns (shaping
+  # spec §5), then the read-back after start_implementation. On the mint path
+  # there is no resume read, so the FIRST read is already the sliced check and
+  # the second is the read-back -- `args_of("_kernel_state")` is the sliced
+  # check there, not the read-back.
+  #
+  # `${{T_STATE_AFTER-implementing}}`, not `:-`: the empty string is a value
+  # this knob has to be able to carry. `_kernel_state` prints nothing on every
+  # failure it has, and "the kernel would not answer" is a case run_item must
+  # handle -- `:-` would have quietly turned it back into `implementing`.
   if [ -n "${{T_FIND_RUN:-}}" ] && [ "$n" = 1 ]; then
     printf '%s' "${{T_STATE_RESUME:-queued}}"
   else
-    printf '%s' "${{T_STATE_AFTER:-implementing}}"
+    printf '%s' "${{T_STATE_AFTER-implementing}}"
   fi
 }}
 _kernel_implementation_started() {{ _log_call _kernel_implementation_started "$@"; return "${{T_IMPL_STARTED:-1}}"; }}
@@ -493,6 +507,46 @@ def test_a_genuine_failure_with_nothing_pending_still_records_failed(tmp_path):
     assert not (d.queue_dir / f"{ITEM}.md").exists()
 
 
+# --- the post-loop state read: "cannot tell" is not "not sliced" -------------
+
+def test_an_unreadable_state_after_the_loop_does_not_take_the_planned_path(tmp_path):
+    """RULING 1, rc 0. `_kernel_state` prints the empty string on every failure
+    it has, so `[ "$(_kernel_state ...)" = sliced ]` used to read an unreadable
+    kernel as "some other state" and carry on to the implementer -- spending a
+    seat, having `start_implementation` refuse it, scoring the run `failed` and
+    retiring the queue file. All of that is unrecoverable on the next pass."""
+    d = _drive(tmp_path, env_extra={"BIRCHER_HAVE_LOCK": "1", "T_STATE_AFTER": ""})
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    # Nothing was recorded and nothing was spent.
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert "_kernel_start_implementation" not in d.names, d.names
+    assert "_create_session" not in d.names, d.names
+    # The queue file is what the next pass reads.
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert d.args_of("_kernel_run_start")[0] in note, note
+    assert "could not be read" in note, note
+
+
+def test_an_unreadable_state_after_a_FAILED_loop_keeps_the_queue_file(tmp_path):
+    """RULING 1, rc != 0. The same read, the other seam: falling through here
+    reached the `failed` escalation, which moves the file to PROCESSED -- and
+    the shaping spec says a run that may be at `sliced` keeps its queue file."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1", "T_STATE_AFTER": "",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "could not be read" in note, note
+
+
 # --- 3. the state read back after start_implementation -----------------------
 
 def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp_path):
@@ -501,7 +555,12 @@ def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp
     })
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     assert "_kernel_start_implementation" in d.names
-    assert d.args_of("_kernel_state") == [d.args_of("_kernel_run_start")[0]]
+    # The READ-BACK, which on the mint path is the SECOND `_kernel_state`: the
+    # first is the sliced check that fires the moment `phases` returns. Both
+    # must name this run, and `args_of` with no `nth` would have asserted the
+    # sliced check under the name of the read-back.
+    assert d.args_of("_kernel_state", nth=0) == [d.args_of("_kernel_run_start")[0]]
+    assert d.args_of("_kernel_state", nth=1) == [d.args_of("_kernel_run_start")[0]]
     assert d.outcomes == ["failed"], d.calls
     assert "_create_session" not in d.names, d.names
     assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()

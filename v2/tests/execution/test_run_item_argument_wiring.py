@@ -157,6 +157,12 @@ _NEEDED_REAL_FUNCTIONS = [
     # omitted definition left run_item calling an undefined function -- which
     # bash treats as false, so every resume silently took the escalate branch.
     "_front_half_resumable",
+    # The two rows `run_item` writes through a helper: the refused mint's
+    # (whose note is the refusal itself) and the post-loop "the kernel would
+    # not say what state this run is in". REAL, not stubbed -- an undefined
+    # one writes no row at all, and a test asserting the outcome then reads an
+    # empty scorecard as "it took some other branch".
+    "_refused_mint_row", "_unreadable_state_item",
 ]
 
 
@@ -598,6 +604,17 @@ def test_start_implementation_gets_the_implementer_generation(happy_drive):
     # generation 2: the operator fence took 1, and the implementer is
     # dispatched AFRESH after phases rather than reusing it.
     assert args == [run_id, "2"], args
+
+
+def test_the_sliced_check_reads_this_run(happy_drive):
+    """The read the sliced branch turns on (shaping spec §5) must ask about
+    THIS run. It fires the moment `phases` returns, before any of the
+    implementer's calls, so a wrong id here silently answers about a different
+    run and decides whether a parent stops or is implemented."""
+    calls, _, _tmp = happy_drive
+    name, args = calls[I_SLICED_CHECK]
+    assert name == "_kernel_state"
+    assert args == [calls[I_RUN_START][1][0]], args
 
 
 def test_the_state_is_read_back_for_this_run_after_start_implementation(happy_drive):

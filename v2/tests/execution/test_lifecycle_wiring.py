@@ -244,6 +244,18 @@ _RUN_NOT_OVER = {
         "the run is waiting on a human. The queue file stays where it is and "
         "the sidecar names the run, so the next pass resumes THIS run rather "
         "than minting a second one for the same item",
+    "children filed":
+        "`_finish_sliced_item`. A parent whose children are filed is NOT over: "
+        "it waits for them, and the sweep ends it when they close. A terminal "
+        "outcome here would close the parent before a single child was worked",
+    "filing interrupted":
+        "`_interrupted_sliced_item`. The coordinator died mid-filing, so the "
+        "run is at `sliced` with obligations outstanding -- the kernel refuses "
+        "`failed` from there in any case, and the next pass repairs the filing",
+    "could not be read after":
+        "`_unreadable_state_item`. The kernel would not say what state the loop "
+        "left the run in, so this pass cannot tell whether it is over. Ending "
+        "a run on a guess is exactly the guess this row exists to refuse",
 }
 
 
@@ -266,8 +278,12 @@ def _logical_lines():
 
     Returns (first_physical_index, logical_text).
     """
+    return _logical(_run_item())
+
+
+def _logical(src):
     out, buf, start = [], "", None
-    for i, raw in enumerate(_run_item().splitlines()):
+    for i, raw in enumerate(src.splitlines()):
         code = raw.split("#", 1)[0] if raw.lstrip().startswith("#") else raw
         if start is None:
             start = i
@@ -287,9 +303,61 @@ def _strip_comment(text):
     return "" if stripped.startswith("#") else text
 
 
-def _scorecard_sites():
-    return [(i, l) for i, l in _logical_lines()
+#: Scorecard rows `run_item` writes THROUGH A HELPER. Each helper is one of
+#: run_item's own exits, factored out because two seams share it -- so its row
+#: is run_item's row and every check in this section applies to it.
+#:
+#: SCANNED AT THE POSITION OF THE CALL, not of the helper's own text: what the
+#: dispatch-position tests below ask is whether a generation exists when the
+#: row is written, and that is a property of the call site.
+#:
+#: This list exists because factoring a row out silently removed it from every
+#: check here. `create_run refused` was exempted with a written reason, the row
+#: moved into `_refused_mint_row`, and the exemption then matched nothing --
+#: caught only because a separate test asserts every exemption still matches
+#: exactly one site. The two sliced-branch rows had moved out the same way a
+#: commit earlier and were not covered here at all until this list was written.
+_ROW_HELPERS = ("_finish_sliced_item", "_interrupted_sliced_item",
+                "_unreadable_state_item", "_refused_mint_row")
+
+
+def _helper_body(name):
+    src = RUN_QUEUE.read_text().splitlines()
+    start = next(i for i, l in enumerate(src) if l.startswith(f"{name}()"))
+    end = next(i for i in range(start + 1, len(src)) if src[i] == "}")
+    return "\n".join(src[start:end])
+
+
+def _helper_rows(name):
+    return [l for _, l in _logical(_helper_body(name))
             if "json_row" in l and "SCORECARD" in l]
+
+
+def test_every_row_helper_exists_and_writes_exactly_one_row():
+    """A parser that finds nothing reports total compliance -- and a helper
+    renamed out from under this list would silently drop its row again."""
+    for name in _ROW_HELPERS:
+        assert len(_helper_rows(name)) == 1, (name, _helper_rows(name))
+
+
+def test_every_row_helper_is_actually_called_by_run_item():
+    """The other half: a helper nobody calls is a row nobody writes, and
+    scanning it here would report coverage of an exit that cannot happen."""
+    body = _run_item()
+    for name in _ROW_HELPERS:
+        assert re.search(rf"(?m)^\s*{name}\s", body), f"run_item never calls {name}"
+
+
+def _scorecard_sites():
+    sites = [(i, l) for i, l in _logical_lines()
+             if "json_row" in l and "SCORECARD" in l]
+    for i, l in _logical_lines():
+        if "json_row" in l:
+            continue
+        for name in _ROW_HELPERS:
+            if re.search(rf"(^|\s){name}\s", l):
+                sites += [(i, row) for row in _helper_rows(name)]
+    return sites
 
 
 def test_the_scorecard_sites_are_found():
@@ -313,11 +381,17 @@ def test_every_terminal_scorecard_row_records_a_kernel_outcome():
 
 def test_every_exemption_still_matches_a_real_site():
     """A stale exemption is worse than none: it silently excuses whatever
-    site later happens to contain its text."""
-    sites = [l for _, l in _scorecard_sites()]
+    site later happens to contain its text.
+
+    Over DISTINCT rows, not call sites: a helper reached from two seams
+    (`_unreadable_state_item` is, from both post-loop reads) contributes one
+    row at two positions, and counting positions would read that as an
+    over-broad exemption. The two failures this guards against are unchanged --
+    0 means the exemption has gone stale, 2 means it excuses a second row."""
+    rows = {l for _, l in _scorecard_sites()}
     for key in list(_NO_KERNEL_OUTCOME) + list(_RUN_NOT_OVER):
-        assert sum(key in l for l in sites) == 1, (
-            f"exemption {key!r} matches {sum(key in l for l in sites)} sites, "
+        assert sum(key in l for l in rows) == 1, (
+            f"exemption {key!r} matches {sum(key in l for l in rows)} rows, "
             "expected exactly 1")
 
 

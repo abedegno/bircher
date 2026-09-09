@@ -263,3 +263,39 @@ def test_two_healthy_runs_end_in_one_firing(world):
     for rid, epoch_n in (("i12-epic-1", 0), ("i13-epic-1", 0)):
         assert front.satisfied_obligation(s, rid, {"run": rid, "epoch": epoch_n, "kind": "umbrella_close"}) is not None
         assert front.satisfied_obligation(s, rid, {"run": rid, "epoch": epoch_n, "kind": "parent_close"}) is not None
+
+
+# --- the default `gh_json` is bounded (fix round 1, minor d) -----------------
+
+def test_the_default_gh_read_is_bounded_and_a_timeout_is_a_ReadFailed(monkeypatch):
+    """The sweep runs INSIDE the wave, before the queue is generated, so a `gh`
+    that never returns stalls every item and not one run. Two claims, because
+    the bound alone is not the behaviour: the read is bounded, AND the timeout
+    arrives as the sweep's own `ReadFailed` -- `TimeoutExpired` is not a
+    `CalledProcessError`, so without the conversion it would surface through
+    the per-run guard as "an unexpected exception", a different log line and a
+    different meaning from "a read did not answer"."""
+    import subprocess
+
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+    monkeypatch.setattr(sweep.subprocess, "run", fake_run)
+    with pytest.raises(sweep.ReadFailed) as exc:
+        sweep.gh_json(["gh", "issue", "view", "12", "--repo", "o/r"])
+    assert seen.get("timeout") == sweep.GH_READ_TIMEOUT
+    assert sweep.GH_READ_TIMEOUT > 0
+    assert "no answer" in str(exc.value)
+
+
+def test_the_default_gh_read_still_parses_a_normal_answer(monkeypatch):
+    """The guard above must not have swallowed the ordinary path."""
+    import subprocess
+
+    monkeypatch.setattr(
+        sweep.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, '{"state": "OPEN"}', ""))
+    assert sweep.gh_json(["gh", "issue", "view", "12"]) == {"state": "OPEN"}

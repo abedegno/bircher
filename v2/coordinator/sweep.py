@@ -38,8 +38,22 @@ class ReadFailed(Exception):
     """A `gh` read did not answer."""
 
 
+#: A `gh` read that never returns is worse than one that fails: the sweep runs
+#: inside the wave, before the queue is generated, so a hung read stalls the
+#: whole wave rather than one run. Bounded, and the timeout is turned into the
+#: sweep's own `ReadFailed` -- `TimeoutExpired` is not a `CalledProcessError`
+#: and would otherwise surface as "an unexpected exception", which is a
+#: different log line and a different meaning from "a read did not answer".
+GH_READ_TIMEOUT = 60
+
+
 def gh_json(argv: list[str]) -> dict:
-    r = subprocess.run(list(argv), capture_output=True, text=True)
+    try:
+        r = subprocess.run(list(argv), capture_output=True, text=True,
+                           timeout=GH_READ_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise ReadFailed(
+            f"{' '.join(argv[:4])}: no answer in {GH_READ_TIMEOUT}s") from exc
     if r.returncode != 0:
         raise ReadFailed(f"{' '.join(argv[:4])} rc={r.returncode}: {r.stderr.strip()[:200]}")
     try:
