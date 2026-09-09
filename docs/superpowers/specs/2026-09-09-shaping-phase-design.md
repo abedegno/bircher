@@ -4,9 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 12, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi), 10 (Codex) and
-11 (Kimi); the dispositions are the last eleven sections.*
+Revision 13, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi), 10 (Codex), 11
+(Kimi) and 12 (Codex); the dispositions are the last twelve sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -825,10 +825,16 @@ one-piece run that submitted a rejected slice plan first. Two amendments:
 the model-ruling check **excludes `question_id: "shape"`** — it means a
 ruling on a question the author raised, and a shape ruling every one-piece
 run carries would satisfy it vacuously; and the phase-set check is per kind
-of run — a sliced parent submits exactly `{slices}` and the hash is the
-accepted plan's, a one-piece run submits `{spec, plan}` with different
+of run **and reads the final epoch only** — `assert_journal` today collects
+submissions across the whole run, and a run that submitted a spec in epoch
+1, had its issue materially revised, and filed an accepted slice plan in
+epoch 2 is a valid history whose whole-run set is `{spec, slices}`. In the
+final epoch a sliced parent submits exactly `{slices}` and the hash is the
+accepted plan's; a one-piece run submits `{spec, plan}` with different
 hashes and may also hold `slices` (the rejected plan before its ruling).
-The parent is exempt from the model-ruling check, its decision being
+Earlier epochs hold whatever they reached before they were superseded, and
+this check does not read them; the binding and session checks still read
+every epoch. The parent is exempt from the model-ruling check, its decision being
 `slice_filed`, and from nothing else: the human-fact checks by mode, the
 reconciled-or-halted check and every session check (`assert_sessions`:
 snapshot names the dispatch's vendor, one obligation per create, every
@@ -983,7 +989,9 @@ amended existing checks: a sliced parent with no model ruling and a
 `{slices}` submission passes `assert_journal`; a one-piece run whose only
 model ruling is `shape` fails the ruling check as a run with none does
 today; a one-piece run with `{slices, spec, plan}` submissions passes the
-phase-set check and one with `{spec}` alone fails it; and the verdict-binding
+phase-set check and one with `{spec}` alone fails it; a parent that
+submitted a spec in epoch 1 and was sliced in epoch 2 passes it, and one
+whose final epoch holds `{slices, spec}` fails it; and the verdict-binding
 block re-rendering a sliced parent's review brief, red when the planted
 brief names the wrong hash.
 
@@ -1274,7 +1282,8 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    sliced parent and a one-piece run: the model-ruling check excludes the
    `shape` ruling, the phase-set check is per kind of run and admits a
    rejected slice plan, and every other check applies to the parent as to
-   any run; §8 tests the four cases.
+   any run; §8 tests the four cases. Round 12, finding 1, scoped the
+   phase-set check to the final epoch.
 3. accepted — the kernel guarantees the order (no outcome without a
    same-generation statement), not the reads; §2, §7 and ruling 17 now say
    so, and round 5's disposition 1 is annotated rather than left
@@ -1358,3 +1367,10 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    `:32`, seven after the change, and the stale "Five" comment named.
 3. accepted — the create is refused while a blocker is unfiled, and
    `render_child` is strict.
+
+## Dispositions — round 12 (Codex, 2026-09-09)
+
+1. accepted — the phase-set check reads the final epoch only; earlier
+   epochs hold whatever they reached before being superseded, and the
+   binding and session checks still read every epoch (§6, two proof tests
+   in §8, round 6's disposition 2 annotated).
