@@ -62,7 +62,7 @@ def test_create_run_freezes_policy_and_puts_the_snapshot(tmp_path):
                      issue=dict(ISSUE, labels=["bircher:queued", "bircher:grill"]),
                      project_config={"max_seats": 20})
     assert out["replayed"] is False
-    assert s.run_state("r-1") == "queued"
+    assert s.run_state("r-1") == "shaping"                  # Task 3 rule (a)
     assert s.has_artifact(out["bundle_hash"])
     frozen = s.newest_fact("r-1", EventKind.POLICY_FROZEN)
     assert frozen.actor == "kernel"

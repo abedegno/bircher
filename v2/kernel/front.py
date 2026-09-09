@@ -53,7 +53,7 @@ def round_bound(store, run_id: str, phase: str, epoch_n: int) -> int:
     return policy_of(store, run_id).max_rounds + round_grants(store, run_id, phase, epoch_n)
 
 
-FRONT_PHASES = ("spec", "plan")
+FRONT_PHASES = ("slices", "spec", "plan")
 
 #: Ruling 14: the server names the bundle, the dispatch names the vendor.
 BUNDLE_PREFIX = "v2_author_"
@@ -270,3 +270,20 @@ def prompt_hashes_of(store, run_id: str, session_id: str) -> set[str]:
             out.add(row["intent"].get("body", {}).get("artifact"))
     out.discard(None)
     return out
+
+
+def frozen_labels(store, run_id: str) -> list[str]:
+    """The issue's labels as `policy_frozen` recorded them, UNFILTERED
+    (policy.py `freeze`): the observable the depth refusal reads, since the
+    bundle canon strips every bircher: label."""
+    fact = store.newest_fact(run_id, EventKind.POLICY_FROZEN)
+    return [] if fact is None else list(fact.payload.get("labels") or [])
+
+
+def shape_ruling(store, run_id: str, epoch_n: int):
+    """The epoch's `model_ruling {question_id: "shape"}`, or None."""
+    from kernel.slices import SHAPE_QUESTION
+    for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, epoch_n):
+        if f.payload.get("question_id") == SHAPE_QUESTION:
+            return f
+    return None

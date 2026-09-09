@@ -91,5 +91,8 @@ def test_front_packet_groups_by_epoch(tmp_path):
     assert p["canon_version"] == 2
     e0 = p["epochs"][0]
     assert [q["question_id"] for q in e0["questions"]] == ["q1"]
-    assert [r["ruling"] for r in e0["rulings"]] == ["A"]
+    # Filtered, not shortened: the driver's birth shape_round records the
+    # epoch's `shape` ruling too (Task 3 rule (c)).
+    assert [r["ruling"] for r in e0["rulings"] if r["question_id"] != "shape"] == ["A"]
+    assert [r["ruling"] for r in e0["rulings"]] == ["one piece", "A"]
     assert [a["answer"] for a in e0["answers"]] == ["fine"]

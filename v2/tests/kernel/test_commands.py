@@ -47,7 +47,8 @@ def test_the_command_interface_is_closed_and_explicit():
     """A narrow interface, not a general one. Growth here is a design change
     to be argued, not absorbed.
 
-    Two commands were added deliberately, each with its argument:
+    Every command below was added deliberately, with its argument. Two of the
+    older ones:
 
     record_merge_outcome -- merge_requested was a dead end, so a merge that
     came back uncertain wedged the run and the only escape recorded
@@ -88,14 +89,28 @@ def test_the_command_interface_is_closed_and_explicit():
         # Task 9: the author's side of the grill (a question, a ruling), the
         # coordinator's dismissal of a refused human token, its record of an
         # omnigent prompt item already sent, and bundle revision as a
-        # command -- a relevant issue change resets the run to `queued` and
-        # opens a new epoch; the kernel refuses an irrelevant one.
+        # command -- a relevant issue change resets the run to `shaping`
+        # (Task 3) and opens a new epoch; the kernel refuses an irrelevant one.
         "record_model_question", "record_model_ruling",
         "dismiss_human_item", "record_prompt_item", "revise_bundle",
         # The kernel's own rendering of the reviewer's brief (spec §2
         # *Brief*): a front-half review_ruling is refused unless its
         # generation carries one.
         "issue_review_brief",
+        # Task 3, the shaping phase (shaping spec §2 *States*), each with its
+        # argument. record_one_piece -- the shaping round's other outcome:
+        # without it the only way out of `shaping` is a slice plan, so a
+        # one-piece issue could never reach `queued`, and a ruling written
+        # through record_model_ruling would carry none of the one-per-epoch,
+        # direction-order or author-seat guards. submit_slices -- the phase's
+        # artefact, which submit_spec cannot carry: the slice-plan grammar and
+        # the "a slice is not sliced" depth refusal are checked at the door,
+        # from the bytes and from policy_frozen. advance_ungated -- the
+        # ungated move from `slices_accepted` to `sliced`, deliberately NOT
+        # folded into the reviewer's accept: filing children is an effect with
+        # an obligation, and the transition that authorises it must be its own
+        # fact.
+        "record_one_piece", "submit_slices", "advance_ungated",
     ])
 
 

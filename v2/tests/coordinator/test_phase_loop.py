@@ -200,7 +200,11 @@ def test_revise_bundle_on_resume_restarts_the_epoch(world, monkeypatch):
     ctx.generation = f._dispatch(__import__("kernel.dispatch", fromlist=["Role"]).Role.OPERATOR, "runner")
     seat.command(ctx, "revise_bundle", {"issue": {"number": 1, "title": "T", "body": "B and C",
                                                   "labels": ["bircher:running"], "comments": []}})
-    assert s.run_state("r-1") == "queued" and front.epoch(s, "r-1") == 1
+    # A revision lands in `shaping`, the epoch's first state (Task 3 rule (d));
+    # the new epoch is ruled one piece before the spec round resumes.
+    assert s.run_state("r-1") == "shaping" and front.epoch(s, "r-1") == 1
+    f.shape_round()
+    assert s.run_state("r-1") == "queued"
     assert phases.run_loop(ctx) == phases.Exit.PARKED
     subs = s.facts_of_kind("r-1", EventKind.ARTIFACT_SUBMITTED)
     assert subs[-1].payload["epoch"] == 1

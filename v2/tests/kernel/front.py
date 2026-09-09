@@ -24,6 +24,20 @@ from kernel.store import Store
 
 SPEC_BYTES = b"# Spec\n\nThe thing, specified.\n"
 PLAN_BYTES = b"# Plan\n\n### Task 1: do the thing\n\n- [ ] Step 1\n"
+SLICES_BYTES = b"""# Slicing T
+
+Why: two pieces.
+
+## Slice 1: The store
+Scope: Add the table. Add the migration. Add the reads.
+Non-goals: the API.
+Depends on: none
+
+## Slice 2: The API
+Scope: Add the endpoint. Wire it to the store. Cover it with a test.
+Non-goals: the client.
+Depends on: 1
+"""
 
 
 class Front:
@@ -31,17 +45,34 @@ class Front:
                  reviewer: str = "codex", labels=("bircher:autonomous",),
                  base_sha: str = "0" * 40, base_repo: str = "o/r",
                  issue: dict | None = None, project_config: dict | None = None,
-                 existing: bool = False) -> None:
+                 existing: bool = False, shape: bool = True) -> None:
         self.store, self.run_id = store, run_id
         self.author, self.reviewer, self.base_sha = author, reviewer, base_sha
         self._n = 0
+        born = _run_exists(store, run_id)
         if existing:
-            assert _run_exists(store, run_id), f"run {run_id} does not exist"
+            assert born, f"run {run_id} does not exist"
+        if born:
+            # A second driver over a run that was already born. An idempotency
+            # key is unique within the RUN, not within this driver: the birth
+            # shape_round has already spent `record_turn_ended-1`, so a driver
+            # numbering from 1 again would be refused for reusing a key on a
+            # different request. Seed from what the run has already been
+            # asked, and shape nothing -- it is born, and `create_run` would
+            # only replay. A fresh run has been asked nothing and numbers
+            # from 1 as before.
+            self._n = len(store.facts_of_kind(run_id, EventKind.COMMAND_REQUESTED))
             return
         issue = issue or {"number": 1, "title": "T", "body": "B",
                           "labels": list(labels), "comments": []}
         create_run(store, run_id=run_id, base_repo=base_repo, base_sha=base_sha,
                    issue=issue, project_config=project_config or {})
+        # Every run is born in `shaping` (shaping spec §2). The driver rules
+        # it one piece by default, so a test of the spec or plan phase gets
+        # its run at `queued` by the only path the kernel admits (planning
+        # ruling 3); a test of the shaping phase passes shape=False.
+        if shape:
+            self.shape_round()
 
     # -- primitives ----------------------------------------------------------
 
@@ -135,6 +166,38 @@ class Front:
 
     # -- rounds ----------------------------------------------------------------
 
+    def shape_round(self, plan: bytes | None = None, *, ended: str = "file",
+                    reasoning: str = "one coherent change", cost: str = "a spec round") -> str | None:
+        """One shaping turn (shaping spec §3): a one-piece ruling, or -- with
+        *plan* -- a slice plan submitted. Returns the plan's hash, or None."""
+        cause = self._newest_id()
+        g = self._dispatch(Role.AUTHOR, self.author)
+        sid = self._session(g, cause)
+        self._end_turn(g, sid, ended)
+        if plan is None:
+            self._cmd(g, "record_one_piece", {"reasoning": reasoning, "cost_if_wrong": cost})
+            return None
+        h = put_artifact(self.store, plan)
+        self._cmd(g, "submit_slices", {"artifact_hash": h})
+        return h
+
+    def advance(self) -> None:
+        """The coordinator's `advance_ungated` at slices_accepted."""
+        g = self._dispatch(Role.OPERATOR, "coordinator")
+        self._cmd(g, "advance_ungated", {})
+
+    def to_sliced(self, plan: bytes = SLICES_BYTES) -> "Front":
+        from kernel.policy import policy_of
+        assert self.state() == "shaping", self.state()
+        self.shape_round(plan)
+        self.review_round("accept")
+        if "slices" in policy_of(self.store, self.run_id).gates:
+            self.approve()
+        else:
+            self.advance()
+        assert self.state() == "sliced", self.state()
+        return self
+
     def author_round(self, artefact: bytes, *, ended: str = "file",
                      resume: str | None = None) -> str:
         cause = self._newest_id()
@@ -164,9 +227,14 @@ class Front:
                            "reasoning": "reasoned", "cost_if_wrong": "low"})
         return sid
 
-    def revise(self, issue: dict) -> None:
+    def revise(self, issue: dict, *, reshape: bool = True) -> None:
+        """A relevant issue change; lands in `shaping` (ruling 11). By default
+        the driver rules the new epoch one piece so the run is back at
+        `queued`; a test that asserts the landing state passes reshape=False."""
         g = self._dispatch(Role.OPERATOR, "runner")
         self._cmd(g, "revise_bundle", {"issue": issue})
+        if reshape:
+            self.shape_round()
 
     def review_round(self, verdict: str = "accept", findings: bytes = b"ok", **override) -> None:
         cause = self._newest_id()

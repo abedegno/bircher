@@ -95,7 +95,7 @@ not push, do not open or comment on anything. You have no credentials.
 remains. If everything you found is `[low]`, the verdict is PASS and the low
 findings travel with it as advice. Do not invent a finding to justify a FAIL,
 and do not withhold a PASS because a document could always be improved.
-{prior_section}
+{slices_section}{prior_section}
 ## Policy
 
     grill: {grill}
@@ -119,6 +119,26 @@ _SPEC_SECTION = """
 ## The accepted spec this plan implements (sha256 {spec_hash})
 
 {spec}
+"""
+
+#: The slice reviewer's one instruction (shaping spec §3 *The review round*):
+#: what a slice is, verbatim from `slices.COARSE`, and what not to grade.
+#: Substitutes the empty string for every other phase, so a spec or plan
+#: brief under template 2 renders the bytes it rendered before.
+_SLICES_SECTION = """
+## What you are grading
+
+The artefact is a slice plan: it divides the issue into two to five slices,
+each to be worked as its own run through the whole pipeline. Grade it
+against this definition of a slice, and nothing else:
+
+> {coarse}
+
+Ask of every slice whether it is a capability a reviewer could see working
+end to end, or a bare step of another slice; whether its dependencies are
+real; and whether the union of the slices covers the issue with nothing
+invented. Do not review the design of any slice: that is its own spec
+phase's work.
 """
 
 _PRIOR_SECTION = """
@@ -150,33 +170,38 @@ def hash8(artifact_hash: str) -> str:
 def render(*, phase: str, artefact: bytes, bundle: bytes, spec: bytes | None,
            policy: Policy, base_sha: str, template: int,
            prior_findings: bytes | None = None) -> bytes:
+    from kernel.slices import COARSE
     if template not in _TEMPLATES:
         raise ValueError(f"unknown brief template version {template}")
-    if phase not in ("spec", "plan"):
-        raise ValueError(f"brief phase must be spec or plan, got {phase!r}")
+    if phase not in ("slices", "spec", "plan"):
+        raise ValueError(f"brief phase must be slices, spec or plan, got {phase!r}")
     if phase == "plan" and spec is None:
         raise ValueError("a plan brief carries the run's current spec")
-    if phase == "spec" and spec is not None:
-        raise ValueError("a spec brief carries no spec")
+    if phase != "plan" and spec is not None:
+        raise ValueError(f"a {phase} brief carries no spec")
     if template == 1 and prior_findings is not None:
         # Purity: the template the spec fixes renders the same bytes for the
         # same named objects, and it names no prior round.
         raise ValueError("template 1 carries no prior findings")
+    if template == 1 and phase == "slices":
+        raise ValueError("template 1 predates the shaping phase")
     p = to_payload(policy)
     artifact_hash = content_hash(artefact)
-    spec_section = ""
-    what = "then the spec"
+    spec_section, slices_section = "", ""
+    what = {"spec": "then the spec", "slices": "then the slice plan"}.get(phase, "")
     if phase == "plan":
         spec_section = _SPEC_SECTION.format(spec_hash=content_hash(spec),
                                             spec=spec.decode("utf-8", "replace"))
         what = "then the accepted spec, then the plan"
+    if phase == "slices":
+        slices_section = _SLICES_SECTION.format(coarse=COARSE)
     prior_section = ""
     if prior_findings is not None:
         prior_section = _PRIOR_SECTION.format(prior_hash=content_hash(prior_findings),
                                               prior=prior_findings.decode("utf-8", "replace"))
     text = _TEMPLATES[template].format(
         template=template, phase=phase, review_out=REVIEW_OUT, what_to_read=what,
-        prior_section=prior_section,
+        prior_section=prior_section, slices_section=slices_section,
         hash8=hash8(artifact_hash), grill=p["grill"], gates=", ".join(p["gates"]) or "(none)",
         max_rounds=p["max_rounds"], max_seats=p["max_seats"], base_sha=base_sha,
         bundle_hash=content_hash(bundle), bundle=bundle.decode("utf-8", "replace"),

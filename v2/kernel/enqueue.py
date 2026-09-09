@@ -115,11 +115,12 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
                issue: dict, project_config: dict) -> dict:
     """Spec §2: `create_run(issue, project_config)`.
 
-    One transaction: the run row (`queued`), the canonical snapshot bytes PUT
-    under `bundle_hash`, `policy_frozen`, `run_enqueued`. Replay only an
-    identical request; a retry whose inputs differ is `NotReplayable` -- the
-    earlier `enqueue` recomputed its answer from the RETRY's arguments and
-    reported success for a policy the journal did not hold.
+    One transaction: the run row (`shaping`, shaping spec §2), the canonical
+    snapshot bytes PUT under `bundle_hash`, `policy_frozen`, `run_enqueued`.
+    Replay only an identical request; a retry whose inputs differ is
+    `NotReplayable` -- the earlier `enqueue` recomputed its answer from the
+    RETRY's arguments and reported success for a policy the journal did not
+    hold.
     """
     labels = sorted(set(issue.get("labels", [])))
     # Validate BEFORE touching the store or hashing: `derive` raises for any
@@ -153,7 +154,8 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
                 "policy": to_payload(policy_of(store, run_id)), "replayed": True}
 
     with store.transaction():
-        store.create_run(run_id=run_id, base_repo=base_repo, base_sha=base_sha)
+        store.create_run(run_id=run_id, base_repo=base_repo, base_sha=base_sha,
+                         state="shaping")
         put = put_artifact(store, raw)
         assert put == bhash, "bundle_hash is content_hash(canonical_bytes(snapshot))"
         p = freeze(store, run_id, labels=labels, project_config=project_config)

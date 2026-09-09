@@ -173,7 +173,10 @@ def test_identical_resubmission_reauthors_once_then_stalls(world):
 
 
 def test_seats_exhausted_is_budget(world):
-    s, f, fake, ctx = world(cfg={"max_seats": 4})
+    # 5, not 4: the driver's birth shape_round has spent one author seat
+    # before this test begins (Task 3 rule (b)). The four below still exhaust
+    # the bound, and the round under test still has none left.
+    s, f, fake, ctx = world(cfg={"max_seats": 5})
     for _ in range(2):
         f._dispatch(Role.AUTHOR, "claude"); f._dispatch(Role.REVIEWER, "codex")
     assert author.author_round(ctx) == "budget"

@@ -143,7 +143,11 @@ def test_turn_ended_names_the_awaited_session_once(tmp_path):
     g2 = f._dispatch(Role.AUTHOR, "claude")
     f._prompt(g2, sid, f._newest_id())
     f._cmd(g2, "record_turn_ended", {"session": sid, "ended": "file"})
-    assert len(s.facts_of_kind("r-1", EventKind.TURN_ENDED)) == 2
+    # This phase's two, filtered: the driver's birth shape_round ended a turn
+    # of its own in phase `slices` (Task 3 rule (c)).
+    assert len([f_ for f_ in s.facts_of_kind("r-1", EventKind.TURN_ENDED)
+                if f_.payload["phase"] == "spec"]) == 2
+    assert len(s.facts_of_kind("r-1", EventKind.TURN_ENDED)) == 3
 
 
 def test_author_empty_names_the_current_author_session_and_retries_once(tmp_path):

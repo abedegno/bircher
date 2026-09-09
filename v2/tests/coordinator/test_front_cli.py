@@ -25,6 +25,9 @@ def test_the_cli_and_the_loop_agree_on_the_exit_codes():
 def test_phases_requires_a_positive_integer_turn_timeout(tmp_path, capsys):
     db = tmp_path / "k.db"
     Front(Store.open(db), "r-1")
+    # The driver's birth shape_round has already spent one author generation
+    # (Task 3 rule (b)); "nothing happened" is that list unchanged, not empty.
+    born = Store.open(db).dispatches_for("r-1")
     base = ["phases", *_common(db), "--server", "http://srv", "--repo", "o/r", "--issue", "1",
             "--repo-dir", str(tmp_path), "--workspaces-root", str(tmp_path / "ws"), "--bundle-dir", str(tmp_path),
             "--host-id", "h", "--agent-claude", "a", "--agent-codex", "b"]
@@ -32,7 +35,7 @@ def test_phases_requires_a_positive_integer_turn_timeout(tmp_path, capsys):
     assert main(base + ["--turn-timeout", "abc"]) == RC_USAGE
     assert main(base + ["--turn-timeout", "0"]) == RC_USAGE
     s = Store.open(db)
-    assert s.dispatches_for("r-1") == []                       # nothing happened
+    assert s.dispatches_for("r-1") == born                     # nothing happened  # Task 3 rule (b)
 
 
 def _phases_argv(db, tmp_path):
@@ -57,11 +60,12 @@ def test_phases_refuses_to_run_outside_enforce_mode(tmp_path, monkeypatch, capsy
     guard that happens to ask."""
     db = tmp_path / "k.db"
     Front(Store.open(db), "r-1")
+    born = Store.open(db).dispatches_for("r-1")   # the birth shape_round's own seat
     monkeypatch.setenv("BIRCHER_KERNEL_MODE", mode)
     assert main(_phases_argv(db, tmp_path)) == RC_USAGE
     err = capsys.readouterr().err
     assert "phases" in err and mode in err, err
-    assert Store.open(db).dispatches_for("r-1") == []           # nothing happened
+    assert Store.open(db).dispatches_for("r-1") == born         # nothing happened  # Task 3 rule (b)
 
 
 def test_approve_grant_direct_revise_and_parked(tmp_path, capsys):

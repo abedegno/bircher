@@ -41,6 +41,14 @@ def _ob(ctx, cause):
     return {"kind": "sess-create", "run": "r-1", "phase": "spec", "epoch": 0, "cause": cause}
 
 
+def _spec_turn_ends(s):
+    """The turn_ended facts of the phase these turns run in. Filtered, not
+    dropped: since Task 3 the driver's birth shape_round has already ended a
+    turn of its own, in phase `slices` (Task 3 rule (c))."""
+    return [f for f in s.facts_of_kind("r-1", EventKind.TURN_ENDED)
+            if f.payload["phase"] == "spec"]
+
+
 def test_run_turn_creates_prompts_waits_ends_stops_and_reads(world, tmp_path):
     s, f, fake, ctx, clock = world
     cause = phases.round_cause(ctx).id
@@ -170,7 +178,7 @@ def test_agent_mismatch_propagates_before_any_read(world):
     with pytest.raises(AgentMismatch):
         seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause),
                       prompt_cause=cause, prompt_text=b"go", watched=[seat.ARTIFACT_OUT])
-    assert s.newest_fact("r-1", EventKind.TURN_ENDED) is None
+    assert _spec_turn_ends(s) == []                                       # Task 3 rule (c)
     assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED) is None
 
 
@@ -279,7 +287,7 @@ def test_an_adopted_session_is_checked_against_the_journals_snapshot(world):
         seat.run_turn(ctx, role=Role.AUTHOR, vendor="claude", session_obligation=_ob(ctx, cause2),
                       prompt_cause=cause2, prompt_text=b"go", watched=[seat.ARTIFACT_OUT],
                       resume_session=snap["id"])
-    assert s.newest_fact("r-1", EventKind.TURN_ENDED) is None
+    assert _spec_turn_ends(s) == []                                       # Task 3 rule (c)
     assert [k for k, _ in fake.posts if k.endswith("/events")] == []      # nothing sent
 
 
