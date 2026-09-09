@@ -58,18 +58,22 @@ def world(tmp_path, monkeypatch):
         db = tmp_path / "k.db"
         s = Store.open(db)
         fronts = {}
+        fake = FakeOmnigent()
         for i, rid in enumerate(run_ids):
             f = Front(s, rid, shape=False, issue=dict(ISSUE, number=12 + i)).to_sliced()
             g = f._dispatch(Role.OPERATOR, "coordinator")
-            f.file_all(g)
+            # Each run's children start at a distinct range (40, 140, 240, ...)
+            # so two runs in the same firing never claim the same child number
+            # -- `file_all`'s own default (40) is unchanged for the single-run
+            # case, so every existing single-run test still sees 40 and 41.
+            f.file_all(g, first_issue=40 + i * 100)
             fronts[rid] = f
-        fake = FakeOmnigent()
-        # Ruling 3: the completion close mutates `fake.issues[12]["state"]`
-        # directly, and the fake raises KeyError for an issue it has never
-        # seen -- the children are minted by `file_all` through the JOURNAL,
-        # never through this fake, so nothing seeds the parent unless this
-        # fixture does.
-        fake.issues[12] = {"state": "OPEN", "labels": [], "blocked_by": []}
+            # Ruling 3: the completion close mutates `fake.issues[<parent>]
+            # ["state"]` directly, and the fake raises KeyError for an issue it
+            # has never seen -- the children are minted by `file_all` through
+            # the JOURNAL, never through this fake, so nothing seeds a run's
+            # parent unless this fixture does.
+            fake.issues[12 + i] = {"state": "OPEN", "labels": [], "blocked_by": []}
         monkeypatch.setattr("kernel.cli.subprocess.run", fake.run)
         env = {"BIRCHER_EFFECT_MODE": KERNEL, "BIRCHER_KERNEL_DB": str(db), "PATH": os.environ["PATH"]}
         return s, fronts, fake, env
@@ -197,3 +201,65 @@ def test_the_cli_runs_the_sweep_as_a_subprocess(world, tmp_path, monkeypatch):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == ""
     assert marker.exists()
+
+
+def test_a_raising_run_does_not_stop_its_sibling(world):
+    """Fix round 1, finding 1: `store.all_run_ids()` is stable oldest-first,
+    so a run that raises something other than `ReadFailed` must not abort the
+    firing for every run listed after it. A is the OLDER run (created first,
+    so listed first) and is the one that raises -- the exact case the
+    unisolated loop got wrong."""
+    s, fronts, fake, env = world(run_ids=("i12-epic-1", "i13-epic-1"))
+    logs = []
+
+    def gh(argv):
+        if argv[1:3] == ["issue", "view"]:
+            n = int(argv[3])
+            if n == 40:                                    # A's first child: not a read failure
+                raise RuntimeError("boom")
+            if n in (140, 141):                             # B's children: closed by hand
+                return {"state": "CLOSED", "closedAt": "2026-09-10T00:00:00Z",
+                        "closedByPullRequestsReferences": []}
+            if n == 13:                                     # B's parent: still open
+                return {"state": "OPEN"}
+            raise AssertionError(f"unexpected issue view for #{n}: A's firing should have ended at #40")
+        raise AssertionError(f"unexpected argv {argv}")
+
+    result = sweep.sweep_sliced(s, server="http://srv", repo="o/r", env=env, gh_json=gh,
+                                log=logs.append, now=lambda: "2026-09-10T12:00:00Z")
+    assert result == ["i13-epic-1"]
+    assert s.run_state("i13-epic-1") == "ended"
+    assert s.run_state("i12-epic-1") == "sliced"
+    assert s.facts_of_kind("i12-epic-1", EventKind.SLICE_CLOSED) == []
+    assert any("i12-epic-1" in line and "RuntimeError" in line for line in logs), logs
+
+
+def test_two_healthy_runs_end_in_one_firing(world):
+    """Fix round 1, finding 2(b): both runs of one firing end, each under its
+    own generation -- one umbrella comment and one parent close per run."""
+    s, fronts, fake, env = world(run_ids=("i12-epic-1", "i13-epic-1"))
+
+    def gh(argv):
+        if argv[1:3] == ["issue", "view"]:
+            n = int(argv[3])
+            if n in (12, 13):                               # the parents: still open, so each owes a close
+                return {"state": "OPEN"}
+            return {"state": "CLOSED", "closedAt": "2026-09-10T00:00:00Z", "closedByPullRequestsReferences": []}
+        raise AssertionError(f"unexpected argv {argv}")
+
+    result = sweep.sweep_sliced(s, server="http://srv", repo="o/r", env=env, gh_json=gh,
+                                log=lambda m: None, now=lambda: "2026-09-10T12:00:00Z")
+    assert result == ["i12-epic-1", "i13-epic-1"]
+    assert s.run_state("i12-epic-1") == "ended"
+    assert s.run_state("i13-epic-1") == "ended"
+    comments = [a for a in fake.gh if a[:3] == ["gh", "issue", "comment"]]
+    assert {c[3] for c in comments} == {"12", "13"}
+    closes = [a for a in fake.gh if a[:3] == ["gh", "issue", "close"]]
+    assert sorted(closes) == [["gh", "issue", "close", "12", "--repo", "o/r"],
+                             ["gh", "issue", "close", "13", "--repo", "o/r"]]
+    # Each run's completion effects are satisfied under ITS OWN obligation --
+    # `check_filing_effect` refuses an obligation naming the wrong run, so a
+    # satisfied row keyed to this run and this epoch is itself the proof.
+    for rid, epoch_n in (("i12-epic-1", 0), ("i13-epic-1", 0)):
+        assert front.satisfied_obligation(s, rid, {"run": rid, "epoch": epoch_n, "kind": "umbrella_close"}) is not None
+        assert front.satisfied_obligation(s, rid, {"run": rid, "epoch": epoch_n, "kind": "parent_close"}) is not None
