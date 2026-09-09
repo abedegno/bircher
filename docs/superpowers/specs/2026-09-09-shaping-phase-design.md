@@ -4,9 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 8, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex) and 7 (Kimi); the dispositions are the last
-seven sections.*
+Revision 9, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi) and 8 (Codex); the dispositions are
+the last eight sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -181,8 +181,11 @@ facts below: a reopened child is open again, whatever was recorded before),
 **and** a `children_observed_closed` fact recorded under the calling
 generation — the firing that ends the run is the firing that read every child
 and found it closed (below); closures from earlier firings are not enough,
-because a read that failed this firing would leave a stale one standing.
-Iterating the filed children rather than the plan was refused in review as a
+because a read that failed this firing would leave a stale one standing —
+**and** the completion effects: the `umbrella_close` obligation satisfied,
+and the `parent_close` obligation satisfied or that same fact saying
+`parent: closed`, a parent a person closed owing no close. Iterating the
+filed children rather than the plan was refused in review as a
 vacuous-truth hole: an epic that crashed before filing anything would have
 closed as complete. **From `sliced`, no other outcome is accepted:** a run that
 has entered `sliced` may have filed children, and `failed` or `merged` over
@@ -315,13 +318,20 @@ date, not a permanent property, and a person who reopens a child reopens the
 epic. The outcome guard above reads current closures, so a parent never
 closes over a child that was closed once and is open now.
 
-`record_children_observed_closed()` is the sweep's statement that **this
-firing read every child of the plan and found every one closed**: legal from
-`sliced` under the sweep's `operator` dispatch after `filing_complete`,
-refused unless every slice's current closure is `slice_closed` — so it cannot
-contradict the closing facts — and refused a second time under the same
-generation. Its fact: `children_observed_closed {epoch, generation, slices:
-[numbers], observed_at}`. **What the kernel guarantees with it is
+`record_children_observed_closed(parent_state)` is the sweep's statement
+that **this firing read every child of the plan and found every one closed,
+and then read the parent**: legal from `sliced` under the sweep's `operator`
+dispatch after `filing_complete`, refused unless every slice's current
+closure is `slice_closed` — so it cannot contradict the closing facts — and
+refused a second time under the same generation. Its fact:
+`children_observed_closed {epoch, generation, slices: [numbers], parent:
+open | closed, observed_at}`. The parent's state rides on it because the
+close that follows is owed only when the parent was open: a parent a person
+closed by hand has no close effect, and the outcome guard (above) accepts
+the fact's `parent: closed` in place of a satisfied `parent_close` — the
+observation is journalled under the generation that made it, and nothing
+has to invent an effect row for a mutation nobody performed. **What the
+kernel guarantees with it is
 ordering, not truth:** no outcome is recorded unless the sweep stated, under
 the same generation, that it read every child closed. Whether that statement
 is true is the coordinator's — as every observation of GitHub in this design
@@ -373,16 +383,35 @@ kernel cannot keep.
 
 The umbrella comment is a `comment` effect; the children's queue labels, the
 parent's label swap and the parent's close are `issue_or_label`. None of
-those is new in kind. One of them carries a **precondition the kernel
-checks when the effect is journalled**: an effect whose obligation kind is
-`slice_queue` is refused while any `slice_issue` or `slice_dependency`
-obligation the accepted plan implies is unsatisfied. The kernel parses the
-plan and holds every obligation's row, so it can see the property §3's
-third pass depends on — a child that carries `bircher:queued` has every
-link — and refuse the effect that would break it, rather than discover the
-breach at `filing_complete` after the generator has already taken the child
-up. The coordinator's pass ordering is the behaviour; this refusal is the
-guard (ruling 18).
+those is new in kind.
+
+**What `perform` refuses, per obligation kind.** Today `perform` checks
+the dispatched identity, the generation, the contract and the halt state
+for every effect, and checks the run's *state* only for `MERGE`
+(`effects.py`, `perform`); a command's transition guards do not reach the
+effects a coordinator performs between commands. So `record_slice_filed`
+being legal only from `sliced` binds the *fact*, not the create: a
+coordinator that performed an `issue_create` from `slices_accepted` would
+mint a child the kernel never authorised, and a refused fact afterwards
+undoes nothing on GitHub. Every obligation kind this design adds therefore
+carries a precondition the kernel checks **when the effect is journalled**,
+before anything reaches the executor:
+
+| Obligation kind | Refused unless |
+|---|---|
+| `slice_issue` | the run is in `sliced`; the dispatch is the coordinator's `operator` generation; the obligation's `epoch` is the current epoch and its `plan_hash` is the hash the epoch's `human_ruling {approve, phase: slices}` or `artifact_advanced {phase: slices}` named — the plan a reviewer accepted and the gate passed, not any plan submitted; the obligation's `slice` is in that plan |
+| `slice_dependency` | all of the above, and the edge `slice ← blocker` is in the plan, and both slices have a `slice_filed` in this epoch |
+| `slice_queue` | all of the `slice_issue` conditions, and every `slice_issue` and `slice_dependency` obligation the plan implies is satisfied — the property §3's third pass depends on, a queued child has every link, refused here rather than discovered at `filing_complete` after the generator has taken the child up |
+| `umbrella`, `umbrella_label` | the `slice_issue` conditions, and a `slice_filed` for every slice of the plan |
+| `umbrella_close`, `parent_close` | the run is in `sliced`; the coordinator's `operator` dispatch; `filing_complete` in this epoch; a `children_observed_closed` under the calling generation |
+
+The kernel parses the plan and holds every obligation's row and every fact
+these rows name, so each precondition is a read of what it already holds.
+The coordinator's pass ordering is the behaviour; these refusals are the
+guard (ruling 18), and the first of them — no create outside `sliced`,
+against the accepted hash — is the one that makes "the transition that
+authorises filing must be its own fact" true of the effect and not only of
+the fact that follows it (ruling 19).
 
 ### Facts
 
@@ -397,7 +426,7 @@ guard (ruling 18).
 | `filing_complete` | `record_filing_complete` | `epoch`, `plan_hash`, `children` |
 | `slice_closed` | `record_slice_closed` | `epoch`, `slice`, `issue`, `closed_at`, `state` |
 | `slice_reopened` | `record_slice_reopened` | `epoch`, `slice`, `issue`, `observed_at` |
-| `children_observed_closed` | `record_children_observed_closed` | `epoch`, `generation`, `slices`, `observed_at` |
+| `children_observed_closed` | `record_children_observed_closed` | `epoch`, `generation`, `slices`, `parent` (`open` or `closed`), `observed_at` |
 | `run_ended` | `record_run_outcome(sliced)` | as today, `outcome: sliced` |
 
 ## §3 Coordinator
@@ -565,15 +594,19 @@ view or the pull request view — ends this run's firing there:** the facts
 recorded before it stand, nothing after it is read or recorded, no
 completion is attempted, and the firing logs which child it could not read;
 the next firing starts over. A firing in which every read succeeded and
-every child was observed closed records `children_observed_closed`, and
-only then, in order: two owed effects — the comment `bircher: sliced
-complete` naming each child and its final state (obligation `{kind:
-umbrella_close, run, epoch}`), then the parent's close (obligation `{kind:
-parent_close, run, epoch}`), performed only if the parent, read in this same
-firing after the children (`gh issue view --json state` on the parent), is
-open; a parent a person already closed is left as it is and the obligation
-is recorded satisfied by that observation — and then the command
-`record_run_outcome(sliced)`. Under the
+every child was observed closed then reads the parent (`gh issue view
+--json state` on it; a failed read ends the firing as a child's would) and
+records `children_observed_closed` with the parent's state, and only then,
+in order: the owed comment `bircher: sliced complete` naming each child and
+its final state (obligation `{kind: umbrella_close, run, epoch}`); the
+parent's close (obligation `{kind: parent_close, run, epoch}`) **only if the
+fact says `parent: open`** — a parent a person already closed owes no close,
+and the outcome guard reads the fact instead of an effect row nothing
+performed (§2); and then the command `record_run_outcome(sliced)`. A person
+who closes the parent between the observation and the close makes the close
+a no-op the executor reports delivered: `parent_close`'s delivered-form is
+the issue's `closed` state, observed, so an uncertain close reconciles by
+reading it. Under the
 parent run's own generation, so the journal holds the story from epic to
 closure. A child abandoned keeps its parent open; that is the honest state,
 and the notice a person sees on the parent is the umbrella comment naming the
@@ -762,7 +795,8 @@ review seats. The children are proved as ordinary runs.
 | The parent issue is edited while in a spec or plan state | `revise_bundle` lands in `shaping`, epoch + 1: the changed issue is shaped again, at the cost of one shaping turn if it is still one piece |
 | The parent issue is edited after filing | `revise_bundle` refused from `sliced`; the edit has no effect on the run; §9 says what a person does instead |
 | A child is closed without merging | `slice_closed {state: closed}`; the parent closes when all are; the completion comment names each child's final state, so a closed-not-merged child is visible |
-| A person closes the parent by hand | the run stays `sliced` and is swept; when its children close, the completion comment is posted, the close is skipped, the outcome recorded |
+| A person closes the parent by hand | the run stays `sliced` and is swept; when its children close, the completing firing reads the parent, records `children_observed_closed {parent: closed}`, posts the completion comment, performs no close, and records the outcome, which the kernel accepts on the fact's `parent: closed` in place of a `parent_close` effect (§2) |
+| A coordinator performs a child create before the gate — from `slices_accepted`, or against a plan hash that is not the accepted one | `perform` refuses the effect at journal time (§2, *what `perform` refuses*); nothing reaches GitHub; the pass halts on the refusal |
 | The sweep meets a halted parent run, or one without `filing_complete` | skipped, logged; a halt is reconciled by a person as every halt is, and an incomplete filing is the loop's |
 | `bircher:sliced` or `bircher:slice` missing on the repo | preflight refuses to start, naming it |
 
@@ -804,7 +838,16 @@ unsatisfied and accepted once all are, the `ISSUE_CREATE` contract refusing
 each of the three runner labels, `revise_bundle` refused from `sliced`,
 `is_front_verdict` true for a `slices` verdict and `revisions_used` not
 spending a repair round on one, `approve_artifact` from `slices_accepted`
-landing in `sliced` and not `planned`.
+landing in `sliced` and not `planned`; and **every row of the `perform`
+table**: an `issue_create` with a `slice_issue` obligation refused from
+`slices_accepted`, refused from `sliced` under an author dispatch, refused
+with the hash of a submitted-but-rejected plan, refused for a slice number
+not in the plan, and accepted from `sliced` under the operator with the
+accepted hash; a `slice_dependency` for an edge not in the plan refused; an
+`umbrella` with a slice unfiled refused; a `parent_close` without a
+same-generation observation fact refused; the outcome accepted with
+`parent: closed` and no `parent_close` row, and refused with `parent: open`
+and no `parent_close` row.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
@@ -959,6 +1002,19 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     that would break it. Costs one precondition on one obligation kind and
     one valued-flag rule; the alternative left the round-4 defect guarded by
     a test of coordinator ordering alone.
+19. **The effects are bound at `perform`, not only the facts that follow
+    them.** A command's from-set guards the fact; the create is an effect
+    performed between commands, and `perform` checks state only for a merge
+    today. Each obligation kind this design adds has a precondition the
+    kernel checks when the effect is journalled — state, dispatch, epoch,
+    the accepted hash, the plan's contents. Costs one table in `perform`;
+    without it a coordinator could mint a child before the gate and no
+    refusal afterwards would take it back.
+20. **The parent's state rides on the observation fact.** A hand-closed
+    parent has no close effect to satisfy, and inventing an effect row for
+    a mutation nobody performed would be a lie in the journal; the sweep
+    reads the parent in the completing firing and the outcome guard accepts
+    `parent: closed` in place of a `parent_close` row. Costs one field.
 
 ## Dispositions — round 1 (Kimi, 2026-09-09)
 
@@ -1138,3 +1194,21 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    satisfies the obligation by that observation.
 6. accepted — the rationale now says what is avoided: a closure per child
    per firing beside the dispatch fact each firing writes anyway.
+
+## Dispositions — round 8 (Codex, 2026-09-09)
+
+1. accepted — a table of what `perform` refuses per obligation kind (§2,
+   *what `perform` refuses*): a `slice_issue` create is refused unless the
+   run is in `sliced`, under the coordinator's operator dispatch, in the
+   current epoch, against the hash the gate or `advance_ungated` named, for
+   a slice in that plan; the other kinds likewise; a failure-table row and
+   the tests §8 lists, refusal before approval first among them (ruling
+   19).
+2. accepted — the parent's state rides on `children_observed_closed`
+   (`parent: open | closed`), read in the completing firing after the
+   children; the close is performed only when open, and the outcome guard
+   accepts `parent: closed` in place of a `parent_close` row, so a
+   hand-closed parent with no close attempt ends cleanly without an
+   invented effect row (§2, §3, §7, ruling 20, tests). Round 7's
+   disposition 5 said the obligation was "recorded satisfied by that
+   observation" without saying how; this is how.
