@@ -4,8 +4,8 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 5, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi) and 4
-(Codex); the dispositions are the last four sections.*
+Revision 6, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex) and 5 (Kimi); the dispositions are the last five sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -167,7 +167,11 @@ an `operator` dispatch, and only when the kernel can see a `filing_complete`
 fact for the current epoch and, **for every slice of the accepted plan** — the
 plan it holds under the phase's artefact hash and parses as below — a current
 closure of `slice_closed` in that epoch (*current* is defined with the closing
-facts below: a reopened child is open again, whatever was recorded before).
+facts below: a reopened child is open again, whatever was recorded before),
+**and** a `children_observed_closed` fact recorded under the calling
+generation — the firing that ends the run is the firing that read every child
+and found it closed (below); closures from earlier firings are not enough,
+because a read that failed this firing would leave a stale one standing.
 Iterating the filed children rather than the plan was refused in review as a
 vacuous-truth hole: an epic that crashed before filing anything would have
 closed as complete. **From `sliced`, no other outcome is accepted:** a run that
@@ -257,10 +261,10 @@ slices, hash}`. The spec phase has no equivalent because its ungated path is
 separates the two because filing children is an effect with an obligation
 (§3), and the transition that authorises it must be its own fact.
 
-### `record_slice_filed`, `record_filing_complete`, `record_slice_closed`, `record_slice_reopened`
+### `record_slice_filed`, `record_filing_complete`, `record_slice_closed`, `record_slice_reopened`, `record_children_observed_closed`
 
 Every fact has an issuing command with legal states, a role and refusals, and
-these four are no exception.
+these five are no exception.
 
 `record_slice_filed(slice, effect_key)` is legal from `sliced` under the
 coordinator's `operator` dispatch. It names the slice number and the
@@ -301,7 +305,20 @@ date, not a permanent property, and a person who reopens a child reopens the
 epic. The outcome guard above reads current closures, so a parent never
 closes over a child that was closed once and is open now.
 
-All four facts carry the epoch. Since `revise_bundle` is refused from
+`record_children_observed_closed()` is the sweep's statement that **this
+firing read every child of the plan and found every one closed**: legal from
+`sliced` under the sweep's `operator` dispatch after `filing_complete`,
+refused unless every slice's current closure is `slice_closed` — so it cannot
+contradict the closing facts — and refused a second time under the same
+generation. Its fact: `children_observed_closed {epoch, generation, slices:
+[numbers], observed_at}`. It is what makes the outcome's freshness a kernel
+guard rather than a coordinator's discipline: the outcome is refused without
+one under its own generation, and the sweep records one only on a firing in
+which no read failed (§3). Recorded at most once per firing and only on a
+firing that saw everything closed, so the journal does not grow by a fact
+per firing while a parent waits.
+
+All five facts carry the epoch. Since `revise_bundle` is refused from
 `sliced`, a run that has filed anything is in its final epoch, and the guards
 above read "this epoch" without ambiguity.
 
@@ -315,7 +332,13 @@ run will consume. Its contract rule: argv is exactly `gh issue create --repo
 by the executor from the intent's `body.text` after the contract check — the
 body never rides argv, for the reason the session events rule gives — and the
 confirmed row's `external_object_id` is the created issue's URL, from which the
-number is parsed as `from_gh` parses comment ids. The effect-site inventory
+number is parsed as `from_gh` parses comment ids. The rule **refuses a
+`--label` value of `bircher:queued`, `bircher:running` or `bircher:sliced`**:
+those are the runner's and the filing step's to set later, and a created
+issue that carried `queued` would be runnable before its links exist (§3) —
+the contract is where that is cheapest to refuse, and a coordinator that
+composes the label anyway is refused before anything reaches GitHub. The
+effect-site inventory
 (`docs/design/effect-site-inventory.md`) gains the site; the routing
 detector's table is **not** changed, because the call lives in the kernel
 executor and not in `run-queue.sh`, and that table lists shell call sites only
@@ -335,7 +358,16 @@ kernel cannot keep.
 
 The umbrella comment is a `comment` effect; the children's queue labels, the
 parent's label swap and the parent's close are `issue_or_label`. None of
-those is new in kind.
+those is new in kind. One of them carries a **precondition the kernel
+checks when the effect is journalled**: an effect whose obligation kind is
+`slice_queue` is refused while any `slice_issue` or `slice_dependency`
+obligation the accepted plan implies is unsatisfied. The kernel parses the
+plan and holds every obligation's row, so it can see the property §3's
+third pass depends on — a child that carries `bircher:queued` has every
+link — and refuse the effect that would break it, rather than discover the
+breach at `filing_complete` after the generator has already taken the child
+up. The coordinator's pass ordering is the behaviour; this refusal is the
+guard (ruling 18).
 
 ### Facts
 
@@ -350,6 +382,7 @@ those is new in kind.
 | `filing_complete` | `record_filing_complete` | `epoch`, `plan_hash`, `children` |
 | `slice_closed` | `record_slice_closed` | `epoch`, `slice`, `issue`, `closed_at`, `state` |
 | `slice_reopened` | `record_slice_reopened` | `epoch`, `slice`, `issue`, `observed_at` |
+| `children_observed_closed` | `record_children_observed_closed` | `epoch`, `generation`, `slices`, `observed_at` |
 | `run_ended` | `record_run_outcome(sliced)` | as today, `outcome: sliced` |
 
 ## §3 Coordinator
@@ -504,17 +537,21 @@ run is refused, and the halt is a person's to reconcile. For each such run,
 under a fresh `operator` dispatch: for **every** slice in the accepted plan —
 not only those without a closure, because a closure is an observation that
 can go stale — read the issue (`gh issue view --json
-state,closedByPullRequestsReferences`). Observed closed with a current
-closure that is not `slice_closed`: `record_slice_closed` with state
-`merged` when that list names a pull request whose own `state` is `MERGED`
-(`gh pr view --json state`), and `closed` otherwise — a child closed by hand,
-or by a pull request that was itself closed unmerged. Observed open with a
-current closure of `slice_closed`: `record_slice_reopened`. Otherwise
-nothing. All observed from the server; the child run's journal is not
-consulted, because a person may close a child the loop never worked. When,
-after this firing's recording, every slice's current closure is
-`slice_closed` — which is to say every child was observed closed in this
-same firing — three
+state,closedAt,closedByPullRequestsReferences`). Observed closed with a
+current closure that is not `slice_closed`: `record_slice_closed` with
+`closed_at` from the issue's `closedAt` and state `merged` when that list
+names a pull request whose own `state` is `MERGED` (`gh pr view --json
+state`), and `closed` otherwise — a child closed by hand, or by a pull
+request that was itself closed unmerged. Observed open with a current closure
+of `slice_closed`: `record_slice_reopened`. Otherwise nothing. All observed
+from the server; the child run's journal is not consulted, because a person
+may close a child the loop never worked. **A read that fails — the issue
+view or the pull request view — ends this run's firing there:** the facts
+recorded before it stand, nothing after it is read or recorded, no
+completion is attempted, and the firing logs which child it could not read;
+the next firing starts over. A firing in which every read succeeded and
+every child was observed closed records `children_observed_closed`, and
+only then three
 owed effects in order — the comment `bircher: sliced complete` naming each
 child and its final state (obligation `{kind: umbrella_close, run, epoch}`),
 the parent's close (obligation `{kind: parent_close, run, epoch}`; a parent a
@@ -549,8 +586,8 @@ instead is stated in §9.
 
 ## §5 Runner
 
-Six changes, three of them to `run_item`, and one changed note on a path that
-already exists:
+Seven changes — three of them to `run_item`, two to the queue generator —
+and one changed note on a path that already exists:
 
 - `_preflight_labels` checks `bircher:slice` and `bircher:sliced` beside
   `running` and `escalated`.
@@ -600,7 +637,15 @@ already exists:
   epoch** — the crash-anywhere-during-filing case — so the next wave's pass
   reaches `file_owed`, which repairs whatever is owed. A `sliced` run with
   `filing_complete` is not queued; it is the sweep's, not the loop's. Whether
-  a slice *file* exists is never the test; the kernel's fact is.
+  a queue file for the parent exists is never the test; the kernel's fact
+  is.
+- **`is_unblocked` fails closed.** Today a `gh` error reading an issue's
+  blockers substitutes zero (`issues-to-queue.sh:21-22`, `|| echo 0`) and the
+  issue is queued as unblocked. That was harmless while nothing depended on
+  the links; this design makes them the sequencing of an epic's children,
+  and a child started because its blocker could not be read is the round-4
+  defect by another door. On a read error the generator skips the issue this
+  wave and says so; the next wave reads again.
 - The wave calls `coordinator.cli sweep-sliced --db … --server … --repo …`
   once per firing, before queue generation.
 
@@ -622,8 +667,10 @@ run as an ordinary run), all through `slices.parse` over the plan the kernel
 holds:
 
 1. **The children are the plan, body and all.** The accepted plan's slices and
-   the `slice_filed` facts correspond one to one, in order, in the run's final
-   epoch; and each child issue, fetched live, has the title and the body that
+   the `slice_filed` facts correspond one to one, matched by slice number —
+   not by journal order, which is dependency order and may run 2, 1 — in the
+   run's final epoch; and each child issue, fetched live, has the title and
+   the body that
    `slices.render_child` produces for its slice from the parsed plan, the
    parent's number, the hash8 and the siblings' filed numbers — compared
    whole, not by marker and title alone, so a filing that gave every child the
@@ -665,8 +712,12 @@ front-half design requires of its own.
 | Crash during the queue labels | the labelled children have every link; the unlabelled ones are invisible; the next pass labels the rest |
 | The coordinator dies between two confirmed filing effects and `phases` exits non-zero with nothing pending | `run_item`'s non-zero branch reads `sliced`, records no outcome, keeps the file, writes an `escalated` row; the next pass repairs. `record_run_outcome(failed)` would be refused from `sliced` in any case |
 | The parent run halts mid-filing (an uncertain effect) | the children created so far are unqueued and stay so; a person reconciles the halt; the next pass completes the filing and only then queues them |
+| A coordinator performs a queue label before a create or a link is satisfied (a bug in the pass order) | the kernel refuses the `slice_queue` effect at journal time; nothing reaches GitHub; the refusal halts the pass and names the unsatisfied obligation |
+| A coordinator composes a child with `bircher:queued` in its labels | the `ISSUE_CREATE` contract refuses the argv; nothing reaches GitHub |
 | Crash between the last queue label and the umbrella, or between the umbrella and its label | the umbrella or the label is performed; then completion |
 | A closed child is reopened while a sibling is still open | the next sweep observes it open and records `slice_reopened`; its current closure is open; the parent does not close until it is observed closed again |
+| A read fails mid-sweep — a child reopened last week, its read failing this firing while its siblings read closed | the firing ends at the failed read: no `children_observed_closed`, no completion effects, no outcome; the facts recorded before the failure stand; the next firing reads every child again. Even a coordinator that ignored the rule could not end the run: the outcome is refused without an observation fact under its own generation |
+| The generator cannot read a child's blockers | the child is skipped this wave, not queued as unblocked; the next wave reads again |
 | A closed child is reopened after the parent closed | the parent's run has ended; the sweep does not read it; the reopened child is a person's, as an issue reopened under any closed epic is |
 | Crash between the completion comment and the parent's close | the comment's obligation is satisfied and is not re-posted; the close's is not and is performed; the outcome follows |
 | Two runs shape the same parent | while the parent's run is open, impossible by the open-run guard; after it has ended `sliced`, impossible by `create_run`'s refusal (§2, *an issue is sliced once*). Neither reads a label |
@@ -704,8 +755,14 @@ before completion, for an unfiled slice and for a currently closed one,
 `record_slice_reopened` for a slice never closed and for one already
 reopened, `record_slice_closed` accepted again after a `slice_reopened`, the
 outcome with a slice open, with a slice reopened after closing, and without
-`filing_complete`, `record_run_outcome(failed)` and `(merged)` refused from
-`sliced`, `revise_bundle` refused from `sliced`.
+`filing_complete`, the outcome refused with every slice closed but no
+`children_observed_closed` under the calling generation (one under an
+earlier generation planted), `record_children_observed_closed` refused with
+a slice open and refused twice under one generation,
+`record_run_outcome(failed)` and `(merged)` refused from `sliced`, a
+`slice_queue` effect refused while a create or a link of the plan is
+unsatisfied and accepted once all are, the `ISSUE_CREATE` contract refusing
+each of the three runner labels, `revise_bundle` refused from `sliced`.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
@@ -724,9 +781,12 @@ all closed, leaving one whose child is open, skipping a halted run and one
 without `filing_complete`, recording the outcome only in the first case,
 recording `merged` for a child whose closing pull request is `MERGED` and
 `closed` for one closed by hand and for one whose pull request was closed
-unmerged, and **across three firings**: child A closed (recorded), A reopened
+unmerged, **across three firings**: child A closed (recorded), A reopened
 and B closed (a `slice_reopened` and a `slice_closed`, no outcome), A closed
-again (the outcome).
+again (the outcome); and **a failed read mid-sweep**: the fake server erring
+on one child's view while the others read closed, the firing recording the
+closures it reached, no observation fact, no completion effect, no outcome,
+and the next firing completing once the read succeeds.
 
 Runner self-test: the two labels in preflight; the resume gate's list; the
 post-loop `sliced` branch recording `sliced`, dispatching nothing and moving
@@ -735,7 +795,8 @@ outcome and keeping the file, and at `shaping` recording `failed` as today;
 the refused mint's scorecard note carrying the refusal's text; the generator
 queueing a `sliced` run without `filing_complete` and not one with; the
 generator not listing a child created without `bircher:queued`; a blocked
-child skipped until its blocker closes.
+child skipped until its blocker closes; a child whose blockers cannot be read
+(the `gh` stub failing) skipped rather than queued.
 
 Proof: each of the four assertions reds on its planted defect, including a
 child whose body carries the wrong slice's scope for assertion 1, and for
@@ -832,6 +893,19 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     child every firing and records reopenings; the outcome guard reads
     current closures. Costs one command, one fact, and N reads per firing
     instead of the unclosed remainder.
+17. **The firing that ends the run is the firing that read every child.**
+    A failed read ends the firing, and the outcome is refused without a
+    `children_observed_closed` under its own generation, so a stale closure
+    can never be the one that closes the parent. Costs one command and one
+    fact, recorded only on the completing firing — not one per firing, which
+    would grow the journal while a parent waits.
+18. **The kernel refuses the out-of-order queue label; the contract refuses
+    the label at creation.** The pass order in `file_owed` is behaviour; the
+    property it protects — a queued child has its links — is one the kernel
+    can see from the plan and the obligation rows, so it refuses the effect
+    that would break it. Costs one precondition on one obligation kind and
+    one valued-flag rule; the alternative left the round-4 defect guarded by
+    a test of coordinator ordering alone.
 
 ## Dispositions — round 1 (Kimi, 2026-09-09)
 
@@ -958,3 +1032,21 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    ordering rule wherever a ruling exists, exactly one decision in the final
    epoch, and an epoch superseded before either passes; both passing cases
    are tests (§6, §8).
+
+## Dispositions — round 5 (Kimi, 2026-09-09)
+
+1. accepted, both halves — a failed read ends the run's firing before any
+   completion (§3, a failure-table row, a coordinator test), and the kernel
+   refuses the outcome without a `children_observed_closed` fact under the
+   calling generation, recorded only by a firing that read every child and
+   found it closed (§2, ruling 17, kernel tests).
+2. accepted, both halves — the `ISSUE_CREATE` contract refuses the three
+   runner labels as `--label` values, and a `slice_queue` effect is refused
+   at journal time while any create or link obligation of the plan is
+   unsatisfied (§2, two failure-table rows, ruling 18, kernel tests).
+3. accepted — assertion 1 matches by slice number and says journal order is
+   dependency order.
+4. accepted — `closedAt` joins the fetch and is the source of `closed_at`.
+5. accepted — `is_unblocked` fails closed: a read error skips the issue this
+   wave (§5, the seventh runner change, a failure-table row, a self-test).
+6. accepted — "a queue file for the parent".
