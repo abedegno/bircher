@@ -93,6 +93,9 @@ def test_sentences_count_full_stops_that_end_a_sentence():
     (b"# T\n\n## Slice 1: only\nScope: A. B. C.\nNon-goals: x.\nDepends on: none\n", "1 slices"),
     (GOOD + b"".join(b"\n## Slice %d: more\nScope: A. B. C.\nNon-goals: x.\nDepends on: none\n" % n for n in (4, 5, 6)), "6 slices"),
     (b"# T\n\nno headings at all\n", "not a slice plan"),
+    (GOOD.replace(b"## Slice 3: The client", b"## Slice3: The client"), "malformed slice heading"),
+    (GOOD.replace(b"## Slice 3: The client", b"## Slice 3 - The client"), "malformed slice heading"),
+    (GOOD.replace(b"## Slice 3: The client", b"## slice 3: The client"), "malformed slice heading"),
     (GOOD.replace(b"Depends on: 1, 2", b"Depends on: two"), "slice numbers"),
 ])
 def test_refusals_name_why(bad, why):

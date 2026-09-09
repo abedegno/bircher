@@ -93,9 +93,20 @@ def parse(data: bytes) -> Plan:
     would be read as more of the last slice's `Depends on:` field, and
     refused as one (kernel authz ruling, fix round following Task 7).
 
+    EXCEPT one shape of `## ` line: after the first slice heading, one
+    whose text (after `## `) begins with `slice`, case-insensitively, but
+    does not match the exact grammar is a MISTYPED slice heading, not a
+    trailing section, and is refused rather than silently ending the plan
+    two, three, or four slices early -- `## Slice3: x`, `## Slice 3 - x`
+    and `## slice 3: x` are all this, not `## Dispositions` (fix round 2:
+    without this, a plan could lose a slice to a typo and still pass the
+    2-5 count, because losing one slice from the end looks exactly like a
+    trailing section that happens to start with the word "slice").
+
     A line that is not a slice heading and does not start with `## ` where
     one is expected is still refused, as before: only a `## ` line reads as
-    the start of a trailing section, everything else is malformed.
+    the start of a trailing section (or a mistyped heading), everything
+    else is malformed.
     """
     lines = data.decode("utf-8", "replace").splitlines()
     title, pre, i = "", [], 0
@@ -107,11 +118,15 @@ def parse(data: bytes) -> Plan:
         i += 1
     blocks: list[tuple[int, str, list[str]]] = []
     while i < len(lines):
-        m = _HEADING.match(lines[i])
+        line = lines[i]
+        m = _HEADING.match(line)
         if not m:
-            if lines[i].startswith("## "):
+            if line.startswith("## "):
+                if line[len("## "):].lower().startswith("slice"):
+                    raise PlanError(
+                        f"line {i + 1}: malformed slice heading {line!r}; the form is `## Slice N: <title>`")
                 break
-            raise PlanError(f"line {i + 1}: expected a `## Slice N: <title>` heading, got {lines[i]!r}")
+            raise PlanError(f"line {i + 1}: expected a `## Slice N: <title>` heading, got {line!r}")
         n, t = int(m.group(1)), m.group(2).strip()
         i += 1
         body: list[str] = []
