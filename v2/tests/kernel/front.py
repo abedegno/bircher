@@ -49,30 +49,39 @@ class Front:
         self.store, self.run_id = store, run_id
         self.author, self.reviewer, self.base_sha = author, reviewer, base_sha
         self._n = 0
-        born = _run_exists(store, run_id)
         if existing:
-            assert born, f"run {run_id} does not exist"
-        if born:
-            # A second driver over a run that was already born. An idempotency
-            # key is unique within the RUN, not within this driver: the birth
-            # shape_round has already spent `record_turn_ended-1`, so a driver
-            # numbering from 1 again would be refused for reusing a key on a
-            # different request. Seed from what the run has already been
-            # asked, and shape nothing -- it is born, and `create_run` would
-            # only replay. A fresh run has been asked nothing and numbers
-            # from 1 as before.
-            self._n = len(store.facts_of_kind(run_id, EventKind.COMMAND_REQUESTED))
+            # The caller created this run, by whatever means -- possibly a bare
+            # `store.create_run` with no bundle or policy. Nothing here is
+            # declared, so there is nothing to replay or to contradict.
+            assert _run_exists(store, run_id), f"run {run_id} does not exist"
+            self._n = self._commands_seen()
             return
         issue = issue or {"number": 1, "title": "T", "body": "B",
                           "labels": list(labels), "comments": []}
+        # On EVERY construction, including a second driver over a run that is
+        # already born: `create_run` replays an identical request and raises
+        # NotReplayable when the inputs differ. Skipping it for a born run
+        # would hand back a driver whose declared issue, labels and
+        # project_config were silently never applied.
         create_run(store, run_id=run_id, base_repo=base_repo, base_sha=base_sha,
                    issue=issue, project_config=project_config or {})
+        # An idempotency key is unique within the RUN, not within this driver:
+        # a run whose birth shape_round has already spent `record_turn_ended-1`
+        # would refuse a second driver that numbered from 1 again, for reusing
+        # a key on a different request. A fresh run has been asked nothing and
+        # numbers from 1 as before.
+        self._n = self._commands_seen()
         # Every run is born in `shaping` (shaping spec §2). The driver rules
         # it one piece by default, so a test of the spec or plan phase gets
         # its run at `queued` by the only path the kernel admits (planning
-        # ruling 3); a test of the shaping phase passes shape=False.
-        if shape:
+        # ruling 3); a test of the shaping phase passes shape=False. Only a run
+        # still AT `shaping` is shaped: a replayed run that has already been
+        # ruled on is not ruled on twice.
+        if shape and self.state() == "shaping":
             self.shape_round()
+
+    def _commands_seen(self) -> int:
+        return len(self.store.facts_of_kind(self.run_id, EventKind.COMMAND_REQUESTED))
 
     # -- primitives ----------------------------------------------------------
 

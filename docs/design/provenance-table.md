@@ -45,7 +45,7 @@ answer, and the value that survives is the kernel's.
 
 | Input | Enters at | Provenance | Bound by / reason |
 |---|---|---|---|
-| `cmd.payload['artifact_hash']` | `submit_spec`, `submit_plan`, `record_review`, `request_merge`, `record_implementation_output` | observed | on a submit, refused unless `store.has_artifact` holds it; on a front-half review, unless equal to `store.phase_artifact` for the state's phase; on a back-half review and on `request_merge`, unless equal to `store.current_artifact`; on `record_implementation_output`, unless `store.has_artifact` |
+| `cmd.payload['artifact_hash']` | `submit_spec`, `submit_plan`, `submit_slices`, `record_review`, `request_merge`, `record_implementation_output` | observed | on a submit, refused unless `store.has_artifact` holds it; on a front-half review, unless equal to `store.phase_artifact` for the state's phase; on a back-half review and on `request_merge`, unless equal to `store.current_artifact`; on `record_implementation_output`, unless `store.has_artifact` |
 | `cmd.payload['phase']` | `record_review` | observed | refused unless equal to `phase_of(store.run_state)` |
 | `cmd.payload['findings_hash']` | `record_review` | observed | refused unless the store holds it |
 | `cmd.payload['hash']` | `_check_submit` | observed | read from the kernel's own `artifact_submitted` facts |
@@ -93,8 +93,8 @@ for a check.
 | `cmd.payload['question_id']` | `record_model_question`, `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
 | `cmd.payload['question']` | `record_model_question` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
 | `cmd.payload['ruling']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
-| `cmd.payload['reasoning']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
-| `cmd.payload['cost_if_wrong']` | `record_model_ruling` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['reasoning']` | `record_model_ruling`, `record_one_piece` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
+| `cmd.payload['cost_if_wrong']` | `record_model_ruling`, `record_one_piece` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
 | `cmd.payload['item_id']` | `record_prompt_item` | asserted | **Residual, §4.** A per-session identity the kernel cannot see: omnigent's item ids are checked for uniqueness within the named session, but the kernel has no way to confirm the id names the item the coordinator means. |
 
 ## Front half

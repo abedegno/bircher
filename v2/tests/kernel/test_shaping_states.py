@@ -8,7 +8,7 @@ from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized, phase_of
 from kernel.brief import render
 from kernel.dispatch import Role
-from kernel.enqueue import create_run
+from kernel.enqueue import NotReplayable, create_run
 from kernel.events import EventKind
 from kernel.policy import Policy
 from kernel.slices import COARSE
@@ -297,6 +297,32 @@ def test_the_slices_brief_carries_the_coarse_paragraph_and_spec_briefs_are_uncha
     with pytest.raises(ValueError, match="carries no spec"):
         render(phase="slices", artefact=SLICES_BYTES, bundle=bundle, spec=SPEC_BYTES,
                policy=Policy(), base_sha="0" * 40, template=2)
+
+
+def test_a_second_driver_with_different_inputs_is_refused(tmp_path):
+    """The driver calls `create_run` on every construction, so a second driver
+    that declares other labels or another project config is refused rather
+    than handed back with a policy the run never froze."""
+    s = _store(tmp_path)
+    Front(s, "r-1")
+    with pytest.raises(NotReplayable):
+        Front(s, "r-1", labels=(), project_config={"max_rounds": 1})
+    assert front.policy_of(s, "r-1").gates == frozenset()      # the run's own, unchanged
+    assert front.policy_of(s, "r-1").max_rounds == 3
+
+
+def test_a_second_driver_with_identical_inputs_replays_and_does_not_reshape(tmp_path):
+    """An identical request is a replay: nothing is recorded, the epoch's one
+    shape ruling stays one, and the driver drives the run it found."""
+    s = _store(tmp_path)
+    Front(s, "r-1")
+    before = len(s.facts_for("r-1"))
+    f = Front(s, "r-1")
+    assert s.run_state("r-1") == "queued"
+    assert len(s.facts_for("r-1")) == before
+    assert len(front.epoch_facts(s, "r-1", EventKind.MODEL_RULING, 0)) == 1
+    f.author_round(SPEC_BYTES)
+    assert s.run_state("r-1") == "spec_submitted"
 
 
 def test_to_sliced_drives_the_whole_phase(tmp_path):
