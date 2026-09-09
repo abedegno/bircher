@@ -65,6 +65,11 @@ _NEEDED_REAL_FUNCTIONS = [
     "_issue_writeback", "_ensure_issue_closed", "_record_deferred_ready",
     "_derived_width_ok",
     "_project_config", "_pending_blocks", "_write_parked_sidecar",
+    # The resume gate's state list (shaping spec §5). REAL, not stubbed: it
+    # decides whether run_item resumes an open run or escalates it, and an
+    # omitted definition left run_item calling an undefined function -- which
+    # bash treats as false, so every resume silently took the escalate branch.
+    "_front_half_resumable",
 ]
 
 
@@ -377,9 +382,15 @@ def test_run_item_calls_phases_between_run_start_and_the_implementer(mint_drive)
     d = mint_drive
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     order = d.names
-    idx = [order.index(n) for n in
-           ("_kernel_run_start", "BIRCHER_PY", "_kernel_start_implementation",
-            "_kernel_state", "_create_session")]
+    # `_kernel_state` is read TWICE on this path now: once the moment `phases`
+    # returns, to take the sliced branch (shaping spec §5), and again after
+    # `start_implementation` as the read-back. The read-back is what this
+    # ordering is about, so take the occurrence after start_implementation --
+    # `.index` would take the sliced check and report it as out of order.
+    i_start = order.index("_kernel_start_implementation")
+    idx = [order.index("_kernel_run_start"), order.index("BIRCHER_PY"), i_start,
+           i_start + 1 + order[i_start + 1:].index("_kernel_state"),
+           order.index("_create_session")]
     assert idx == sorted(idx), order
     assert len(set(idx)) == len(idx), order
     # The operator fence sits between run_start and phases; the implementer

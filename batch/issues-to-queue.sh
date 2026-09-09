@@ -16,10 +16,15 @@ eval "$(sed -n "/^_format_issue_comments()/,/^}$/p" "$HERE/run-queue.sh")"
 
 slug() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-40; }
 
-# unblocked = no OPEN blocked_by dependency
+# unblocked = no OPEN blocked_by dependency. FAILS CLOSED (shaping spec §5):
+# a blocker that cannot be read is not "no blocker" -- the links are an
+# epic's sequencing now, and a child started because its blocker could not
+# be read is the round-4 defect by another door. The next wave reads again.
 is_unblocked() {
-  local blockers; blockers=$(gh api "/repos/$REPO/issues/$1/dependencies/blocked_by" \
-    --jq '[.[] | select(.state=="open")] | length' 2>/dev/null || echo 0)
+  local blockers
+  blockers=$(gh api "/repos/$REPO/issues/$1/dependencies/blocked_by" \
+    --jq '[.[] | select(.state=="open")] | length' 2>/dev/null) || {
+    echo "skip #$1 (blockers unreadable; the next wave reads again)" >&2; return 1; }
   [ "${blockers:-0}" -eq 0 ]
 }
 
@@ -53,7 +58,12 @@ for rid in s.all_run_ids():
     m = re.match(r"^i(\d+)-", rid)
     if not m or s.run_state(rid) in closed:
         continue
-    if front.current_park(s, rid) is not None:
+    # A parked run, whatever its labels (finding 12); and a sliced run whose
+    # filing is not complete (shaping spec §5) -- the crash-anywhere-during-
+    # filing case -- so the next pass reaches file_owed. Whether a queue
+    # file exists is never the test; the kernel fact is.
+    if front.current_park(s, rid) is not None or (
+            s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None):
         out.append(m.group(1))
 print(" ".join(dict.fromkeys(out)))' 2>/dev/null) || parked_nums=""
   [ -z "$parked_nums" ] || echo "parked runs to resume: $parked_nums" >&2

@@ -152,6 +152,11 @@ _NEEDED_REAL_FUNCTIONS = [
     # function, which killed the drive before any kernel call and surfaced as
     # an IndexError on an empty call sequence.
     "_derived_width_ok",
+    # The resume gate's state list (shaping spec §5). REAL, not stubbed: it
+    # decides whether run_item resumes an open run or escalates it, and an
+    # omitted definition left run_item calling an undefined function -- which
+    # bash treats as false, so every resume silently took the escalate branch.
+    "_front_half_resumable",
 ]
 
 
@@ -498,15 +503,22 @@ def failed_merge_drive(tmp_path_factory):
 #: as a wrong ARGUMENT rather than as a stale index.
 _SEQUENCE = [
     "_kernel_find_run", "_kernel_run_start", "_kernel_dispatch", "BIRCHER_PY",
+    # The sliced branch reads the state the moment `phases` returns 0 (shaping
+    # spec §5): a parent whose children are filed stops here and never reaches
+    # the implementer. On this drive it is not sliced, so the read is a read
+    # and the drive carries on -- but it IS a kernel call site and belongs in
+    # the sequence, or an inserted one would read as a missing later call.
+    "_kernel_state",
     "_kernel_dispatch", "_kernel_start_implementation", "_kernel_state",
     "_implementer_brief", "_kernel_bundle_hash", "observe_outcome",
     "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
     "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
     "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
 ]
-(I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_IMPLEMENTER, I_START_IMPL,
- I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_OUTPUT, I_CI, I_REVIEWER, I_REVIEW,
- I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME, I_RUN_OUTCOME) = range(len(_SEQUENCE))
+(I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_SLICED_CHECK, I_IMPLEMENTER,
+ I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_OUTPUT, I_CI, I_REVIEWER,
+ I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
+ I_RUN_OUTCOME) = range(len(_SEQUENCE))
 
 
 def test_the_drive_reaches_every_kernel_call_site(happy_drive):
