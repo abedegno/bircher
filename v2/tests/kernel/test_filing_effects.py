@@ -284,6 +284,97 @@ def test_completion_pair_needs_filing_complete_and_a_same_generation_observation
         perform(s, f.run_id, g2, EffectClass.ISSUE_OR_LABEL, "p3", {"argv": filing.close_argv("o/r", 12), "obligation": close}, gh)
 
 
+# -- review round 1: every refusal is a NotAuthorized with a reason ----------------
+
+def test_queue_label_refuses_a_slice_whose_create_is_confirmed_but_unrecorded(tmp_path):
+    """`_per_kind`'s slice_queue clause reads satisfied OBLIGATIONS; the
+    binding reads `slice_filed` FACTS. A create confirmed whose
+    `record_slice_filed` never landed -- the crash window of §7 -- satisfies
+    the obligations and leaves no fact, and the binding used to reach
+    `numbers[ob["slice"]]` and raise KeyError, which `perform` does not route
+    through `shadow_or_raise`."""
+    s, f, g, gh = _sliced(tmp_path)
+    h = front.accepted_slices_hash(s, f.run_id, 0)
+    for ob in front.filing_obligations(s, f.run_id, 0):
+        if ob["kind"] in ("slice_issue", "slice_dependency"):
+            f._journal(g, f"x:{ob['kind']}:{ob.get('slice')}:{ob.get('blocker')}",
+                       {"argv": ["gh", "issue", "create"], "obligation": ob},
+                       json.dumps({"url": "u", "number": 40, "id": 1040}),
+                       cls="issue_create" if ob["kind"] == "slice_issue" else "issue_or_label")
+    assert front.slices_filed(s, f.run_id, 0) == {}                     # no fact...
+    assert [o["kind"] for o in front.unsatisfied_filing(s, f.run_id, 0)] == [
+        "slice_queue", "slice_queue", "umbrella", "umbrella_label"]     # ...and no create or link owed
+    q1 = {"kind": "slice_queue", "run": f.run_id, "epoch": 0, "plan_hash": h, "slice": 1}
+    with pytest.raises(NotAuthorized, match="slice_filed"):
+        perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "q",
+                {"argv": filing.queue_argv("o/r", 40), "obligation": q1}, gh)
+    assert gh.calls == []
+
+
+def test_an_epoch_with_no_accepted_plan_is_a_refusal_not_a_traceback(tmp_path, monkeypatch):
+    """`umbrella_close` and `parent_close` carry no `plan_hash`, so nothing in
+    `_common` refuses first when the epoch has no accepted plan: `_common`'s
+    `plan.by_number()` raised AttributeError and `_binding`'s `hash8` raised
+    TypeError, neither of which `perform` routes through `shadow_or_raise`.
+
+    The state machine cannot reach this state -- a bundle revision starts a new
+    epoch AND leaves `sliced`, so a `sliced` run's current epoch always has an
+    accepted hash -- so the query is made to answer None, which is what a
+    reader of any future state that separates the two would see. Driven through
+    `perform`, so the refusal is shown reaching the caller and not only raised.
+    """
+    s, f, g, gh = _sliced(tmp_path)
+    f.file_all(g)
+    for n in (1, 2):
+        f._cmd(g, "record_slice_closed", {"slice": n, "closed_at": "t", "state": "merged"})
+    f._cmd(g, "record_children_observed_closed", {"parent_state": "open", "observed_at": "t"})
+    body = {"artifact": put_artifact(s, b"x\n")}
+    monkeypatch.setattr(front, "accepted_slices_hash", lambda *a, **k: None)
+    cases = [
+        (EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 12),
+         {"kind": "parent_close", "run": f.run_id, "epoch": 0}, None),
+        (EffectClass.ISSUE_CREATE, filing.create_argv("o/r", "T", filing.expected_labels(s, f.run_id)),
+         {"kind": "slice_issue", "run": f.run_id, "epoch": 0, "slice": 1, "parent": 12, "plan_hash": None}, body),
+    ]
+    for i, (cls, argv, ob, b) in enumerate(cases):
+        intent = {"argv": argv, "obligation": ob}
+        if b is not None:
+            intent["body"] = b
+        with pytest.raises(NotAuthorized, match="no accepted slice plan"):
+            perform(s, f.run_id, g, cls, f"np-{i}", intent, gh)
+    assert gh.calls == []
+
+
+def test_the_obligation_must_be_one_the_accepted_plan_implies(tmp_path):
+    """`front.satisfied_obligation` keys on whole-dict equality, and the field
+    checks never name `parent`: a second create for a filed slice with `parent`
+    omitted or wrong is a different dict, satisfies nothing, passed every
+    check and minted a duplicate child."""
+    s, f, g, gh = _sliced(tmp_path)
+    h = front.accepted_slices_hash(s, f.run_id, 0)
+    _create(s, f, g, gh, 1)
+    key1 = [r for r in s.effects_for(f.run_id) if r["effect_class"] == "issue_create"][-1]["idempotency_key"]
+    f._cmd(g, "record_slice_filed", {"slice": 1, "effect_key": key1})
+    plan = front.accepted_plan(s, f.run_id)
+    t, b = slices.render_child(plan.by_number()[1], 12, h[:8], {})
+    argv = filing.create_argv("o/r", t, filing.expected_labels(s, f.run_id))
+    body = {"artifact": put_artifact(s, b.encode())}
+    for i, ob in enumerate((
+            {"kind": "slice_issue", "run": f.run_id, "epoch": 0, "slice": 1, "plan_hash": h},           # parent omitted
+            {"kind": "slice_issue", "run": f.run_id, "epoch": 0, "slice": 1, "parent": 99, "plan_hash": h})):
+        assert front.satisfied_obligation(s, f.run_id, ob) is None      # uniqueness sees nothing
+        with pytest.raises(NotAuthorized, match="not one the accepted plan implies"):
+            perform(s, f.run_id, g, EffectClass.ISSUE_CREATE, f"dup-{i}",
+                    {"argv": argv, "obligation": ob, "body": body}, gh)
+    # ...and the canonical obligation for the same slice is still refused by
+    # uniqueness, so the set membership did not replace the rule it guards.
+    with pytest.raises(NotAuthorized, match="one satisfied effect per obligation"):
+        perform(s, f.run_id, g, EffectClass.ISSUE_CREATE, "dup-canonical",
+                {"argv": argv, "obligation": {"kind": "slice_issue", "run": f.run_id, "epoch": 0,
+                                              "slice": 1, "parent": 12, "plan_hash": h}, "body": body}, gh)
+    assert len([c for c in gh.calls if c[0] == EffectClass.ISSUE_CREATE]) == 1
+
+
 # -- delivered forms -----------------------------------------------------------
 
 def test_delivered_forms(tmp_path):
