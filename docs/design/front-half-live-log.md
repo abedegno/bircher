@@ -294,8 +294,9 @@ issue that failed three times passed both phases in nine rounds unattended, and 
 ## What the live runs found
 
 Seventeen defects across the two days, none reachable from a test suite that
-now stands at 1440 tests, because the tests were written from the same
-assumptions as the code. Fourteen fixed, three open.
+now stands at 1439 tests, because the tests were written from the same
+assumptions as the code. All seventeen closed by the morning of 2026-09-09,
+the last three under the same commit that made dispositions the default.
 
 | # | Finding | State |
 |---|---|---|
@@ -309,9 +310,9 @@ assumptions as the code. Fourteen fixed, three open.
 | 8 | A park is invisible: omnigent's inbox counts elicitations, which nothing raises | fixed — the park now comments on its issue |
 | 9 | The notice did not say a reply is read by the next wave, not when it is sent | fixed |
 | 10 | Under `grill=model` the model's own questions made every human message an "answer", so a gate approval was eaten and the gate was unreachable on the DEFAULT policy | fixed |
-| 11 | A not-delivered effect is never retried: its key names the run and the label, so it can only ever be attempted once | open |
-| 12 | A parked run can become unreachable from the runner — the queue file is consumed and the issue loses its label, so neither source finds it | open |
-| 13 | The human's control channel is a live agent session: every reply wakes a model, which echoes, costs a turn, and could act | open |
+| 11 | A not-delivered effect is never retried: its key names the run and the label, so it can only ever be attempted once | fixed — the key carries the generation, so the next pass attempts it afresh |
+| 12 | A parked run can become unreachable from the runner — the queue file is consumed and the issue loses its label, so neither source finds it | fixed — the queue generator asks the journal: an open run with a current park is queued whatever its labels say |
+| 13 | The human's control channel is a live agent session: every reply wakes a model, which echoes, costs a turn, and could act | fixed, prompt-side — the park prompt opens by telling the model it and any reply are not for it; stopping the carrier before the park remains the stronger option and needs a live check of how the server treats a message to a stopped session |
 | 14 | The proof read the server's cancellation notice as an unrecorded prompt, failing the first run that converged unattended on four sessions | fixed |
 | 15 | An empty watched file counted as present: a reviewer's zero-byte review file ended its turn before the content landed, parking an unattended run with no verdict | fixed |
 | 16 | The proof held a park prompt to the seat's rule and demanded a `turn_ended` nobody awaits | fixed |

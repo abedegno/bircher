@@ -86,29 +86,15 @@ untested branches, duplicated work, and naming the next change should tidy.
   the replies it was meant to protect, and reverted; the invariant is stated in the sender's
   docstring instead. Any change that sends a prompt outside a park has to re-establish it.
 
-## Raised by the live runs (2026-09-08)
+## Raised by the live runs (2026-09-08), closed 2026-09-09
 
-Three findings from E2 to E7 that were not fixed. The full record, including
-the fourteen that were, is in `front-half-live-log.md`.
-
-- **A not-delivered effect is never retried.** `running:20` carries no
-  generation in its key, so once reconciled the key is spent and the label swap
-  the run intended never happens. Harmless where it was seen, but it is a key
-  that says "this run's running label" and can therefore only ever be attempted
-  once. Decide whether a reconciled-as-not-delivered effect should be
-  re-attempted under a fresh generation.
-- **A parked run can become unreachable from the runner.** Taking an item
-  consumes the queue file and swaps the issue's queued label for running. If
-  the run then parks, launching from issues skips it and launching from the
-  queue finds no file, while the run sits alive in the journal with a current
-  park. Recovery needs a human to re-add the label. Resumption should be driven
-  by the journal — an open run with a current park is exactly what the next
-  wave should pick up — not by two pieces of external state that can both be
-  gone.
-- **The human's control channel is a live agent session.** The park prompt goes
-  into the author's own session, so a reply wakes a model: it echoes the word
-  back, which makes a working reply look like a no-op, it costs a turn, and it
-  has a shell and a worktree. Nothing bad has happened, but an agent woken by a
-  reply could write to the watched artefact path. Either stop the session
-  before parking, so a reply sits unread until a wave reads it, or tell the
-  agent in the park prompt that replies are addressed to the coordinator.
+The three findings E2 to E7 left open were closed the next morning, all in
+one commit: the running-label effect is keyed per generation, so a
+not-delivered attempt is retried by the next pass; the queue generator asks
+the journal for open runs with a current park and queues them whatever their
+labels or queue files say; and the park prompt opens by telling the model in
+the session that it and any reply to it are not for the model. That last one
+is the prompt-side half of the fix -- stopping the carrier session before the
+park is the stronger half, and it waits on a live check of what the server
+does with a message to a stopped session. The full record, including the
+fourteen fixed on the day, is in `front-half-live-log.md`.

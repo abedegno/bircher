@@ -31,6 +31,37 @@ queued_nums=$(gh issue list --repo "$REPO" --state open --limit 200 \
                --jq '[.[] | select(any(.labels[].name; .=="bircher:queued"))]
                      | sort_by((.labels|map(.name)|map(select(startswith("priority:")))|.[0] // "priority:p9"), .number)
                      | .[].number') || { echo "issues-to-queue: gh issue list failed" >&2; exit 1; }
+# Journal-driven resumption (spec section 5). A run that parked for a person
+# has already lost its bircher:queued label -- the runner swapped it for
+# running when it took the item -- and its queue file may be gone too, so the
+# labels alone cannot find it and neither can the queue directory. The kernel
+# can: an open run holding a current `parked` fact is exactly the work the
+# next wave must pick up, and it is queued here whatever the issue's labels
+# say. Its item renders from the live issue like any other; run_item adopts
+# the open run rather than minting a second one. Off when there is no kernel
+# database to ask.
+parked_nums=""
+if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
+  parked_nums=$(PYTHONPATH="$HERE/../v2" "${BIRCHER_PY:-python3}" -c '
+import os, re, sys
+from kernel import front
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+closed = {"ended", "cancelled"}
+out = []
+for rid in s.all_run_ids():
+    m = re.match(r"^i(\d+)-", rid)
+    if not m or s.run_state(rid) in closed:
+        continue
+    if front.current_park(s, rid) is not None:
+        out.append(m.group(1))
+print(" ".join(dict.fromkeys(out)))' 2>/dev/null) || parked_nums=""
+  [ -z "$parked_nums" ] || echo "parked runs to resume: $parked_nums" >&2
+fi
+# Union, label-queued first, then parked runs not already listed.
+for n in $parked_nums; do
+  case " $queued_nums " in *" $n "*) ;; *) queued_nums="$queued_nums $n" ;; esac
+done
 [ "$DRY" = 1 ] || : > "$QUEUE/.manifest"
 for n in $queued_nums; do
   is_unblocked "$n" || { echo "skip #$n (blocked)"; continue; }

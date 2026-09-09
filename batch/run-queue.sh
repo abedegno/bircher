@@ -4370,7 +4370,14 @@ run_item() {
   BIRCHER_GENERATION=$(_kernel_dispatch runner operator); export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || { echo "[batch] $item: operator dispatch failed" >&2; return 5; }
   # Now that a generation exists, the label is a routed effect like any other.
-  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
+  # The key carries the GENERATION. Keyed on the issue alone it said "this
+  # run's running label" and could be attempted exactly once: a swap that
+  # failed half-way (the label absent on the repo, 2026-09-08) was reconciled
+  # as not delivered, the key was spent, and no later pass could try again --
+  # the issue kept bircher:queued for the rest of the run. Under a generation
+  # the same pass replays (a retry within it is still the same act) and the
+  # next pass, a new generation, attempts it afresh.
+  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
   if [ "$resumed" = 1 ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.
@@ -8822,6 +8829,49 @@ SH
     echo "FAIL issues-to-queue: run-queue no longer passes REPO to the generator"; exit 1; }
   rm -rf "$qdir"
   echo "issues-to-queue repo targeting OK"
+
+  # --- the running-label effect is keyed per generation -----------------------
+  # A key without the generation can be attempted once per run; reconciled as
+  # not delivered, it is spent forever (finding 11, 2026-09-08).
+  grep -q 'issue_or_label "running:\$_iss:\$BIRCHER_GENERATION"' "$BUNDLE_DIR/batch/run-queue.sh" || {
+    echo "FAIL running-label key: no longer carries the generation"; exit 1; }
+  echo "running-label key carries the generation OK"
+
+  # --- a parked open run is queued from the journal, whatever its labels -----
+  # Finding 12 (2026-09-08): after a park the issue has lost bircher:queued and
+  # the queue file may be gone, so the ordinary launch found nothing while the
+  # run sat alive in the journal with a current park.
+  local pdir; pdir=$(mktemp -d)
+  cat > "$pdir/gh" <<'SH'
+#!/usr/bin/env bash
+# No queued issues at all; `issue view` answers a title/body for any number.
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;           # is_unblocked reads a COUNT, not a list
+  *"--json title"*) echo "parked issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$pdir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -c '
+import sys
+from tests.kernel.front import Front
+from kernel.dispatch import Role
+from kernel.store import Store
+s = Store.open(sys.argv[1])
+f = Front(s, "i77-parked-thing-1")
+g = f._dispatch(Role.OPERATOR, "runner")
+f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id": None,
+                   "findings_hash": None, "verdict": None, "reviewer": None})
+' "$pdir/k.db" ) || { echo "FAIL parked-run fixture could not be built"; exit 1; }
+  ( cd "$pdir" && QUEUE="$pdir/queue" PATH="$pdir:$PATH" BIRCHER_KERNEL_DB="$pdir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with a parked run exited non-zero"; exit 1; }
+  ls "$pdir/queue"/i77-*.md >/dev/null 2>&1 || { echo "FAIL parked run i77 was not queued from the journal"; exit 1; }
+  grep -q "^i77-" "$pdir/queue/.manifest" || { echo "FAIL parked run i77 is not in the manifest"; exit 1; }
+  rm -rf "$pdir"
+  echo "parked runs are queued from the journal OK"
 
   # --- _preflight_labels: refuse a repo that lacks a label the pipeline sets --
   local ldir; ldir=$(mktemp -d)

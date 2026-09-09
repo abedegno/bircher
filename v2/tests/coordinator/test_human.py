@@ -454,3 +454,21 @@ def test_a_gate_approval_is_not_eaten_by_the_models_own_questions(world):
     assert kind == "approve"
     assert s.newest_fact("r-1", EventKind.HUMAN_RULING).payload["ruling"] == "approve"
     assert s.run_state("r-1") == "specified", "the gate is passed, not parked at again"
+
+
+def test_the_park_prompt_tells_the_agent_it_is_not_for_it(world):
+    """Finding 13. The park prompt lands in a live agent session, so the
+    agent reads it and a person's reply wakes it. Its first paragraph is
+    addressed to the model: do nothing, write nothing, end the turn."""
+    s, f, fake, ctx = world(labels=())
+    sid, g = _session_with_prompt(s, f, fake, ctx)
+    f.author_round(SPEC_BYTES, resume=sid); f.review_round("accept")
+    g = f._dispatch(Role.OPERATOR, "runner")
+    f._cmd(g, "park", {"reason": "gate", "session_id": sid, "cursor_item_id": None,
+                       "findings_hash": None, "verdict": None, "reviewer": None})
+    park = front.current_park(s, "r-1")
+    text = human.park_prompt(ctx, park).decode() if hasattr(human, "park_prompt") else None
+    assert text is not None, "the park prompt builder must be a module-level function to test"
+    assert text.startswith(human.NOT_FOR_THE_AGENT), text[:200]
+    assert "do not write or change any file" in text
+    assert "approve" in text

@@ -47,6 +47,17 @@ def _own_prompts(ctx, session_id: str) -> tuple[set, set]:
     return ids, hashes
 
 
+#: The first paragraph of every park prompt. It is read by the model in the
+#: session as well as by the person, and it has to tell the model to do
+#: nothing -- with a reply's echo costing a turn and a woken agent able to
+#: write into the watched path.
+NOT_FOR_THE_AGENT = (
+    "[To the model in this session: this message and any reply to it are for the "
+    "person watching this run, not for you. Do not act on either, do not write or "
+    "change any file, and end your turn with no output.]"
+)
+
+
 def unread_human_items(ctx, session_id: str, listing: list) -> list:
     """Every user-role item after the cursor that the coordinator did not send.
 
@@ -299,14 +310,21 @@ def park_prompt(ctx, park) -> bytes:
         return b""                                       # the author's own questions are the prompt
     h = store.phase_artifact(run_id, phase)
     art = store.read_blob(h).decode("utf-8", "replace") if h else "(no artefact yet)"
+    # The prompt lands in a LIVE agent session, because that is where the
+    # person's reply has to land for the coordinator to read it (spec section
+    # 4). So the agent sees it too, and a reply wakes the agent: it echoed
+    # "retry" back at a person on 2026-09-08 and, with a shell and a worktree,
+    # could have done worse. The first paragraph is addressed to the agent.
     if reason == "gate":
-        return (f"The {phase} below was accepted by the reviewer and waits for your approval.\n\n"
+        return (f"{NOT_FOR_THE_AGENT}\n\n"
+                f"The {phase} below was accepted by the reviewer and waits for your approval.\n\n"
                 f"Reply with the single word `approve`, or give corrections.\n\n---\n\n{art}").encode()
     findings = ""
     if park.payload.get("findings_hash"):
         findings = ("\n\n## Final findings\n\n"
                     + store.read_blob(park.payload["findings_hash"]).decode("utf-8", "replace"))
-    return (f"The run is stalled ({reason}) at {phase}.\n\n"
+    return (f"{NOT_FOR_THE_AGENT}\n\n"
+            f"The run is stalled ({reason}) at {phase}.\n\n"
             f"Reply with the single word `retry`, or give corrections.\n\n---\n\n{art}{findings}").encode()
 
 
