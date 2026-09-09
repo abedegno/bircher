@@ -348,11 +348,12 @@ def run_loop(ctx: Ctx) -> int:
     supersedes it; `retire_owed` and `publish_owed` perform their effects
     under the coordinator's generation.
     """
-    from coordinator import author, human, review
+    from coordinator import author, human, review, seat
     from coordinator.session import AgentMismatch
     from coordinator.sessions import WorktreeExists
     from kernel.dispatch import PendingEffects, Role, dispatch
     from kernel.effects import UncertainEffect, is_halted, pending_reconciliation
+    from kernel.policy import policy_of
     store, run_id = ctx.store, ctx.run_id
     if is_halted(store, run_id) or pending_reconciliation(store, run_id):
         ctx.log(f"run {run_id} halted or holds pending effects: {pending_reconciliation(store, run_id)}")
@@ -414,7 +415,7 @@ def run_loop(ctx: Ctx) -> int:
                 elif out == "failed":
                     return Exit.FAILED
                 continue
-            if state in ("spec_submitted", "plan_submitted"):
+            if state in ("slices_submitted", "spec_submitted", "plan_submitted"):
                 out = review.review_round(ctx)
                 if out.status == "recorded":
                     continue
@@ -428,7 +429,15 @@ def run_loop(ctx: Ctx) -> int:
                          reviewer=out.reviewer or None) == "parked":
                     return Exit.PARKED
                 continue
-            if state in ("spec_accepted", "plan_accepted"):
+            if state in ("slices_accepted", "spec_accepted", "plan_accepted"):
+                if state == "slices_accepted" and "slices" not in policy_of(store, run_id).gates:
+                    # The coordinator's own transition when the policy holds no
+                    # slice gate (shaping spec §2 `advance_ungated`): its own
+                    # fact, because filing children is an effect with an
+                    # obligation and the transition that authorises it must be
+                    # one. Under the pass's operator generation.
+                    seat.command(ctx, "advance_ungated", {})
+                    continue
                 if stall(ctx, "gate", session_id=_newest_author_session(ctx), findings_hash=None, verdict=None,
                          reviewer=None) == "parked":
                     return Exit.PARKED
