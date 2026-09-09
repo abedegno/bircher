@@ -4,9 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 10, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex) and 9 (Kimi); the
-dispositions are the last nine sections.*
+Revision 11, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi) and 10 (Codex);
+the dispositions are the last ten sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -185,7 +185,13 @@ and found it closed (below); closures from earlier firings are not enough,
 because a read that failed this firing would leave a stale one standing —
 **and** the completion effects: the `umbrella_close` obligation satisfied,
 and the `parent_close` obligation satisfied or that same fact saying
-`parent: closed`, a parent a person closed owing no close. Iterating the
+`parent: closed`, a parent a person closed owing no close. A satisfied
+`parent_close` beside a fact saying `parent: open` is the one remaining
+shape — the pipeline closed the parent, a crash preceded the outcome, and
+a person reopened it before the next firing — and it is accepted: the
+obligation was delivered once, a satisfied obligation is never re-performed,
+and a parent a person reopened after the pipeline closed it is the
+person's, as one reopened after the run ended is (§7). Iterating the
 filed children rather than the plan was refused in review as a
 vacuous-truth hole: an epic that crashed before filing anything would have
 closed as complete. **From `sliced`, no other outcome is accepted:** a run that
@@ -283,13 +289,13 @@ these five are no exception.
 `record_slice_filed(slice, effect_key)` is legal from `sliced` under the
 coordinator's `operator` dispatch. It names the slice number and the
 idempotency key of the `issue_create` effect that filed it; the kernel reads
-the created issue's number from that effect row's confirmed
-`external_object_id` — **observed from the server's answer, never asserted by
+the created issue's number and database id from that effect row's confirmed
+delivered value — **observed from the server's answer, never asserted by
 the coordinator** — and refuses when the slice is not in the accepted plan,
 when the effect is not confirmed or reconciled `delivered`, when its
 obligation does not name this run, this epoch, this slice and this plan hash,
 or when this slice already has a `slice_filed` in this epoch. Its fact:
-`slice_filed {epoch, slice, issue, title, parent, plan_hash}`.
+`slice_filed {epoch, slice, issue, issue_id, title, parent, plan_hash}`.
 
 `record_filing_complete()` is legal from `sliced` under the coordinator's
 `operator` dispatch, and refused unless the kernel can see, for the current
@@ -358,7 +364,9 @@ run will consume. Its contract rule: argv is exactly `gh issue create --repo
 by the executor from the intent's `body.text` after the contract check — the
 body never rides argv, for the reason the session events rule gives — and the
 confirmed row's `external_object_id` is the created issue's URL, from which the
-number is parsed as `from_gh` parses comment ids. The rule **refuses a
+number is parsed as `from_gh` parses comment ids; the confirmation then reads
+the issue back for its database id, which the dependency link needs (below).
+The rule **refuses a
 `--label` value of `bircher:queued`, `bircher:running` or `bircher:sliced`**:
 those are the runner's and the filing step's to set later, and a created
 issue that carried `queued` would be runnable before its links exist (§3) —
@@ -417,8 +425,33 @@ that slice is in the accepted plan.
 | `umbrella`, `umbrella_label` | a `slice_filed` for every slice of the plan |
 | `umbrella_close`, `parent_close` (no `plan_hash`, no `slice`) | `filing_complete` in this epoch, and a `children_observed_closed` under the calling generation |
 
-The kernel parses the plan and holds every obligation's row and every fact
-these rows name, so each precondition is a read of what it already holds.
+**Bound to the effect, not only to the metadata.** The obligation says what
+the effect is for; the argv says what it does; `perform` refuses the pair
+when they disagree, as it binds a merge to its actual target today and
+nothing else. Every `ISSUE_CREATE` effect must carry a `slice_issue`
+obligation — a create with none, or with an obligation of another kind, is
+refused, which is what makes "no create outside `sliced`" true of every
+create and not only of the ones that announce themselves. Each kind is
+admitted on exactly one effect class and operation, against the targets
+the kernel already holds:
+
+| Kind | Class and operation | The argv must name |
+|---|---|---|
+| `slice_issue` | `issue_create` | `--repo` the run's repository; `--title` the slice's title; a body file whose bytes equal `slices.render_child` over the accepted plan, the run's issue number, `hash8` and the siblings' numbers from this epoch's `slice_filed` facts — the kernel renders and compares; labels exactly `bircher:slice` plus the inherited policy labels |
+| `slice_dependency` | `issue_or_label`, the blocked-by `POST` | the path's issue number is the child the epoch's `slice_filed` names for `slice`; `issue_id` is the database id that fact names for `blocker` |
+| `slice_queue` | `issue_or_label`, `gh issue edit` | the `slice_filed` issue for `slice`; `--add-label bircher:queued` and nothing else |
+| `umbrella` | `comment` | the run's issue; a body equal to the umbrella text rendered from the plan and the `slice_filed` numbers |
+| `umbrella_label` | `issue_or_label`, `gh issue edit` | the run's issue; `--add-label bircher:sliced --remove-label bircher:running` and nothing else |
+| `umbrella_close` | `comment` | the run's issue; a body equal to the completion text rendered from the plan and the current closures |
+| `parent_close` | `issue_or_label`, `gh issue close` | the run's issue |
+
+The database id the dependency link needs is not in the create's URL, so
+the create's confirmation reads the created issue back (`gh api
+/repos/<repo>/issues/<n>`, `.id`) and the confirmed row's delivered value
+carries both number and id; `record_slice_filed` records both. The kernel
+parses the plan and holds every obligation's row and every fact these rows
+name, so each precondition and each binding is a read of what it already
+holds.
 The coordinator's pass ordering is the behaviour; these refusals are the
 guard (ruling 18), and the first of them — no create outside `sliced`,
 against the accepted hash — is the one that makes "the transition that
@@ -434,7 +467,7 @@ the fact that follows it (ruling 19).
 | `model_ruling` | `record_one_piece` | `question_id: "shape"`, `ruling`, `reasoning`, `cost_if_wrong` |
 | `human_ruling` | `approve_artifact` | as today, `phase: slices` |
 | `artifact_advanced` | `advance_ungated` | `phase: slices`, `hash` |
-| `slice_filed` | `record_slice_filed` | `epoch`, `slice`, `issue`, `title`, `parent`, `plan_hash` |
+| `slice_filed` | `record_slice_filed` | `epoch`, `slice`, `issue`, `issue_id`, `title`, `parent`, `plan_hash` |
 | `filing_complete` | `record_filing_complete` | `epoch`, `plan_hash`, `children` |
 | `slice_closed` | `record_slice_closed` | `epoch`, `slice`, `issue`, `closed_at`, `state` |
 | `slice_reopened` | `record_slice_reopened` | `epoch`, `slice`, `issue`, `observed_at` |
@@ -621,9 +654,11 @@ records `children_observed_closed` with the parent's state, and only then,
 in order: the owed comment `bircher: sliced complete` naming each child and
 its final state (obligation `{kind: umbrella_close, run, epoch}`); the
 parent's close (obligation `{kind: parent_close, run, epoch}`) **only if the
-fact says `parent: open`** — a parent a person already closed owes no close,
-and the outcome guard reads the fact instead of an effect row nothing
-performed (§2); and then the command `record_run_outcome(sliced)`. A person
+fact says `parent: open` and the obligation is unsatisfied** — a parent a
+person already closed owes no close, and the outcome guard reads the fact
+instead of an effect row nothing performed; a parent the pipeline closed and
+a person reopened is not closed again, and is the person's (§2); and then
+the command `record_run_outcome(sliced)`. A person
 who closes the parent between the observation and the close makes the close
 a no-op the executor reports delivered: `parent_close`'s delivered-form is
 the issue's `closed` state, observed, so an uncertain close reconciles by
@@ -812,6 +847,8 @@ review seats. The children are proved as ordinary runs.
 | The generator cannot read a child's blockers | the child is skipped this wave, not queued as unblocked; the next wave reads again |
 | A closed child is reopened after the parent closed | the parent's run has ended; the sweep does not read it; the reopened child is a person's, as an issue reopened under any closed epic is |
 | Crash between the completion comment and the parent's close | the comment's obligation is satisfied and is not re-posted; the close's is not and is performed; the outcome follows |
+| Crash between the parent's close and the outcome, and a person reopens the parent before the next firing | the next completing firing observes `parent: open` beside a satisfied `parent_close`; no second close — a satisfied obligation is never re-performed, and the reopening is the person's; the outcome is recorded and the parent stays open as they left it, exactly as a parent reopened after the run ended |
+| An effect's argv disagrees with its obligation — a link targeting the wrong child, a create whose body is not the slice's, a create with no obligation | `perform` refuses the pair at journal time (§2, *bound to the effect*); nothing reaches GitHub |
 | Two runs shape the same parent | while the parent's run is open, impossible by the open-run guard; once any run for the issue has attempted a create — ended, cancelled or halted — impossible by `create_run`'s refusal (§2, *an issue is sliced once*). Neither reads a label |
 | A stale queue file for a sliced parent is drained after its run ended (the `queue` source drains `queue/*.md` whatever the manifest says) | `_kernel_find_run … open` finds nothing; the mint is refused; the scorecard row names the run that sliced the issue; the file is moved to `processed`. Nothing is re-sliced |
 | The parent is re-labelled `bircher:queued` by a person | while the run is open: adopted, re-labelled `running` by `run_item`'s own label effect as on every resume, nothing owed, no filing command issued, the loop exits through the `sliced` branch; the parent carries `running` and `sliced` until the sweep closes it. After the run has ended: the refused mint, once per wave until the person removes the label. Nothing is re-sliced |
@@ -871,8 +908,19 @@ refused; a `slice_dependency` for an edge not in the plan refused, and one
 whose blocker has no `slice_filed` refused; an `umbrella` and an
 `umbrella_label` each refused with a slice unfiled; a `parent_close` without
 a same-generation observation fact refused; the outcome accepted with
-`parent: closed` and no `parent_close` row, and refused with `parent: open`
-and no `parent_close` row.
+`parent: closed` and no `parent_close` row, refused with `parent: open`
+and no `parent_close` row, and accepted with `parent: open` beside a
+satisfied `parent_close` (the reopened-after-close case) with no second
+close performed; **and every row of the binding table**: an `issue_create`
+with no obligation refused, one with a `slice_dependency` obligation
+refused, one whose title is not the slice's refused, one whose body is not
+`render_child`'s bytes refused, one whose labels include `bircher:queued`
+refused by the contract; a `slice_dependency` whose path issue is a
+sibling's refused and one whose `issue_id` is not the blocker's refused; a
+`slice_queue` on the wrong child or adding a second label refused; an
+`umbrella` on a child refused; an `umbrella_label` removing nothing
+refused; a `parent_close` on a child refused; and each accepted when the
+argv matches.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
@@ -1040,6 +1088,17 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     a mutation nobody performed would be a lie in the journal; the sweep
     reads the parent in the completing firing and the outcome guard accepts
     `parent: closed` in place of a `parent_close` row. Costs one field.
+21. **The obligation is bound to the argv.** Metadata that says "slice 2's
+    link" on an effect that links slice 3 satisfies nothing; `perform`
+    compares the argv with what the kernel holds — the filed numbers, the
+    rendered child, the parent — and refuses the pair, and every create must
+    carry a `slice_issue` obligation. Costs one binding table and a read-back
+    of the created issue for its database id.
+22. **A parent a person reopens after the pipeline closed it is the
+    person's.** Whether the run has ended or a crash merely preceded the
+    outcome, closing it again would fight a deliberate act; the satisfied
+    obligation stands, the outcome is recorded, the parent stays as they
+    left it. Costs a person the parent they reopened.
 
 ## Dispositions — round 1 (Kimi, 2026-09-09)
 
@@ -1252,3 +1311,19 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    the capture is code.
 6. accepted — the prefix pin and its companions are named in §3 as
    expected reds.
+
+## Dispositions — round 10 (Codex, 2026-09-09)
+
+1. accepted — a binding table beside the precondition table (§2, *bound to
+   the effect*): every `ISSUE_CREATE` must carry a `slice_issue`
+   obligation, each kind is admitted on one class and operation, and the
+   argv must name the targets the kernel holds — the filed numbers and
+   database ids, the rendered child body, the parent; the create's
+   confirmation reads the database id back and `slice_filed` records it;
+   a failure-table row, ruling 21, and a planted refusal per binding in
+   §8. Round 8's disposition 1 claimed the state binding for every create;
+   the obligation requirement is what makes that true.
+2. accepted — the reopened-after-close case is decided: the satisfied
+   close stands, no second close is performed, the outcome is recorded and
+   the parent is the person's (§2 outcome guard, §3, a failure-table row,
+   ruling 22, a test).
