@@ -4,8 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 6, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex) and 5 (Kimi); the dispositions are the last five sections.*
+Revision 7, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi) and 6 (Codex); the dispositions are the last six
+sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -76,7 +77,7 @@ against the spec.
 
 | From | Command | To | Notes |
 |---|---|---|---|
-| — (no run) | `create_run` | `shaping` | unchanged otherwise: snapshot, `policy_frozen`, base sha; **refused for an issue an earlier run sliced** (below) |
+| — (no run) | `create_run` | `shaping` | unchanged otherwise: snapshot, `policy_frozen`, base sha; **refused for an issue an earlier run may have filed children for** (below) |
 | `shaping` | `record_one_piece` | `queued` | the model ruling; the run proceeds as today |
 | `shaping` | `submit_slices` | `slices_submitted` | the artefact, hashed, PUT to the store |
 | `slices_submitted` | `record_review(accept)` | `slices_accepted` | the reviewer's verdict, bound as every verdict is |
@@ -90,7 +91,7 @@ against the spec.
 | `sliced` | `revise_bundle` | **refused** | its children are the work now (ruling 7) |
 | the three shaping states | `park`, `record_human_answer`, `record_prompt_item`, `dismiss_human_item`, `cancel_run` | as today | by the membership table below, not by joining `FRONT_HALF_STATES` |
 | `shaping` | `record_human_direction` | as today | the author-round state of this phase, as `queued` and `specified` are of theirs |
-| `sliced` | `cancel_run`, `record_run_outcome` | as today | via `_ALL_ACTIVE`; nothing human is legal at `sliced` — no park exists there for `human_pass` to read under |
+| `sliced` | `cancel_run`, `record_run_outcome` | as today | via `_ALL_ACTIVE`; nothing human is legal at `sliced` — no park exists there for `human_pass` to read under. A cancel after a create was attempted leaves the children as they are on GitHub and the issue un-mintable (below); §9 says what a person does with them |
 
 **Existing commands whose from-sets gain states.** The front-half design's
 tables list each command's legal states explicitly, and the code enforces them
@@ -135,13 +136,20 @@ stated per command and not inherited:
 | `run_item`'s resume gate (§5) | gains the four states |
 
 **An issue is sliced once.** `create_run` is refused when the journal holds
-a run whose snapshot names the same repository and issue number and whose
-`run_ended` carries outcome `sliced`; the refusal names that run. This is the
-guard that binds when the parent's run has ended and something — a stale
-queue file, a person's `bircher:queued` — asks the runner to mint a second
-one: the open-run guard covers only an open run, and the parent's
-`bircher:sliced` label is a label, not a fact the kernel reads. The runner's
-existing refused-mint path handles it (§5).
+a run whose snapshot names the same repository and issue number and which
+holds **any `issue_create` effect row not reconciled as not-delivered** —
+performed, confirmed, uncertain or reconciled delivered — whatever that
+run's state: ended `sliced`, cancelled, or halted. The observable is the
+attempt, not the outcome, because a child may exist from the first attempt
+on, and a cancelled run that had created two children would otherwise be
+followed by a fresh run filing five. The refusal names the run and its
+rows. This is the guard that binds when the parent's run is closed and
+something — a stale queue file, a person's `bircher:queued` — asks the
+runner to mint a second one: the open-run guard covers only an open run,
+and the parent's `bircher:sliced` label is a label, not a fact the kernel
+reads. A run cancelled before any create was attempted leaves the issue
+mintable — nothing exists to duplicate. The runner's existing refused-mint
+path handles the refusal (§5).
 
 `sliced` is a **front-half state the loop works in and then exits from**, as
 `planned` is today: `_LOOP_STATES` includes it, the loop's pass at `sliced`
@@ -311,12 +319,16 @@ firing read every child of the plan and found every one closed**: legal from
 refused unless every slice's current closure is `slice_closed` — so it cannot
 contradict the closing facts — and refused a second time under the same
 generation. Its fact: `children_observed_closed {epoch, generation, slices:
-[numbers], observed_at}`. It is what makes the outcome's freshness a kernel
-guard rather than a coordinator's discipline: the outcome is refused without
-one under its own generation, and the sweep records one only on a firing in
-which no read failed (§3). Recorded at most once per firing and only on a
-firing that saw everything closed, so the journal does not grow by a fact
-per firing while a parent waits.
+[numbers], observed_at}`. **What the kernel guarantees with it is
+ordering, not truth:** no outcome is recorded unless the sweep stated, under
+the same generation, that it read every child closed. Whether that statement
+is true is the coordinator's — as every observation of GitHub in this design
+is, `slice_closed` included; the kernel cannot tell a lie from a read, and
+this design does not pretend it can. The freshness itself is the sweep's
+abort rule (§3): a firing that could not read a child records nothing after
+the failure and never this fact. Recorded at most once per firing and only
+on a firing that saw everything closed, so the journal does not grow by a
+fact per firing while a parent waits.
 
 All five facts carry the epoch. Since `revise_bundle` is refused from
 `sliced`, a run that has filed anything is in its final epoch, and the guards
@@ -696,6 +708,24 @@ one `human_ruling {approve}` at it is admitted beside the spec gate's. Every
 assertion is exercised by a planted defect in the tests, as §8 of the
 front-half design requires of its own.
 
+**What the existing assertions do over a sliced parent.** `assert_journal`
+today requires at least one `model_ruling` and a submission phase set of
+exactly `{spec, plan}` with different hashes (`prove_front_half.py`,
+`assert_journal`); read unchanged, it fails every sliced parent and every
+one-piece run that submitted a rejected slice plan first. Two amendments:
+the model-ruling check **excludes `question_id: "shape"`** — it means a
+ruling on a question the author raised, and a shape ruling every one-piece
+run carries would satisfy it vacuously; and the phase-set check is per kind
+of run — a sliced parent submits exactly `{slices}` and the hash is the
+accepted plan's, a one-piece run submits `{spec, plan}` with different
+hashes and may also hold `slices` (the rejected plan before its ruling).
+The parent is exempt from the model-ruling check, its decision being
+`slice_filed`, and from nothing else: the human-fact checks by mode, the
+reconciled-or-halted check and every session check (`assert_sessions`:
+snapshot names the dispatch's vendor, one obligation per create, every
+session prompted or stopped) apply to it as to any run, over its shaping and
+review seats. The children are proved as ordinary runs.
+
 ## §7 Failure table
 
 | Situation | What happens |
@@ -711,16 +741,17 @@ front-half design requires of its own.
 | Crash after the creates, before or during the links | the children exist without `bircher:queued`; the generator does not list them; no child runs before its links; the next pass performs the missing links, then the queue labels |
 | Crash during the queue labels | the labelled children have every link; the unlabelled ones are invisible; the next pass labels the rest |
 | The coordinator dies between two confirmed filing effects and `phases` exits non-zero with nothing pending | `run_item`'s non-zero branch reads `sliced`, records no outcome, keeps the file, writes an `escalated` row; the next pass repairs. `record_run_outcome(failed)` would be refused from `sliced` in any case |
-| The parent run halts mid-filing (an uncertain effect) | the children created so far are unqueued and stay so; a person reconciles the halt; the next pass completes the filing and only then queues them |
+| The parent run halts mid-filing (an uncertain effect) | in the first or second pass: the children created so far are unqueued and stay so until a person reconciles the halt and the next pass completes the filing. In the third pass: the children already labelled have their links and may be worked; the one whose label went uncertain is reconciled like any label effect; the rest stay unqueued. In the fourth: every child is queued and linked; only the umbrella is owed |
+| A person cancels a parent after a create was attempted | the run is `cancelled`; the children created stand as issues, queued or not by the pass the cancel interrupted; the issue cannot be minted again (§2, *an issue is sliced once*); the person closes the children that should not be worked and opens a new issue for what remains (§9). A cancel before any create was attempted leaves the issue mintable |
 | A coordinator performs a queue label before a create or a link is satisfied (a bug in the pass order) | the kernel refuses the `slice_queue` effect at journal time; nothing reaches GitHub; the refusal halts the pass and names the unsatisfied obligation |
 | A coordinator composes a child with `bircher:queued` in its labels | the `ISSUE_CREATE` contract refuses the argv; nothing reaches GitHub |
 | Crash between the last queue label and the umbrella, or between the umbrella and its label | the umbrella or the label is performed; then completion |
 | A closed child is reopened while a sibling is still open | the next sweep observes it open and records `slice_reopened`; its current closure is open; the parent does not close until it is observed closed again |
-| A read fails mid-sweep — a child reopened last week, its read failing this firing while its siblings read closed | the firing ends at the failed read: no `children_observed_closed`, no completion effects, no outcome; the facts recorded before the failure stand; the next firing reads every child again. Even a coordinator that ignored the rule could not end the run: the outcome is refused without an observation fact under its own generation |
+| A read fails mid-sweep — a child reopened last week, its read failing this firing while its siblings read closed | the firing ends at the failed read: no `children_observed_closed`, no completion effects, no outcome; the facts recorded before the failure stand; the next firing reads every child again. The kernel holds the order — no outcome without the sweep's same-generation statement — and the statement's truth is the sweep's (§2) |
 | The generator cannot read a child's blockers | the child is skipped this wave, not queued as unblocked; the next wave reads again |
 | A closed child is reopened after the parent closed | the parent's run has ended; the sweep does not read it; the reopened child is a person's, as an issue reopened under any closed epic is |
 | Crash between the completion comment and the parent's close | the comment's obligation is satisfied and is not re-posted; the close's is not and is performed; the outcome follows |
-| Two runs shape the same parent | while the parent's run is open, impossible by the open-run guard; after it has ended `sliced`, impossible by `create_run`'s refusal (§2, *an issue is sliced once*). Neither reads a label |
+| Two runs shape the same parent | while the parent's run is open, impossible by the open-run guard; once any run for the issue has attempted a create — ended, cancelled or halted — impossible by `create_run`'s refusal (§2, *an issue is sliced once*). Neither reads a label |
 | A stale queue file for a sliced parent is drained after its run ended (the `queue` source drains `queue/*.md` whatever the manifest says) | `_kernel_find_run … open` finds nothing; the mint is refused; the scorecard row names the run that sliced the issue; the file is moved to `processed`. Nothing is re-sliced |
 | The parent is re-labelled `bircher:queued` by a person | while the run is open: adopted, re-labelled `running` by `run_item`, nothing owed, no command issued, the loop exits through the `sliced` branch; the parent carries `running` and `sliced` until the sweep closes it. After the run has ended: the refused mint, once per wave until the person removes the label. Nothing is re-sliced |
 | The parent issue is edited while in a spec or plan state | `revise_bundle` lands in `shaping`, epoch + 1: the changed issue is shaped again, at the cost of one shaping turn if it is still one piece |
@@ -746,7 +777,10 @@ from-set, **every row of the membership table** — in particular
 `record_model_question` and `record_model_ruling` refused from each of the
 three shaping states, and `record_model_ruling` refusing `question_id:
 "shape"` from `queued` — `create_run` refused for an issue whose earlier run
-ended `sliced` and admitted for one whose earlier run ended any other way,
+holds an `issue_create` row (one ended `sliced`, one cancelled after a
+confirmed create, one halted on an uncertain create) and admitted for one
+whose earlier run was cancelled before any create and for one that ended
+any other way,
 `revise_bundle` landing in `shaping` from `spec_submitted`, `record_slice_filed`
 against an unconfirmed effect, a wrong obligation and a duplicate,
 `record_filing_complete` with a link unsatisfied, with a queue label
@@ -801,7 +835,12 @@ child skipped until its blocker closes; a child whose blockers cannot be read
 Proof: each of the four assertions reds on its planted defect, including a
 child whose body carries the wrong slice's scope for assertion 1, and for
 assertion 4 both passing cases — a ruling after a rejected plan, and an epoch
-superseded by `revise_bundle` while a plan waited — beside its red.
+superseded by `revise_bundle` while a plan waited — beside its red. The
+amended existing checks: a sliced parent with no model ruling and a
+`{slices}` submission passes `assert_journal`; a one-piece run whose only
+model ruling is `shape` fails the ruling check as a run with none does
+today; a one-piece run with `{slices, spec, plan}` submissions passes the
+phase-set check and one with `{spec}` alone fails it.
 
 Every new condition's mutation is executed, not argued; the review package for
 each task states which line was mutated and which test went red.
@@ -870,10 +909,12 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     one-piece issue one shaping turn per revision, and the front-half tests
     that assert `queued` their expected state.
 12. **An issue is sliced once, by the journal.** `create_run` refuses an
-    issue whose earlier run ended `sliced`, reading the journal and not the
-    parent's `bircher:sliced` label, because a person can remove a label and
-    cannot remove a fact. Costs a parse of the ended runs' snapshots at
-    minting, and a person who wants an epic re-sliced the steps §9 gives.
+    issue whose earlier run attempted a create — the `issue_create` row,
+    whatever the run's state — reading the journal and not the parent's
+    `bircher:sliced` label, because a person can remove a label and cannot
+    remove a fact, and because a cancelled run's children are as real as an
+    ended run's. Costs a scan of the issue's earlier runs at minting, and a
+    person who wants an epic re-sliced the steps §9 gives.
 13. **The shaping states stay out of `FRONT_HALF_STATES`.** Membership is
     stated per site; the model's question and ruling channels are refused
     from the phase, and the `shape` question id is reserved to
@@ -895,10 +936,11 @@ and closes nothing on GitHub; the issue is what the sweep reads.
     instead of the unclosed remainder.
 17. **The firing that ends the run is the firing that read every child.**
     A failed read ends the firing, and the outcome is refused without a
-    `children_observed_closed` under its own generation, so a stale closure
-    can never be the one that closes the parent. Costs one command and one
-    fact, recorded only on the completing firing — not one per firing, which
-    would grow the journal while a parent waits.
+    `children_observed_closed` under its own generation. The kernel binds the
+    order; the reads are the sweep's, as every GitHub observation is, and
+    the design says so rather than claiming a guard it cannot have. Costs one
+    command and one fact, recorded only on the completing firing — not one
+    per firing, which would grow the journal while a parent waits.
 18. **The kernel refuses the out-of-order queue label; the contract refuses
     the label at creation.** The pass order in `file_owed` is behaviour; the
     property it protects — a queued child has its links — is one the kernel
@@ -1038,8 +1080,8 @@ and closes nothing on GitHub; the issue is what the sweep reads.
 1. accepted, both halves — a failed read ends the run's firing before any
    completion (§3, a failure-table row, a coordinator test), and the kernel
    refuses the outcome without a `children_observed_closed` fact under the
-   calling generation, recorded only by a firing that read every child and
-   found it closed (§2, ruling 17, kernel tests).
+   calling generation (§2, ruling 17, kernel tests). Round 6, finding 3,
+   corrected what the second half guarantees: the order, not the reads.
 2. accepted, both halves — the `ISSUE_CREATE` contract refuses the three
    runner labels as `--label` values, and a `slice_queue` effect is refused
    at journal time while any create or link obligation of the plan is
@@ -1050,3 +1092,21 @@ and closes nothing on GitHub; the issue is what the sweep reads.
 5. accepted — `is_unblocked` fails closed: a read error skips the issue this
    wave (§5, the seventh runner change, a failure-table row, a self-test).
 6. accepted — "a queue file for the parent".
+
+## Dispositions — round 6 (Codex, 2026-09-09)
+
+1. accepted — `create_run`'s refusal reads the attempt, not the outcome: any
+   `issue_create` row not reconciled not-delivered in an earlier run of the
+   issue, whatever that run's state; a cancel before any create leaves the
+   issue mintable; the cancel-after-create row and the "two runs" row say so
+   (§2, §7, ruling 12 rewritten, kernel tests).
+2. accepted — §6 states what the existing `assert_journal` does over a
+   sliced parent and a one-piece run: the model-ruling check excludes the
+   `shape` ruling, the phase-set check is per kind of run and admits a
+   rejected slice plan, and every other check applies to the parent as to
+   any run; §8 tests the four cases.
+3. accepted — the kernel guarantees the order (no outcome without a
+   same-generation statement), not the reads; §2, §7 and ruling 17 now say
+   so, and round 5's disposition 1 is annotated rather than left
+   over-claiming.
+4. accepted — the halt row is qualified by pass.
