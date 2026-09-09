@@ -1,0 +1,84 @@
+# v2/coordinator/shape.py
+"""The shaping round (shaping spec §3 *The shaping round*): the author
+round's twin, with two watched paths and two ways to end."""
+from __future__ import annotations
+
+from coordinator import author, phases, seat
+from coordinator.human import take_listing
+from coordinator.session import AgentMismatch
+from kernel import front, slices
+from kernel.artifacts import put_artifact
+from kernel.authz import NotAuthorized
+from kernel.dispatch import Role, SeatsExhausted
+from kernel.events import EventKind
+
+
+def shape_round(ctx) -> str:
+    """One shaping turn: `one_piece` (the ruling recorded, the run at
+    `queued`), `submitted` (a slice plan at `slices_submitted`),
+    `empty_retry`, `direction`, `budget`, `stall`, `reauthor` or `failed` --
+    the author round's vocabulary, so the loop parks the same way."""
+    store, run_id = ctx.store, ctx.run_id
+    n = ctx.epoch()
+    cause = phases.round_cause(ctx)
+    session_ob = {"kind": "sess-create", "run": run_id, "phase": "slices", "epoch": n, "cause": cause.id}
+    vendor = author.choose_author_vendor(ctx)
+    try:
+        turn = seat.run_turn(ctx, role=Role.AUTHOR, vendor=vendor, session_obligation=session_ob,
+                             prompt_cause=cause.id, prompt_text=author.author_brief(ctx, phase="slices"),
+                             watched=[seat.SHAPE_OUT, seat.ARTIFACT_OUT])
+    except SeatsExhausted:
+        return "budget"
+    except AgentMismatch as exc:
+        ctx.log(f"agent mismatch: {exc}")
+        return "failed"
+    if turn.ended == "displaced":
+        return "direction"
+    # The human first: a message in the session is taken before anything is recorded.
+    if take_listing(ctx, turn.session_id, turn.listing) == "direction":
+        return "direction"
+    shape_file = turn.files.get(seat.SHAPE_OUT)
+    artefact = turn.files.get(seat.ARTIFACT_OUT)
+    ruling = slices.parse_ruling(shape_file) if shape_file else None
+    if shape_file and ruling is None:
+        # A ruling with no reasoning is not a ruling (spec §3): the empty turn.
+        ctx.log(f"{seat.SHAPE_OUT} does not parse as a ruling; the empty turn: {shape_file[:200]!r}")
+    if ruling is not None:
+        if artefact is not None:
+            # The ruling is read first; the artefact beside it is ignored, and
+            # `_move_aside` retires it before any re-prompt (spec §3).
+            ctx.log(f"{seat.ARTIFACT_OUT} beside a ruling is ignored")
+        try:
+            seat.command(ctx, "record_one_piece", {"reasoning": ruling.reasoning, "cost_if_wrong": ruling.cost_if_wrong})
+        except NotAuthorized as exc:
+            if "human_direction" in str(exc):
+                return "direction"
+            ctx.log(f"unexpected refusal: {exc}")
+            return "failed"
+        return "one_piece"
+    if artefact is None:
+        try:
+            seat.command(ctx, "record_author_empty", {"session": turn.session_id})
+        except NotAuthorized as exc:
+            ctx.log(f"author_empty refused: {exc}")
+            return "failed"
+        return "empty_retry"
+    h = put_artifact(store, artefact)
+    rnd = len(front.submissions(store, run_id, "slices", n)) + 1
+    author._copy(ctx, "slices", rnd, artefact)
+    try:
+        seat.command(ctx, "submit_slices", {"artifact_hash": h})
+    except NotAuthorized as exc:
+        msg = str(exc)
+        if "human_direction" in msg:
+            return "direction"
+        # A grammar refusal, the depth refusal or an identical resubmission
+        # is the next round's findings (spec §7), as the grill refusal is in
+        # the spec phase: `_findings_for` reads the command_rejected cause.
+        if "submit_slices:" in msg or "identical" in msg or "a slice is not sliced" in msg:
+            seat_row = front.newest_seat(store, run_id, Role.AUTHOR, "slices", n)
+            cause_kind = next((x.kind for x in store.facts_for(run_id) if x.id == seat_row["cause"]), None)
+            return "stall" if cause_kind == EventKind.COMMAND_REJECTED else "reauthor"
+        ctx.log(f"unexpected refusal: {msg}")
+        return "failed"
+    return "submitted"

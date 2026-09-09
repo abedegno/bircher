@@ -19,6 +19,9 @@ from kernel.policy import policy_of, to_payload
 SKILLS = pathlib.Path(__file__).resolve().parents[2] / "skills"
 _Q = re.compile(r"^### (Q[^:\s]+):\s*(.+?)\s*$", re.M)
 
+#: Where each phase's author skill lives (planning ruling 11).
+_SKILL_DIR = {"slices": "shape-author"}
+
 
 def parse_questions(text: str) -> list[dict]:
     out = []
@@ -109,8 +112,16 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
                 "counts as an empty turn.\n\n"
                 + resume_answer.payload["answer"]).encode()
     parts = [f"# Bircher {phase} author brief\n"]
-    parts.append((SKILLS / f"{phase}-author" / "SKILL.md").read_text())
-    parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
+    parts.append((SKILLS / _SKILL_DIR.get(phase, f"{phase}-author") / "SKILL.md").read_text())
+    if phase == "slices":
+        from kernel.slices import COARSE
+        parts.append("\n## Files\n\nRuling: `%s`\nSlice plan: `%s`\n\nEnd the turn with exactly one of them.\n"
+                     % (seat.SHAPE_OUT, seat.ARTIFACT_OUT))
+        # The definition of coarse, rendered from the one place it lives
+        # (shaping spec §1): never a second copy in a skill file.
+        parts.append("\n## The definition of a slice\n\n> %s\n\nA slice plan names no files, tasks or acceptance tests.\n" % COARSE)
+    else:
+        parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
     pol = policy_of(store, run_id)
     parts.append("\n## Policy\n\n```json\n%s\n```\n" % json.dumps(to_payload(pol), indent=1))
     # The policy as an instruction, not as data. The skill describes both
