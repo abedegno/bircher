@@ -1,4 +1,3 @@
-# v2/tests/coordinator/test_shape_round.py
 """Task 6: the shaping round (shaping spec §3 *The shaping round*)."""
 import os
 import time

@@ -174,6 +174,44 @@ def _copy(ctx, phase: str, rnd: int, data: bytes) -> None:
     (d / f"{phase}-r{rnd}.md").write_bytes(data)
 
 
+def record_empty(ctx, session_id: str) -> str:
+    """`record_author_empty` for a turn that produced nothing: `empty_retry`,
+    or `failed` when the kernel refuses it. The kernel refuses a second empty
+    turn in a row (the seat's own create was itself caused by an
+    author_empty): that is RC_FAILED, and the reason belongs in the log
+    rather than only in the journal. Shared by the author round and the
+    shaping round -- the same refusal, the same two outcomes."""
+    try:
+        seat.command(ctx, "record_author_empty", {"session": session_id})
+    except NotAuthorized as exc:
+        ctx.log(f"author_empty refused: {exc}")
+        return "failed"
+    return "empty_retry"
+
+
+def refusal_outcome(ctx, phase: str, msg: str, markers: tuple[str, ...]) -> str:
+    """What a submit refusal means for the round's return value (spec §7),
+    shared by the author round's `submit_spec`/`submit_plan` and the shaping
+    round's `submit_slices`: `direction` when a human_direction interrupted
+    the turn; `stall`/`reauthor` when *markers* -- the refusal messages that
+    mean "the next round's findings", not a failure -- match the message:
+    `stall` when the round's own seat was already caused by a
+    command_rejected (the loop parks rather than spending another seat on
+    the same refusal), `reauthor` otherwise, so the finding reaches the next
+    author round through `_findings_for`. Anything else is logged and
+    `failed`.
+    """
+    if "human_direction" in msg:
+        return "direction"
+    if any(m in msg for m in markers):
+        n = ctx.epoch()
+        seat_row = front.newest_seat(ctx.store, ctx.run_id, Role.AUTHOR, phase, n)
+        cause_kind = next((x.kind for x in ctx.store.facts_for(ctx.run_id) if x.id == seat_row["cause"]), None)
+        return "stall" if cause_kind == EventKind.COMMAND_REJECTED else "reauthor"
+    ctx.log(f"unexpected refusal: {msg}")
+    return "failed"
+
+
 def author_round(ctx) -> str:
     store, run_id = ctx.store, ctx.run_id
     phase, n = ctx.phase(), ctx.epoch()
@@ -229,15 +267,7 @@ def author_round(ctx) -> str:
         if asked and artefact is None:
             return "questions"
     if artefact is None:
-        try:
-            seat.command(ctx, "record_author_empty", {"session": turn.session_id})
-        except NotAuthorized as exc:
-            # The kernel refuses a second empty turn in a row (the seat's own
-            # create was caused by an author_empty): that is RC_FAILED, and
-            # the reason belongs in the log rather than only in the journal.
-            ctx.log(f"author_empty refused: {exc}")
-            return "failed"
-        return "empty_retry"
+        return record_empty(ctx, turn.session_id)
     h = put_artifact(store, artefact)
     rnd = len(front.submissions(store, run_id, phase, n)) + 1
     _copy(ctx, phase, rnd, artefact)
@@ -245,9 +275,6 @@ def author_round(ctx) -> str:
     try:
         seat.command(ctx, name, {"artifact_hash": h})
     except NotAuthorized as exc:
-        msg = str(exc)
-        if "human_direction" in msg:
-            return "direction"
         # "the grill is open" -- under grill=human the kernel refuses a spec
         # submitted before the human has answered (spec section 1: the author
         # MUST ask at least once). An author that wrote the artefact instead
@@ -257,11 +284,5 @@ def author_round(ctx) -> str:
         # 2026-09-08, when it took the unexpected-refusal path and discarded
         # a run that had done nothing wrong except be told "may" where the
         # kernel meant "must".
-        if ("identical" in msg or "### Task" in msg or "current spec" in msg
-                or "the grill is open" in msg):
-            seat_row = front.newest_seat(store, run_id, Role.AUTHOR, phase, n)
-            cause_kind = next((x.kind for x in store.facts_for(run_id) if x.id == seat_row["cause"]), None)
-            return "stall" if cause_kind == EventKind.COMMAND_REJECTED else "reauthor"
-        ctx.log(f"unexpected refusal: {msg}")
-        return "failed"
+        return refusal_outcome(ctx, phase, str(exc), ("identical", "### Task", "current spec", "the grill is open"))
     return "submitted"

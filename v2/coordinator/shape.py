@@ -1,4 +1,3 @@
-# v2/coordinator/shape.py
 """The shaping round (shaping spec §3 *The shaping round*): the author
 round's twin, with two watched paths and two ways to end."""
 from __future__ import annotations
@@ -10,7 +9,6 @@ from kernel import front, slices
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.dispatch import Role, SeatsExhausted
-from kernel.events import EventKind
 
 
 def shape_round(ctx) -> str:
@@ -57,28 +55,15 @@ def shape_round(ctx) -> str:
             return "failed"
         return "one_piece"
     if artefact is None:
-        try:
-            seat.command(ctx, "record_author_empty", {"session": turn.session_id})
-        except NotAuthorized as exc:
-            ctx.log(f"author_empty refused: {exc}")
-            return "failed"
-        return "empty_retry"
+        return author.record_empty(ctx, turn.session_id)
     h = put_artifact(store, artefact)
     rnd = len(front.submissions(store, run_id, "slices", n)) + 1
     author._copy(ctx, "slices", rnd, artefact)
     try:
         seat.command(ctx, "submit_slices", {"artifact_hash": h})
     except NotAuthorized as exc:
-        msg = str(exc)
-        if "human_direction" in msg:
-            return "direction"
         # A grammar refusal, the depth refusal or an identical resubmission
         # is the next round's findings (spec §7), as the grill refusal is in
         # the spec phase: `_findings_for` reads the command_rejected cause.
-        if "submit_slices:" in msg or "identical" in msg or "a slice is not sliced" in msg:
-            seat_row = front.newest_seat(store, run_id, Role.AUTHOR, "slices", n)
-            cause_kind = next((x.kind for x in store.facts_for(run_id) if x.id == seat_row["cause"]), None)
-            return "stall" if cause_kind == EventKind.COMMAND_REJECTED else "reauthor"
-        ctx.log(f"unexpected refusal: {msg}")
-        return "failed"
+        return author.refusal_outcome(ctx, "slices", str(exc), ("submit_slices:", "identical", "a slice is not sliced"))
     return "submitted"
