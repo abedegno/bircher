@@ -15,8 +15,7 @@ from tests.coordinator.fake_omnigent import FakeOmnigent
 from tests.kernel.front import SLICES_BYTES, Front
 
 ISSUE = {"number": 12, "title": "Epic", "body": "B", "labels": [], "comments": []}
-REVISED = SLICES_BYTES.replace(b"the API.", b"the API and the client.").replace(
-    b"\n## Slice 1: The store", b"\n## Dispositions\n\n1. accepted - merged.\n\n## Slice 1: The store")
+REVISED = SLICES_BYTES.replace(b"the API.", b"the API and the client.") + b"\n## Dispositions\n\n1. accepted - merged.\n"
 
 
 @pytest.fixture

@@ -54,6 +54,24 @@ def test_good_plan_parses():
     assert slices.topo_order(p) == [1, 2, 3]
 
 
+def test_a_trailing_section_after_the_last_slice_is_not_parsed():
+    """The author's brief demands `## Dispositions` at the end of a revised
+    artefact; the parser must not read it as more of the last slice's
+    `Depends on:` field (fix round following Task 7)."""
+    p = slices.parse(GOOD + b"\n## Dispositions\n\n1. accepted - merged.\n")
+    assert [s.number for s in p.slices] == [1, 2, 3]
+    assert p.slices[2].depends_on == (1, 2)
+
+
+def test_a_non_slice_heading_before_the_first_slice_stays_preamble():
+    """`## Notes` is not `## Slice N: <title>`; before the first real slice
+    heading it is preamble, same as any other line."""
+    pre, sep, rest = GOOD.partition(b"## Slice 1")
+    p = slices.parse(pre + b"## Notes\n\nSome notes.\n\n" + sep + rest)
+    assert "## Notes" in p.preamble and "Some notes." in p.preamble
+    assert [s.number for s in p.slices] == [1, 2, 3]
+
+
 def test_sentences_count_full_stops_that_end_a_sentence():
     assert slices.sentences("One. Two. Three.") == 3
     assert slices.sentences("Use this. Then 3.5 of that. Done.") == 3

@@ -81,6 +81,22 @@ def sentences(text: str) -> int:
 
 
 def parse(data: bytes) -> Plan:
+    """The slice-plan grammar (spec §2 *The artefact*).
+
+    Before the first `## Slice N: <title>` heading, every line -- including
+    one that itself starts with `## ` -- is preamble. After it, a `## `
+    line that is not a slice heading ends the slices: everything from it to
+    the end of the file is a TRAILING SECTION and is not parsed. This is
+    what lets a revision's artefact carry `## Dispositions` (the author's
+    brief demands one, spec §2/§3) after its last slice -- a slice plan is
+    not free text, and without this a reviewer's own findings section
+    would be read as more of the last slice's `Depends on:` field, and
+    refused as one (kernel authz ruling, fix round following Task 7).
+
+    A line that is not a slice heading and does not start with `## ` where
+    one is expected is still refused, as before: only a `## ` line reads as
+    the start of a trailing section, everything else is malformed.
+    """
     lines = data.decode("utf-8", "replace").splitlines()
     title, pre, i = "", [], 0
     while i < len(lines) and not _HEADING.match(lines[i]):
@@ -93,11 +109,13 @@ def parse(data: bytes) -> Plan:
     while i < len(lines):
         m = _HEADING.match(lines[i])
         if not m:
+            if lines[i].startswith("## "):
+                break
             raise PlanError(f"line {i + 1}: expected a `## Slice N: <title>` heading, got {lines[i]!r}")
         n, t = int(m.group(1)), m.group(2).strip()
         i += 1
         body: list[str] = []
-        while i < len(lines) and not _HEADING.match(lines[i]):
+        while i < len(lines) and not lines[i].startswith("## "):
             body.append(lines[i])
             i += 1
         blocks.append((n, t, body))
