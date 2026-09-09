@@ -6,15 +6,17 @@ from __future__ import annotations
 from kernel.canon import content_hash
 from kernel.policy import Policy, to_payload
 
-#: Which template `issue_review_brief` renders. 1 is the spec's brief. 2 is
-#: the disposition experiment (2026-09-08): severities, a verdict rule that
-#: PASSes when nothing high or medium remains, and the previous round's
-#: findings attached with an instruction not to relitigate what the author's
-#: Dispositions section resolved. Chosen at render time by
-#: `BIRCHER_REVIEW_DISPOSITIONS=on`; the fact records which was used, so the
-#: proof re-renders the right one.
-TEMPLATE_VERSION = 1
-DISPOSITION_TEMPLATE_VERSION = 2
+#: Which template `issue_review_brief` renders. 2 is the spec's brief since
+#: 2026-09-09: severities, a verdict rule that PASSes when nothing high or
+#: medium remains, and the previous round's findings attached with an
+#: instruction not to relitigate what the author's Dispositions section
+#: resolved. It began as an experiment on 2026-09-08 and became the default
+#: after two converged runs against three that did not. The fact records
+#: which template was used, so the proof re-renders the right one.
+TEMPLATE_VERSION = 2
+#: The spec's original brief, renderable so the proof can re-render the
+#: briefs of runs that were issued under it; never issued any more.
+LEGACY_TEMPLATE_VERSION = 1
 #: Relative to the reviewer's worktree root. A convention stated in the
 #: brief, not an environment variable (spec §3 Author round).
 REVIEW_OUT = "bircher/review.md"

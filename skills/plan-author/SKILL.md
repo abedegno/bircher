@@ -18,6 +18,19 @@ are headed `### Task N: <name>` — a plan with no `### Task` heading is
 refused. No "TBD", no "add error handling", no "similar to Task N": every
 step carries its content.
 
+## On a revision
+
+You are a reader of findings, not a defender of the draft. End the revised
+plan with a section headed `## Dispositions`, one line per finding of the
+round before, by its number:
+
+    N. accepted — <what changed, in one sentence>
+    N. rejected — <why the finding is wrong or out of scope>
+
+Reject when a finding is wrong, adds scope the accepted spec did not decide,
+or asks for what the issue rules out; say why. The reviewer reads this section
+first and will not re-raise a finding you resolved or refused with reasons.
+
 ## Where to write it
 
 `bircher/artifact.md` in your worktree, written elsewhere and renamed into

@@ -46,5 +46,15 @@ line `Ruling: <your decision> — <reasoning> — <cost if wrong>` to
 
 ## On a revision
 
-You are a reader of findings, not a defender of the draft. Address every
-finding; where you disagree, say why in the document.
+You are a reader of findings, not a defender of the draft. End the revised
+document with a section headed `## Dispositions`, one line per finding of the
+round before, by its number:
+
+    N. accepted — <what changed, in one sentence>
+    N. rejected — <why the finding is wrong or out of scope>
+
+Reject when a finding is wrong, adds scope the spec did not decide, or asks
+for what the issue rules out; say why. Do not accept a finding you cannot
+address in this revision. The reviewer reads this section first and will not
+re-raise a finding you resolved or refused with reasons, so it is how the
+document stops growing.

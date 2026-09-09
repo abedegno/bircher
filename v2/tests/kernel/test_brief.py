@@ -164,8 +164,8 @@ def test_template_2_carries_the_prior_round_and_the_verdict_rule():
 
 
 def test_template_1_is_untouched_and_refuses_a_prior():
-    """The spec's template renders the same bytes it always did; the proof
-    re-renders it over its named objects and it names no prior round."""
+    """The legacy template renders the same bytes it always did, so the proof
+    can re-render the briefs of runs issued under it; it names no prior."""
     a = brief.render(phase="spec", artefact=b"# S", bundle=b'{"body":"B"}', spec=None,
                      policy=Policy(), base_sha="0" * 40, template=1).decode()
     assert "[high]" not in a and "previous round" not in a
@@ -174,8 +174,7 @@ def test_template_1_is_untouched_and_refuses_a_prior():
                      policy=Policy(), base_sha="0" * 40, template=1, prior_findings=b"x")
 
 
-def test_issue_review_brief_attaches_the_previous_rounds_findings_when_on(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
+def test_issue_review_brief_attaches_the_previous_rounds_findings(tmp_path):
     s = _store(tmp_path)
     f = Front(s, "r-1")
     f.author_round(SPEC_BYTES)
@@ -186,7 +185,7 @@ def test_issue_review_brief_attaches_the_previous_rounds_findings_when_on(tmp_pa
     g = f._dispatch(Role.REVIEWER, "codex")
     f._cmd(g, "issue_review_brief", {"phase": "spec"})
     p = s.newest_fact("r-1", EventKind.REVIEW_BRIEF_ISSUED).payload
-    assert p["brief_template"] == brief.DISPOSITION_TEMPLATE_VERSION
+    assert p["brief_template"] == brief.TEMPLATE_VERSION == 2
     assert p["prior_findings_hash"] == prev.payload["findings_hash"]
     stored = s.read_blob(p["brief_hash"])
     expected = brief.render(phase="spec", artefact=s.read_blob(h2),
@@ -194,16 +193,3 @@ def test_issue_review_brief_attaches_the_previous_rounds_findings_when_on(tmp_pa
                             policy=Policy(gates=frozenset()), base_sha="0" * 40,
                             template=2, prior_findings=s.read_blob(prev.payload["findings_hash"]))
     assert stored == expected, "the fact names everything the proof needs to re-render"
-
-
-def test_issue_review_brief_uses_template_1_when_off(tmp_path, monkeypatch):
-    monkeypatch.delenv("BIRCHER_REVIEW_DISPOSITIONS", raising=False)
-    s = _store(tmp_path)
-    f = Front(s, "r-1")
-    f.author_round(SPEC_BYTES)
-    f.review_round("request_revision")
-    f.author_round(SPEC_BYTES + b"\nrevised\n")
-    g = f._dispatch(Role.REVIEWER, "codex")
-    f._cmd(g, "issue_review_brief", {"phase": "spec"})
-    p = s.newest_fact("r-1", EventKind.REVIEW_BRIEF_ISSUED).payload
-    assert p["brief_template"] == 1 and p["prior_findings_hash"] is None

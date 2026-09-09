@@ -262,12 +262,11 @@ def test_each_assertion_fails_on_its_defect(tmp_path):
     assert any(sid8 in x and "satisfied stops" in x for x in prove.assert_sessions(s, "r-1", fetch=fetch4))
 
 
-def test_the_proof_re_renders_a_template_2_brief_over_its_prior_findings(tmp_path, monkeypatch):
-    """The disposition experiment issues template 2 briefs that carry the
-    previous round's findings. The REVIEW_BRIEF_ISSUED fact names that prior
-    by hash, and the proof must re-render with it -- otherwise every brief of
-    an experiment run reads as "not render() over its named objects"."""
-    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
+def test_the_proof_re_renders_a_template_2_brief_over_its_prior_findings(tmp_path):
+    """Briefs carry the previous round's findings. The REVIEW_BRIEF_ISSUED
+    fact names that prior by hash, and the proof must re-render with it --
+    otherwise every brief after the first round reads as "not render() over
+    its named objects"."""
     s = _store_with_confirmed_stops(tmp_path / "k.db")
     f = Front(s, "r-1")
     f.ask_round([("q1", "?")], rulings={"q1": "yes"})

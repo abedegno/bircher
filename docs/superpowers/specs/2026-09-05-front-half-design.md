@@ -912,6 +912,17 @@ prompt from a lost one. Two changes:
 
 ### Author round
 
+**A revision answers every finding.** An artefact submitted after a
+`request_revision` ends with a section headed `## Dispositions`, one line per
+finding of the round before, by number: `N. accepted — <what changed>` or
+`N. rejected — <why>`. Rejection is for a finding that is wrong, adds scope
+the spec did not decide, or asks for what the issue rules out. The section is
+part of the artefact, so it is hashed, reviewed and published with it. It is
+what lets a wrong finding be refused on the record instead of obeyed, and it
+is why the document stops growing: without it an author could only add, and
+a spec grew from 19 KB to 92 KB in six rounds without ever passing (E5,
+2026-09-08). The brief for a revision says all of this in the imperative.
+
 A fresh session, agent `v2_author_<vendor>`: `v2_implementer`'s Landlock and
 credential-proxy shape, no push allowance, a worktree at the run's base sha.
 There are **two** author bundles, not one, because the rotation below needs
@@ -1124,6 +1135,28 @@ already orders it so; a verdict first with findings after it would parse as
 the last finding, `None`, and park every valid review; the coordinator waits
 under the one rule below, *The turn's end is a fact*, the file it watches
 being `$BIRCHER_REVIEW_OUT`; an ended turn with no file is an absent verdict.
+
+**Findings carry a severity, and the verdict follows from it.** Each finding
+opens `[high]`, `[medium]` or `[low]`: high is wrong, unsafe, or a
+contradiction of the issue, the spec or itself; medium is a gap an implementer
+would have to guess at, or a decision the artefact makes that the spec did
+not; low is wording, ordering or preference. FAIL needs at least one high or
+medium finding; a review whose findings are all low is a PASS with advice.
+The brief says so in those words, and says not to invent a finding to justify
+a FAIL nor withhold a PASS because a document could always be improved.
+
+**The brief carries the previous round.** From the second round of a phase
+the kernel attaches the findings of the round before, by hash (the
+`review_brief_issued` fact names it as `prior_findings_hash`, so §8
+re-renders the brief over both), with the rule for reading them: a finding
+the author accepted and addressed is resolved and is not raised again unless
+the revision fails to do what its disposition claims; a finding the author
+rejected stands only on new evidence the rejection did not consider; a
+finding with no disposition is unresolved and is raised at its original
+severity. The reviewer grades what is wrong now, not what it would have
+written. Without this each fresh reviewer re-derived every objection against
+a fresh read, and no plan converged in three live runs (E2–E4, 2026-09-08);
+with it, two did (E6, E7).
 The cap is `ITEM_TIMEOUT` (`run-queue.sh:45`, 5400 s) applied to **each waited
 turn from its own start**, which is how the back half's implementer wait
 applies it (`start` at `:4115`, the loop at `:4120`); the runner hands the
@@ -1314,6 +1347,15 @@ implementation review at `implementing`/`reviewing` keeps `omnigent run` and
 its PR prompt, a template with a PR number in it, a few hundred bytes.
 
 ### Rotation
+
+*Rotation is not what makes the loop converge, and it was tried the other
+way.* With both roles rotating and no dispositions, findings per round stayed
+flat on every plan (E2–E4); with the author fixed and no dispositions, the
+spec grew without bound (E5); with rotation as below and the disposition step
+above, an epic converged in nine rounds and a smaller issue in five and went
+on to a merged pull request (E6, E7). Rotation is kept for the reason that
+follows; convergence comes from the dispositions and the prior round in the
+brief.
 
 Round *r*'s reviewer is the vendor that did not author the artefact under
 review. The vendor that reviewed round *r* authors the revision in round

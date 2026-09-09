@@ -263,21 +263,17 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
     elif cmd.name == "issue_review_brief":
         from kernel import brief as _brief
         from kernel.policy import policy_of, policy_version
-        import os
         artifact_hash = store.phase_artifact(cmd.run_id, phase)
         bundle_h = front.bundle_hash(store, cmd.run_id)
         spec_hash = store.phase_artifact(cmd.run_id, "spec") if phase == "plan" else None
-        # The disposition experiment (2026-09-08): template 2 attaches the
-        # previous round's findings so the reviewer can honour the author's
-        # dispositions instead of re-deriving every objection against a
-        # fresh read. The fact records the template and the prior hash, so
-        # the proof re-renders exactly what was issued. Off by default.
+        # The brief attaches the previous round's findings (spec section 3,
+        # Review round) so the reviewer honours the author's dispositions
+        # instead of re-deriving every objection against a fresh read. The
+        # fact records the template and the prior hash, so the proof
+        # re-renders exactly what was issued.
         template = _brief.TEMPLATE_VERSION
-        prior_hash = None
-        if os.environ.get("BIRCHER_REVIEW_DISPOSITIONS") == "on":
-            template = _brief.DISPOSITION_TEMPLATE_VERSION
-            prev = front.newest_review_verdict(store, cmd.run_id, phase, epoch_n)
-            prior_hash = prev.payload.get("findings_hash") if prev is not None else None
+        prev = front.newest_review_verdict(store, cmd.run_id, phase, epoch_n)
+        prior_hash = prev.payload.get("findings_hash") if prev is not None else None
         rendered = _brief.render(
             phase=phase, artefact=store.read_blob(artifact_hash), bundle=store.read_blob(bundle_h),
             spec=None if spec_hash is None else store.read_blob(spec_hash),

@@ -260,31 +260,11 @@ def test_the_revision_author_rotates_by_default(world):
     assert author.choose_author_vendor(ctx) != first, "the reviewer authors the revision"
 
 
-def test_fixed_mode_keeps_the_phases_author(world, monkeypatch):
-    """THE EXPERIMENT. With BIRCHER_AUTHOR_ROTATION=fixed the phase's author
-    revises its own draft, so improvements accumulate instead of each vendor
-    rewriting to its own taste. Measured against the flat finding counts of
-    2026-09-08's three live runs."""
-    monkeypatch.setenv("BIRCHER_AUTHOR_ROTATION", "fixed")
-    s, f, fake, ctx = world()
-    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
-    assert author.author_round(ctx) == "submitted"
-    first = front.submissions(s, "r-1", "spec", 0)[0].payload["author"]
-    f.review_round("request_revision")
-    assert author.choose_author_vendor(ctx) == first, "the author does not rotate"
-
-    # And the reviewer is still the OTHER vendor: the kernel refuses a review
-    # by the author's own vendor, so the cross-vendor guarantee is untouched.
-    from coordinator import review
-    assert review.choose_reviewer_vendor(ctx) != first
-
-
-def test_a_revision_brief_requires_dispositions_when_on(world, monkeypatch):
-    """The disposition experiment: on a revision the author must answer each
-    finding by number, accepted or rejected with a reason, inside the
+def test_a_revision_brief_requires_dispositions(world):
+    """Spec section 3, Author round: on a revision the author must answer
+    each finding by number, accepted or rejected with a reason, inside the
     artefact -- so a wrong finding can be refused on the record and the
     document stops growing."""
-    monkeypatch.setenv("BIRCHER_REVIEW_DISPOSITIONS", "on")
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
@@ -295,12 +275,10 @@ def test_a_revision_brief_requires_dispositions_when_on(world, monkeypatch):
     assert "rejected —" in brief and "accepted —" in brief
 
 
-def test_a_first_draft_and_the_default_mode_ask_for_no_dispositions(world, monkeypatch):
-    monkeypatch.delenv("BIRCHER_REVIEW_DISPOSITIONS", raising=False)
+def test_a_first_draft_asks_for_no_dispositions(world):
+    """There is nothing to disposition before a review has happened. The
+    skill text the brief embeds mentions dispositions in its own revision
+    section, so the assertion is on the brief's requirement heading, not on
+    the word."""
     s, f, fake, ctx = world()
-    assert "Dispositions" not in author.author_brief(ctx, phase="spec").decode()
-    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
-    author.author_round(ctx)
-    f.review_round("request_revision")
-    assert "Dispositions" not in author.author_brief(ctx, phase="spec").decode(), \
-        "off by default: the spec's brief is unchanged"
+    assert "## Dispositions are required" not in author.author_brief(ctx, phase="spec").decode()
