@@ -232,6 +232,37 @@ limit, while watching CI. The Go job on that PR is red and the cross-vendor
 review never ran, so the PR is open and unmerged. That is the v1 pipeline's
 failure, on cost and a failing test, after the v2 front half had done its job.
 
+## E7 — issue 11 under dispositions, to a merged pull request
+
+*2026-09-08 22:41 to 2026-09-09 00:17. Muesli issue 11, "Design: lists-vs-folders
+mental model", labelled autonomous. `BIRCHER_REVIEW_DISPOSITIONS=on`, rotation on,
+five rounds, forty seats. Run `i11-design-lists-vs-folders-mental-model-1788902841`.*
+
+| Round | Author | Draft | Reviewer | Blocking (high+medium) | Verdict |
+|---|---|---|---|---|---|
+| spec 1 | claude | 13 KB | codex | 3 | revise |
+| spec 2 | codex | 10 KB | claude | 1 | revise |
+| spec 3 | claude | 13 KB | codex | — | **no verdict** (finding 15) |
+| spec 3, retried | claude | 13 KB | codex | 1 | revise |
+| spec 4 | codex | 12 KB | claude | 0, four low | **accept** |
+| plan 1 | codex | 15 KB | claude | 0, four low | **accept** |
+
+Then the existing back half implemented the plan, opened muesli PR #758, watched CI
+go red on two of its own new tests — a Go test for the folder resolver, and a
+renderer test batching 301 ids that timed out — pushed a fix at 23:07, passed the
+Codex cross-review, and merged at 00:17. **Vague issue to merged pull request, with
+one human fact in the journal**: a `retry` I posted after the stall, against a
+defect fixed the same night. `prove_front_half --expect-human` prints
+`PROOF: PASS`; E6 still passes in zero-touch mode under the corrected proof.
+
+The stall is finding 15. The codex reviewer had a real finding in its last message
+and a **zero-byte** `review.md` on disk beside a `.write-check` probe: the poll saw
+the path exist, ended the turn, and stopped the session before the content landed.
+A watched file now counts as present only with bytes in it. Findings 16 and 17 were
+in the proof itself and were exposed by this being the first *parked* run to pass:
+a park prompt is not an awaited turn and earns no `turn_ended`, and a person's
+message the coordinator read past is not an unrecorded prompt.
+
 ## What the plan phase does
 
 Three runs, two repositories, two policies, two round limits:
@@ -243,6 +274,7 @@ Three runs, two repositories, two policies, two round limits:
 | E4 (muesli, 5-round bound) | rotate | 2 | 6 | no |
 | E5 (muesli, fixed author) | fixed | never (6, growing) | — | — |
 | E6 (muesli, dispositions) | rotate + dispositions | 4 | 5 | **yes** |
+| E7 (muesli #11, dispositions, autonomous) | rotate + dispositions | 4 | 1 | **yes — and merged** |
 
 Specs converge in two or three rounds every time. Plans converge never. Since
 raising the bound changed nothing, "plans need a little more room" is ruled
@@ -257,13 +289,13 @@ E5 and E6 settled it. Rounds were not the lever (E4 at five rounds failed
 like E3 at three), and neither was a fixed author (E5 grew without bound).
 The lever was letting an author refuse a finding on the record and telling
 the reviewer not to relitigate what was resolved. With that, the same epic
-issue that failed three times passed both phases in nine rounds unattended.
+issue that failed three times passed both phases in nine rounds unattended, and the smaller issue that had failed at five plan rounds passed in five, then went all the way to a merged pull request.
 
 ## What the live runs found
 
-Thirteen defects, none reachable from a test suite that ended the day at
-1437 tests, because the tests were written from the same assumptions as the
-code. Ten fixed, three open.
+Seventeen defects across the two days, none reachable from a test suite that
+now stands at 1440 tests, because the tests were written from the same
+assumptions as the code. Fourteen fixed, three open.
 
 | # | Finding | State |
 |---|---|---|
@@ -281,6 +313,9 @@ code. Ten fixed, three open.
 | 12 | A parked run can become unreachable from the runner — the queue file is consumed and the issue loses its label, so neither source finds it | open |
 | 13 | The human's control channel is a live agent session: every reply wakes a model, which echoes, costs a turn, and could act | open |
 | 14 | The proof read the server's cancellation notice as an unrecorded prompt, failing the first run that converged unattended on four sessions | fixed |
+| 15 | An empty watched file counted as present: a reviewer's zero-byte review file ended its turn before the content landed, parking an unattended run with no verdict | fixed |
+| 16 | The proof held a park prompt to the seat's rule and demanded a `turn_ended` nobody awaits | fixed |
+| 17 | The proof read a person's message the coordinator had already read past as an unrecorded prompt | fixed |
 
 Four of them are one shape: a condition testing a proxy rather than the thing
 it meant. Unanswered questions stood in for "the human owes an answer". The
@@ -296,9 +331,12 @@ answered, the plan resubmitted unchanged, the outcome the runner tried to
 write over a run the coordinator owned. Nothing was corrupted, and every
 recovery was possible from the journal.
 
-The claim of *The claim* is met, once, on the last run of the day: a
-pre-registered vague issue to an accepted spec and an accepted plan with zero
-human facts, `PROOF: PASS`, and the existing back half opening a real pull
-request from the result. It took a mechanism the spec did not have — the
-disposition step — and it is a sample of one. The front half is finished
-enough to be argued about; the numbers above are what to argue from.
+The claim of *The claim* is met twice. E6: a pre-registered vague epic to an
+accepted spec and plan with zero human facts, `PROOF: PASS`. E7: a smaller
+pre-registered issue through the same front half and on through the existing
+back half to a **merged pull request**, with one human fact in the journal — a
+retry against a defect fixed the same night — and `PROOF: PASS` in the mode
+that admits it. Both took a mechanism the spec did not have, the disposition
+step, which is still behind a flag. Two samples on two shapes of work,
+against three failures without it: that is the case for making it the default,
+and it is the next decision.
