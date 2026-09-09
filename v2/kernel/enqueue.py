@@ -32,6 +32,11 @@ class NotApproved(Exception):
     """Enqueue attempted without a human at the operator's path."""
 
 
+class IssueAlreadySliced(Exception):
+    """An earlier run of this issue attempted a child create; an issue is
+    sliced once (shaping spec §2, ruling 12)."""
+
+
 def propose_enqueue(store, run_id: str, *, reason: str) -> None:
     """The model path. Records the request and enqueues nothing.
 
@@ -133,6 +138,15 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
     raw = canonical_bytes(snap)
     bhash = content_hash(raw)
     cfg_hash = canonical_hash({} if project_config is None else project_config)
+
+    from kernel import front
+    prior = front.create_attempted_for_issue(store, base_repo, int(snap["number"]))
+    if prior is not None and not _run_exists(store, run_id):
+        raise IssueAlreadySliced(
+            f"issue #{snap['number']} of {base_repo}: run {prior} attempted a child create, so a child "
+            "may exist; an issue is sliced once (shaping spec §2). Close the children that should not "
+            "be worked and open a new issue for what remains (§9)."
+        )
 
     if _run_exists(store, run_id):
         started = store.newest_fact(run_id, EventKind.RUN_STARTED)

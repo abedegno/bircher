@@ -39,6 +39,7 @@ answer, and the value that survives is the kernel's.
 | `store.phase_artifact` | `validate_review`, `_check_submit` | observed | `phase_artifacts`, written only by an accepted `submit_spec`/`submit_plan` |
 | `store.read_blob` | `_check_submit` | observed | content-addressed bytes |
 | `store.facts_of_kind` | `front.submissions`, `front.epoch` | observed | the append-only journal |
+| `store.effect_by_key` | `record_slice_filed` | observed | the effect journal's row for the key the command names; the created issue's number and database id are read from its delivered value |
 | `seat["session"].get("agent_name")` | `_check_submit`, `validate_review` (a `review_ruling`) | observed | the recorded create snapshot the server returned (`front.newest_seat`'s `session`, read from the satisfied `sess-create`'s `external_object_id`), compared against the dispatch actor via `front.vendor_of` -- ruling 14's vendor guard, and not a `store.X` attribute or a payload key, so the AST walk that derives this table's input list cannot see it; named here by hand |
 
 ## Caller-presented, bound to kernel state
@@ -64,6 +65,9 @@ answer, and the value that survives is the kernel's.
 | `cmd.payload['rejection']` | `dismiss_human_item` | observed | refused unless it names a `command_rejected` fact of this run attributed to `human`, and unless it is not already dismissed (one reply per refusal) |
 | `cmd.payload['sha256']` | `record_prompt_item` | observed | refused unless a satisfied `sess-prompt` of the named session carries it as `body.artifact` |
 | `cmd.payload['issue']` | `revise_bundle` | observed | refused unless its snapshot hashes differently from the current bundle -- the kernel observes only that COMPARISON; the fetched issue's content is asserted by the runner adapter (§9), named as a residual below |
+| `cmd.payload['slice']` | `record_slice_filed`, `record_slice_closed`, `record_slice_reopened` | observed | refused unless the accepted plan has the slice (`front.accepted_plan`) and, for a closure, unless the epoch holds its `slice_filed` |
+| `cmd.payload['effect_key']` | `record_slice_filed` | observed | refused unless it names a satisfied `issue_create` row of this run whose obligation names this run, epoch, slice, parent and the accepted plan's hash |
+| `fact.payload['parent']` | `record_run_outcome` (the `sliced` guard) | observed | read off the kernel's own `children_observed_closed` fact, written by `_side_fact` under the generation that recorded it; the guard reads the FACT rather than an effect row so that a parent a person closed by hand owes no `parent_close`. What the sweep saw when it read the parent is the `cmd.payload['parent_state']` residual below; that the guard reads the recorded fact and not a caller's claim is what this row states |
 | `cmd.payload['session']` | `record_turn_ended`, `record_author_empty` | observed | refused unless it names the session the PHASE's newest satisfied sess-prompt names (`record_turn_ended`, ruling 15), or the session the newest satisfied author sess-create delivered (`record_author_empty`) -- Task 10 |
 
 ## Asserted — declared residuals
@@ -96,6 +100,10 @@ for a check.
 | `cmd.payload['reasoning']` | `record_model_ruling`, `record_one_piece` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
 | `cmd.payload['cost_if_wrong']` | `record_model_ruling`, `record_one_piece` | asserted | **Intentional and permanent.** The model's words; the kernel binds the epoch and phase they were asked in and refuses a ruling on a question no `model_question` of the epoch asked. |
 | `cmd.payload['item_id']` | `record_prompt_item` | asserted | **Residual, §4.** A per-session identity the kernel cannot see: omnigent's item ids are checked for uniqueness within the named session, but the kernel has no way to confirm the id names the item the coordinator means. |
+| `cmd.payload['closed_at']` | `record_slice_closed` | asserted | **Residual, shaping §2.** The sweep's observation of GitHub, shape-checked (a non-empty string, the child's `closedAt` as the sweep read it) and recorded; whether it is true is the sweep's, as every observation of GitHub in this design is (ruling 17). |
+| `cmd.payload['state']` | `record_slice_closed` | asserted | **Residual, shaping §2.** The sweep's observation of GitHub, shape-checked (bounded to `merged` or `closed`: `merged` when the child's closing pull request is itself merged, `closed` otherwise) and recorded; whether it is true is the sweep's, as every observation of GitHub in this design is (ruling 17). |
+| `cmd.payload['observed_at']` | `record_slice_reopened`, `record_children_observed_closed` | asserted | **Residual, shaping §2.** The sweep's observation of GitHub, shape-checked (a non-empty string, when the firing read the child or the parent) and recorded; whether it is true is the sweep's, as every observation of GitHub in this design is (ruling 17). |
+| `cmd.payload['parent_state']` | `record_children_observed_closed` | asserted | **Residual, shaping §2.** The sweep's observation of GitHub, shape-checked (bounded to `open` or `closed`, the parent issue's state as the firing read it) and recorded; whether it is true is the sweep's, as every observation of GitHub in this design is (ruling 17). The outcome guard reads the recorded fact (`fact.payload['parent']` above), never this payload. |
 
 ## Front half
 

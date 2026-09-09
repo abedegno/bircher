@@ -193,6 +193,13 @@ def test_every_command_declares_its_legal_states():
             # The kernel's own rendering of the reviewer's brief: an
             # observation, not a move.
             "issue_review_brief",
+            # Task 4's five filing and closing facts (shaping spec §2): what
+            # was filed, that nothing is still owed, and what the sweep read
+            # of each child and of the parent. A `sliced` run stays `sliced`
+            # through all of them -- it leaves only through
+            # record_run_outcome's own `sliced` outcome, or a cancel.
+            "record_slice_filed", "record_filing_complete", "record_slice_closed",
+            "record_slice_reopened", "record_children_observed_closed",
         )
 
 

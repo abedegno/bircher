@@ -111,6 +111,17 @@ def test_the_command_interface_is_closed_and_explicit():
         # an obligation, and the transition that authorises it must be its own
         # fact.
         "record_one_piece", "submit_slices", "advance_ungated",
+        # Task 4, the filing and closing facts (shaping spec §2). Each is a
+        # fact about children the run has already filed or observed: legal
+        # only from `sliced`, only under an operator dispatch, and none of
+        # them transitions. record_slice_filed reads the created issue's
+        # number and database id off the confirmed effect row, so a parent's
+        # ledger carries the server's answer rather than the coordinator's
+        # claim; record_filing_complete is the kernel's statement that
+        # nothing about filing is still owed; the three closing facts are the
+        # sweep's readings, and the `sliced` outcome is guarded on them.
+        "record_slice_filed", "record_filing_complete", "record_slice_closed",
+        "record_slice_reopened", "record_children_observed_closed",
     ])
 
 

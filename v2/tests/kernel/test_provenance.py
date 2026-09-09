@@ -179,6 +179,12 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['cost_if_wrong']",
         # A per-session identity the kernel cannot see.
         "cmd.payload['item_id']",
+        # The shaping phase's four: the sweep's readings of GitHub (shaping
+        # spec §2, ruling 17).
+        "cmd.payload['closed_at']",
+        "cmd.payload['state']",
+        "cmd.payload['observed_at']",
+        "cmd.payload['parent_state']",
         # The front half's own three (docs/design/provenance-table.md's
         # "Front half" section, spec §9): prose rows with no single
         # store.X or payload[...] the AST walk could find, added by hand
@@ -248,7 +254,11 @@ def test_the_spec_and_the_table_agree_on_the_count():
              # Task 21: the front half's own three (policy inputs, the
              # stop's teardown, the runner's lock) push the count to
              # twenty-five.
-             "twenty-four": 24, "twenty-five": 25}
+             "twenty-four": 24, "twenty-five": 25,
+             # The shaping phase's four: the sweep's closed-at, state,
+             # observed-at and parent-state readings of GitHub.
+             "twenty-six": 26, "twenty-seven": 27, "twenty-eight": 28,
+             "twenty-nine": 29}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")

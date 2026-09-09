@@ -103,6 +103,14 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_one_piece": (frozenset({"shaping"}), "queued"),
     "submit_slices": (frozenset({"shaping"}), "slices_submitted"),
     "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
+    # The filing and closing facts (shaping spec §2): no transition; legal
+    # only from `sliced`, under the coordinator's or the sweep's operator
+    # dispatch (checked in authorize).
+    "record_slice_filed": (frozenset({"sliced"}), None),
+    "record_filing_complete": (frozenset({"sliced"}), None),
+    "record_slice_closed": (frozenset({"sliced"}), None),
+    "record_slice_reopened": (frozenset({"sliced"}), None),
+    "record_children_observed_closed": (frozenset({"sliced"}), None),
     "start_implementation": (frozenset({"planned"}), "implementing"),
     # Destination depends on state, verdict and the run's gates: computed in
     # authorize() by _review_destination. In the back half a revision request
@@ -285,6 +293,9 @@ _MERGE_OUTCOMES: dict[str, str] = {
 #: effect, on the same reasoning as record_merge_outcome.
 _RUN_OUTCOMES: frozenset[str] = frozenset({
     "merged", "ready", "escalated", "noop", "skipped", "failed", "timeout",
+    # sliced: the sweep's terminal record for an epic whose children all
+    # closed (shaping spec §2); guarded in authorize.
+    "sliced",
 })
 
 
@@ -769,6 +780,19 @@ def _require_turn_recorded(store, cmd, role: str) -> None:
         )
 
 
+def _check_operator(store, cmd) -> None:
+    if role_for(store, cmd.run_id, cmd.generation) != Role.OPERATOR:
+        raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the operator role")
+
+
+def _check_slice_in_plan(store, cmd, n) -> None:
+    """A payload `slice` is observed: refused unless the accepted plan has it."""
+    from kernel import front
+    plan = front.accepted_plan(store, cmd.run_id)
+    if plan is None or type(n) is not int or n not in plan.by_number():
+        raise NotAuthorized(f"{cmd.name}: slice {n!r} is not in the accepted plan")
+
+
 def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str | None:
     """Authorize *cmd* against the run's current state. Returns the next state.
 
@@ -969,6 +993,89 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             )
         return next_state
 
+    if cmd.name == "record_slice_filed":
+        import json as _json
+        from kernel import front
+        _check_operator(store, cmd)
+        n, key = cmd.payload.get("slice"), cmd.payload.get("effect_key")
+        _check_slice_in_plan(store, cmd, n)
+        epoch_n = front.epoch(store, cmd.run_id)
+        row = None if not isinstance(key, str) else store.effect_by_key(key, run_id=cmd.run_id)
+        if row is None or row["effect_class"] != "issue_create" or not front.is_satisfied(row):
+            raise NotAuthorized(f"record_slice_filed: {key!r} is not a satisfied issue_create of this run")
+        want = {"kind": "slice_issue", "run": cmd.run_id, "epoch": epoch_n, "slice": n,
+                "parent": front.issue_number(store, cmd.run_id),
+                "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n)}
+        if (row["intent"].get("obligation") or {}) != want:
+            raise NotAuthorized(f"record_slice_filed: {key}'s obligation {row['intent'].get('obligation')} is not {want}")
+        try:
+            delivered = _json.loads(row["external_object_id"])
+            int(delivered["number"]); int(delivered["id"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise NotAuthorized(f"record_slice_filed: {key}'s delivered value is not {{url, number, id}}") from exc
+        if n in front.slices_filed(store, cmd.run_id, epoch_n):
+            raise NotAuthorized(f"slice {n} already has a slice_filed in epoch {epoch_n}")
+        return None
+
+    if cmd.name == "record_filing_complete":
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is not None:
+            raise NotAuthorized(f"filing_complete already recorded in epoch {epoch_n}")
+        filed = front.slices_filed(store, cmd.run_id, epoch_n)
+        for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+            if s.number not in filed:
+                raise NotAuthorized(f"record_filing_complete: slice {s.number} has no slice_filed")
+        owed = front.unsatisfied_filing(store, cmd.run_id, epoch_n)
+        if owed:
+            raise NotAuthorized(f"record_filing_complete: {len(owed)} obligation(s) unsatisfied, first {owed[0]}")
+        return None
+
+    if cmd.name in ("record_slice_closed", "record_slice_reopened"):
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+            raise NotAuthorized(f"{cmd.name}: no filing_complete in epoch {epoch_n}; the sweep reads only a filed epic")
+        n = cmd.payload.get("slice")
+        if n not in front.slices_filed(store, cmd.run_id, epoch_n):
+            raise NotAuthorized(f"{cmd.name}: no slice_filed for slice {n!r} in epoch {epoch_n}")
+        cur = front.current_closure(store, cmd.run_id, epoch_n, n)
+        if cmd.name == "record_slice_closed":
+            if cmd.payload.get("state") not in ("merged", "closed"):
+                raise NotAuthorized("record_slice_closed state is merged or closed")
+            if not _non_empty_str(cmd.payload.get("closed_at")):
+                raise NotAuthorized("record_slice_closed carries closed_at")
+            if cur is not None and cur.kind == EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {n} is currently closed: a closure is recorded once until a reopening")
+        else:
+            if not _non_empty_str(cmd.payload.get("observed_at")):
+                raise NotAuthorized("record_slice_reopened carries observed_at")
+            if cur is None:
+                raise NotAuthorized(f"slice {n} was never closed: nothing to reopen")
+            if cur.kind != EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {n} is not currently closed")
+        return None
+
+    if cmd.name == "record_children_observed_closed":
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+            raise NotAuthorized(f"no filing_complete in epoch {epoch_n}")
+        if cmd.payload.get("parent_state") not in ("open", "closed"):
+            raise NotAuthorized("record_children_observed_closed parent_state is open or closed")
+        if not _non_empty_str(cmd.payload.get("observed_at")):
+            raise NotAuthorized("record_children_observed_closed carries observed_at")
+        for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+            cur = front.current_closure(store, cmd.run_id, epoch_n, s.number)
+            if cur is None or cur.kind != EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {s.number} is not currently closed: the statement cannot contradict the closing facts")
+        if front.observed_closed_under(store, cmd.run_id, epoch_n, cmd.generation) is not None:
+            raise NotAuthorized(f"children_observed_closed already recorded under generation {cmd.generation}")
+        return None
+
     if cmd.name == "record_review":
         verdict = cmd.payload.get("verdict")
         if verdict not in _VERDICT_WORDS:
@@ -1074,6 +1181,15 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(
                 f"outcome {outcome!r} is not one of {sorted(_RUN_OUTCOMES)}"
             )
+        # A run that entered `sliced` may have filed children; `failed` over
+        # them would end the epic with its filing half done and nothing left
+        # to repair it (shaping spec §2, ruling 15). cancel_run is the other exit.
+        # BEFORE the `merged` check below, not after: from `sliced` the STATE
+        # refuses every other outcome, `merged` included, and the refusal that
+        # names why is the state's one -- "no confirmed merge effect" would
+        # invite a caller to go and get one.
+        if current == "sliced" and outcome != "sliced":
+            raise NotAuthorized(f"a run that entered sliced ends only as sliced, not {outcome!r}; cancel_run is the other exit")
         # The one outcome a mechanism can contradict. Without this, a run that
         # never merged anything could still close its ledger as `merged` --
         # the exact claim-outruns-evidence shape record_merge_outcome already
@@ -1085,6 +1201,32 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 "no confirmed merge outcome for this run: a merged outcome "
                 "reports what the mechanism observed, not what an actor claims"
             )
+        if outcome == "sliced":
+            from kernel import front
+            if current != "sliced":
+                raise NotAuthorized("outcome sliced is legal only from sliced")
+            _check_operator(store, cmd)
+            epoch_n = front.epoch(store, cmd.run_id)
+            if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+                raise NotAuthorized("outcome sliced: no filing_complete in this epoch")
+            for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+                cur = front.current_closure(store, cmd.run_id, epoch_n, s.number)
+                if cur is None or cur.kind != EventKind.SLICE_CLOSED:
+                    raise NotAuthorized(f"outcome sliced: slice {s.number} is not currently closed")
+            obs = front.observed_closed_under(store, cmd.run_id, epoch_n, cmd.generation)
+            if obs is None:
+                raise NotAuthorized(
+                    "outcome sliced: no children_observed_closed under this generation -- the firing "
+                    "that ends the run is the firing that read every child (ruling 17)"
+                )
+            base = {"run": cmd.run_id, "epoch": epoch_n}
+            if front.satisfied_obligation(store, cmd.run_id, dict(base, kind="umbrella_close")) is None:
+                raise NotAuthorized("outcome sliced: the umbrella_close comment is not satisfied")
+            # A hand-closed parent owes no close; a satisfied close beside an
+            # observed-open parent is a person's reopening (ruling 22).
+            if obs.payload.get("parent") == "open" and \
+                    front.satisfied_obligation(store, cmd.run_id, dict(base, kind="parent_close")) is None:
+                raise NotAuthorized("outcome sliced: the parent was observed open and its parent_close is not satisfied")
         return "ended"
 
     if cmd.name == "request_merge":

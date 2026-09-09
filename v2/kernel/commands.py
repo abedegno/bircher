@@ -104,6 +104,9 @@ COMMAND_NAMES = frozenset({
     # The shaping phase (shaping spec §2 *States*): the ruling, the slice
     # plan, and the coordinator's own ungated advance.
     "record_one_piece", "submit_slices", "advance_ungated",
+    # The filing and closing facts (shaping spec §2).
+    "record_slice_filed", "record_filing_complete", "record_slice_closed",
+    "record_slice_reopened", "record_children_observed_closed",
 })
 
 
@@ -185,6 +188,51 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             run_id=cmd.run_id, kind=EventKind.ARTIFACT_ADVANCED, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"phase": phase, "epoch": epoch_n, "hash": store.phase_artifact(cmd.run_id, phase)},
+        )
+    elif cmd.name == "record_slice_filed":
+        import json as _json
+        row = store.effect_by_key(cmd.payload["effect_key"], run_id=cmd.run_id)
+        delivered = _json.loads(row["external_object_id"])
+        plan = front.accepted_plan(store, cmd.run_id, epoch_n)
+        n = cmd.payload["slice"]
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.SLICE_FILED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            # The number and the database id are OBSERVED from the confirmed
+            # row's delivered value, never taken from the payload.
+            payload={"epoch": epoch_n, "slice": n, "issue": int(delivered["number"]),
+                     "issue_id": int(delivered["id"]), "title": plan.by_number()[n].title,
+                     "parent": front.issue_number(store, cmd.run_id),
+                     "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n)},
+        )
+    elif cmd.name == "record_filing_complete":
+        filed = front.slices_filed(store, cmd.run_id, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.FILING_COMPLETE, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n),
+                     "children": [filed[n].payload["issue"] for n in sorted(filed)]},
+        )
+    elif cmd.name in ("record_slice_closed", "record_slice_reopened"):
+        n = cmd.payload["slice"]
+        issue = front.slices_filed(store, cmd.run_id, epoch_n)[n].payload["issue"]
+        if cmd.name == "record_slice_closed":
+            payload = {"epoch": epoch_n, "slice": n, "issue": issue,
+                       "closed_at": cmd.payload["closed_at"], "state": cmd.payload["state"]}
+            kind = EventKind.SLICE_CLOSED
+        else:
+            payload = {"epoch": epoch_n, "slice": n, "issue": issue, "observed_at": cmd.payload["observed_at"]}
+            kind = EventKind.SLICE_REOPENED
+        store.append_fact(run_id=cmd.run_id, kind=kind, actor=actor,
+                          causal_command_id=cmd.idempotency_key, payload=payload)
+    elif cmd.name == "record_children_observed_closed":
+        plan = front.accepted_plan(store, cmd.run_id, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.CHILDREN_OBSERVED_CLOSED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "generation": cmd.generation,
+                     "slices": [s.number for s in plan.slices],
+                     "parent": cmd.payload["parent_state"], "observed_at": cmd.payload["observed_at"]},
         )
     elif cmd.name == "record_turn_ended":
         prompt = front.newest_prompt(store, cmd.run_id, phase, epoch_n)

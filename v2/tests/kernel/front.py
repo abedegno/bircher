@@ -111,15 +111,55 @@ class Front:
     def _dispatch(self, role: str, actor: str) -> int:
         return dispatch(self.store, self.run_id, actor=actor, role=role).generation
 
-    def _journal(self, generation: int, key: str, intent: dict, external: str | None) -> None:
+    def _journal(self, generation: int, key: str, intent: dict, external: str | None, *,
+                 cls: str = "session_control", state: str = "confirmed") -> None:
         # The effect ROW id is a global primary key while the idempotency key
         # is unique only within a run, so the run id goes in the row id. Two
         # runs in one store both open session `s-1` under generation 1, and
         # without this the second one collides on the id rather than on
         # anything the kernel would refuse.
-        self.store.journal_intent(f"e-{self.run_id}-{key}", self.run_id, generation,
-                                  "session_control", key, intent)
-        self.store.mark_effect(key, "confirmed", external, run_id=self.run_id)
+        self.store.journal_intent(f"e-{self.run_id}-{key}", self.run_id, generation, cls, key, intent)
+        self.store.mark_effect(key, state, external, run_id=self.run_id)
+
+    def file_slice(self, generation: int, n: int, issue: int, issue_id: int) -> str:
+        """A satisfied issue_create for slice *n* -- journalled directly, as
+        `_journal` does for sessions -- and its slice_filed fact."""
+        epoch_n = self.epoch()
+        h = fq.accepted_slices_hash(self.store, self.run_id, epoch_n)
+        parent = fq.issue_number(self.store, self.run_id)
+        key = f"slice:{self.run_id}:{n}:{generation}"
+        ob = {"kind": "slice_issue", "run": self.run_id, "epoch": epoch_n, "slice": n,
+              "parent": parent, "plan_hash": h}
+        self._journal(generation, key, {"argv": ["gh", "issue", "create", "--repo", "o/r", "--title",
+                                                 "t", "--label", "bircher:slice"], "obligation": ob},
+                      json.dumps({"url": f"https://github.com/o/r/issues/{issue}", "number": issue, "id": issue_id}),
+                      cls="issue_create")
+        self._cmd(generation, "record_slice_filed", {"slice": n, "effect_key": key})
+        return key
+
+    def satisfy(self, generation: int, ob: dict, *, cls: str = "issue_or_label", value: str = "ok") -> str:
+        """A satisfied effect carrying *ob*, journalled directly."""
+        key = f"{ob['kind']}:{self.run_id}:{ob.get('slice', '')}:{ob.get('blocker', '')}:{generation}"
+        self._journal(generation, key, {"argv": ["gh", "issue", "edit", "1", "--repo", "o/r"],
+                                        "obligation": ob}, value, cls=cls)
+        return key
+
+    def file_all(self, generation: int, first_issue: int = 40) -> dict[int, int]:
+        """Every filing obligation of the accepted plan satisfied, in
+        dependency order, and filing_complete recorded."""
+        from kernel import slices as _slices
+        plan = fq.accepted_plan(self.store, self.run_id)
+        filed = {}
+        for n in _slices.topo_order(plan):
+            filed[n] = first_issue + n - 1
+            self.file_slice(generation, n, filed[n], 1000 + filed[n])
+        for ob in fq.filing_obligations(self.store, self.run_id, self.epoch()):
+            if ob["kind"] == "slice_issue":
+                continue
+            self.satisfy(generation, ob, cls="comment" if ob["kind"] == "umbrella" else "issue_or_label",
+                         value="https://github.com/o/r/issues/1#issuecomment-1" if ob["kind"] == "umbrella" else "ok")
+        self._cmd(generation, "record_filing_complete", {})
+        return filed
 
     def _create(self, generation: int, cause: str, *, actor: str | None = None) -> str:
         """A satisfied sess-create under *generation* -- and nothing else. The
