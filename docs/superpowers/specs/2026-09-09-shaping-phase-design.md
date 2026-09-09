@@ -4,9 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 9, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi) and 8 (Codex); the dispositions are
-the last eight sections.*
+Revision 10, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex) and 9 (Kimi); the
+dispositions are the last nine sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -140,7 +140,8 @@ stated per command and not inherited:
 **An issue is sliced once.** `create_run` is refused when the journal holds
 a run whose snapshot names the same repository and issue number and which
 holds **any `issue_create` effect row not reconciled as not-delivered** —
-performed, confirmed, uncertain or reconciled delivered — whatever that
+`intended`, `confirmed`, `uncertain` or reconciled delivered, the row states
+`effects.py` has — whatever that
 run's state: ended `sliced`, cancelled, or halted. The observable is the
 attempt, not the outcome, because a child may exist from the first attempt
 on, and a cancelled run that had created two children would otherwise be
@@ -397,13 +398,24 @@ undoes nothing on GitHub. Every obligation kind this design adds therefore
 carries a precondition the kernel checks **when the effect is journalled**,
 before anything reaches the executor:
 
-| Obligation kind | Refused unless |
+Every filing obligation (§3) carries `run`, `epoch` and `plan_hash`; the
+per-slice kinds carry `slice`, and `slice_dependency` carries `blocker`
+too. **The common conditions**, checked for every kind in the table: the
+run is in `sliced`; the dispatch is the coordinator's `operator`
+generation; the obligation's `run` is this run and its `epoch` the current
+epoch; where the kind carries `plan_hash`, it equals **the accepted hash** —
+the hash the epoch's `human_ruling {approve, phase: slices}` or
+`artifact_advanced {phase: slices}` named, the plan a reviewer accepted and
+the gate passed, not any plan submitted; where the kind carries `slice`,
+that slice is in the accepted plan.
+
+| Obligation kind | Refused unless, beyond the common conditions |
 |---|---|
-| `slice_issue` | the run is in `sliced`; the dispatch is the coordinator's `operator` generation; the obligation's `epoch` is the current epoch and its `plan_hash` is the hash the epoch's `human_ruling {approve, phase: slices}` or `artifact_advanced {phase: slices}` named — the plan a reviewer accepted and the gate passed, not any plan submitted; the obligation's `slice` is in that plan |
-| `slice_dependency` | all of the above, and the edge `slice ← blocker` is in the plan, and both slices have a `slice_filed` in this epoch |
-| `slice_queue` | all of the `slice_issue` conditions, and every `slice_issue` and `slice_dependency` obligation the plan implies is satisfied — the property §3's third pass depends on, a queued child has every link, refused here rather than discovered at `filing_complete` after the generator has taken the child up |
-| `umbrella`, `umbrella_label` | the `slice_issue` conditions, and a `slice_filed` for every slice of the plan |
-| `umbrella_close`, `parent_close` | the run is in `sliced`; the coordinator's `operator` dispatch; `filing_complete` in this epoch; a `children_observed_closed` under the calling generation |
+| `slice_issue` | nothing further |
+| `slice_dependency` | the edge `slice ← blocker` is in the plan, and both slices have a `slice_filed` in this epoch |
+| `slice_queue` | every `slice_issue` and `slice_dependency` obligation the plan implies is satisfied — the property §3's third pass depends on, a queued child has every link, refused here rather than discovered at `filing_complete` after the generator has taken the child up |
+| `umbrella`, `umbrella_label` | a `slice_filed` for every slice of the plan |
+| `umbrella_close`, `parent_close` (no `plan_hash`, no `slice`) | `filing_complete` in this epoch, and a `children_observed_closed` under the calling generation |
 
 The kernel parses the plan and holds every obligation's row and every fact
 these rows name, so each precondition is a read of what it already holds.
@@ -525,7 +537,9 @@ visible before its links exist:
    run, epoch, slice: n, parent, plan_hash}`, key
    `slice:<run>:<n>:<generation>`. If no satisfied `issue_create` carries this
    obligation, compose the child with `slices.render_child(slice, parent,
-   hash8, sibling_numbers)` — title: the slice title; body: the marker line
+   hash8, sibling_numbers)` — `hash8` being the first eight hex characters
+   of the accepted plan's hash, wherever it appears in this document —
+   title: the slice title; body: the marker line
    `Slice n of #<parent> (bircher shaping <hash8>)`, a blank line, the scope,
    `Non-goals: …`, and `Depends on: #<x>, #<y>` with the siblings' numbers
    already filed, or `Depends on: none`; labels: `bircher:slice` and the
@@ -538,11 +552,12 @@ visible before its links exist:
    satisfied create with its fact already recorded is skipped here and *not*
    skipped in the passes below.
 2. **The links**, for each slice and each of its dependencies: obligation
-   `{kind: slice_dependency, run, epoch, slice: n, blocker: m}`; performed if
-   unsatisfied, as an `issue_or_label` effect posting the blocked-by link.
+   `{kind: slice_dependency, run, epoch, plan_hash, slice: n, blocker: m}`;
+   performed if unsatisfied, as an `issue_or_label` effect posting the
+   blocked-by link.
 3. **The queue labels**, for each slice: obligation `{kind: slice_queue, run,
-   epoch, slice: n}`, an `issue_or_label` effect adding `bircher:queued` to
-   the child; performed if unsatisfied. This pass starts only when every
+   epoch, plan_hash, slice: n}`, an `issue_or_label` effect adding
+   `bircher:queued` to the child; performed if unsatisfied. This pass starts only when every
    obligation of passes 1 and 2 is satisfied, so **a child that carries
    `bircher:queued` has every link the plan gives it**, and a child the
    generator would otherwise take up — created, linked or not — is invisible
@@ -555,7 +570,7 @@ visible before its links exist:
    `{kind: umbrella, run, epoch, plan_hash}` — `bircher: sliced <hash8>`
    followed by one line per child, `- #<number> Slice n: <title>` — and the
    label swap `bircher:running` → `bircher:sliced` on the parent, obligation
-   `{kind: umbrella_label, run, epoch}`.
+   `{kind: umbrella_label, run, epoch, plan_hash}`.
 
 Last, if this epoch has no `filing_complete` fact,
 `record_filing_complete()`, which the kernel accepts only when every
@@ -569,7 +584,13 @@ satisfied obligation is never re-performed — `perform` replays a confirmed key
 label edit (§5).
 
 `bircher: sliced ` joins `BIRCHER_STATUS_PREFIXES` in both copies of the
-predicate, so the umbrella never freezes into a bundle.
+predicate, so neither the umbrella nor the completion comment (which shares
+the prefix) ever freezes into a bundle. The pin
+`test_prefixes_are_exactly_five_and_not_the_generic_one`
+(`v2/tests/kernel/test_bundle_v2.py:37`) becomes six, and the fixture and
+bash-agreement tests that enumerate the prefixes change with it — stated
+here so the reds are expected, as §2's note on the `revise_bundle` tests
+states its own.
 
 ### The sweep
 
@@ -681,7 +702,9 @@ and one changed note on a path that already exists:
   existing refused-mint path records a scorecard row and moves the file to
   `processed` (`run-queue.sh:4362-4371`); the row's note carries the
   refusal's text, so it reads "sliced by run i12-…" and not a bare "refused".
-  No new runner code, one changed note.
+  Today the call's output is discarded (`_kernel_run_start … >/dev/null`)
+  and the note is a constant; the change is to capture the refusal and put
+  it in the note — small, but code, not only a string.
 - `issues-to-queue.sh`'s journal sweep queues, beside open runs with a current
   park, **open runs in `sliced` with no `filing_complete` fact in the current
   epoch** — the crash-anywhere-during-filing case — so the next wave's pass
@@ -843,9 +866,11 @@ table**: an `issue_create` with a `slice_issue` obligation refused from
 `slices_accepted`, refused from `sliced` under an author dispatch, refused
 with the hash of a submitted-but-rejected plan, refused for a slice number
 not in the plan, and accepted from `sliced` under the operator with the
-accepted hash; a `slice_dependency` for an edge not in the plan refused; an
-`umbrella` with a slice unfiled refused; a `parent_close` without a
-same-generation observation fact refused; the outcome accepted with
+accepted hash; a `slice_issue` whose `epoch` is not the current one
+refused; a `slice_dependency` for an edge not in the plan refused, and one
+whose blocker has no `slice_filed` refused; an `umbrella` and an
+`umbrella_label` each refused with a slice unfiled; a `parent_close` without
+a same-generation observation fact refused; the outcome accepted with
 `parent: closed` and no `parent_close` row, and refused with `parent: open`
 and no `parent_close` row.
 
@@ -1212,3 +1237,18 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    invented effect row (§2, §3, §7, ruling 20, tests). Round 7's
    disposition 5 said the obligation was "recorded satisfied by that
    observation" without saying how; this is how.
+
+## Dispositions — round 9 (Kimi, 2026-09-09)
+
+1. accepted — every filing obligation now carries `plan_hash` (§3's
+   payloads for `slice_dependency`, `slice_queue` and `umbrella_label`
+   extended), the table's common conditions are stated once and scoped to
+   the fields a kind carries, and the completion pair is marked as carrying
+   neither `plan_hash` nor `slice`.
+2. accepted — `hash8` is defined at its first use in §3.
+3. accepted — the three missing planted refusals are in §8.
+4. accepted — `intended`, `confirmed`, `uncertain`, reconciled.
+5. accepted — the refused mint's note is a captured refusal, and §5 says
+   the capture is code.
+6. accepted — the prefix pin and its companions are named in §3 as
+   expected reds.
