@@ -142,10 +142,16 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
     from kernel import front
     prior = front.create_attempted_for_issue(store, base_repo, int(snap["number"]))
     if prior is not None and not _run_exists(store, run_id):
+        # The run AND ITS ROWS (spec §2 *An issue is sliced once*: "The refusal
+        # names the run and its rows"). Naming only the run leaves the person
+        # the refusal is addressed to hunting for which children exist, which
+        # is the very question the refusal asks them to answer.
+        prior_run, rows = prior
+        named = ", ".join(f"{r['idempotency_key']} [{r['state']}]" for r in rows)
         raise IssueAlreadySliced(
-            f"issue #{snap['number']} of {base_repo}: run {prior} attempted a child create, so a child "
-            "may exist; an issue is sliced once (shaping spec §2). Close the children that should not "
-            "be worked and open a new issue for what remains (§9)."
+            f"issue #{snap['number']} of {base_repo}: run {prior_run} attempted a child create, so a child "
+            f"may exist; rows {named}. An issue is sliced once (shaping spec §2). Close the children that "
+            "should not be worked and open a new issue for what remains (§9)."
         )
 
     if _run_exists(store, run_id):

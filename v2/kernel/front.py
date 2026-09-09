@@ -387,12 +387,18 @@ def issue_create_rows(store, run_id: str) -> list[dict]:
     return [r for r in store.effects_for(run_id) if r["effect_class"] == "issue_create"]
 
 
-def create_attempted_for_issue(store, base_repo: str, number: int) -> str | None:
+def create_attempted_for_issue(store, base_repo: str, number: int) -> tuple[str, list[dict]] | None:
     """A run of the same repository and issue holding ANY issue_create row
     not reconciled not-delivered -- intended, confirmed, uncertain or
     reconciled delivered -- whatever that run's state (spec §2 *An issue is
-    sliced once*, ruling 12). The observable is the attempt: a child may
-    exist from the first attempt on."""
+    sliced once*, ruling 12), AND those rows. The observable is the attempt: a
+    child may exist from the first attempt on.
+
+    `(run_id, rows)` rather than the run id alone because the spec says the
+    refusal "names the run and its rows": a person told only that some earlier
+    run attempted a create has to go and find which children exist before they
+    can act on the refusal, and the journal already knows.
+    """
     for rid in store.all_run_ids():
         try:
             if store.run_base_repo(rid) != base_repo:
@@ -403,8 +409,8 @@ def create_attempted_for_issue(store, base_repo: str, number: int) -> str | None
                 continue
         except (KeyError, ValueError, TypeError):
             continue
-        for row in issue_create_rows(store, rid):
-            if row["state"] == "reconciled" and row.get("external_object_id") in (None, ""):
-                continue
-            return rid
+        rows = [row for row in issue_create_rows(store, rid)
+                if not (row["state"] == "reconciled" and row.get("external_object_id") in (None, ""))]
+        if rows:
+            return rid, rows
     return None

@@ -209,6 +209,58 @@ def test_a_hand_closed_parent_ends_without_a_close_and_a_reopened_one_with_its_o
     assert s2.run_state(f2.run_id) == "ended"
 
 
+# -- the operator role ---------------------------------------------------------
+
+def test_every_filing_command_needs_the_operator_role(tmp_path):
+    """Each of the five checks its OWN role (shaping spec §2: every one of them
+    is legal `under the coordinator's operator dispatch`).
+
+    At each point below the command would otherwise be accepted, so deleting
+    that branch's `_check_operator` turns a refusal into an accepted fact --
+    the exception is `record_run_outcome {sliced}`, whose guard also wants a
+    `children_observed_closed` under the CALLING generation and an author's
+    generation can never hold one, recording it being operator-only itself.
+    """
+    s, f, g = _sliced(tmp_path)
+    # record_filing_complete: everything filed and satisfied, nothing recorded.
+    for n, issue in ((1, 40), (2, 41)):
+        f.file_slice(g, n, issue, 1000 + issue)
+    for ob in front.filing_obligations(s, f.run_id, 0):
+        if ob["kind"] != "slice_issue":
+            f.satisfy(g, ob, cls="comment" if ob["kind"] == "umbrella" else "issue_or_label",
+                      value="https://github.com/o/r/issues/1#issuecomment-1" if ob["kind"] == "umbrella" else "ok")
+    a = f._dispatch(Role.AUTHOR, "claude")
+    with pytest.raises(NotAuthorized, match="operator role"):
+        f._cmd(a, "record_filing_complete", {})
+    g = f._dispatch(Role.OPERATOR, "coordinator")
+    f._cmd(g, "record_filing_complete", {})
+    # record_slice_closed: slice 1 filed, no closure yet.
+    a = f._dispatch(Role.AUTHOR, "claude")
+    with pytest.raises(NotAuthorized, match="operator role"):
+        f._cmd(a, "record_slice_closed", {"slice": 1, "closed_at": "t", "state": "merged"})
+    g = f._dispatch(Role.OPERATOR, "coordinator")
+    f._cmd(g, "record_slice_closed", {"slice": 1, "closed_at": "t", "state": "merged"})
+    # record_slice_reopened: slice 1's current closure is slice_closed.
+    a = f._dispatch(Role.AUTHOR, "claude")
+    with pytest.raises(NotAuthorized, match="operator role"):
+        f._cmd(a, "record_slice_reopened", {"slice": 1, "observed_at": "t"})
+    # record_children_observed_closed: both children closed, none observed
+    # under the author's own generation.
+    g = f._dispatch(Role.OPERATOR, "coordinator")
+    f._cmd(g, "record_slice_closed", {"slice": 2, "closed_at": "t", "state": "merged"})
+    a = f._dispatch(Role.AUTHOR, "claude")
+    with pytest.raises(NotAuthorized, match="operator role"):
+        f._cmd(a, "record_children_observed_closed", {"parent_state": "closed", "observed_at": "t"})
+    # record_run_outcome {sliced}: everything else the guard asks for is here.
+    g = f._dispatch(Role.OPERATOR, "coordinator")
+    f._cmd(g, "record_children_observed_closed", {"parent_state": "closed", "observed_at": "t"})
+    f.satisfy(g, _ob(f, "umbrella_close"), cls="comment", value="https://github.com/o/r/issues/12#issuecomment-9")
+    a = f._dispatch(Role.AUTHOR, "claude")
+    with pytest.raises(NotAuthorized, match="operator role"):
+        f._cmd(a, "record_run_outcome", {"outcome": "sliced"})
+    assert s.run_state(f.run_id) == "sliced"
+
+
 # -- sliced once ---------------------------------------------------------------
 
 def _mint_again(s, run_id="i12-epic-2"):
@@ -222,21 +274,27 @@ def test_create_run_refuses_after_a_create_attempt_whatever_the_state(tmp_path):
     f._cmd(g, "record_children_observed_closed", {"parent_state": "closed", "observed_at": "t"})
     f.satisfy(g, _ob(f, "umbrella_close"), cls="comment", value="https://github.com/o/r/issues/12#issuecomment-9")
     f._cmd(g, "record_run_outcome", {"outcome": "sliced"})
-    with pytest.raises(IssueAlreadySliced, match="i12-epic-1"):
+    # The run AND ITS ROWS, each with the state it is in (spec §2 *An issue is
+    # sliced once*): a person told only that some earlier run attempted a
+    # create still has to go and find which children exist, which is the very
+    # question the refusal asks them to answer.
+    with pytest.raises(IssueAlreadySliced,
+                       match=r"run i12-epic-1 .* rows slice:i12-epic-1:1:\d+ \[confirmed\], "
+                             r"slice:i12-epic-1:2:\d+ \[confirmed\]\."):
         _mint_again(s)
     # Cancelled after a confirmed create.
     s, f, g = _sliced(tmp_path, "cancelled.db")
     f.file_slice(g, 1, 40, 1040)
     f.human("cancel_run", {})
     assert s.run_state(f.run_id) == "cancelled"
-    with pytest.raises(IssueAlreadySliced):
+    with pytest.raises(IssueAlreadySliced, match=r"rows slice:i12-epic-1:1:\d+ \[confirmed\]\."):
         _mint_again(s)
     # Halted on an uncertain create.
     s, f, g = _sliced(tmp_path, "halted.db")
     f._journal(g, "slice:u", {"argv": ["gh", "issue", "create"], "obligation": _ob(f, "slice_issue", slice=1, parent=12,
                                                                                    plan_hash=s.phase_artifact(f.run_id, "slices"))},
                None, cls="issue_create", state="uncertain")
-    with pytest.raises(IssueAlreadySliced):
+    with pytest.raises(IssueAlreadySliced, match=r"rows slice:u \[uncertain\]\."):
         _mint_again(s)
 
 
