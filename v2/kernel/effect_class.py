@@ -32,7 +32,12 @@ class EffectClass:
     REVERT_OR_RECOVERY = "revert_or_recovery"
     CREDENTIAL_LIFECYCLE = "credential_lifecycle"
     SESSION_CONTROL = "session_control"
+    # Creating an issue mints work another run will consume (shaping spec
+    # §2 *The effect class*): a blast radius of its own, kept distinct from
+    # editing or labelling one (ruling 6).
+    ISSUE_CREATE = "issue_create"
     ALL = frozenset({
         REF_UPDATE, PULL_REQUEST, MERGE, STATUS_CHECK, COMMENT,
         ISSUE_OR_LABEL, REVERT_OR_RECOVERY, CREDENTIAL_LIFECYCLE, SESSION_CONTROL,
+        ISSUE_CREATE,
     })

@@ -154,6 +154,13 @@ class Rule:
     #: may not start with `@`: curl reads `@path` as a FILE, which is an
     #: arbitrary local read baked into a request body, not a body.
     forbid_value_prefix: tuple[tuple[str, str], ...] = ()
+    #: (flag, values) pairs: the flag may not carry any of those values. The
+    #: filing step creates children with `bircher:slice` and the inherited
+    #: policy labels; `bircher:queued`, `bircher:running` and `bircher:sliced`
+    #: are the runner's and the filing step's to set LATER (shaping spec §2),
+    #: and a created issue carrying `queued` would be runnable before its
+    #: links exist.
+    forbid_value: tuple[tuple[str, frozenset], ...] = ()
 
 
 _GH_COMMON = frozenset({"--repo"})
@@ -235,6 +242,21 @@ CONTRACTS: dict[str, list[Rule]] = {
              valued=frozenset({"--repo", "--comment"})),
         Rule("gh issue reopen", flags=_GH_COMMON | {"--comment"},
              valued=frozenset({"--repo", "--comment"})),
+        # The write half of the endpoint the queue generator reads
+        # (`is_unblocked`, issues-to-queue.sh): a blocked-by link between two
+        # issues (shaping spec §2).
+        Rule("gh api", url_path=r"/issues/\d+/dependencies/blocked_by$", flags=frozenset({"-X", "-f"}),
+             valued=frozenset({"-X", "-f"}), methods=frozenset({"POST"})),
+    ],
+    # The child issue (shaping spec §2 *The effect class*). No --body-file:
+    # the executor appends it after this check, from the artefact the intent's
+    # body names (planning ruling 1). The three runner labels are refused as
+    # values, so no create can queue a child before its links exist.
+    EffectClass.ISSUE_CREATE: [
+        Rule("gh issue create", flags=_GH_COMMON | {"--title", "--label"},
+             valued=frozenset({"--repo", "--title", "--label"}),
+             required=frozenset({"--repo", "--title"}),
+             forbid_value=(("--label", frozenset({"bircher:queued", "bircher:running", "bircher:sliced"})),)),
     ],
     EffectClass.REVERT_OR_RECOVERY: [
         Rule("git revert", flags=frozenset({"-n", "--no-edit", "-m"}),
@@ -376,6 +398,11 @@ def check(effect_class: str, argv: list[str]) -> Rule:
                       if any(v.startswith(pre) for v in p.values.get(f, []))]
         if bad_prefix:
             reasons.append(f"{rule.name}: {bad_prefix} value may not start with a file/prefix")
+            continue
+        bad_value = [f for f, vals in rule.forbid_value
+                     if set(p.values.get(f, [])) & set(vals)]
+        if bad_value:
+            reasons.append(f"{rule.sig}: {bad_value} carry a value the rule refuses")
             continue
         return rule
     raise ContractViolation(

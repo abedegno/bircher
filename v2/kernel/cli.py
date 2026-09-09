@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -143,6 +144,37 @@ def _write_event_file(store, body: dict) -> str:
     return fh.name
 
 
+def _write_raw_file(store, body: dict) -> str:
+    """The artefact the intent names, raw: an issue body (planning ruling 1)."""
+    data = store.read_blob(body["artifact"])
+    if data is None:
+        raise RuntimeError(f"artifact {body['artifact']} is not held")
+    fh = tempfile.NamedTemporaryFile(
+        dir=os.path.dirname(os.path.abspath(store.path)), prefix="body-",
+        suffix=".md", delete=False)
+    with fh:
+        os.chmod(fh.name, 0o600)
+        fh.write(data)
+    return fh.name
+
+
+_ISSUE_URL = re.compile(r"/issues/(\d+)/?$")
+
+
+def _read_back_issue(argv: list[str], url: str) -> str:
+    """The created issue's number from its URL and its database id from a
+    read-back (planning ruling 6), as {url, number, id} JSON."""
+    m = _ISSUE_URL.search(url.strip())
+    if not m:
+        raise RuntimeError(f"issue_create returned no issue URL: {url[:200]!r}")
+    repo = argv[argv.index("--repo") + 1]
+    r = subprocess.run(resolve_command(["gh", "api", f"repos/{repo}/issues/{m.group(1)}", "--jq", ".id"]),
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip().isdigit():
+        raise RuntimeError(f"issue_create read-back failed rc={r.returncode}: {r.stderr.strip()[:200]}")
+    return json.dumps({"url": url.strip(), "number": int(m.group(1)), "id": int(r.stdout.strip())}, sort_keys=True)
+
+
 def make_executor(store):
     """The real executor, closed over the store the body is composed from.
 
@@ -164,8 +196,12 @@ def make_executor(store):
             if body is not None:
                 if store is None:
                     raise RuntimeError("an intent with a body needs the store it is composed from")
-                path = _write_event_file(store, body)
-                extra = ["--data-binary", f"@{path}"]
+                if effect_class == EffectClass.ISSUE_CREATE:
+                    path = _write_raw_file(store, body)
+                    extra = ["--body-file", path]
+                else:
+                    path = _write_event_file(store, body)
+                    extra = ["--data-binary", f"@{path}"]
             r = subprocess.run(resolve_command(argv + extra), capture_output=True, text=True)
         finally:
             if path is not None:
@@ -179,6 +215,8 @@ def make_executor(store):
         out = r.stdout.strip()
         if rule.name == "sess-create":
             return validate_create_response(out, create_body(argv))
+        if effect_class == EffectClass.ISSUE_CREATE:
+            return _read_back_issue(argv, out)
         return out or "ok"
 
     return executor

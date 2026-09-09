@@ -3092,7 +3092,8 @@ def is_bircher_status(body):
             head.startswith("Outcome derived from the repository") or
             head.startswith("Cross-vendor review (outcome derived") or
             head.startswith("bircher: published ") or
-            head.startswith("bircher: parked "))
+            head.startswith("bircher: parked ") or
+            head.startswith("bircher: sliced "))
 
 kept = [c for c in comments if not is_bircher_status(c.get("body") or "")]
 maxc, maxch = int(os.environ["MAXC"]), int(os.environ["MAXCH"])

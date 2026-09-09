@@ -35,7 +35,7 @@ FROZEN_FIELDS = ("number", "title", "body", "labels", "comments")
 BIRCHER_LABEL_PREFIX = "bircher:"
 
 #: The single definition of the predicate `run-queue.sh`'s digest also
-#: applies. Five EXACT prefixes, matched with startswith on the stripped body
+#: applies. Seven EXACT prefixes, matched with startswith on the stripped body
 #: -- not the generic "bircher: ", which would silence a human discussing a
 #: marker. Both copies are tested against tests/fixtures/bircher_status_comments.tsv.
 BIRCHER_STATUS_PREFIXES: tuple[str, ...] = (
@@ -49,6 +49,9 @@ BIRCHER_STATUS_PREFIXES: tuple[str, ...] = (
     # something the issue's author said, and letting it in would make every
     # park revise the bundle and start a fresh epoch.
     "bircher: parked ",
+    # The umbrella and the completion comment (shaping spec §3): a notice about
+    # the run's own children, never the issue's author.
+    "bircher: sliced ",
 )
 
 
