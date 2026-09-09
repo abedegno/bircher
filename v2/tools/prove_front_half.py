@@ -132,7 +132,17 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         if f.kind != EventKind.REVIEW_VERDICT or f.payload.get("ruling") == "review_ruling"
     ]
 
+    # Not every prompt is an awaited turn. The park prompt (cause: a `parked`
+    # fact) tells the person what the run is waiting for, and the refusal
+    # reply (cause: a `command_rejected` fact) answers a token the kernel
+    # refused; neither is polled for a file and neither earns a `turn_ended`
+    # (spec section 4). Holding them to the seat's rule failed the first
+    # parked run that otherwise passed, on 2026-09-09.
+    kind_of = {f.id: f.kind for f in store.facts_for(run_id)}
+    unawaited = {EventKind.PARKED, EventKind.COMMAND_REJECTED}
     for row in prompts:
+        if kind_of.get(row["intent"]["obligation"].get("cause")) in unawaited:
+            continue
         te = front.turn_ended_for(store, run_id, row["idempotency_key"])
         if te is None:
             fails.append(f"prompt {row['idempotency_key']} has no turn_ended")
@@ -212,6 +222,10 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
         listed = set()
 
     prompt_items = {p.payload["item_id"] for p in store.facts_of_kind(run_id, EventKind.PROMPT_ITEM)}
+    cursors = {f.payload.get("cursor_item_id")
+               for f in store.facts_of_kind(run_id, EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING,
+                                            EventKind.HUMAN_DIRECTION, EventKind.PARKED,
+                                            EventKind.HUMAN_ITEM_DISMISSED)} - {None}
     prompt_hashes = {r["intent"]["body"]["artifact"]
                      for r in front.satisfied_effects(store, run_id, "sess-prompt")}
     briefs = {b.payload["generation"]: b.payload["brief_hash"]
@@ -257,8 +271,18 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
         # the proof must use the SAME rule, or every session the coordinator
         # stopped mid-work reads as an unrecorded prompt -- four of them on the
         # first run that converged unattended (2026-09-08).
+        # A person's message the coordinator READ is a touch the run's mode
+        # already judged (assert_journal), not an unrecorded prompt. Every
+        # human fact names the cursor it was read to; everything in this
+        # listing at or before such a cursor was read. Under mode "zero" no
+        # human fact exists, so nothing is admitted and the check is as
+        # strict as before.
+        ids = [it["id"] for it in items]
+        read_to = max((ids.index(c) for c in cursors if c in ids), default=-1)
         users = [it for it in items if it["role"] == "user" and not _is_cancellation_notice(it)]
         for it in users:
+            if ids.index(it["id"]) <= read_to:
+                continue
             if it["id"] not in prompt_items and content_hash(it["text"].encode()) not in prompt_hashes:
                 fails.append(
                     f"session {sid}: user item {it['id']} is no prompt_item "

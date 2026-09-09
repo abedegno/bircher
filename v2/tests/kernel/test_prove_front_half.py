@@ -305,3 +305,49 @@ def test_the_servers_cancellation_notice_is_not_an_unrecorded_prompt(tmp_path):
                                    "content": [{"type": "input_text", "text": "please use postgres"}]})
     fails = prove.assert_sessions(s, "r-1", fetch=fetch)
     assert any("it-human" in x and "no prompt_item" in x for x in fails), fails
+
+
+def _parked_world(tmp_path):
+    """A run that parked once, was told so in its author session, and was
+    granted a round by a person -- the shape of the first unattended run that
+    reached a merged PR (2026-09-09), whose one human fact was that retry."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    # A rejection keeps the run in the spec phase, where the author seat the
+    # driver's phase-scoped helper finds still exists; an accept would move
+    # the phase to `plan`, where there is no author seat yet and the helper
+    # answers None -- which parked a session called None the first time.
+    _review_round_with_real_brief(f, verdict="request_revision")
+    sid = f._newest_author_session()
+    assert sid, "the fixture needs a real carrier session"
+    g = f._dispatch(Role.OPERATOR, "runner")
+    f._cmd(g, "park", {"reason": "no_verdict", "session_id": sid, "cursor_item_id": None,
+                       "findings_hash": None, "verdict": None, "reviewer": None})
+    park = front.current_park(s, "r-1")
+    _prompt_with_artifact(f, g, sid, park.id, put_artifact(s, b"The run is stalled. Reply retry."))
+    return s, f, sid, park
+
+
+def test_a_park_prompt_is_not_an_awaited_turn(tmp_path):
+    s, f, sid, park = _parked_world(tmp_path)
+    f.grant()
+    fails = prove.assert_journal(s, "r-1", mode="human")
+    assert not [x for x in fails if "has no turn_ended" in x], fails
+
+
+def test_a_message_the_coordinator_read_past_is_not_an_unrecorded_prompt(tmp_path):
+    s, f, sid, park = _parked_world(tmp_path)
+    fetch, sessions, listed = _fake_fetch_for(s)
+    sessions[sid]["items"].append({"id": "it-retry", "role": "user", "response_id": "turn_r",
+                                   "content": [{"type": "input_text", "text": "retry"}]})
+    sessions[sid]["items"].append({"id": "it-echo", "role": "assistant", "response_id": "resp_e",
+                                   "content": [{"type": "output_text", "text": "retry"}]})
+    f.human("grant_round", {"cursor_item_id": "it-echo"})     # read to the echo, past the retry
+    assert prove.assert_sessions(s, "r-1", fetch=fetch) == []
+    # A message AFTER the newest cursor was never read: still an unrecorded prompt.
+    sessions[sid]["items"].append({"id": "it-later", "role": "user", "response_id": "turn_l",
+                                   "content": [{"type": "input_text", "text": "and another thing"}]})
+    fails = prove.assert_sessions(s, "r-1", fetch=fetch)
+    assert any("it-later" in x for x in fails) and not any("it-retry" in x for x in fails), fails
