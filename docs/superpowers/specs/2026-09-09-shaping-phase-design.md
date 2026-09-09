@@ -4,9 +4,9 @@
 for its plan; argues from, and does not restate, the front-half design
 (`2026-09-05-front-half-design.md`), which it extends. Where this document
 names a mechanism without defining it, the front-half design defines it.
-Revision 11, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
-(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi) and 10 (Codex);
-the dispositions are the last ten sections.*
+Revision 12, after cross-vendor rounds 1 (Kimi), 2 (Codex), 3 (Kimi), 4
+(Codex), 5 (Kimi), 6 (Codex), 7 (Kimi), 8 (Codex), 9 (Kimi), 10 (Codex) and
+11 (Kimi); the dispositions are the last eleven sections.*
 
 ## §0 The claim, and why the front half falls short of it
 
@@ -428,16 +428,27 @@ that slice is in the accepted plan.
 **Bound to the effect, not only to the metadata.** The obligation says what
 the effect is for; the argv says what it does; `perform` refuses the pair
 when they disagree, as it binds a merge to its actual target today and
-nothing else. Every `ISSUE_CREATE` effect must carry a `slice_issue`
-obligation — a create with none, or with an obligation of another kind, is
-refused, which is what makes "no create outside `sliced`" true of every
-create and not only of the ones that announce themselves. Each kind is
-admitted on exactly one effect class and operation, against the targets
-the kernel already holds:
+nothing else. The kernel admits effects with no obligation by design — the runner's own
+merges, labels and comments are journalled as `{argv}` alone — so a
+precondition that fires only when an effect announces its kind polices only
+the effects that announce themselves. **Every argv shape this design adds
+to the contracts is therefore admitted only with its kind:** an
+`ISSUE_CREATE` must carry `slice_issue`; the blocked-by `POST` must carry
+`slice_dependency`; an `issue_or_label` argv that adds `bircher:queued` must
+carry `slice_queue`, and one that adds `bircher:sliced` must carry
+`umbrella_label`; a comment whose body opens `bircher: sliced ` must carry
+`umbrella` or `umbrella_close`; and `gh issue close` on the issue of a run in
+`sliced` must carry `parent_close`. An effect of any of those shapes with no
+obligation, or with an obligation of another kind, is refused — which is
+what makes "no create outside `sliced`" and "a queued child has its links"
+true of every create and every queue label, not only of the ones that say
+what they are. The runner's own label swap, `queued` → `running`, adds
+neither label and stays as it is. Each kind is admitted on exactly one
+effect class and operation, against the targets the kernel already holds:
 
 | Kind | Class and operation | The argv must name |
 |---|---|---|
-| `slice_issue` | `issue_create` | `--repo` the run's repository; `--title` the slice's title; a body file whose bytes equal `slices.render_child` over the accepted plan, the run's issue number, `hash8` and the siblings' numbers from this epoch's `slice_filed` facts — the kernel renders and compares; labels exactly `bircher:slice` plus the inherited policy labels |
+| `slice_issue` | `issue_create` | `--repo` the run's repository; `--title` the slice's title; a body file whose bytes equal `slices.render_child` over the accepted plan, the run's issue number, `hash8` and the siblings' numbers from this epoch's `slice_filed` facts — the kernel renders and compares, and **refuses the create while any blocker of the slice has no `slice_filed` in this epoch**: `render_child` is strict and raises on a missing sibling number rather than rendering `Depends on: none`, so an out-of-order create cannot produce a body the binding admits; labels exactly `bircher:slice` plus the inherited policy labels |
 | `slice_dependency` | `issue_or_label`, the blocked-by `POST` | the path's issue number is the child the epoch's `slice_filed` names for `slice`; `issue_id` is the database id that fact names for `blocker` |
 | `slice_queue` | `issue_or_label`, `gh issue edit` | the `slice_filed` issue for `slice`; `--add-label bircher:queued` and nothing else |
 | `umbrella` | `comment` | the run's issue; a body equal to the umbrella text rendered from the plan and the `slice_filed` numbers |
@@ -619,11 +630,13 @@ label edit (§5).
 `bircher: sliced ` joins `BIRCHER_STATUS_PREFIXES` in both copies of the
 predicate, so neither the umbrella nor the completion comment (which shares
 the prefix) ever freezes into a bundle. The pin
-`test_prefixes_are_exactly_five_and_not_the_generic_one`
-(`v2/tests/kernel/test_bundle_v2.py:37`) becomes six, and the fixture and
-bash-agreement tests that enumerate the prefixes change with it — stated
-here so the reds are expected, as §2's note on the `revise_bundle` tests
-states its own.
+`test_prefixes_are_exactly_six_and_not_the_generic_one`
+(`v2/tests/kernel/test_bundle_v2.py:32`) becomes seven — both copies hold
+six today (`bundle.py:41-52`, `run-queue.sh:3090-3095`); the "Five EXACT
+prefixes" comment at `bundle.py:38` is stale and goes with the change — and
+the fixture and bash-agreement tests that enumerate the prefixes change
+with it, stated here so the reds are expected, as §2's note on the
+`revise_bundle` tests states its own.
 
 ### The sweep
 
@@ -920,7 +933,13 @@ sibling's refused and one whose `issue_id` is not the blocker's refused; a
 `slice_queue` on the wrong child or adding a second label refused; an
 `umbrella` on a child refused; an `umbrella_label` removing nothing
 refused; a `parent_close` on a child refused; and each accepted when the
-argv matches.
+argv matches; **and the mandate**: with no obligation at all, each of a
+blocked-by `POST`, `--add-label bircher:queued`, `--add-label
+bircher:sliced`, a comment opening `bircher: sliced ` and `gh issue close`
+on a `sliced` run's issue refused, each with an obligation of another kind
+refused, and the runner's `queued` → `running` swap admitted with none as
+today; a create for a slice whose blocker is unfiled refused, and
+`render_child` raising on the missing number rather than rendering `none`.
 
 Coordinator, through the fake server: both endings of the shaping round and
 the both-files case; the ruling grammar's edge cases; the review round with a
@@ -1327,3 +1346,15 @@ and closes nothing on GitHub; the issue is what the sweep reads.
    close stands, no second close is performed, the outcome is recorded and
    the parent is the person's (§2 outcome guard, §3, a failure-table row,
    ruling 22, a test).
+
+## Dispositions — round 11 (Kimi, 2026-09-09)
+
+1. accepted — the mandate covers every argv shape this design adds: the
+   blocked-by `POST`, `--add-label bircher:queued` and `bircher:sliced`, a
+   `bircher: sliced ` comment, and `gh issue close` on a `sliced` run's
+   issue each require their kind; the runner's own swap is unaffected (§2,
+   tests in §8).
+2. accepted — `test_prefixes_are_exactly_six_and_not_the_generic_one` at
+   `:32`, seven after the change, and the stale "Five" comment named.
+3. accepted — the create is refused while a blocker is unfiled, and
+   `render_child` is strict.
