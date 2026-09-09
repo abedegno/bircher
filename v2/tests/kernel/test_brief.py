@@ -27,7 +27,7 @@ def test_render_is_pure_and_names_its_inputs():
     assert "VERDICT: PASS|FAIL" in text
     assert "0" * 40 in text
     assert "# S" in text and '"body":"B"' in text
-    assert "grill: model" in text and "gates: spec" in text
+    assert "grill: model" in text and "gates: slices, spec" in text
     other = brief.render(phase="spec", artefact=b"# S2", bundle=b'{"body":"B"}', spec=None,
                          policy=Policy(), base_sha="0" * 40, template=1)
     assert other != a
