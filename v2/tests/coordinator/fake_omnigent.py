@@ -50,6 +50,12 @@ class FakeOmnigent:
         self._ids = itertools.count(1)
         self.posts = []
         self.gh = []          # every `gh` argv, newest last
+        #: The GitHub side of the filing step and the sweep (shaping spec §3):
+        #: the issues this fake has minted or been told about, the PR states a
+        #: sweep reads, and the number the next `issue create` takes.
+        self.issues = {}
+        self.prs = {}
+        self.next_issue = 40
 
     # -- read side ------------------------------------------------------------
     def _listing_order(self) -> list[str]:
@@ -107,6 +113,58 @@ class FakeOmnigent:
                                              "workspace", "title", "labels")})
 
     # -- write side -------------------------------------------------------------
+    def _gh(self, argv: list[str]) -> str:
+        """What GitHub answers a filing or sweep argv (shaping spec §3):
+        creates mint issues from `next_issue`, reads answer from `issues` and
+        `prs`, links and labels mutate `issues`, comments and closes answer
+        as gh does."""
+        def val(flag):
+            return argv[argv.index(flag) + 1] if flag in argv else None
+
+        def vals(flag):
+            return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+        sub = argv[1:3]
+        if sub == ["issue", "create"]:
+            n = self.next_issue
+            self.next_issue += 1
+            body = open(val("--body-file")).read() if "--body-file" in argv else ""
+            self.issues[n] = {"state": "OPEN", "closedAt": None, "closedByPullRequestsReferences": [],
+                              "labels": vals("--label"), "blocked_by": [], "title": val("--title"), "body": body}
+            return f"https://github.com/o/r/issues/{n}\n"
+        if argv[1] == "api":
+            path = argv[2]
+            # Index 4, not 3: `repos/o/r/issues/<n>` splits to
+            # ["repos", "o", "r", "issues", "<n>"], and index 3 is the literal
+            # "issues".
+            if path.endswith("/dependencies/blocked_by") and "-X" in argv:
+                n = int(path.split("/")[4])
+                self.issues[n]["blocked_by"].append(int(val("-f").split("=", 1)[1]))
+                return "{}"
+            if "--jq" in argv and val("--jq") == ".id":
+                return f"{1000 + int(path.split('/')[4])}\n"
+            if path.endswith("/dependencies/blocked_by"):
+                n = int(path.split("/")[4])
+                return json.dumps([{"state": "open"} for _ in self.issues[n]["blocked_by"]])
+            return "{}"
+        if sub == ["issue", "edit"]:
+            n = int(argv[3])
+            labs = set(self.issues.setdefault(n, {"labels": [], "state": "OPEN"})["labels"])
+            labs |= set(vals("--add-label"))
+            labs -= set(vals("--remove-label"))
+            self.issues[n]["labels"] = sorted(labs)
+            return ""
+        if sub == ["issue", "comment"]:
+            return f"https://github.com/o/r/issues/{argv[3]}#issuecomment-{next(self._ids)}"
+        if sub == ["issue", "close"]:
+            self.issues[int(argv[3])]["state"] = "CLOSED"
+            return ""
+        if sub == ["issue", "view"]:
+            fields = val("--json").split(",")
+            return json.dumps({k: self.issues[int(argv[3])].get(k) for k in fields})
+        if sub == ["pr", "view"]:
+            return json.dumps({"state": self.prs.get(int(argv[3]), "OPEN")})
+        return f"https://github.com/o/r/issues/1#issuecomment-{next(self._ids)}"
+
     def run(self, argv, **kw):
         class R:
             returncode, stdout, stderr = 0, "", ""
@@ -117,9 +175,15 @@ class FakeOmnigent:
         # StopIteration from the url search below, reported as an uncertain
         # effect, which says nothing about what was missing.
         if os.path.basename(str(argv[0])) == "gh":
-            self.gh.append(list(argv))
+            # RECORDED on the basename: `kernel.cli.resolve_command` rewrites
+            # `gh` to an absolute path before `subprocess.run`, so an argv
+            # recorded raw would carry `/opt/homebrew/bin/gh` here on one
+            # machine and `/usr/bin/gh` on another, and every assertion over
+            # `fake.gh` would have to know which.
+            recorded = [os.path.basename(str(argv[0])), *argv[1:]]
+            self.gh.append(recorded)
             r = R()
-            r.stdout = f"https://github.com/o/r/issues/1#issuecomment-{next(self._ids)}"
+            r.stdout = self._gh(recorded)
             return r
         url = next(a for a in argv if a.startswith("http"))
         path = url.split("//", 1)[-1].split("/", 1)[1]

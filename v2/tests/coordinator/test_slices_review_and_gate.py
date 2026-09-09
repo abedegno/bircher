@@ -99,6 +99,9 @@ def test_gated_by_default_parks_and_approve_moves_on(world):
         "ruling": "approve", "phase": "slices", "epoch": 0,
         "artifact_hash": s.phase_artifact("i12-epic-1", "slices"),
         "cursor_item_id": fake.sessions[sid]["items"][-1]["id"]}
+    # The gated path from approval into filing, in one loop (shaping spec §3):
+    # the pass that reaches `sliced` files the children before it exits.
+    assert sorted(n for n in fake.issues if n != 12) == [40, 41]
 
 
 def test_a_correction_at_the_gate_is_the_next_rounds_findings(world):

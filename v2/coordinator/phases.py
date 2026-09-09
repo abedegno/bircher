@@ -376,6 +376,12 @@ def run_loop(ctx: Ctx) -> int:
             state = ctx.state()
             if state == "planned":
                 return Exit.OK
+            if state == "sliced":
+                # The pass that reaches `sliced` owes the filing (shaping spec
+                # §3); the run then waits for its children and the sweep.
+                from coordinator import filing
+                filing.file_owed(ctx)
+                return Exit.OK
             # The park comes first: the state alone is ambiguous, and a run
             # at `spec_submitted` with a current park needs the human, not
             # another review.
