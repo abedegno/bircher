@@ -96,7 +96,14 @@ MAIN_CI_POLL_INTERVAL="${BIRCHER_MAIN_CI_POLL_INTERVAL:-30}"
 # BIRCHER_IMPLEMENTER=claude_code to force a single-vendor run.
 IMPLEMENTER="${BIRCHER_IMPLEMENTER:-auto}"
 # 5h-window utilization (%) above which a vendor is excluded from selection.
-FIVEH_MAX="${BIRCHER_5H_MAX:-92}"
+# 60, not 92. The 5h window is what an IMPLEMENTER burns: on 2026-09-08 one
+# was dispatched with Claude at 64% and died on the session limit while
+# watching CI, 5,297 lines in, leaving an open PR nobody had reviewed. The
+# gate compares a percentage already spent against this ceiling and sleeps
+# until the sooner reset when both vendors are over it -- so the ceiling has
+# to leave room for a whole implementation, not just a turn. BIRCHER_5H_MAX
+# still overrides it for a deliberately short wave.
+FIVEH_MAX="${BIRCHER_5H_MAX:-60}"
 # Claude usage: read live from Claude Code's OWN statusLine, harvested by a
 # short PTY probe (claude-usage-probe.py). It runs the genuine `claude` binary
 # interactively with a one-shot --settings statusLine override + one trivial
@@ -8872,6 +8879,25 @@ f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id":
   grep -q "^i77-" "$pdir/queue/.manifest" || { echo "FAIL parked run i77 is not in the manifest"; exit 1; }
   rm -rf "$pdir"
   echo "parked runs are queued from the journal OK"
+
+  # --- wave-timer.sh: fires launch.sh with the wave's own log, skips a missing checkout --
+  local tdir; tdir=$(mktemp -d)
+  ( BIRCHER_WAVE_ONCE=1 BIRCHER_WAVE_DIR="$tdir/absent" bash "$BUNDLE_DIR/batch/wave-timer.sh" 2>&1 | grep -q "no checkout" ) || {
+    echo "FAIL wave-timer: a missing checkout must be skipped, not crashed on"; exit 1; }
+  mkdir -p "$tdir/co/batch"
+  cat > "$tdir/co/batch/launch.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$(dirname "$0")/../launched.args"; echo "launch: wave started (stub)"
+SH
+  chmod +x "$tdir/co/batch/launch.sh"
+  ( BIRCHER_WAVE_ONCE=1 BIRCHER_WAVE_DIR="$tdir/co" BIRCHER_WAVE_KERNEL_DB="$tdir/k.db" bash "$BUNDLE_DIR/batch/wave-timer.sh" >/dev/null 2>&1 ) || {
+    echo "FAIL wave-timer: one firing exited non-zero"; exit 1; }
+  grep -qx -- "--source" "$tdir/co/launched.args" && grep -qx -- "issues" "$tdir/co/launched.args" || {
+    echo "FAIL wave-timer: did not launch from issues (args: $(tr '\n' ' ' < "$tdir/co/launched.args"))"; exit 1; }
+  grep -q '^\.run/timer/[0-9-]*\.log$' "$tdir/co/launched.args" || {
+    echo "FAIL wave-timer: the wave must get its own log under .run/timer/"; exit 1; }
+  rm -rf "$tdir"
+  echo "wave-timer OK"
 
   # --- _preflight_labels: refuse a repo that lacks a label the pipeline sets --
   local ldir; ldir=$(mktemp -d)

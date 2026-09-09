@@ -94,7 +94,7 @@ not-delivered attempt is retried by the next pass; the queue generator asks
 the journal for open runs with a current park and queues them whatever their
 labels or queue files say; and the park prompt opens by telling the model in
 the session that it and any reply to it are not for the model. That last one
-is the prompt-side half of the fix -- stopping the carrier session before the
-park is the stronger half, and it waits on a live check of what the server
-does with a message to a stopped session. The full record, including the
+is the whole fix, not half of one: checked live on 2026-09-09, a message to a
+stopped session revives it and gets a reply, so stopping the carrier before
+the park would prevent nothing. The full record, including the
 fourteen fixed on the day, is in `front-half-live-log.md`.
