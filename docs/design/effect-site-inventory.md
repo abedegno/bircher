@@ -103,7 +103,7 @@ The shaping phase performs its effects from Python through `perform` (`v2/coordi
 | Where | Call | Effect class | Bound by |
 |---|---|---|---|
 | `coordinator/filing.py` pass 1 | `gh issue create --repo --title --label … --body-file` | `issue_create` | `kernel/filing.py`: obligation `slice_issue` required; state `sliced`, operator dispatch, the accepted hash, the slice in the plan; title, body (`render_child`) and labels bound; one per obligation |
-| `coordinator/filing.py` pass 2 | `gh api …/issues/<n>/dependencies/blocked_by -X POST -f issue_id=` | `issue_or_label` | `slice_dependency`; the child's and the blocker's filed numbers and ids |
+| `coordinator/filing.py` pass 2 | `gh api …/issues/<n>/dependencies/blocked_by -X POST -F issue_id=` | `issue_or_label` | `slice_dependency`; the child's and the blocker's filed numbers and ids |
 | `coordinator/filing.py` pass 3 | `gh issue edit <child> --add-label bircher:queued` | `issue_or_label` | `slice_queue`; refused while any create or link is unsatisfied |
 | `coordinator/filing.py` pass 4 | `gh issue comment <parent> --body 'bircher: sliced <hash8>…'` | `comment` | `umbrella`; the rendered body |
 | `coordinator/filing.py` pass 4 | `gh issue edit <parent> --add-label bircher:sliced --remove-label bircher:running` | `issue_or_label` | `umbrella_label` |

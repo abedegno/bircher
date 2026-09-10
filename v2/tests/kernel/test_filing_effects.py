@@ -142,11 +142,11 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
 #: operand or value (Codex, three passes).
 _OTHER_SPELLINGS = [
     ("leading-slash-path", EffectClass.ISSUE_OR_LABEL,
-     ["gh", "api", "/repos/o/r/issues/41/dependencies/blocked_by", "-X", "POST", "-f", "issue_id=1040"],
+     ["gh", "api", "/repos/o/r/issues/41/dependencies/blocked_by", "-X", "POST", "-F", "issue_id=1040"],
      {"slice_dependency"}),
     ("full-url-path", EffectClass.ISSUE_OR_LABEL,
      ["gh", "api", "https://api.github.com/repos/o/r/issues/41/dependencies/blocked_by",
-      "-X", "POST", "-f", "issue_id=1040"],
+      "-X", "POST", "-F", "issue_id=1040"],
      {"slice_dependency"}),
     ("comma-joined-queue-label", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", "bircher:queued,bircher:grill"],
@@ -348,7 +348,7 @@ def test_link_binding_is_byte_exact_on_the_composers_spelling(tmp_path):
     numbers, ids = _file_two(s, f, g, gh)
     before = list(gh.calls)
     for why, path in _OTHER_LINK_SPELLINGS:
-        argv = ["gh", "api", path.format(child=numbers[2]), "-X", "POST", "-f", f"issue_id={ids[1]}"]
+        argv = ["gh", "api", path.format(child=numbers[2]), "-X", "POST", "-F", f"issue_id={ids[1]}"]
         check(EffectClass.ISSUE_OR_LABEL, argv)                                   # reachable: the contract admits it
         assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, argv) == {"slice_dependency"}, why
         with pytest.raises(NotAuthorized, match="not exactly"):                    # ...and the binding refuses it

@@ -383,7 +383,7 @@ and reds on an entry with none.
 
 Two more contract changes, stated so they are not discovered as refusals: the
 `ISSUE_OR_LABEL` contract (`contract.py:230-238`) gains a rule admitting `gh
-api -X POST /repos/<repo>/issues/<n>/dependencies/blocked_by -f issue_id=<id>`,
+api -X POST /repos/<repo>/issues/<n>/dependencies/blocked_by -F issue_id=<id>`,
 the write half of the endpoint the queue generator already reads
 (`is_unblocked`, `issues-to-queue.sh:20-24`); and the new obligation kinds —
 `slice_issue`, `slice_dependency`, `slice_queue`, `umbrella`,
