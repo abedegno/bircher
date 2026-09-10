@@ -78,13 +78,26 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     if EventKind.EFFECT_RECONCILED in kinds or store.reconciliation_evidence(run_id) is not None:
         fails.append("the run was reconciled or halted")
 
-    if EventKind.MODEL_RULING not in kinds:
+    from kernel.slices import SHAPE_QUESTION
+    n = front.epoch(store, run_id)
+    sliced_parent = bool(front.slices_filed(store, run_id, n))
+    # A ruling on a question the AUTHOR raised: the shape ruling every
+    # one-piece run carries would satisfy this vacuously (shaping spec §6).
+    # A sliced parent is exempt -- its decision is slice_filed.
+    if not sliced_parent and not any(
+            f.kind == EventKind.MODEL_RULING and f.payload.get("question_id") != SHAPE_QUESTION for f in facts):
         fails.append("no model_ruling: the author did not rule on a question")
 
+    # The FINAL epoch only (shaping spec §6, round 12): a run that submitted
+    # a spec before its issue changed and was then sliced is a valid history.
     subs = {f.payload["phase"]: f.payload["hash"]
-            for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)}
-    if set(subs) != {"spec", "plan"} or subs["spec"] == subs["plan"]:
-        fails.append(f"artifact_submitted for spec and plan with different hashes: {subs}")
+            for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED) if f.payload.get("epoch") == n}
+    if sliced_parent:
+        if set(subs) != {"slices"} or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
+            fails.append(f"artifact_submitted: a sliced parent's final epoch submits exactly the accepted slice plan: {subs}")
+    elif (not {"spec", "plan"} <= set(subs) or not set(subs) <= {"slices", "spec", "plan"}
+          or subs["spec"] == subs["plan"]):
+        fails.append(f"artifact_submitted for spec and plan with different hashes (and at most a slice plan): {subs}")
 
     roles = {d["generation"]: d for d in store.dispatches_for(run_id)}
     creates = front.satisfied_effects(store, run_id, "sess-create")
@@ -308,6 +321,93 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
     return fails
 
 
+def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
+    """The four assertions of shaping spec §6 over a parent. `gh_json` is
+    the sweep's reader (coordinator.sweep.gh_json) or a fake; it is not
+    called for a run that filed nothing (assertion 4 still runs).
+
+    A failed read is a proof failure, not a crash: each `gh_json` call is
+    wrapped so a `ReadFailed` appends a failure line naming the child (or
+    the parent) and what could not be read, and the function carries on
+    with the remaining children and assertions. A read that fails cannot
+    satisfy its own assertion, so the failure line stands in for it -- no
+    further check is attempted for that same read."""
+    import collections
+    from coordinator.sweep import ReadFailed
+    from kernel import slices
+    fails: list[str] = []
+    n = front.epoch(store, run_id)
+    plan = front.accepted_plan(store, run_id, n)
+    h = front.accepted_slices_hash(store, run_id, n)
+    filed = front.slices_filed(store, run_id, n)
+    parent = front.issue_number(store, run_id)
+    numbers = {k: f.payload["issue"] for k, f in filed.items()}
+    if plan is not None and filed:
+        # 1. The children are the plan, body and all -- and exactly one delivered create per slice.
+        if sorted(filed) != [s.number for s in plan.slices]:
+            fails.append(f"slice_filed {sorted(filed)} does not match the plan's slices, by number")
+        creates = front.satisfied_effects(store, run_id, "slice_issue")
+        per = collections.Counter(r["intent"]["obligation"].get("slice") for r in creates)
+        for s in plan.slices:
+            if per.get(s.number, 0) != 1:
+                fails.append(f"slice {s.number}: {per.get(s.number, 0)} delivered creates, want exactly one")
+        for k in per:
+            if k not in filed:
+                fails.append(f"a delivered create for slice {k} has no slice_filed")
+        for s in plan.slices:
+            if s.number not in filed:
+                continue
+            try:
+                live = gh_json(["gh", "issue", "view", str(numbers[s.number]), "--repo", repo, "--json", "title,body"])
+            except ReadFailed as exc:
+                fails.append(f"slice {s.number} (#{numbers[s.number]}): could not read title,body: {exc}")
+                continue
+            title, body = slices.render_child(s, parent, h[:8], {d: numbers[d] for d in s.depends_on})
+            if live.get("title") != title or (live.get("body") or "").rstrip("\n") != body.rstrip("\n"):
+                fails.append(f"child #{numbers[s.number]}: title or body is not render_child over slice {s.number}")
+        # 2. The dependencies are the links.
+        for s in plan.slices:
+            if s.number not in filed:
+                continue
+            try:
+                links = gh_json(["gh", "api", f"repos/{repo}/issues/{numbers[s.number]}/dependencies/blocked_by"])
+            except ReadFailed as exc:
+                fails.append(f"slice {s.number} (#{numbers[s.number]}): could not read blocked_by: {exc}")
+                continue
+            got = sorted(int(x["number"]) for x in links)
+            want = sorted(numbers[d] for d in s.depends_on)
+            if got != want:
+                fails.append(f"child #{numbers[s.number]}: blocked-by links {got} are not the plan's {want} (a missing or extra link)")
+        # 3. The umbrella names the children.
+        try:
+            comments = gh_json(["gh", "issue", "view", str(parent), "--repo", repo, "--json", "comments"]).get("comments") or []
+        except ReadFailed as exc:
+            fails.append(f"parent #{parent}: could not read comments: {exc}")
+            comments = None
+        if comments is not None:
+            ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
+            if len(ums) != 1:
+                fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
+            elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
+                fails.append("the umbrella comment does not list exactly the filed children")
+    # 4. One decision per epoch, and every filing in the last.
+    for f in store.facts_of_kind(run_id, EventKind.SLICE_FILED):
+        if f.payload.get("epoch") != n:
+            fails.append(f"slice_filed in epoch {f.payload.get('epoch')}, outside the final epoch {n}")
+    for e in range(n + 1):
+        ruling = front.shape_ruling(store, run_id, e)
+        if ruling is None:
+            continue
+        subs = front.submissions(store, run_id, "slices", e)
+        if subs and ruling.seq < subs[-1].seq:
+            fails.append(f"epoch {e}: a slice plan was submitted after the shape ruling (one decision per epoch)")
+        if front.slices_filed(store, run_id, e):
+            fails.append(f"epoch {e}: a shape ruling beside a filing (one decision per epoch)")
+    if bool(front.shape_ruling(store, run_id, n)) == bool(filed):
+        fails.append(f"final epoch {n}: exactly one decision, a slice_filed or a shape ruling")
+    return fails
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Prove the §8 done criterion over a merged front-half run.",
@@ -321,11 +421,35 @@ def main(argv=None) -> int:
                     help="admit exactly the gate's approval (E3); default admits none (E4)")
     ap.add_argument("--issues", default=None,
                     help="the pre-registered issue list; the run's issue must be in it")
+    ap.add_argument("--repo", default="")
+    ap.add_argument("--children", action="store_true",
+                    help="prove the parent's slicing and each child's run")
     a = ap.parse_args(argv)
 
     store = Store.open(a.db)
     mode = "human" if a.expect_human else "approval" if a.expect_approval else "zero"
     fails = assert_journal(store, a.run_id, mode=mode) + assert_sessions(store, a.run_id, server=a.server)
+
+    if a.children:
+        from coordinator.sweep import ReadFailed, gh_json
+        if not a.repo:
+            print("--children needs --repo", file=sys.stderr)
+            return 2
+        fails += assert_slices(store, a.run_id, repo=a.repo, gh_json=gh_json)
+        for f in store.facts_of_kind(a.run_id, EventKind.SLICE_FILED):
+            kids = [r for r in store.all_run_ids() if r.startswith(f"i{f.payload['issue']}-")]
+            if not kids:
+                fails.append(f"child #{f.payload['issue']} has no run yet")
+                continue
+            # Nothing here reads gh today, but a read failure while proving a
+            # child must become a failure line, not an exception escaping
+            # main -- the loop continues over the remaining children either way.
+            try:
+                child_fails = assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)
+            except ReadFailed as exc:
+                fails.append(f"child #{f.payload['issue']} ({kids[-1]}): could not read: {exc}")
+                continue
+            fails += [f"child #{f.payload['issue']} ({kids[-1]}): {x}" for x in child_fails]
 
     if a.issues:
         # The body-content half of this rule (no file, function or acceptance

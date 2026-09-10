@@ -19,12 +19,16 @@ from kernel.events import EventKind
 # "implementation". The back-half -- the repair loop's allowance, its
 # durability check, and recovery -- must never act on a spec or plan verdict,
 # or a spec-phase FAIL would spend the implementation's revision allowance.
-FRONT_PHASES = ("spec", "plan")
+# A `slices` verdict is the front half's too: a one-piece run that needed two
+# slice-plan rounds must not arrive in its back half with its repair allowance
+# spent (shaping spec §2).
+FRONT_PHASES = ("slices", "spec", "plan")
 
 
 def is_front_verdict(payload: dict) -> bool:
-    """A review_verdict of the spec or plan phase. A verdict with no phase
-    was written before the front half existed and is the implementation's."""
+    """A review_verdict of the slices, spec or plan phase. A verdict with no
+    phase was written before the front half existed and is the
+    implementation's."""
     return payload.get("phase") in FRONT_PHASES
 
 

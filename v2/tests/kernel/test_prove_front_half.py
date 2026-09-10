@@ -148,16 +148,35 @@ def test_a_clean_autonomous_run_passes(tmp_path):
     assert prove.assert_sessions(s, "r-1", fetch=fetch) == []
 
 
+def test_a_run_that_ruled_on_no_question_fails_the_model_ruling_assertion(tmp_path):
+    """The planted defect: a run whose author never ruled on a question, which
+    §8's fourth assertion is supposed to catch.
+
+    Since Task 3 every run is born in `shaping` and the one-piece ruling that
+    leaves it IS a `model_ruling`, so the proof -- which does not yet exclude
+    `question_id == "shape"` -- sees a ruling and the planted red goes green.
+    Task 11 makes the proof exclude the shape ruling; this mark comes off
+    with it (Task 3 rule (e))."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES); _accept(f); f.approve()
+    f.author_round(PLAN_BYTES); _accept(f)
+    fails = prove.assert_journal(s, "r-1", mode="zero")
+    assert any("model_ruling" in x for x in fails)
+    assert prove.assert_journal(s, "r-1", mode="approval") == [x for x in
+                                                              prove.assert_journal(s, "r-1", mode="approval")
+                                                              if "model_ruling" in x]
+
+
 def test_each_assertion_fails_on_its_defect(tmp_path):
     s = _store_with_confirmed_stops(tmp_path / "k.db")
     f = Front(s, "r-1", labels=())
     spec_hash = f.author_round(SPEC_BYTES); _accept(f); f.approve()
     f.author_round(PLAN_BYTES); _accept(f)
     fails = prove.assert_journal(s, "r-1", mode="zero")
-    assert any("human_ruling" in x for x in fails) and any("model_ruling" in x for x in fails)
-    assert prove.assert_journal(s, "r-1", mode="approval") == [x for x in
-                                                              prove.assert_journal(s, "r-1", mode="approval")
-                                                              if "model_ruling" in x]
+    assert any("human_ruling" in x for x in fails)
+    # The model_ruling half of this planted defect is its own test below, so
+    # that only it carries the xfail mark (Task 3 rule (e)).
 
     # A run that was reconciled or halted fails in every mode.
     s.set_reconciliation("r-1", {"run_id": "r-1", "reason": "test halt"})

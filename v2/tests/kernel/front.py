@@ -24,6 +24,20 @@ from kernel.store import Store
 
 SPEC_BYTES = b"# Spec\n\nThe thing, specified.\n"
 PLAN_BYTES = b"# Plan\n\n### Task 1: do the thing\n\n- [ ] Step 1\n"
+SLICES_BYTES = b"""# Slicing T
+
+Why: two pieces.
+
+## Slice 1: The store
+Scope: Add the table. Add the migration. Add the reads.
+Non-goals: the API.
+Depends on: none
+
+## Slice 2: The API
+Scope: Add the endpoint. Wire it to the store. Cover it with a test.
+Non-goals: the client.
+Depends on: 1
+"""
 
 
 class Front:
@@ -31,17 +45,43 @@ class Front:
                  reviewer: str = "codex", labels=("bircher:autonomous",),
                  base_sha: str = "0" * 40, base_repo: str = "o/r",
                  issue: dict | None = None, project_config: dict | None = None,
-                 existing: bool = False) -> None:
+                 existing: bool = False, shape: bool = True) -> None:
         self.store, self.run_id = store, run_id
         self.author, self.reviewer, self.base_sha = author, reviewer, base_sha
         self._n = 0
         if existing:
+            # The caller created this run, by whatever means -- possibly a bare
+            # `store.create_run` with no bundle or policy. Nothing here is
+            # declared, so there is nothing to replay or to contradict.
             assert _run_exists(store, run_id), f"run {run_id} does not exist"
+            self._n = self._commands_seen()
             return
         issue = issue or {"number": 1, "title": "T", "body": "B",
                           "labels": list(labels), "comments": []}
+        # On EVERY construction, including a second driver over a run that is
+        # already born: `create_run` replays an identical request and raises
+        # NotReplayable when the inputs differ. Skipping it for a born run
+        # would hand back a driver whose declared issue, labels and
+        # project_config were silently never applied.
         create_run(store, run_id=run_id, base_repo=base_repo, base_sha=base_sha,
                    issue=issue, project_config=project_config or {})
+        # An idempotency key is unique within the RUN, not within this driver:
+        # a run whose birth shape_round has already spent `record_turn_ended-1`
+        # would refuse a second driver that numbered from 1 again, for reusing
+        # a key on a different request. A fresh run has been asked nothing and
+        # numbers from 1 as before.
+        self._n = self._commands_seen()
+        # Every run is born in `shaping` (shaping spec §2). The driver rules
+        # it one piece by default, so a test of the spec or plan phase gets
+        # its run at `queued` by the only path the kernel admits (planning
+        # ruling 3); a test of the shaping phase passes shape=False. Only a run
+        # still AT `shaping` is shaped: a replayed run that has already been
+        # ruled on is not ruled on twice.
+        if shape and self.state() == "shaping":
+            self.shape_round()
+
+    def _commands_seen(self) -> int:
+        return len(self.store.facts_of_kind(self.run_id, EventKind.COMMAND_REQUESTED))
 
     # -- primitives ----------------------------------------------------------
 
@@ -71,15 +111,55 @@ class Front:
     def _dispatch(self, role: str, actor: str) -> int:
         return dispatch(self.store, self.run_id, actor=actor, role=role).generation
 
-    def _journal(self, generation: int, key: str, intent: dict, external: str | None) -> None:
+    def _journal(self, generation: int, key: str, intent: dict, external: str | None, *,
+                 cls: str = "session_control", state: str = "confirmed") -> None:
         # The effect ROW id is a global primary key while the idempotency key
         # is unique only within a run, so the run id goes in the row id. Two
         # runs in one store both open session `s-1` under generation 1, and
         # without this the second one collides on the id rather than on
         # anything the kernel would refuse.
-        self.store.journal_intent(f"e-{self.run_id}-{key}", self.run_id, generation,
-                                  "session_control", key, intent)
-        self.store.mark_effect(key, "confirmed", external, run_id=self.run_id)
+        self.store.journal_intent(f"e-{self.run_id}-{key}", self.run_id, generation, cls, key, intent)
+        self.store.mark_effect(key, state, external, run_id=self.run_id)
+
+    def file_slice(self, generation: int, n: int, issue: int, issue_id: int) -> str:
+        """A satisfied issue_create for slice *n* -- journalled directly, as
+        `_journal` does for sessions -- and its slice_filed fact."""
+        epoch_n = self.epoch()
+        h = fq.accepted_slices_hash(self.store, self.run_id, epoch_n)
+        parent = fq.issue_number(self.store, self.run_id)
+        key = f"slice:{self.run_id}:{n}:{generation}"
+        ob = {"kind": "slice_issue", "run": self.run_id, "epoch": epoch_n, "slice": n,
+              "parent": parent, "plan_hash": h}
+        self._journal(generation, key, {"argv": ["gh", "issue", "create", "--repo", "o/r", "--title",
+                                                 "t", "--label", "bircher:slice"], "obligation": ob},
+                      json.dumps({"url": f"https://github.com/o/r/issues/{issue}", "number": issue, "id": issue_id}),
+                      cls="issue_create")
+        self._cmd(generation, "record_slice_filed", {"slice": n, "effect_key": key})
+        return key
+
+    def satisfy(self, generation: int, ob: dict, *, cls: str = "issue_or_label", value: str = "ok") -> str:
+        """A satisfied effect carrying *ob*, journalled directly."""
+        key = f"{ob['kind']}:{self.run_id}:{ob.get('slice', '')}:{ob.get('blocker', '')}:{generation}"
+        self._journal(generation, key, {"argv": ["gh", "issue", "edit", "1", "--repo", "o/r"],
+                                        "obligation": ob}, value, cls=cls)
+        return key
+
+    def file_all(self, generation: int, first_issue: int = 40) -> dict[int, int]:
+        """Every filing obligation of the accepted plan satisfied, in
+        dependency order, and filing_complete recorded."""
+        from kernel import slices as _slices
+        plan = fq.accepted_plan(self.store, self.run_id)
+        filed = {}
+        for n in _slices.topo_order(plan):
+            filed[n] = first_issue + n - 1
+            self.file_slice(generation, n, filed[n], 1000 + filed[n])
+        for ob in fq.filing_obligations(self.store, self.run_id, self.epoch()):
+            if ob["kind"] == "slice_issue":
+                continue
+            self.satisfy(generation, ob, cls="comment" if ob["kind"] == "umbrella" else "issue_or_label",
+                         value="https://github.com/o/r/issues/1#issuecomment-1" if ob["kind"] == "umbrella" else "ok")
+        self._cmd(generation, "record_filing_complete", {})
+        return filed
 
     def _create(self, generation: int, cause: str, *, actor: str | None = None) -> str:
         """A satisfied sess-create under *generation* -- and nothing else. The
@@ -135,6 +215,38 @@ class Front:
 
     # -- rounds ----------------------------------------------------------------
 
+    def shape_round(self, plan: bytes | None = None, *, ended: str = "file",
+                    reasoning: str = "one coherent change", cost: str = "a spec round") -> str | None:
+        """One shaping turn (shaping spec §3): a one-piece ruling, or -- with
+        *plan* -- a slice plan submitted. Returns the plan's hash, or None."""
+        cause = self._newest_id()
+        g = self._dispatch(Role.AUTHOR, self.author)
+        sid = self._session(g, cause)
+        self._end_turn(g, sid, ended)
+        if plan is None:
+            self._cmd(g, "record_one_piece", {"reasoning": reasoning, "cost_if_wrong": cost})
+            return None
+        h = put_artifact(self.store, plan)
+        self._cmd(g, "submit_slices", {"artifact_hash": h})
+        return h
+
+    def advance(self) -> None:
+        """The coordinator's `advance_ungated` at slices_accepted."""
+        g = self._dispatch(Role.OPERATOR, "coordinator")
+        self._cmd(g, "advance_ungated", {})
+
+    def to_sliced(self, plan: bytes = SLICES_BYTES) -> "Front":
+        from kernel.policy import policy_of
+        assert self.state() == "shaping", self.state()
+        self.shape_round(plan)
+        self.review_round("accept")
+        if "slices" in policy_of(self.store, self.run_id).gates:
+            self.approve()
+        else:
+            self.advance()
+        assert self.state() == "sliced", self.state()
+        return self
+
     def author_round(self, artefact: bytes, *, ended: str = "file",
                      resume: str | None = None) -> str:
         cause = self._newest_id()
@@ -164,9 +276,14 @@ class Front:
                            "reasoning": "reasoned", "cost_if_wrong": "low"})
         return sid
 
-    def revise(self, issue: dict) -> None:
+    def revise(self, issue: dict, *, reshape: bool = True) -> None:
+        """A relevant issue change; lands in `shaping` (ruling 11). By default
+        the driver rules the new epoch one piece so the run is back at
+        `queued`; a test that asserts the landing state passes reshape=False."""
         g = self._dispatch(Role.OPERATOR, "runner")
         self._cmd(g, "revise_bundle", {"issue": issue})
+        if reshape:
+            self.shape_round()
 
     def review_round(self, verdict: str = "accept", findings: bytes = b"ok", **override) -> None:
         cause = self._newest_id()

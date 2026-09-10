@@ -16,20 +16,26 @@ ISSUE = {"number": 3, "title": "T", "body": "B", "labels": ["bircher:queued"],
 
 
 def test_defaults_are_the_specs():
-    p = policy.Policy()
-    assert (p.grill, p.gates, p.max_rounds, p.max_seats) == ("model", frozenset({"spec"}), 3, 16)
+    p = policy.derive([], {})
+    assert (p.grill, p.gates, p.max_rounds, p.max_seats) == ("model", frozenset({"slices", "spec"}), 3, 16)
+    assert policy.PHASES == ("slices", "spec", "plan")
 
 
 def test_labels_override_project_config():
     assert policy.derive(["bircher:grill"], {}).grill == "human"
     assert policy.derive(["bircher:autonomous"], {}).gates == frozenset()
-    assert policy.derive(["bircher:gate-plan"], {}).gates == frozenset({"spec", "plan"})
-    # Ruling 5: autonomous wins when both are present.
+    assert policy.derive(["bircher:gate-plan"], {}).gates == frozenset({"slices", "spec", "plan"})
+    # Ruling 5 (front half): cleared last, so autonomous wins over gate-plan.
     assert policy.derive(["bircher:gate-plan", "bircher:autonomous"], {}).gates == frozenset()
     cfg = {"grill": "human", "gates": ["spec", "plan"], "max_rounds": 5, "max_seats": 40}
     p = policy.derive([], cfg)
     assert (p.grill, p.gates, p.max_rounds, p.max_seats) == ("human", frozenset({"spec", "plan"}), 5, 40)
     assert policy.derive(["bircher:autonomous"], cfg).gates == frozenset()
+    # A project may gate only the slices (shaping spec §1).
+    assert policy.derive([], {"gates": ["slices"]}).gates == frozenset({"slices"})
+    # A slice label on the issue changes no policy: depth is the kernel's
+    # refusal on policy_frozen's labels (spec §2), not a gate.
+    assert policy.derive(["bircher:slice"], {}).gates == frozenset({"slices", "spec"})
 
 
 @pytest.mark.parametrize("cfg", [
@@ -47,7 +53,7 @@ def test_out_of_range_config_is_refused(cfg):
 def test_payload_round_trips():
     p = policy.derive(["bircher:gate-plan"], {"max_seats": 20})
     assert policy.from_payload(policy.to_payload(p)) == p
-    assert policy.to_payload(p)["gates"] == ["plan", "spec"]
+    assert policy.to_payload(p)["gates"] == ["plan", "slices", "spec"]
 
 
 def test_create_run_freezes_policy_and_puts_the_snapshot(tmp_path):
@@ -56,11 +62,11 @@ def test_create_run_freezes_policy_and_puts_the_snapshot(tmp_path):
                      issue=dict(ISSUE, labels=["bircher:queued", "bircher:grill"]),
                      project_config={"max_seats": 20})
     assert out["replayed"] is False
-    assert s.run_state("r-1") == "queued"
+    assert s.run_state("r-1") == "shaping"                  # Task 3 rule (a)
     assert s.has_artifact(out["bundle_hash"])
     frozen = s.newest_fact("r-1", EventKind.POLICY_FROZEN)
     assert frozen.actor == "kernel"
-    assert frozen.payload["policy"] == {"grill": "human", "gates": ["spec"],
+    assert frozen.payload["policy"] == {"grill": "human", "gates": ["slices", "spec"],
                                         "max_rounds": 3, "max_seats": 20}
     assert frozen.payload["labels"] == ["bircher:grill", "bircher:queued"]
     assert len(frozen.payload["project_config_hash"]) == 64

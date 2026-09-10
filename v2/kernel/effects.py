@@ -115,6 +115,16 @@ def perform(store, run_id, generation, effect_class, idempotency_key, intent, ex
                     f"repo={authorized.get('repo')!r}"
                 )
 
+    # The filing effects (shaping spec §2): the mandate, the preconditions,
+    # the binding and the uniqueness, checked where the mutation would
+    # happen and not after it. For every class: the mandate is what makes an
+    # obligation-less queue label or close refusable at all.
+    from kernel.filing import check_filing_effect
+    try:
+        check_filing_effect(store, run_id, generation, effect_class, idempotency_key, intent)
+    except NotAuthorized as exc:
+        shadow_or_raise(store, run_id, exc, idempotency_key, effect_class=effect_class, argv=argv[:6])
+
     if is_halted(store, run_id):
         raise RuntimeError(
             f"run {run_id} is halted pending reconciliation; resolve it before "
@@ -430,6 +440,26 @@ def _delivered_value(store, run_id: str, key: str, value: str | None) -> str:
         if not (snap.get("title") == body.get("title") == key):
             raise ValueError(f"{key}: snapshot title {snap.get('title')!r} must equal the create's title and the key")
         return json.dumps(session_projection(snap), sort_keys=True)
+    if kind == "slice_issue":
+        try:
+            d = json.loads(value or "")
+        except ValueError as exc:
+            raise ValueError(f"{key}: a delivered slice_issue needs {{url, number, id}} JSON") from exc
+        if not (isinstance(d, dict) and d.get("url") and type(d.get("number")) is int and type(d.get("id")) is int):
+            raise ValueError(f"{key}: a delivered slice_issue needs {{url, number, id}} JSON")
+        return json.dumps({"url": d["url"], "number": d["number"], "id": d["id"]}, sort_keys=True)
+    if kind in ("slice_dependency", "slice_queue", "umbrella_label"):
+        if value is not None:
+            raise ValueError(f"{key}: a delivered {kind} takes no delivered value")
+        return "ok"
+    if kind in ("umbrella", "umbrella_close"):
+        if not value:
+            raise ValueError(f"{key}: a delivered {kind} needs its comment URL")
+        return value
+    if kind == "parent_close":
+        if value not in (None, "closed"):
+            raise ValueError(f"{key}: a delivered parent_close is the observed state 'closed'")
+        return "closed"
     raise ValueError(f"{key}: obligation kind {kind!r} has no delivered form")
 
 

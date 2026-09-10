@@ -11,9 +11,11 @@ was never about. `kernel.projection.is_front_verdict` is the one predicate;
 this exercises it through every consumer, not just at its own definition.
 """
 
+import pytest
+
 from coordinator.observe import revisions_used
 from coordinator.recover import decide
-from kernel.projection import project
+from kernel.projection import is_front_verdict, project
 
 
 class _F:
@@ -44,6 +46,17 @@ def test_revisions_used_counts_implementation_verdicts_only():
     assert revisions_used(_journal()) == 0
     facts = _journal() + [_F("review_verdict", {"verdict": "request_revision", "phase": "implementation"}, 6)]
     assert revisions_used(facts) == 1
+
+
+@pytest.mark.parametrize("phase", ["slices", "spec", "plan"])
+def test_a_front_verdict_of_any_phase_is_skipped(phase):
+    """§8: `is_front_verdict` true for a `slices` verdict, and
+    `revisions_used` not spending a repair round on one. A one-piece run that
+    needed two slice-plan rounds must not arrive in its back half with its
+    repair allowance already spent (Task 3 rule (g))."""
+    assert is_front_verdict({"phase": phase})
+    assert revisions_used([_F("review_verdict",
+                              {"verdict": "request_revision", "phase": phase}, 1)]) == 0
 
 
 def test_a_v1_verdict_without_phase_still_counts():

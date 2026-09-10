@@ -33,7 +33,16 @@ FRONT_HALF_STATES = frozenset({
     "specified", "plan_submitted", "plan_accepted",
 })
 
+#: The shaping states (shaping spec §2 *Which state set each site reads*).
+#: DELIBERATELY NOT part of FRONT_HALF_STATES: that set is the from-set of
+#: record_model_question and record_model_ruling, and joining it would
+#: legalise both from the shaping states -- the second of them writing the
+#: very model_ruling shape record_one_piece records, with none of its
+#: guards. Membership is stated per site below, never inherited (ruling 13).
+SHAPING_STATES = frozenset({"shaping", "slices_submitted", "slices_accepted"})
+
 _PHASE_OF_STATE = {
+    "shaping": "slices", "slices_submitted": "slices", "slices_accepted": "slices", "sliced": "slices",
     "queued": "spec", "spec_submitted": "spec", "spec_accepted": "spec",
     "specified": "plan", "plan_submitted": "plan", "plan_accepted": "plan",
     "implementing": "implementation", "reviewing": "implementation",
@@ -64,14 +73,15 @@ TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
 #: a review_ruling joins this set too, checked separately in authorize()
 #: because its role is REVIEWER rather than AUTHOR.
 OUTPUT_COMMANDS = frozenset({
-    "submit_spec", "submit_plan", "record_author_empty",
-    "record_model_question", "record_model_ruling",
+    "submit_spec", "submit_plan", "submit_slices", "record_one_piece",
+    "record_author_empty", "record_model_question", "record_model_ruling",
 })
 
 #: Every non-terminal state. `record_run_outcome` and `cancel_run` are legal
 #: from all of them, so listing them by hand meant each new front-half state
 #: had to be remembered in two more places.
 _ALL_ACTIVE = frozenset({
+    "shaping", "slices_submitted", "slices_accepted", "sliced",
     "queued", "spec_submitted", "spec_accepted", "specified",
     "plan_submitted", "plan_accepted", "planned", "implementing", "reviewing",
     "merge_requested",
@@ -86,20 +96,38 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # only a reviewer's accept of the current hash moves on from there.
     "submit_spec": (frozenset({"queued"}), "spec_submitted"),
     "submit_plan": (frozenset({"specified"}), "plan_submitted"),
+    # The shaping phase (shaping spec §2 *States*): the ruling and the plan
+    # leave `shaping` by different doors; the ungated advance is the
+    # coordinator's own fact, separate from the reviewer's accept, because
+    # the transition that authorises filing must be its own fact.
+    "record_one_piece": (frozenset({"shaping"}), "queued"),
+    "submit_slices": (frozenset({"shaping"}), "slices_submitted"),
+    "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
+    # The filing and closing facts (shaping spec §2): no transition; legal
+    # only from `sliced`, under the coordinator's or the sweep's operator
+    # dispatch (checked in authorize).
+    "record_slice_filed": (frozenset({"sliced"}), None),
+    "record_filing_complete": (frozenset({"sliced"}), None),
+    "record_slice_closed": (frozenset({"sliced"}), None),
+    "record_slice_reopened": (frozenset({"sliced"}), None),
+    "record_children_observed_closed": (frozenset({"sliced"}), None),
     "start_implementation": (frozenset({"planned"}), "implementing"),
     # Destination depends on state, verdict and the run's gates: computed in
     # authorize() by _review_destination. In the back half a revision request
     # must return the run to `planned` so implementation can start again;
     # landing every review in `reviewing` left it nowhere to do the revision.
     "record_review": (
-        frozenset({"spec_submitted", "spec_accepted", "plan_submitted",
-                   "plan_accepted", "implementing", "reviewing"}),
+        frozenset({"slices_submitted", "slices_accepted", "spec_submitted", "spec_accepted",
+                   "plan_submitted", "plan_accepted", "implementing", "reviewing"}),
         None,
     ),
     "record_turn_ended": (
-        frozenset({"queued", "specified", "spec_submitted", "plan_submitted"}), None,
+        frozenset({"shaping", "slices_submitted", "queued", "specified", "spec_submitted", "plan_submitted"}), None,
     ),
-    "park": (FRONT_HALF_STATES, None),
+    # The membership table (shaping spec §2): the carrier session's items and
+    # the gate park are legal in the shaping states too; the model's two
+    # channels are NOT.
+    "park": (FRONT_HALF_STATES | SHAPING_STATES, None),
     # merge_requested must not be a dead end. Without an outbound transition a
     # merge that comes back uncertain can never be retried after
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
@@ -107,11 +135,13 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_merge_outcome": (frozenset({"merge_requested"}), None),
     # The human's commands (spec §2 Commands), reachable only through
     # execute_as_human -- checked in authorize() below.
-    "record_human_answer": (FRONT_HALF_STATES, None),
-    "record_human_direction": (frozenset({"queued", "specified"}), None),
+    "record_human_answer": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    # The three author-round states.
+    "record_human_direction": (frozenset({"queued", "specified", "shaping"}), None),
     # Destination by phase: computed in authorize().
-    "approve_artifact": (frozenset({"spec_accepted", "plan_accepted"}), None),
-    "grant_round": (frozenset({"queued", "specified", "spec_submitted", "plan_submitted"}), None),
+    "approve_artifact": (frozenset({"slices_accepted", "spec_accepted", "plan_accepted"}), None),
+    "grant_round": (frozenset({"shaping", "slices_submitted", "queued", "specified",
+                               "spec_submitted", "plan_submitted"}), None),
     # Records what the implementation produced; does not itself transition.
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
@@ -129,29 +159,33 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # The model's questions and rulings (spec §2 Commands): every front-half
     # state, since a grill can happen at any point before planned. Neither
     # transitions; a question and a ruling are facts about the epoch, not
-    # moves in it.
+    # moves in it. DELIBERATELY NOT extended with SHAPING_STATES (shaping
+    # spec §2): refused from every shaping state, because record_model_ruling
+    # writes the very fact shape record_one_piece writes, with none of its
+    # guards -- and the `shape` question id is refused from anywhere.
     "record_model_question": (FRONT_HALF_STATES, None),
     "record_model_ruling": (FRONT_HALF_STATES, None),
     # The author's report that a turn produced nothing (spec §2 Commands):
-    # only `queued` and `specified`, the two states an author round can start
-    # from. Does not transition -- the RC_FAILED escalation is the
-    # coordinator's, not a kernel move.
-    "record_author_empty": (frozenset({"queued", "specified"}), None),
+    # only `shaping`, `queued` and `specified`, the three states an author
+    # round can start from. Does not transition -- the RC_FAILED escalation is
+    # the coordinator's, not a kernel move.
+    "record_author_empty": (frozenset({"shaping", "queued", "specified"}), None),
     # The coordinator's dismissal of a refused human token (spec §2 Commands):
-    # every front-half state, any role. Does not transition -- it is a reply
-    # to a rejection, not a move.
-    "dismiss_human_item": (FRONT_HALF_STATES, None),
+    # every front-half and shaping state, any role. Does not transition -- it
+    # is a reply to a rejection, not a move.
+    "dismiss_human_item": (FRONT_HALF_STATES | SHAPING_STATES, None),
     # The coordinator's record of an omnigent prompt item it has already sent
-    # (spec §2 Commands): every front-half state, any role. Does not
-    # transition -- it is an observation of what was sent.
-    "record_prompt_item": (FRONT_HALF_STATES, None),
-    # A relevant issue change resets the run to `queued` and opens a new
-    # epoch (ruling 13); an irrelevant one is refused in authorize() below.
-    "revise_bundle": (FRONT_HALF_STATES, "queued"),
+    # (spec §2 Commands): every front-half and shaping state, any role. Does
+    # not transition -- it is an observation of what was sent.
+    "record_prompt_item": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    # Every revision lands in `shaping`, the epoch's first state (ruling 11):
+    # a materially changed issue may have changed size. Refused from `sliced`
+    # by this very from-set: its children are the work now (ruling 7).
+    "revise_bundle": (FRONT_HALF_STATES | SHAPING_STATES, "shaping"),
     # The kernel renders the reviewer's brief (spec §2 *Brief*): legal only
-    # from the two states a reviewer seat is dispatched into. Does not
+    # from the states a reviewer seat is dispatched into. Does not
     # transition -- it is an artefact the seat reads, not a move.
-    "issue_review_brief": (frozenset({"spec_submitted", "plan_submitted"}), None),
+    "issue_review_brief": (frozenset({"slices_submitted", "spec_submitted", "plan_submitted"}), None),
 }
 
 #: Verdicts `record_review` may carry. A closed set: arbitrary strings were
@@ -164,6 +198,13 @@ _VERDICT_WORDS = frozenset({"accept", "request_revision", "reject"})
 _BACK_HALF_DESTINATIONS: dict[str, str] = {
     "accept": "reviewing", "request_revision": "planned", "reject": "reviewing",
 }
+
+
+#: Where a request_revision -- the reviewer's or the human's -- returns the
+#: run: each phase's one revision destination (shaping spec §2 *States*).
+_REVISION_DESTINATION = {"slices": "shaping", "spec": "queued", "plan": "specified"}
+#: Where the human's approval lands each phase (shaping spec §2).
+_APPROVAL_DESTINATION = {"slices": "sliced", "spec": "specified", "plan": "planned"}
 
 
 def _review_destination(store, run_id: str, state: str, verdict: str, ruling: str) -> str:
@@ -180,14 +221,14 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
     from kernel.policy import policy_of
     phase = phase_of(state)
     if ruling == "human_ruling":
-        if state not in FRONT_HALF_STATES:
+        if state not in FRONT_HALF_STATES | SHAPING_STATES:
             raise NotAuthorized("a human record_review is front-half only (spec §2 Commands)")
         if verdict != "request_revision":
             raise NotAuthorized(
                 "the human's record_review is request_revision; approval is "
                 "approve_artifact, after the reviewer"
             )
-        return "queued" if phase == "spec" else "specified"
+        return _REVISION_DESTINATION[phase]
     if state in ("implementing", "reviewing"):
         return _BACK_HALF_DESTINATIONS[verdict]
     if verdict == "reject":
@@ -209,8 +250,12 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
                 f"max_rounds: {used} request_revision rulings already in {phase}/epoch {n} "
                 f"against a bound of {bound}; the loop parks bound_exhausted and a human retry grants one"
             )
-        return "queued" if phase == "spec" else "specified"
+        return _REVISION_DESTINATION[phase]
     gates = policy_of(store, run_id).gates
+    if phase == "slices":
+        # WHATEVER the gates (shaping spec §2): the ungated path leaves
+        # through advance_ungated, its own fact, not through the accept.
+        return "slices_accepted"
     if phase == "spec":
         return "spec_accepted" if "spec" in gates else "specified"
     return "plan_accepted" if "plan" in gates else "planned"
@@ -248,6 +293,9 @@ _MERGE_OUTCOMES: dict[str, str] = {
 #: effect, on the same reasoning as record_merge_outcome.
 _RUN_OUTCOMES: frozenset[str] = frozenset({
     "merged", "ready", "escalated", "noop", "skipped", "failed", "timeout",
+    # sliced: the sweep's terminal record for an epic whose children all
+    # closed (shaping spec §2); guarded in authorize.
+    "sliced",
 })
 
 
@@ -539,14 +587,10 @@ def _merge_is_authorized(store, run_id: str, payload: dict) -> bool:
     return latest == "accept"
 
 
-def _check_submit(store, cmd, state: str) -> None:
-    """What a submission has to be, before it becomes the phase's artefact.
-
-    The author role, an artefact the kernel holds, and a change: an identical
-    resubmission in the same phase and epoch is the loop spinning, not a
-    revision, and the plan additionally has to be a different object from the
-    spec and to have tasks in it.
-    """
+def _check_author_seat(store, cmd, state: str) -> None:
+    """The author role and the vendor guard (ruling 14): the artefact was
+    read from the round's session, and its author is the vendor that ran it.
+    Shared by the submits and by record_one_piece."""
     from kernel import front
     if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
         raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the author role")
@@ -561,6 +605,42 @@ def _check_submit(store, cmd, state: str) -> None:
             f"{phase}/epoch {epoch_n} names: the artefact was read from that session, "
             "and its author is the vendor that ran it (ruling 14)"
         )
+
+
+def _check_no_newer_direction(store, cmd) -> None:
+    """spec §2 Refusals: a human_direction newer than this generation's own
+    dispatch means a human interrupted the turn this output is the product
+    of. The output of the turn it interrupted is not this run's to record;
+    the direction starts a fresh round instead. Shared by the submits and by
+    record_one_piece (shaping spec §2, round 2 finding 5)."""
+    from kernel import front
+    dispatched_seq = front.dispatch_seq(store, cmd.run_id, cmd.generation)
+    if dispatched_seq is None:
+        raise NotAuthorized(
+            f"generation {cmd.generation} has no attempt_dispatched fact: nothing to "
+            "order a human_direction against"
+        )
+    newer = front.direction_after(store, cmd.run_id, dispatched_seq)
+    if newer is not None:
+        raise NotAuthorized(
+            f"a human_direction (seq {newer.seq}) is newer than generation "
+            f"{cmd.generation}'s dispatch: the output of the turn it interrupted is not "
+            "recorded; the direction starts a fresh round"
+        )
+
+
+def _check_submit(store, cmd, state: str) -> None:
+    """What a submission has to be, before it becomes the phase's artefact.
+
+    The author role, an artefact the kernel holds, and a change: an identical
+    resubmission in the same phase and epoch is the loop spinning, not a
+    revision; the plan additionally has to be a different object from the
+    spec and to have tasks in it; the slice plan has to parse (shaping spec
+    §2 *The artefact*) and the issue must not itself be a slice.
+    """
+    from kernel import front
+    _check_author_seat(store, cmd, state)
+    phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
     if cmd.name == "submit_spec" and front.grill_open(store, cmd.run_id):
         raise NotAuthorized(
             "the grill is open: under grill=human the spec waits for a human_answer "
@@ -579,23 +659,24 @@ def _check_submit(store, cmd, state: str) -> None:
             raise NotAuthorized("the plan is the run's current spec: a plan is a different artefact")
         if b"### Task" not in store.read_blob(h):
             raise NotAuthorized("plan has no tasks: no `### Task` heading (a shape check)")
-    # spec §2 Refusals: a human_direction newer than this generation's own
-    # dispatch means a human interrupted the turn this submission is the
-    # output of. The artefact of the turn it interrupted is not this run's to
-    # submit; the direction starts a fresh round instead.
-    dispatched_seq = front.dispatch_seq(store, cmd.run_id, cmd.generation)
-    if dispatched_seq is None:
-        raise NotAuthorized(
-            f"generation {cmd.generation} has no attempt_dispatched fact: nothing to "
-            "order a human_direction against"
-        )
-    newer = front.direction_after(store, cmd.run_id, dispatched_seq)
-    if newer is not None:
-        raise NotAuthorized(
-            f"a human_direction (seq {newer.seq}) is newer than generation "
-            f"{cmd.generation}'s dispatch: the artefact of the turn it interrupted is not "
-            "submitted; the direction starts a fresh round"
-        )
+    if cmd.name == "submit_slices":
+        from kernel import slices as _slices
+        # The grammar (shaping spec §2 *The artefact*): a shape check from the
+        # bytes, the one judgement-shaped rule being the sentence bound.
+        try:
+            _slices.parse(store.read_blob(h))
+        except _slices.PlanError as exc:
+            raise NotAuthorized(f"submit_slices: {exc}") from exc
+        # A slice is not sliced. The frozen BUNDLE cannot carry the label --
+        # the canon strips every bircher: label as state, not input -- but
+        # policy_frozen records the issue's labels unfiltered at creation,
+        # and that is the observable (round 1, finding 1).
+        if "bircher:slice" in front.frozen_labels(store, cmd.run_id):
+            raise NotAuthorized(
+                "a slice is not sliced: this issue carries bircher:slice in its policy_frozen "
+                "labels; depth is one by construction (shaping spec §2)"
+            )
+    _check_no_newer_direction(store, cmd)
 
 
 def _non_empty_str(value) -> bool:
@@ -699,6 +780,19 @@ def _require_turn_recorded(store, cmd, role: str) -> None:
         )
 
 
+def _check_operator(store, cmd) -> None:
+    if role_for(store, cmd.run_id, cmd.generation) != Role.OPERATOR:
+        raise NotAuthorized(f"{cmd.name} must come from an attempt dispatched in the operator role")
+
+
+def _check_slice_in_plan(store, cmd, n) -> None:
+    """A payload `slice` is observed: refused unless the accepted plan has it."""
+    from kernel import front
+    plan = front.accepted_plan(store, cmd.run_id)
+    if plan is None or type(n) is not int or n not in plan.by_number():
+        raise NotAuthorized(f"{cmd.name}: slice {n!r} is not in the accepted plan")
+
+
 def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str | None:
     """Authorize *cmd* against the run's current state. Returns the next state.
 
@@ -735,7 +829,7 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
     # through `omnigent run`, not a session.
     if cmd.name in OUTPUT_COMMANDS:
         _require_turn_recorded(store, cmd, Role.AUTHOR)
-    if cmd.name == "record_review" and ruling == "review_ruling" and current in FRONT_HALF_STATES:
+    if cmd.name == "record_review" and ruling == "review_ruling" and current in FRONT_HALF_STATES | SHAPING_STATES:
         _require_turn_recorded(store, cmd, Role.REVIEWER)
 
     if cmd.name in ("record_model_question", "record_model_ruling"):
@@ -745,6 +839,12 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         qid = cmd.payload.get("question_id")
         if not isinstance(qid, str) or not qid:
             raise NotAuthorized(f"{cmd.name} names a question_id")
+        from kernel.slices import SHAPE_QUESTION
+        if qid == SHAPE_QUESTION:
+            raise NotAuthorized(
+                f"question_id {SHAPE_QUESTION!r} is reserved to record_one_piece (shaping spec §2): "
+                "no path writes a shape ruling without that command's guards"
+            )
         if cmd.name == "record_model_question":
             if not isinstance(cmd.payload.get("question"), str) or not cmd.payload.get("question").strip():
                 raise NotAuthorized("record_model_question carries a non-empty question")
@@ -863,9 +963,118 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(f"generation {cmd.generation} already carries a review_brief_issued")
         return None
 
-    if cmd.name in ("submit_spec", "submit_plan"):
+    if cmd.name in ("submit_spec", "submit_plan", "submit_slices"):
         _check_submit(store, cmd, current)
         return next_state
+
+    if cmd.name == "record_one_piece":
+        from kernel import front
+        # Literal reads (the provenance extractor): the two strings a ruling
+        # carries, already declared residuals for record_model_ruling.
+        for name, value in (("reasoning", cmd.payload.get("reasoning")),
+                            ("cost_if_wrong", cmd.payload.get("cost_if_wrong"))):
+            if not _non_empty_str(value):
+                raise NotAuthorized(f"record_one_piece carries a non-empty {name}")
+        _check_author_seat(store, cmd, current)
+        _check_no_newer_direction(store, cmd)
+        n = front.epoch(store, cmd.run_id)
+        if front.shape_ruling(store, cmd.run_id, n) is not None:
+            raise NotAuthorized(f"a shape ruling already exists in epoch {n}: one decision per epoch (shaping spec §2)")
+        return next_state
+
+    if cmd.name == "advance_ungated":
+        from kernel.policy import policy_of
+        if role_for(store, cmd.run_id, cmd.generation) != Role.OPERATOR:
+            raise NotAuthorized("advance_ungated must come from an attempt dispatched in the operator role")
+        if "slices" in policy_of(store, cmd.run_id).gates:
+            raise NotAuthorized(
+                "advance_ungated: this run's policy gates slices; only approve_artifact "
+                "moves on from slices_accepted"
+            )
+        return next_state
+
+    if cmd.name == "record_slice_filed":
+        import json as _json
+        from kernel import front
+        _check_operator(store, cmd)
+        n, key = cmd.payload.get("slice"), cmd.payload.get("effect_key")
+        _check_slice_in_plan(store, cmd, n)
+        epoch_n = front.epoch(store, cmd.run_id)
+        row = None if not isinstance(key, str) else store.effect_by_key(key, run_id=cmd.run_id)
+        if row is None or row["effect_class"] != "issue_create" or not front.is_satisfied(row):
+            raise NotAuthorized(f"record_slice_filed: {key!r} is not a satisfied issue_create of this run")
+        want = {"kind": "slice_issue", "run": cmd.run_id, "epoch": epoch_n, "slice": n,
+                "parent": front.issue_number(store, cmd.run_id),
+                "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n)}
+        if (row["intent"].get("obligation") or {}) != want:
+            raise NotAuthorized(f"record_slice_filed: {key}'s obligation {row['intent'].get('obligation')} is not {want}")
+        try:
+            delivered = _json.loads(row["external_object_id"])
+            int(delivered["number"]); int(delivered["id"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise NotAuthorized(f"record_slice_filed: {key}'s delivered value is not {{url, number, id}}") from exc
+        if n in front.slices_filed(store, cmd.run_id, epoch_n):
+            raise NotAuthorized(f"slice {n} already has a slice_filed in epoch {epoch_n}")
+        return None
+
+    if cmd.name == "record_filing_complete":
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is not None:
+            raise NotAuthorized(f"filing_complete already recorded in epoch {epoch_n}")
+        filed = front.slices_filed(store, cmd.run_id, epoch_n)
+        for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+            if s.number not in filed:
+                raise NotAuthorized(f"record_filing_complete: slice {s.number} has no slice_filed")
+        owed = front.unsatisfied_filing(store, cmd.run_id, epoch_n)
+        if owed:
+            raise NotAuthorized(f"record_filing_complete: {len(owed)} obligation(s) unsatisfied, first {owed[0]}")
+        return None
+
+    if cmd.name in ("record_slice_closed", "record_slice_reopened"):
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+            raise NotAuthorized(f"{cmd.name}: no filing_complete in epoch {epoch_n}; the sweep reads only a filed epic")
+        n = cmd.payload.get("slice")
+        if n not in front.slices_filed(store, cmd.run_id, epoch_n):
+            raise NotAuthorized(f"{cmd.name}: no slice_filed for slice {n!r} in epoch {epoch_n}")
+        cur = front.current_closure(store, cmd.run_id, epoch_n, n)
+        if cmd.name == "record_slice_closed":
+            if cmd.payload.get("state") not in ("merged", "closed"):
+                raise NotAuthorized("record_slice_closed state is merged or closed")
+            if not _non_empty_str(cmd.payload.get("closed_at")):
+                raise NotAuthorized("record_slice_closed carries closed_at")
+            if cur is not None and cur.kind == EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {n} is currently closed: a closure is recorded once until a reopening")
+        else:
+            if not _non_empty_str(cmd.payload.get("observed_at")):
+                raise NotAuthorized("record_slice_reopened carries observed_at")
+            if cur is None:
+                raise NotAuthorized(f"slice {n} was never closed: nothing to reopen")
+            if cur.kind != EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {n} is not currently closed")
+        return None
+
+    if cmd.name == "record_children_observed_closed":
+        from kernel import front
+        _check_operator(store, cmd)
+        epoch_n = front.epoch(store, cmd.run_id)
+        if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+            raise NotAuthorized(f"no filing_complete in epoch {epoch_n}")
+        if cmd.payload.get("parent_state") not in ("open", "closed"):
+            raise NotAuthorized("record_children_observed_closed parent_state is open or closed")
+        if not _non_empty_str(cmd.payload.get("observed_at")):
+            raise NotAuthorized("record_children_observed_closed carries observed_at")
+        for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+            cur = front.current_closure(store, cmd.run_id, epoch_n, s.number)
+            if cur is None or cur.kind != EventKind.SLICE_CLOSED:
+                raise NotAuthorized(f"slice {s.number} is not currently closed: the statement cannot contradict the closing facts")
+        if front.observed_closed_under(store, cmd.run_id, epoch_n, cmd.generation) is not None:
+            raise NotAuthorized(f"children_observed_closed already recorded under generation {cmd.generation}")
+        return None
 
     if cmd.name == "record_review":
         verdict = cmd.payload.get("verdict")
@@ -925,7 +1134,7 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 "the hash; the caller can only supply the right answer"
             )
         _check_cursor(cmd)
-        return "specified" if phase == "spec" else "planned"
+        return _APPROVAL_DESTINATION[phase]
 
     if cmd.name == "grant_round":
         from kernel import front
@@ -972,6 +1181,15 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(
                 f"outcome {outcome!r} is not one of {sorted(_RUN_OUTCOMES)}"
             )
+        # A run that entered `sliced` may have filed children; `failed` over
+        # them would end the epic with its filing half done and nothing left
+        # to repair it (shaping spec §2, ruling 15). cancel_run is the other exit.
+        # BEFORE the `merged` check below, not after: from `sliced` the STATE
+        # refuses every other outcome, `merged` included, and the refusal that
+        # names why is the state's one -- "no confirmed merge effect" would
+        # invite a caller to go and get one.
+        if current == "sliced" and outcome != "sliced":
+            raise NotAuthorized(f"a run that entered sliced ends only as sliced, not {outcome!r}; cancel_run is the other exit")
         # The one outcome a mechanism can contradict. Without this, a run that
         # never merged anything could still close its ledger as `merged` --
         # the exact claim-outruns-evidence shape record_merge_outcome already
@@ -983,6 +1201,32 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
                 "no confirmed merge outcome for this run: a merged outcome "
                 "reports what the mechanism observed, not what an actor claims"
             )
+        if outcome == "sliced":
+            from kernel import front
+            if current != "sliced":
+                raise NotAuthorized("outcome sliced is legal only from sliced")
+            _check_operator(store, cmd)
+            epoch_n = front.epoch(store, cmd.run_id)
+            if front.filing_complete(store, cmd.run_id, epoch_n) is None:
+                raise NotAuthorized("outcome sliced: no filing_complete in this epoch")
+            for s in front.accepted_plan(store, cmd.run_id, epoch_n).slices:
+                cur = front.current_closure(store, cmd.run_id, epoch_n, s.number)
+                if cur is None or cur.kind != EventKind.SLICE_CLOSED:
+                    raise NotAuthorized(f"outcome sliced: slice {s.number} is not currently closed")
+            obs = front.observed_closed_under(store, cmd.run_id, epoch_n, cmd.generation)
+            if obs is None:
+                raise NotAuthorized(
+                    "outcome sliced: no children_observed_closed under this generation -- the firing "
+                    "that ends the run is the firing that read every child (ruling 17)"
+                )
+            base = {"run": cmd.run_id, "epoch": epoch_n}
+            if front.satisfied_obligation(store, cmd.run_id, dict(base, kind="umbrella_close")) is None:
+                raise NotAuthorized("outcome sliced: the umbrella_close comment is not satisfied")
+            # A hand-closed parent owes no close; a satisfied close beside an
+            # observed-open parent is a person's reopening (ruling 22).
+            if obs.payload.get("parent") == "open" and \
+                    front.satisfied_obligation(store, cmd.run_id, dict(base, kind="parent_close")) is None:
+                raise NotAuthorized("outcome sliced: the parent was observed open and its parent_close is not satisfied")
         return "ended"
 
     if cmd.name == "request_merge":

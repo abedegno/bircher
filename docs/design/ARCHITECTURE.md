@@ -119,7 +119,7 @@ session has settled and exits when the tuple is printed.
 | `seat.py` | one waited turn of a seat, shared by the author, the reviewer and the human pass |
 | `author.py` | the author round: the brief and the submission; `author_round` reaches the dispatch and the worktree only through the seat (`seat.run_turn`) |
 | `human.py` | human interaction: the cursor, the discriminator, the batch rules, dismissals and their replies |
-| `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption |
+| `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption; a shaping round before the spec — a one-piece ruling or a slice plan (`coordinator/shape.py`); the slice plan's review and gate; `file_owed` (`coordinator/filing.py`), which files an accepted plan's children in four idempotent passes; and `sweep_sliced` (`coordinator/sweep.py`), run by each wave before it generates the queue |
 
 It returns an eight-field pipe-delimited tuple:
 
@@ -177,7 +177,7 @@ Genuinely non-transitioning: `record_implementation_output`,
 `record_run_outcome` is legal from every state except `ended`. `ended` is
 terminal and unreachable-from.
 
-**Effect classes:** `merge`, `comment`, `status_check`, `pull_request`,
+**Effect classes:** `merge`, `comment`, `status_check`, `pull_request`, `issue_create`,
 `issue_or_label`, `ref_update`, `session_control`.
 
 **Fact kinds (the journal):** `run_started`, `command_requested`,
@@ -187,6 +187,8 @@ terminal and unreachable-from.
 `effect_uncertain`, `effect_reconciled`, `attempt_dispatched`,
 `merge_authorized`, `model_question`, `enqueue_proposed`, `run_enqueued`,
 `revision_proposed`, `bundle_revised`, `shadow_rejected`.
+
+Also added by the shaping phase: the shaping states (`shaping`, `slices_submitted`, `slices_accepted`, `sliced`), the slice-plan grammar (`kernel/slices.py`), the `issue_create` effect class, and `kernel/filing.py` — what `perform` refuses of a filing effect: every argv shape the design adds needs its obligation kind, each kind is bound to its argv's targets, and one satisfied effect exists per obligation.
 
 **Two independent mode switches — do not conflate them:**
 
@@ -248,7 +250,7 @@ path.**
    kernel mode, and its `|| true` swallowed the failure) or — worse, on the
    second item of a run — attributed to the PREVIOUS item's stale exported
    generation.
-4. **The front half.** `phases` runs the loop: author rounds and review seats
+4. **The shaping phase.** Every run is born in `shaping`: the author rules the issue one piece (the run proceeds to `queued`) or writes a slice plan the other vendor reviews; gated by default, the accepted plan is filed as child issues labelled `bircher:queued` only once their blocked-by links exist, the parent carries `bircher:sliced` as an umbrella, and the sweep closes it when its children close. Spec: `docs/superpowers/specs/2026-09-09-shaping-phase-design.md`. **The front half.** `phases` runs the loop: author rounds and review seats
    as sessions under the `v2_author_*` bundles, every session an effect with
    an obligation, every turn's end a fact. Parks for the human (grill, gate,
    stall) exit `RC_PARKED`, and the next pass resumes. `specified` and

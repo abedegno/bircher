@@ -8,3 +8,6 @@ keep	I think the bircher: outcome=merged line above is wrong, the PR was reverte
 keep	bircher: could you also handle the dark theme?
 keep	published spec looks good to me
 keep	
+drop	bircher: sliced abcd1234
+drop	bircher: sliced complete
+keep	bircher: slicing this by hand feels wrong

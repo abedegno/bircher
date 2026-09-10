@@ -93,12 +93,20 @@ COMMAND_NAMES = frozenset({
     # The coordinator's dismissal of a refused human token, and its record of
     # an omnigent prompt item it has already sent -- either role.
     "dismiss_human_item", "record_prompt_item",
-    # A relevant issue change resets the run to `queued` and opens a new
-    # epoch; the kernel refuses an irrelevant one (ruling 13).
+    # A relevant issue change resets the run to `shaping` -- the epoch's first
+    # state, since a changed issue may have changed size (shaping spec §2,
+    # ruling 11) -- and opens a new epoch; the kernel refuses an irrelevant
+    # one (ruling 13).
     "revise_bundle",
     # The kernel's own rendering of the reviewer's brief (spec §2 *Brief*): a
     # front-half review_ruling is refused unless its generation carries one.
     "issue_review_brief",
+    # The shaping phase (shaping spec §2 *States*): the ruling, the slice
+    # plan, and the coordinator's own ungated advance.
+    "record_one_piece", "submit_slices", "advance_ungated",
+    # The filing and closing facts (shaping spec §2).
+    "record_slice_filed", "record_filing_complete", "record_slice_closed",
+    "record_slice_reopened", "record_children_observed_closed",
 })
 
 
@@ -156,7 +164,7 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
     from kernel.authz import phase_of
     state = store.run_state(cmd.run_id)
     phase, epoch_n = phase_of(state), front.epoch(store, cmd.run_id)
-    if cmd.name in ("submit_spec", "submit_plan"):
+    if cmd.name in ("submit_spec", "submit_plan", "submit_slices"):
         h = cmd.payload["artifact_hash"]
         rnd = len(front.submissions(store, cmd.run_id, phase, epoch_n)) + 1
         store.append_fact(
@@ -165,6 +173,67 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             payload={"phase": phase, "epoch": epoch_n, "hash": h, "author": actor, "round": rnd},
         )
         store.set_phase_artifact(cmd.run_id, phase, h)
+    elif cmd.name == "record_one_piece":
+        from kernel.slices import SHAPE_QUESTION
+        # The existing fact and payload shape (record_model_ruling's), with
+        # the reserved question id: the proof's fourth assertion reads it.
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.MODEL_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "question_id": SHAPE_QUESTION, "ruling": "one piece",
+                     "reasoning": cmd.payload["reasoning"], "cost_if_wrong": cmd.payload["cost_if_wrong"]},
+        )
+    elif cmd.name == "advance_ungated":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.ARTIFACT_ADVANCED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"phase": phase, "epoch": epoch_n, "hash": store.phase_artifact(cmd.run_id, phase)},
+        )
+    elif cmd.name == "record_slice_filed":
+        import json as _json
+        row = store.effect_by_key(cmd.payload["effect_key"], run_id=cmd.run_id)
+        delivered = _json.loads(row["external_object_id"])
+        plan = front.accepted_plan(store, cmd.run_id, epoch_n)
+        n = cmd.payload["slice"]
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.SLICE_FILED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            # The number and the database id are OBSERVED from the confirmed
+            # row's delivered value, never taken from the payload.
+            payload={"epoch": epoch_n, "slice": n, "issue": int(delivered["number"]),
+                     "issue_id": int(delivered["id"]), "title": plan.by_number()[n].title,
+                     "parent": front.issue_number(store, cmd.run_id),
+                     "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n)},
+        )
+    elif cmd.name == "record_filing_complete":
+        filed = front.slices_filed(store, cmd.run_id, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.FILING_COMPLETE, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "plan_hash": front.accepted_slices_hash(store, cmd.run_id, epoch_n),
+                     "children": [filed[n].payload["issue"] for n in sorted(filed)]},
+        )
+    elif cmd.name in ("record_slice_closed", "record_slice_reopened"):
+        n = cmd.payload["slice"]
+        issue = front.slices_filed(store, cmd.run_id, epoch_n)[n].payload["issue"]
+        if cmd.name == "record_slice_closed":
+            payload = {"epoch": epoch_n, "slice": n, "issue": issue,
+                       "closed_at": cmd.payload["closed_at"], "state": cmd.payload["state"]}
+            kind = EventKind.SLICE_CLOSED
+        else:
+            payload = {"epoch": epoch_n, "slice": n, "issue": issue, "observed_at": cmd.payload["observed_at"]}
+            kind = EventKind.SLICE_REOPENED
+        store.append_fact(run_id=cmd.run_id, kind=kind, actor=actor,
+                          causal_command_id=cmd.idempotency_key, payload=payload)
+    elif cmd.name == "record_children_observed_closed":
+        plan = front.accepted_plan(store, cmd.run_id, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.CHILDREN_OBSERVED_CLOSED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n, "generation": cmd.generation,
+                     "slices": [s.number for s in plan.slices],
+                     "parent": cmd.payload["parent_state"], "observed_at": cmd.payload["observed_at"]},
+        )
     elif cmd.name == "record_turn_ended":
         prompt = front.newest_prompt(store, cmd.run_id, phase, epoch_n)
         store.append_fact(

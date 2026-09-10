@@ -26,6 +26,10 @@ FORBIDDEN_TO_MODELS = {
     EffectClass.REF_UPDATE, EffectClass.PULL_REQUEST, EffectClass.MERGE,
     EffectClass.STATUS_CHECK, EffectClass.COMMENT, EffectClass.ISSUE_OR_LABEL,
     EffectClass.REVERT_OR_RECOVERY, EffectClass.CREDENTIAL_LIFECYCLE,
+    # Creating a child issue mints work another run will consume (shaping spec
+    # §2): the kernel performs it from its own credential domain, as it does
+    # every other GitHub mutation.
+    EffectClass.ISSUE_CREATE,
 }
 
 

@@ -1434,3 +1434,48 @@ Four advisory findings, all accepted and folded:
 3. accepted — `bircher:sliced` is the filing step's, not the runner's (§1).
 4. accepted — a deleted child is a failure-table row: the signal is in the
    log, and the parent's exit is the person's.
+
+## Amendments from the plan (2026-09-09)
+
+Planning found four places where the text and the code it extends could not
+both hold; each is ruled in
+`docs/superpowers/plans/2026-09-09-shaping-phase.md` and amended here:
+
+1. §2 *The effect class*: "the body file written by the executor from the
+   intent's `body.text`" reads "from the artefact the intent's
+   `body.artifact` names" — the kernel's intent bodies are `{"artifact":
+   <sha256>}`, and the binding compares that blob with `render_child` (plan
+   ruling 1).
+2. §2 *States*, `create_run` → `shaping`: `Store.create_run` takes the
+   initial state; the front half's `enqueue.create_run` passes `shaping`,
+   the v1 `enqueue()` path keeps `queued` (plan ruling 2).
+3. §8: the kernel test driver shapes every run one piece by default
+   (`Front(shape=True)`), so tests of later phases reach `queued` by the
+   only path the kernel admits (plan ruling 3).
+4. §5 *The refused mint*: the scorecard note carries the refusal's first 200
+   characters, which read "run i12-… attempted a child create" (plan ruling
+   12).
+
+Five more places where execution found the text incomplete rather than
+wrong, ruled while building the phase and amended here:
+
+5. §2 *The artefact: a slice plan* (grammar): the slices end at the first
+   `## ` heading that is not a slice heading, so a trailing section such as
+   `## Dispositions` parses; but a `## ` heading after the first slice whose
+   text begins `Slice` (case-insensitively) and does not match `## Slice N:
+   <title>` is a malformed slice heading and refuses the plan by name.
+6. §3 *The sweep*: a failed read ends that run's firing quietly (as
+   written); any other failure while processing one run is logged with the
+   run id and the firing continues with the next run — one run can never
+   wedge the others.
+7. §5 *The runner*: when the kernel's state cannot be read after the phase
+   loop, on either exit code, the item is escalated with a row saying so, no
+   outcome is recorded and the queue file stays for the next wave; the
+   runner never guesses "not sliced" from an empty read.
+8. §5 *The runner*, `is_unblocked`: fail-closed includes a read that exits 0
+   with empty or non-numeric output — such an issue is skipped this wave and
+   the reason printed.
+9. §6 *The proof*: a failed GitHub read is a proof failure line naming the
+   child (or parent) and what could not be read; the remaining children and
+   assertions still run; the tool never exits with a traceback for a read
+   failure.

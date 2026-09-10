@@ -46,6 +46,15 @@ class EventKind:
     HUMAN_ITEM_DISMISSED = "human_item_dismissed"
     PROMPT_ITEM = "prompt_item"
 
+    # The shaping phase (shaping spec §2 *Facts*). Each is written by exactly
+    # one command; see kernel/commands.py::_side_fact.
+    ARTIFACT_ADVANCED = "artifact_advanced"
+    SLICE_FILED = "slice_filed"
+    FILING_COMPLETE = "filing_complete"
+    SLICE_CLOSED = "slice_closed"
+    SLICE_REOPENED = "slice_reopened"
+    CHILDREN_OBSERVED_CLOSED = "children_observed_closed"
+
 
 SCHEMA_VERSIONS = {
     EventKind.RUN_STARTED: 1,
@@ -81,6 +90,12 @@ SCHEMA_VERSIONS = {
     EventKind.HUMAN_DIRECTION: 1,
     EventKind.HUMAN_ITEM_DISMISSED: 1,
     EventKind.PROMPT_ITEM: 1,
+    EventKind.ARTIFACT_ADVANCED: 1,
+    EventKind.SLICE_FILED: 1,
+    EventKind.FILING_COMPLETE: 1,
+    EventKind.SLICE_CLOSED: 1,
+    EventKind.SLICE_REOPENED: 1,
+    EventKind.CHILDREN_OBSERVED_CLOSED: 1,
 }
 
 MECHANISM_VERSION = 1

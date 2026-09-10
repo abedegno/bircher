@@ -84,25 +84,30 @@ class Store:
         )
         return fid
 
-    def create_run(self, *, run_id: str, base_repo: str, base_sha: str) -> None:
+    def create_run(self, *, run_id: str, base_repo: str, base_sha: str,
+                   state: str = "queued") -> None:
         """Create a run, and record the fact that says so.
 
         The row alone is not the truth: without a RUN_STARTED fact the
         projection has nothing to build from and returns None, so state is
         rebuildable only in principle. Facts are the truth; the row is
         derived.
+
+        *state* is where the run is born (planning ruling 2): `queued` for a
+        v1 enqueue whose spec and plan already exist, `shaping` for a run the
+        front half creates from an issue (shaping spec §2).
         """
         from kernel.events import EventKind
 
         self._conn.execute(
             "INSERT INTO runs (run_id, state, base_repo, base_sha, created_at_us)"
             " VALUES (?,?,?,?,?)",
-            (run_id, "queued", base_repo, base_sha, self._clock.now_us()),
+            (run_id, state, base_repo, base_sha, self._clock.now_us()),
         )
         self.append_fact(
             run_id=run_id, kind=EventKind.RUN_STARTED, actor="kernel",
             causal_command_id=None,
-            payload={"base_sha": base_sha, "base_repo": base_repo, "state": "queued"},
+            payload={"base_sha": base_sha, "base_repo": base_repo, "state": state},
         )
 
     def all_run_ids(self) -> list[str]:
@@ -136,6 +141,14 @@ class Store:
         ).fetchone()
         if row is None:
             raise KeyError(f"no such run: {run_id}")
+        return row[0]
+
+    def run_base_repo(self, run_id: str) -> str:
+        row = self._conn.execute(
+            "SELECT base_repo FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
         return row[0]
 
     def run_owner(self, run_id: str) -> str | None:

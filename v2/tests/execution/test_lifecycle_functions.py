@@ -253,7 +253,7 @@ def test_run_start_creates_a_real_run_others_can_build_on(tmp_path):
     assert r.returncode == 0
 
     store = Store.open(db)
-    assert store.run_state("run-1") == "queued"
+    assert store.run_state("run-1") == "shaping"            # Task 3 rule (a)
     assert store.run_base_sha("run-1") == BASE_SHA
     kinds = [f.kind for f in store.facts_for("run-1")]
     assert EventKind.RUN_STARTED in kinds, kinds
@@ -277,7 +277,7 @@ def test_run_start_is_idempotent_on_a_repeated_run_id(tmp_path):
     assert r2.returncode == 0
     assert r2.stdout.strip() == r1.stdout.strip() != ""
     store = Store.open(db)
-    assert store.run_state("run-2") == "queued"
+    assert store.run_state("run-2") == "shaping"            # Task 3 rule (a)
 
 
 def test_run_start_refuses_a_retry_whose_inputs_differ(tmp_path):
@@ -821,8 +821,9 @@ def test_adopting_a_run_reports_the_base_the_KERNEL_recorded(tmp_path):
 
 
 def test_a_MINTED_run_has_NO_fabricated_history(tmp_path):
-    """A minted run must stay at `queued`, and the caller's lifecycle drive
-    must be refused. Those refusals are the gate working.
+    """A minted run must stay where it was born -- `shaping` since Task 3 --
+    and the caller's lifecycle drive must be refused. Those refusals are the
+    gate working.
 
     THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE -- that minting advances the run
     to `implementing` -- and the code seeded submit_spec/submit_plan/
@@ -843,7 +844,7 @@ def test_a_MINTED_run_has_NO_fabricated_history(tmp_path):
     assert run_id.startswith("brand-new-adopted-"), run_id
 
     st = Store.open(db)
-    assert st.run_state(run_id) == "queued", (
+    assert st.run_state(run_id) == "shaping", (                 # Task 3 rule (a)
         f"a minted run is at {st.run_state(run_id)!r}: something advanced it, "
         "which means a history was manufactured for a PR that has none")
     accepted = {(f.payload or {}).get("command_name") for f in st.facts_for(run_id)

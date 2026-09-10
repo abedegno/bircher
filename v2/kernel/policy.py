@@ -13,7 +13,7 @@ from kernel.canon import canonical_hash
 from kernel.events import EventKind
 
 GRILLS = ("human", "model")
-PHASES = ("spec", "plan")
+PHASES = ("slices", "spec", "plan")
 ROUNDS = range(1, 6)      # 1..5
 SEATS = range(4, 41)      # 4..40
 
@@ -25,7 +25,7 @@ class PolicyFrozen(Exception):
 @dataclass(frozen=True)
 class Policy:
     grill: str = "model"
-    gates: frozenset[str] = frozenset({"spec"})
+    gates: frozenset[str] = frozenset({"slices", "spec"})
     max_rounds: int = 3
     max_seats: int = 16
 
@@ -51,7 +51,7 @@ def derive(labels: Iterable[str], project_config: dict) -> Policy:
     grill = cfg.get("grill", "model")
     if grill not in GRILLS:
         raise ValueError(f"policy grill must be one of {GRILLS}, got {grill!r}")
-    raw_gates = cfg.get("gates", ["spec"])
+    raw_gates = cfg.get("gates", ["slices", "spec"])
     if not isinstance(raw_gates, (list, tuple, set, frozenset)):
         raise ValueError("policy gates must be a list")
     gates = set(raw_gates)

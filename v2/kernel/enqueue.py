@@ -32,6 +32,11 @@ class NotApproved(Exception):
     """Enqueue attempted without a human at the operator's path."""
 
 
+class IssueAlreadySliced(Exception):
+    """An earlier run of this issue attempted a child create; an issue is
+    sliced once (shaping spec §2, ruling 12)."""
+
+
 def propose_enqueue(store, run_id: str, *, reason: str) -> None:
     """The model path. Records the request and enqueues nothing.
 
@@ -115,11 +120,12 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
                issue: dict, project_config: dict) -> dict:
     """Spec §2: `create_run(issue, project_config)`.
 
-    One transaction: the run row (`queued`), the canonical snapshot bytes PUT
-    under `bundle_hash`, `policy_frozen`, `run_enqueued`. Replay only an
-    identical request; a retry whose inputs differ is `NotReplayable` -- the
-    earlier `enqueue` recomputed its answer from the RETRY's arguments and
-    reported success for a policy the journal did not hold.
+    One transaction: the run row (`shaping`, shaping spec §2), the canonical
+    snapshot bytes PUT under `bundle_hash`, `policy_frozen`, `run_enqueued`.
+    Replay only an identical request; a retry whose inputs differ is
+    `NotReplayable` -- the earlier `enqueue` recomputed its answer from the
+    RETRY's arguments and reported success for a policy the journal did not
+    hold.
     """
     labels = sorted(set(issue.get("labels", [])))
     # Validate BEFORE touching the store or hashing: `derive` raises for any
@@ -132,6 +138,21 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
     raw = canonical_bytes(snap)
     bhash = content_hash(raw)
     cfg_hash = canonical_hash({} if project_config is None else project_config)
+
+    from kernel import front
+    prior = front.create_attempted_for_issue(store, base_repo, int(snap["number"]))
+    if prior is not None and not _run_exists(store, run_id):
+        # The run AND ITS ROWS (spec §2 *An issue is sliced once*: "The refusal
+        # names the run and its rows"). Naming only the run leaves the person
+        # the refusal is addressed to hunting for which children exist, which
+        # is the very question the refusal asks them to answer.
+        prior_run, rows = prior
+        named = ", ".join(f"{r['idempotency_key']} [{r['state']}]" for r in rows)
+        raise IssueAlreadySliced(
+            f"issue #{snap['number']} of {base_repo}: run {prior_run} attempted a child create, so a child "
+            f"may exist; rows {named}. An issue is sliced once (shaping spec §2). Close the children that "
+            "should not be worked and open a new issue for what remains (§9)."
+        )
 
     if _run_exists(store, run_id):
         started = store.newest_fact(run_id, EventKind.RUN_STARTED)
@@ -153,7 +174,8 @@ def create_run(store, *, run_id: str, base_repo: str, base_sha: str,
                 "policy": to_payload(policy_of(store, run_id)), "replayed": True}
 
     with store.transaction():
-        store.create_run(run_id=run_id, base_repo=base_repo, base_sha=base_sha)
+        store.create_run(run_id=run_id, base_repo=base_repo, base_sha=base_sha,
+                         state="shaping")
         put = put_artifact(store, raw)
         assert put == bhash, "bundle_hash is content_hash(canonical_bytes(snapshot))"
         p = freeze(store, run_id, labels=labels, project_config=project_config)

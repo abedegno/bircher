@@ -53,7 +53,7 @@ def round_bound(store, run_id: str, phase: str, epoch_n: int) -> int:
     return policy_of(store, run_id).max_rounds + round_grants(store, run_id, phase, epoch_n)
 
 
-FRONT_PHASES = ("spec", "plan")
+FRONT_PHASES = ("slices", "spec", "plan")
 
 #: Ruling 14: the server names the bundle, the dispatch names the vendor.
 BUNDLE_PREFIX = "v2_author_"
@@ -270,3 +270,147 @@ def prompt_hashes_of(store, run_id: str, session_id: str) -> set[str]:
             out.add(row["intent"].get("body", {}).get("artifact"))
     out.discard(None)
     return out
+
+
+def frozen_labels(store, run_id: str) -> list[str]:
+    """The issue's labels as `policy_frozen` recorded them, UNFILTERED
+    (policy.py `freeze`): the observable the depth refusal reads, since the
+    bundle canon strips every bircher: label."""
+    fact = store.newest_fact(run_id, EventKind.POLICY_FROZEN)
+    return [] if fact is None else list(fact.payload.get("labels") or [])
+
+
+def shape_ruling(store, run_id: str, epoch_n: int):
+    """The epoch's `model_ruling {question_id: "shape"}`, or None."""
+    from kernel.slices import SHAPE_QUESTION
+    for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, epoch_n):
+        if f.payload.get("question_id") == SHAPE_QUESTION:
+            return f
+    return None
+
+
+# -- the shaping phase (shaping spec §2, §3) ------------------------------------
+
+FILING_KINDS = frozenset({"slice_issue", "slice_dependency", "slice_queue", "umbrella", "umbrella_label"})
+COMPLETION_KINDS = frozenset({"umbrella_close", "parent_close"})
+
+
+def is_satisfied(row: dict) -> bool:
+    return _satisfied(row)
+
+
+def issue_number(store, run_id: str) -> int:
+    """The run's issue, from the bundle snapshot the kernel holds."""
+    return int(json.loads(store.read_blob(bundle_hash(store, run_id)))["number"])
+
+
+def accepted_slices_hash(store, run_id: str, epoch_n: int) -> str | None:
+    """The hash the epoch's `human_ruling {approve, phase: slices}` or
+    `artifact_advanced {phase: slices}` named: the plan a reviewer accepted
+    and the gate passed, not any plan submitted (spec §2 *What perform
+    refuses*)."""
+    found = None
+    for f in store.facts_of_kind(run_id, EventKind.HUMAN_RULING, EventKind.ARTIFACT_ADVANCED):
+        p = f.payload
+        if p.get("phase") != "slices" or p.get("epoch") != epoch_n:
+            continue
+        if f.kind == EventKind.HUMAN_RULING:
+            if p.get("ruling") == "approve":
+                found = p.get("artifact_hash")
+        else:
+            found = p.get("hash")
+    return found
+
+
+def accepted_plan(store, run_id: str, epoch_n: int | None = None):
+    from kernel import slices
+    n = epoch(store, run_id) if epoch_n is None else epoch_n
+    h = accepted_slices_hash(store, run_id, n)
+    return None if h is None else slices.parse(store.read_blob(h))
+
+
+def slices_filed(store, run_id: str, epoch_n: int) -> dict:
+    return {f.payload["slice"]: f for f in epoch_facts(store, run_id, EventKind.SLICE_FILED, epoch_n)}
+
+
+def filing_complete(store, run_id: str, epoch_n: int):
+    fs = epoch_facts(store, run_id, EventKind.FILING_COMPLETE, epoch_n)
+    return fs[-1] if fs else None
+
+
+def current_closure(store, run_id: str, epoch_n: int, n: int):
+    """The slice's newest `slice_closed` or `slice_reopened` in the epoch, or
+    None: a closure is an observation with a date, not a property."""
+    found = None
+    for f in store.facts_of_kind(run_id, EventKind.SLICE_CLOSED, EventKind.SLICE_REOPENED):
+        if f.payload.get("epoch") == epoch_n and f.payload.get("slice") == n:
+            found = f
+    return found
+
+
+def observed_closed_under(store, run_id: str, epoch_n: int, generation: int):
+    for f in epoch_facts(store, run_id, EventKind.CHILDREN_OBSERVED_CLOSED, epoch_n):
+        if f.payload.get("generation") == generation:
+            return f
+    return None
+
+
+def satisfied_obligation(store, run_id: str, ob: dict) -> dict | None:
+    for row in store.effects_for(run_id):
+        if (row.get("intent") or {}).get("obligation") == ob and _satisfied(row):
+            return row
+    return None
+
+
+def filing_obligations(store, run_id: str, epoch_n: int) -> list[dict]:
+    """Every obligation the accepted plan implies (spec §2
+    `record_filing_complete`, §3 *Filing the children*), the one source of
+    their shapes: creates, then links, then queue labels, then the umbrella
+    and its label."""
+    plan = accepted_plan(store, run_id, epoch_n)
+    h = accepted_slices_hash(store, run_id, epoch_n)
+    parent = issue_number(store, run_id)
+    base = {"run": run_id, "epoch": epoch_n}
+    obs = [dict(base, kind="slice_issue", slice=s.number, parent=parent, plan_hash=h) for s in plan.slices]
+    obs += [dict(base, kind="slice_dependency", plan_hash=h, slice=n, blocker=b) for n, b in plan.edges()]
+    obs += [dict(base, kind="slice_queue", plan_hash=h, slice=s.number) for s in plan.slices]
+    obs += [dict(base, kind="umbrella", plan_hash=h), dict(base, kind="umbrella_label", plan_hash=h)]
+    return obs
+
+
+def unsatisfied_filing(store, run_id: str, epoch_n: int) -> list[dict]:
+    return [ob for ob in filing_obligations(store, run_id, epoch_n)
+            if satisfied_obligation(store, run_id, ob) is None]
+
+
+def issue_create_rows(store, run_id: str) -> list[dict]:
+    return [r for r in store.effects_for(run_id) if r["effect_class"] == "issue_create"]
+
+
+def create_attempted_for_issue(store, base_repo: str, number: int) -> tuple[str, list[dict]] | None:
+    """A run of the same repository and issue holding ANY issue_create row
+    not reconciled not-delivered -- intended, confirmed, uncertain or
+    reconciled delivered -- whatever that run's state (spec §2 *An issue is
+    sliced once*, ruling 12), AND those rows. The observable is the attempt: a
+    child may exist from the first attempt on.
+
+    `(run_id, rows)` rather than the run id alone because the spec says the
+    refusal "names the run and its rows": a person told only that some earlier
+    run attempted a create has to go and find which children exist before they
+    can act on the refusal, and the journal already knows.
+    """
+    for rid in store.all_run_ids():
+        try:
+            if store.run_base_repo(rid) != base_repo:
+                continue
+            enq = store.newest_fact(rid, EventKind.RUN_ENQUEUED)
+            blob = None if enq is None or not enq.payload.get("bundle_hash") else store.read_blob(enq.payload["bundle_hash"])
+            if blob is None or int(json.loads(blob).get("number", -1)) != number:
+                continue
+        except (KeyError, ValueError, TypeError):
+            continue
+        rows = [row for row in issue_create_rows(store, rid)
+                if not (row["state"] == "reconciled" and row.get("external_object_id") in (None, ""))]
+        if rows:
+            return rid, rows
+    return None

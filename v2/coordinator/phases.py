@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from coordinator import sessions
 from coordinator.effects import perform_effect
 from kernel import front
-from kernel.authz import FRONT_HALF_STATES, phase_of
+from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, phase_of
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
 
@@ -16,12 +16,12 @@ PUBLISH_CAP = 60_000
 APPROVED_AT = {"spec": ("specified", "plan_submitted", "plan_accepted", "planned"),
                "plan": ("planned",)}
 _BEYOND_FRONT = ("implementing", "reviewing", "merge_requested", "merged", "ended")
-#: The states `run_loop` works in. `planned` is one of them because the pass
-#: that REACHES it still owes the plan's publication (§3 Artefacts); every
-#: state past it belongs to the back half, and the loop exits 0 without
-#: retiring, publishing or dispatching anything (§3: "A run already at or
-#: beyond `planned` exits 0 at once").
-_LOOP_STATES = FRONT_HALF_STATES | frozenset({"planned"})
+#: The states `run_loop` works in. `planned` and `sliced` are the two the
+#: loop reaches and then exits from: the pass that reaches `planned` still
+#: owes the plan's publication, and the pass that reaches `sliced` owes the
+#: filing (shaping spec §2, §3). Every state past them belongs to nothing
+#: this loop touches.
+_LOOP_STATES = FRONT_HALF_STATES | SHAPING_STATES | frozenset({"planned", "sliced"})
 
 
 @dataclass
@@ -67,7 +67,8 @@ ROUND_CAUSE_KINDS = frozenset({
 
 def _is_round_cause(f) -> bool:
     if f.kind == EventKind.COMMAND_REJECTED:
-        return f.payload.get("command_name") in ("submit_spec", "submit_plan") and f.actor != "human"
+        return f.payload.get("command_name") in ("submit_spec", "submit_plan", "submit_slices",
+                                                  "record_one_piece") and f.actor != "human"
     return f.kind in ROUND_CAUSE_KINDS
 
 
@@ -109,11 +110,11 @@ def derived_session_obligation(ctx: Ctx) -> dict | None:
     `queued`/`specified`, the seat's at `*_submitted`, the parked session's
     at `*_accepted` when its park has no session yet -- else None."""
     state, phase, n = ctx.state(), ctx.phase(), ctx.epoch()
-    if state in ("queued", "specified"):
+    if state in ("queued", "specified", "shaping"):
         cause = round_cause(ctx).id
-    elif state in ("spec_submitted", "plan_submitted"):
+    elif state in ("spec_submitted", "plan_submitted", "slices_submitted"):
         cause = seat_cause(ctx).id
-    elif state in ("spec_accepted", "plan_accepted"):
+    elif state in ("spec_accepted", "plan_accepted", "slices_accepted"):
         park = front.current_park(ctx.store, ctx.run_id)
         if park is None or park.payload.get("session_id"):
             return None
@@ -347,11 +348,12 @@ def run_loop(ctx: Ctx) -> int:
     supersedes it; `retire_owed` and `publish_owed` perform their effects
     under the coordinator's generation.
     """
-    from coordinator import author, human, review
+    from coordinator import author, human, review, seat
     from coordinator.session import AgentMismatch
     from coordinator.sessions import WorktreeExists
     from kernel.dispatch import PendingEffects, Role, dispatch
     from kernel.effects import UncertainEffect, is_halted, pending_reconciliation
+    from kernel.policy import policy_of
     store, run_id = ctx.store, ctx.run_id
     if is_halted(store, run_id) or pending_reconciliation(store, run_id):
         ctx.log(f"run {run_id} halted or holds pending effects: {pending_reconciliation(store, run_id)}")
@@ -374,6 +376,12 @@ def run_loop(ctx: Ctx) -> int:
             state = ctx.state()
             if state == "planned":
                 return Exit.OK
+            if state == "sliced":
+                # The pass that reaches `sliced` owes the filing (shaping spec
+                # §3); the run then waits for its children and the sweep.
+                from coordinator import filing
+                filing.file_owed(ctx)
+                return Exit.OK
             # The park comes first: the state alone is ambiguous, and a run
             # at `spec_submitted` with a current park needs the human, not
             # another review.
@@ -381,6 +389,20 @@ def run_loop(ctx: Ctx) -> int:
             if park is not None:
                 if human.human_pass(ctx, park) == "parked":
                     return Exit.PARKED
+                continue
+            if state == "shaping":
+                from coordinator import shape
+                out = shape.shape_round(ctx)
+                if out == "budget":
+                    if stall(ctx, "budget_exhausted", session_id=None, findings_hash=None, verdict=None,
+                             reviewer=None) == "parked":
+                        return Exit.PARKED
+                elif out == "stall":
+                    if stall(ctx, "identical_resubmission", session_id=_newest_author_session(ctx),
+                             findings_hash=None, verdict=None, reviewer=None) == "parked":
+                        return Exit.PARKED
+                elif out == "failed":
+                    return Exit.FAILED
                 continue
             if state in ("queued", "specified"):
                 out = author.author_round(ctx)
@@ -399,7 +421,7 @@ def run_loop(ctx: Ctx) -> int:
                 elif out == "failed":
                     return Exit.FAILED
                 continue
-            if state in ("spec_submitted", "plan_submitted"):
+            if state in ("slices_submitted", "spec_submitted", "plan_submitted"):
                 out = review.review_round(ctx)
                 if out.status == "recorded":
                     continue
@@ -413,7 +435,15 @@ def run_loop(ctx: Ctx) -> int:
                          reviewer=out.reviewer or None) == "parked":
                     return Exit.PARKED
                 continue
-            if state in ("spec_accepted", "plan_accepted"):
+            if state in ("slices_accepted", "spec_accepted", "plan_accepted"):
+                if state == "slices_accepted" and "slices" not in policy_of(store, run_id).gates:
+                    # The coordinator's own transition when the policy holds no
+                    # slice gate (shaping spec §2 `advance_ungated`): its own
+                    # fact, because filing children is an effect with an
+                    # obligation and the transition that authorises it must be
+                    # one. Under the pass's operator generation.
+                    seat.command(ctx, "advance_ungated", {})
+                    continue
                 if stall(ctx, "gate", session_id=_newest_author_session(ctx), findings_hash=None, verdict=None,
                          reviewer=None) == "parked":
                     return Exit.PARKED

@@ -16,7 +16,7 @@ def _store(tmp_path):
     return Store.open(tmp_path / "k.db")
 
 
-def test_a_relevant_change_resets_to_queued_and_bumps_the_epoch(tmp_path):
+def test_a_relevant_change_resets_to_shaping_and_bumps_the_epoch(tmp_path):
     s = _store(tmp_path)
     f = Front(s, "r-1", issue=dict(ISSUE, labels=["bircher:queued", "bircher:autonomous"]))
     f.author_round(SPEC_BYTES); f.review_round("accept")
@@ -25,8 +25,8 @@ def test_a_relevant_change_resets_to_queued_and_bumps_the_epoch(tmp_path):
     old_hash = front.bundle_hash(s, "r-1")
     new_issue = dict(ISSUE, body="B\n\nAlso handle the dark theme.",
                      labels=["bircher:running", "bircher:autonomous"])
-    f.revise(new_issue)
-    assert s.run_state("r-1") == "queued"
+    f.revise(new_issue, reshape=False)
+    assert s.run_state("r-1") == "shaping"           # Task 3 rule (d)
     assert front.epoch(s, "r-1") == 1
     fact = s.newest_fact("r-1", EventKind.BUNDLE_REVISED)
     new_hash = bundle.bundle_hash(bundle.snapshot(new_issue))
@@ -39,6 +39,8 @@ def test_a_relevant_change_resets_to_queued_and_bumps_the_epoch(tmp_path):
     assert front.bundle_hash(s, "r-1") == new_hash
     # The phase artefacts of epoch 0 are still readable, but a fresh epoch submits afresh.
     assert s.phase_artifact("r-1", "spec") is not None
+    f.shape_round()                                  # the new epoch is ruled one piece
+    assert s.run_state("r-1") == "queued"
     f.author_round(SPEC_BYTES)                       # same bytes, new epoch: not identical
     assert s.run_state("r-1") == "spec_submitted"
     assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["epoch"] == 1
@@ -63,9 +65,9 @@ def test_revision_consumes_a_park_and_is_not_a_round(tmp_path):
     g = f._dispatch(Role.REVIEWER, "codex")
     f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id": None,
                        "findings_hash": None, "verdict": None, "reviewer": None})
-    f.revise(dict(ISSUE, title="T2"))
+    f.revise(dict(ISSUE, title="T2"), reshape=False)
     assert front.current_park(s, "r-1") is None            # the transition consumed it
-    assert s.run_state("r-1") == "queued"
+    assert s.run_state("r-1") == "shaping"                 # Task 3 rule (d)
 
 
 def test_snapshot_diff_shape_and_cap():

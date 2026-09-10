@@ -69,7 +69,7 @@ bash batch/launch.sh
 
 That detaches with `setsid` so the run survives the shell that started it, and refuses to start over a live run. Add `--foreground` to watch it.
 
-Issues move `bircher:queued` → `bircher:running` → closed on merge, or `bircher:escalated` if the runner could not finish safely. Escalation is a normal outcome, not a crash: it means the run declined to merge something it could not verify.
+Issues move `bircher:queued` → `bircher:running` → closed on merge, or `bircher:escalated` if the runner could not finish safely. Escalation is a normal outcome, not a crash: it means the run declined to merge something it could not verify. A parent issue accepted for slicing carries `bircher:sliced` as an umbrella instead of moving through that flow itself; its children are filed labelled `bircher:slice` and then move `bircher:queued` → `bircher:running` → closed like any other issue, and the sweep closes the parent once they do.
 
 ## Commands
 

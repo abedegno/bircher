@@ -148,3 +148,37 @@ def test_obligation_mismatch_is_not_replayable(tmp_path):
     with pytest.raises(NotReplayable):
         perform(s, "r-1", gen, EffectClass.SESSION_CONTROL, "sess-stop:s1:1",
                 {"argv": EVENTS}, lambda *a: "never")
+
+
+def test_issue_create_writes_the_body_file_after_the_check_and_reads_the_id_back(tmp_path, monkeypatch):
+    """Planning ruling 1 and 6: the body is the artefact the intent names,
+    passed as --body-file after the contract check; the confirmation reads
+    the created issue's database id back and returns {url, number, id}."""
+    import json
+    from kernel import cli
+    from kernel.artifacts import put_artifact
+    from kernel.store import Store
+    s = Store.open(tmp_path / "k.db")
+    h = put_artifact(s, b"Slice 1 of #12 (bircher shaping abcd1234)\n\nbody\n")
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv)
+        class R: returncode, stderr = 0, ""
+        r = R()
+        if "create" in argv:
+            path = argv[argv.index("--body-file") + 1]
+            assert open(path, "rb").read() == s.read_blob(h)
+            r.stdout = "https://github.com/o/r/issues/40\n"
+        else:
+            r.stdout = "1040\n"
+        return r
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "resolve_command", lambda argv: argv)
+    ex = cli.make_executor(s)
+    out = ex("issue_create", {"argv": ["gh", "issue", "create", "--repo", "o/r", "--title", "T", "--label", "bircher:slice"],
+                              "body": {"artifact": h}}, "k")
+    assert json.loads(out) == {"id": 1040, "number": 40, "url": "https://github.com/o/r/issues/40"}
+    assert seen[0][:3] == ["gh", "issue", "create"] and "--body-file" in seen[0]
+    assert seen[1][:3] == ["gh", "api", "repos/o/r/issues/40"] and seen[1][3:] == ["--jq", ".id"]
+    assert not __import__("os").path.exists(seen[0][seen[0].index("--body-file") + 1])

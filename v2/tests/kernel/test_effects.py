@@ -49,7 +49,7 @@ def test_the_effect_classes_are_all_declared():
     assert sorted(EffectClass.ALL) == sorted([
         "ref_update", "pull_request", "merge", "status_check", "comment",
         "issue_or_label", "revert_or_recovery", "credential_lifecycle",
-        "session_control",
+        "session_control", "issue_create",
     ])
 
 

@@ -193,6 +193,23 @@ _kernel_state() {  # <run_id>
   printf '%s' "$out"
 }
 
+# _kernel_sliced_children <run_id> -> the issue numbers of the children the
+# run filed (its slice_filed facts), space-separated; empty if none.
+_kernel_sliced_children() {  # <run_id>
+  local out=""
+  out=$( K_RUN_ID="$1" BIRCHER_V2_DIR="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -c '
+import os, sys
+sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
+from kernel import front
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+rid = os.environ["K_RUN_ID"]
+filed = front.slices_filed(s, rid, front.epoch(s, rid))
+print(" ".join(str(filed[n].payload["issue"]) for n in sorted(filed)))' 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
 # _kernel_run_base <run_id> -> the base sha the kernel recorded, or empty.
 # Empty means the kernel has nothing to check provenance against, which for
 # publication is a refusal, not a default.
@@ -543,7 +560,7 @@ import json, os, sys
 sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
 from kernel.bundle import from_gh
 from kernel.effects import NotReplayable
-from kernel.enqueue import create_run
+from kernel.enqueue import IssueAlreadySliced, create_run
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 issue = from_gh(json.load(open(os.environ["K_ISSUE_JSON"])))
@@ -553,6 +570,8 @@ try:
                      base_sha=os.environ["K_BASE_SHA"], issue=issue, project_config=cfg)
 except NotReplayable as exc:
     print(f"create_run NotReplayable: {exc}", file=sys.stderr); sys.exit(1)
+except IssueAlreadySliced as exc:
+    print(f"create_run refused: {exc}", file=sys.stderr); sys.exit(1)
 print(out["bundle_hash"])
 '
   local out

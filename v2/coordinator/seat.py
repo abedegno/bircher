@@ -19,6 +19,9 @@ from kernel.dispatch import dispatch
 ARTIFACT_OUT = "bircher/artifact.md"
 QUESTIONS_OUT = "bircher/questions.md"
 
+#: The shaping round's ruling file (shaping spec §3): read before the artefact.
+SHAPE_OUT = "bircher/shape.md"
+
 
 @dataclass
 class Turn:

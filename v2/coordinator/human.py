@@ -131,7 +131,8 @@ def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, s
     single = texts[0].casefold() if len(texts) == 1 else None
     if single == RETRY:
         return "retry", ""
-    if state in ("spec_submitted", "spec_accepted", "plan_submitted", "plan_accepted"):
+    if state in ("slices_submitted", "slices_accepted", "spec_submitted", "spec_accepted",
+                 "plan_submitted", "plan_accepted"):
         if single == APPROVE:
             return "approve", ""
         return "revision", joined

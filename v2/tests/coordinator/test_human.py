@@ -58,7 +58,7 @@ def _session_with_prompt(s, f, fake, ctx, text=b"the brief"):
     ([" Approve "], "spec_accepted", ("approve", "")),
     (["approve?"], "spec_accepted", ("revision", "approve?")),
     (["approve."], "spec_accepted", ("revision", "approve.")),
-    (["approve", "but fix the title"], "spec_accepted", ("revision", "approve\n\nbut fix the title")),
+    (["approve", "but fix the title"], "slices_accepted", ("revision", "approve\n\nbut fix the title")),
     (["retry"], "spec_submitted", ("retry", "")),
     (["retry"], "queued", ("retry", "")),
     (["use sqlite"], "queued", ("direction", "use sqlite")),

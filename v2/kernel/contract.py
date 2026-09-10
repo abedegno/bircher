@@ -154,6 +154,13 @@ class Rule:
     #: may not start with `@`: curl reads `@path` as a FILE, which is an
     #: arbitrary local read baked into a request body, not a body.
     forbid_value_prefix: tuple[tuple[str, str], ...] = ()
+    #: (flag, values) pairs: the flag may not carry any of those values. The
+    #: filing step creates children with `bircher:slice` and the inherited
+    #: policy labels; `bircher:queued`, `bircher:running` and `bircher:sliced`
+    #: are the runner's and the filing step's to set LATER (shaping spec §2),
+    #: and a created issue carrying `queued` would be runnable before its
+    #: links exist.
+    forbid_value: tuple[tuple[str, frozenset], ...] = ()
 
 
 _GH_COMMON = frozenset({"--repo"})
@@ -235,6 +242,21 @@ CONTRACTS: dict[str, list[Rule]] = {
              valued=frozenset({"--repo", "--comment"})),
         Rule("gh issue reopen", flags=_GH_COMMON | {"--comment"},
              valued=frozenset({"--repo", "--comment"})),
+        # The write half of the endpoint the queue generator reads
+        # (`is_unblocked`, issues-to-queue.sh): a blocked-by link between two
+        # issues (shaping spec §2).
+        Rule("gh api", url_path=r"/issues/\d+/dependencies/blocked_by$", flags=frozenset({"-X", "-f"}),
+             valued=frozenset({"-X", "-f"}), methods=frozenset({"POST"})),
+    ],
+    # The child issue (shaping spec §2 *The effect class*). No --body-file:
+    # the executor appends it after this check, from the artefact the intent's
+    # body names (planning ruling 1). The three runner labels are refused as
+    # values, so no create can queue a child before its links exist.
+    EffectClass.ISSUE_CREATE: [
+        Rule("gh issue create", flags=_GH_COMMON | {"--title", "--label"},
+             valued=frozenset({"--repo", "--title", "--label"}),
+             required=frozenset({"--repo", "--title"}),
+             forbid_value=(("--label", frozenset({"bircher:queued", "bircher:running", "bircher:sliced"})),)),
     ],
     EffectClass.REVERT_OR_RECOVERY: [
         Rule("git revert", flags=frozenset({"-n", "--no-edit", "-m"}),
@@ -283,6 +305,29 @@ def _rule_parts(argv: list[str], rule) -> list[str]:
     return argv[lead:]
 
 
+def endpoint_path(operand: str) -> str:
+    """The endpoint a URL-ish operand names, with everything that is not the
+    endpoint removed: the scheme, the authority (host[:port]), the query and
+    the fragment.
+
+    A `gh api` operand carries no scheme at all (`repos/o/r/...`) and already
+    IS the path; a `curl` operand is a full URL; and `gh` accepts the same
+    endpoint with a leading slash or spelled as a full `https://api.github.com`
+    URL. `kernel.filing` reads its shapes through THIS function, so what the
+    contract admits and what the filing mandate recognises cannot drift: five
+    contract-admitted spellings of three commands reached the executor with no
+    obligation while the mandate matched only the kernel's own spelling (final
+    review, finding 1).
+    """
+    target = operand
+    if "://" in target:
+        after_scheme = target.split("://", 1)[1]
+        _, _, after_authority = after_scheme.partition("/")
+        target = "/" + after_authority
+    # Query and fragment are DATA. The path is the endpoint.
+    return target.split("#", 1)[0].split("?", 1)[0]
+
+
 def check(effect_class: str, argv: list[str]) -> Rule:
     """Refuse an argv inconsistent with its declared class; return the rule
     that matched, so a caller can act on WHICH shape was authorized."""
@@ -313,19 +358,13 @@ def check(effect_class: str, argv: list[str]) -> Rule:
             if scheme is not None and scheme not in rule.schemes:
                 reasons.append(f"{rule.sig}: scheme {scheme!r} not permitted")
                 continue
-            # The authority (host[:port]) is transport, not endpoint. A `gh
-            # api` operand carries no scheme at all (`repos/o/r/...`), so the
-            # whole operand already IS the path; a `curl` operand is a full
-            # URL, and ANCHORING url_path (this task) only means something
-            # once the host it was never anchored against is gone -- the old
-            # unanchored `/v1/sessions` matched `http://srv/v1/sessions` as a
-            # substring, which a `^...$` pattern cannot.
-            if scheme is not None:
-                after_scheme = target.split("://", 1)[1]
-                _, _, after_authority = after_scheme.partition("/")
-                target = "/" + after_authority
-            # Query and fragment are DATA. The path is the endpoint.
-            path = target.split("#", 1)[0].split("?", 1)[0]
+            # The authority (host[:port]) is transport, not endpoint, and
+            # ANCHORING url_path (Task 4) only means something once the host it
+            # was never anchored against is gone -- the old unanchored
+            # `/v1/sessions` matched `http://srv/v1/sessions` as a substring,
+            # which a `^...$` pattern cannot. `endpoint_path` is that
+            # normalisation, shared with `kernel.filing`.
+            path = endpoint_path(target)
             if not re.search(rule.url_path, path):
                 reasons.append(
                     f"{rule.sig}: url path {path!r} does not match {rule.url_path!r}")
@@ -376,6 +415,11 @@ def check(effect_class: str, argv: list[str]) -> Rule:
                       if any(v.startswith(pre) for v in p.values.get(f, []))]
         if bad_prefix:
             reasons.append(f"{rule.name}: {bad_prefix} value may not start with a file/prefix")
+            continue
+        bad_value = [f for f, vals in rule.forbid_value
+                     if set(p.values.get(f, [])) & set(vals)]
+        if bad_value:
+            reasons.append(f"{rule.sig}: {bad_value} carry a value the rule refuses")
             continue
         return rule
     raise ContractViolation(
