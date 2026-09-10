@@ -112,8 +112,14 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
     assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL,
                                  ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:running",
                                   "--remove-label", "bircher:queued"]) == frozenset()
-    # A close on some OTHER issue, or on the parent of a run not in sliced, demands nothing.
-    assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 99)) == frozenset()
+    # EVERY close while the run is sliced demands the parent close, even one
+    # naming another issue (gh's operand grammar is not ours to model; the
+    # binding admits only the composer's argv) -- and the parent's close on a
+    # run that is NOT sliced demands nothing.
+    assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 99)) == {"parent_close"}
+    s2 = Store.open(tmp_path / "k2.db")
+    f2 = Front(s2, "i12-epic-1", shape=False, issue=ISSUE)                     # born in shaping, never sliced
+    assert filing.required_kinds(s2, f2.run_id, EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 12)) == frozenset()
 
 
 #: THE SAME FIVE COMMANDS, spelled the way the CONTRACT admits them rather than
@@ -160,6 +166,18 @@ _OTHER_SPELLINGS = [
      {"parent_close"}),
     ("close-by-url-percent-encoded", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "close", "https://github.com/o/r/issues/12%2F", "--repo", "o/r"],
+     {"parent_close"}),
+    # gh also reads a signed number and a PULL url as the same number, and its
+    # grammar keeps growing -- so every close during a sliced run demands the
+    # parent close, whatever the operand; even one naming another issue.
+    ("close-by-signed-number", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "+12", "--repo", "o/r"],
+     {"parent_close"}),
+    ("close-by-pull-url", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/pull/12", "--repo", "o/r"],
+     {"parent_close"}),
+    ("close-of-another-issue-while-sliced", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "99", "--repo", "o/r"],
      {"parent_close"}),
 ]
 

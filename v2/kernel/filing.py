@@ -18,7 +18,6 @@ argv shape and not two.
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote
 
 from kernel import front, slices
 from kernel.authz import NotAuthorized
@@ -36,9 +35,6 @@ _WITH_SLICE = frozenset({"slice_issue", "slice_dependency", "slice_queue"})
 #: URL -- both admitted by the same rule in `contract.CONTRACTS` -- demanded no
 #: obligation at all (final review, finding 1).
 _BLOCKED_BY = re.compile(r"/issues/(\d+)/dependencies/blocked_by$")
-#: `gh issue close` takes an issue number or an issue URL, and they close the
-#: same issue.
-_ISSUE_URL = re.compile(r"/issues/(\d+)")
 _VALUED = frozenset({"--repo", "--title", "--label", "--body", "--add-label", "--remove-label",
                      "--comment", "-X", "-f", "--jq"})
 
@@ -108,23 +104,6 @@ def _blocked_by(ops: list[str]) -> tuple[str, int] | None:
     return (path, int(m.group(1))) if m else None
 
 
-def _issue_operand(tok: str) -> int | None:
-    """The issue an operand names: `12`, or a URL/path ending `/issues/12`."""
-    if not isinstance(tok, str):
-        return None
-    # Read the operand the way gh does, generously: gh strips whitespace,
-    # reads `#12` as 12, decodes the URL path and matches `/issues/<n>` WITHOUT
-    # an end anchor, so a trailing slash, a trailing space or any suffix still
-    # names issue 12 (final re-review; Codex's review of 34d6f1b). Demanding an
-    # obligation for a spelling gh would reject costs nothing -- the BINDING
-    # admits only the composer's argv -- so the mandate errs on demanding.
-    tok = unquote(tok).strip().lstrip("#")
-    if tok.isdigit():
-        return int(tok)
-    m = _ISSUE_URL.search(endpoint_path(tok))
-    return int(m.group(1)) if m else None
-
-
 def _labels(p, flag: str) -> set[str]:
     """The labels a `--add-label`/`--remove-label` flag NAMES. `gh` splits each
     value on commas, so `--add-label bircher:queued,bircher:grill` adds
@@ -152,8 +131,14 @@ def required_kinds(store, run_id: str, effect_class: str, argv: list[str]) -> fr
     if ops[:3] == ["gh", "issue", "comment"] and any(
             v.startswith("bircher: sliced ") for v in p.values.get("--body", [])):
         return frozenset({"umbrella", "umbrella_close"})
-    if ops[:3] == ["gh", "issue", "close"] and len(ops) > 3 and store.run_state(run_id) == "sliced" \
-            and _issue_operand(ops[3]) == front.issue_number(store, run_id):
+    # EVERY `gh issue close` while the run is `sliced` demands the parent
+    # close, whatever its operand: gh reads `#12`, `+12`, an issue OR pull URL,
+    # decoded paths and unanchored `/issues/<n>`, and a mandate that models
+    # that grammar will always trail it (Codex, twice). A sliced run has no
+    # other issue to close, and the binding admits only the composer's argv,
+    # so demanding too much costs nothing and demanding too little is a
+    # close with no obligation.
+    if ops[:3] == ["gh", "issue", "close"] and store.run_state(run_id) == "sliced":
         return frozenset({"parent_close"})
     return frozenset()
 
