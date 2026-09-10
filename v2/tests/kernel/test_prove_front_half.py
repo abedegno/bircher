@@ -25,8 +25,6 @@ at the moment a stop is actually marked confirmed -- the same moment
 """
 import json
 
-import pytest
-
 from kernel import brief, front
 from kernel.artifacts import put_artifact
 from kernel.dispatch import Role
@@ -150,7 +148,6 @@ def test_a_clean_autonomous_run_passes(tmp_path):
     assert prove.assert_sessions(s, "r-1", fetch=fetch) == []
 
 
-@pytest.mark.xfail(strict=True, reason="Task 11 excludes the shape ruling")
 def test_a_run_that_ruled_on_no_question_fails_the_model_ruling_assertion(tmp_path):
     """The planted defect: a run whose author never ruled on a question, which
     §8's fourth assertion is supposed to catch.
