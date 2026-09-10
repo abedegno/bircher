@@ -2597,11 +2597,12 @@ _recovery_review_prompt() {
   # read anything, three reviews in a row derived as FAIL, and both repair
   # rounds were spent on a review that never happened. `git worktree remove
   # --force` deletes the directory itself; `git worktree prune` clears a stale
-  # registration; the nonce makes a leftover plain directory unlikely, and if
-  # one exists the add fails and the reviewer reports BLOCKED, as told.
+  # registration; a leftover plain directory (a crashed run, a killed session:
+  # muesli #711 round 2 answered BLOCKED over one) is MOVED aside, not deleted,
+  # so the add always starts clean and nothing here can read as a delete.
   cat <<EOF
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree remove --force /tmp/review-$pr-$_nonce-oob 2>/dev/null; git worktree prune; git worktree add --detach /tmp/review-$pr-$_nonce-oob $_co; cd /tmp/review-$pr-$_nonce-oob.
+First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree remove --force /tmp/review-$pr-$_nonce-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-$pr-$_nonce-oob ] || mv /tmp/review-$pr-$_nonce-oob /tmp/review-$pr-$_nonce-oob.stale.\$\$; git worktree add --detach /tmp/review-$pr-$_nonce-oob $_co; cd /tmp/review-$pr-$_nonce-oob.
 You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
@@ -7851,8 +7852,8 @@ SH
     *"rm -rf"*) echo "FAIL _recovery_review_prompt: the setup line carries rm -rf, which the guardrail rejects"; exit 1 ;;
   esac
   case "$_pp" in
-    *"git worktree prune; git worktree add --detach /tmp/review-9-a502a88e-oob"*) : ;;
-    *) echo "FAIL _recovery_review_prompt: the setup line does not prune before adding the worktree"; exit 1 ;;
+    *"git worktree prune; [ ! -e /tmp/review-9-a502a88e-oob ] || mv /tmp/review-9-a502a88e-oob /tmp/review-9-a502a88e-oob.stale."*) : ;;
+    *) echo "FAIL _recovery_review_prompt: the setup line does not prune and move a leftover aside before adding the worktree"; exit 1 ;;
   esac
   # With no sha it must still work (pre-#66 behaviour), rather than emitting an
   # empty checkout target.

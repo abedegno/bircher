@@ -788,13 +788,21 @@ def test_the_worktree_path_clears_itself_before_creating():
     The prompt now removes the path first. That also clears the leftovers no
     nonce can predict: crashed runs, killed sessions, and the worktrees this
     runner has accumulated since smoke PR #11 with nothing to remove them.
+
+    It clears WITHOUT `rm -rf`: omnigent's blast_radius guardrail rejects
+    `rm -rf /...` before execution, and on muesli #759 (2026-09-10) three
+    reviews in a row derived as FAIL over a setup line that never ran. A
+    registered worktree is removed, a stale registration pruned, and a plain
+    leftover directory is moved aside -- the add starts clean either way.
     """
     from coordinator.review import review_prompt
     p = review_prompt("751", "o/r", "9" * 40)
     path = "/tmp/review-751-99999999-oob"
     assert f"git worktree remove --force {path}" in p
-    assert f"rm -rf {path}" in p
-    assert p.index("rm -rf " + path) < p.index("worktree add --detach " + path), (
+    assert "git worktree prune;" in p
+    assert f"[ ! -e {path} ] || mv {path} {path}.stale." in p
+    assert "rm -rf" not in p
+    assert p.index(f"mv {path} ") < p.index("worktree add --detach " + path), (
         "the path must be cleared BEFORE it is created")
 
 
