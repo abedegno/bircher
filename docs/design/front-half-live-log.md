@@ -263,6 +263,84 @@ in the proof itself and were exposed by this being the first *parked* run to pas
 a park prompt is not an awaited turn and earns no `turn_ended`, and a person's
 message the coordinator read past is not an unrecorded prompt.
 
+## E8 — the shaping phase on `abedegno/bircher-smoke`, epic to closed umbrella
+
+*2026-09-10 08:38 to 09:49 UTC. The shaping phase (spec
+`docs/superpowers/specs/2026-09-09-shaping-phase-design.md`, merged as bircher
+PR #94 at `8028068`) deployed to the runner by fast-forward. Smoke epic #21,
+"Keep a record of which exercises have been completed": three coherent parts, a
+store, an API and a page, naming no file. Kernel database `.run/kernel-e8.db`,
+run `i21-keep-a-record-of-which-exercises-have-be-1789029708`.*
+
+| Step | When (UTC) | What the journal and GitHub show |
+|---|---|---|
+| shaping round | 08:41 to 08:44 | the author ruled an epic and wrote a three-slice plan (hash `35e3962b`); the reviewer accepted; the run parked at the **slices** gate; the notice on #21 named the phase and the carrier session |
+| approval | 09:10 | `approve`, posted into the carrier session on the person's behalf, read by a hand-launched wave: `human_ruling {approve, slices}`, transition to `sliced` |
+| filing, pass 1 | 09:12 | children #22, #23, #24 created with `bircher:slice` and the rendered bodies; `slice_filed` with the read-back database ids |
+| filing, pass 2 | 09:12 | the first blocked-by link **failed with HTTP 422**: `-f issue_id=` sent a string, the endpoint wants an integer (finding 18). The effect became `uncertain`, the run halted at `sliced`, the queue file stayed, the scorecard row said escalated |
+| repair | 09:35 | the composer changed to `-F` (bircher PR #95), the uncertain link reconciled as not delivered at version 13, the wave relaunched |
+| filing, passes 2 to 4 | 09:37 | links (#23 by #22, #24 by #23), `bircher:queued` on each child, the umbrella comment `bircher: sliced 35e3962b`, `bircher:sliced` on the parent, `filing_complete {22, 23, 24}`; scorecard row `sliced` |
+| the sweep | 09:49 | the three children closed by hand; a wave's sweep recorded the closures, posted `bircher: sliced complete` naming each child closed, closed #21, ended the run `sliced` |
+
+`prove_front_half --repo abedegno/bircher-smoke --expect-approval`: the four
+slice assertions pass; the one failing line is "the run was reconciled or
+halted", which is true and is the point of the line. This run is not
+zero-touch; a fresh epic on the merged fix would be. The gate worked the way
+§4 says: nothing appeared in an inbox, the notice on the issue and the
+message in the carrier session were the two channels, and the reply was read
+by the next wave.
+
+## E9 — muesli #12, a one-piece ruling to a merged pull request
+
+*2026-09-10 09:44 to 20:55 UTC. Muesli #12, "Design: workspaces/teams boundary
++ default-private + shareable folders", labelled `bircher:queued` under the
+default policy. Run `i12-design-workspaces-teams-boundary-default-1789033898`,
+picked up by the scheduled wave at 09:50.*
+
+The shaping author ruled the issue **one piece**: "a design decision … the
+deliverable is a single design document", with a cost-if-wrong clause
+promising the spec phase would hand back a re-shape if it found two surfaces.
+The spec took two rounds, the plan three, and the implementer built the whole
+feature: muesli PR #759, forty files, +2719/−297, a migration, store, API and
+client. Nothing in the design gave the spec phase the hand-back the ruling
+counted on, and a one-piece ruling has no gate of its own (finding 20).
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| shaping → spec gate | 09:50 to 10:09 | one-piece ruling; spec accepted after one revision; parked at the **spec** gate |
+| approval | 11:10 | `approve` posted on the person's behalf; the plan accepted after two revision requests; `planned`, `implementing` by 11:43 |
+| implementation | 12:53 | PR #759 opened; Go tests red, repaired to green |
+| cross-review | 13:10 to 14:08 | **FAIL three times without a review**: the reviewer's setup line ran `rm -rf /tmp/review-…`, which omnigent 0.9.0's `blast_radius` guardrail rejects before execution; both repair rounds spent on it (finding 19); the run ended `failed` |
+| harness fix | 18:35 | the setup line moves a stale worktree aside instead of deleting it (bircher PR #96); `--recover-pr … 759 codex` re-adopted the run |
+| cross-review | 18:40 | **PASS** on `47f05f8` at the first attempt; `bircher/cross-review` posted and verified; every required check green |
+| merge | 20:55 | the runner declined to merge an ended run and left the PR to the person; merged by hand as `4985598`; #12 closed |
+
+The pipeline's verdict was earned, but the shape was wrong: this is the
+epic-sized change the shaping phase exists to slice, and it went through as one
+piece because the only judgement on a one-piece ruling is the author's own.
+
+### What the shaping proof found
+
+Three defects, none reachable from a suite that now stands at 1616 tests.
+
+18. **The link's `issue_id` was a string.** `gh api … -f issue_id=<id>` sends
+    a string field; GitHub's dependencies endpoint requires an integer and
+    answers 422. The test fake accepted the string, the same unfaithful
+    reproduction as before. Fixed by `-F` in the composer, a contract rule that
+    admits only `-F`, a binding that refuses `-f`, and a fake that refuses the
+    string form with GitHub's own message (bircher #95).
+19. **The reviewer's own setup was denied.** The out-of-band review prompt
+    asked the reviewer to `rm -rf` its scratch worktree; the guardrail treats
+    `rm -rf /…` as catastrophic and rejected it before execution, and each
+    attempt derived as FAIL rather than BLOCKED. Fixed by removing, pruning,
+    and moving any leftover aside, in the bash prompt and its byte-identical
+    Python twin, with the self-test pinning the absence of `rm -rf` (bircher #96).
+20. **A one-piece ruling has no gate and no hand-back.** By the brainstorm's
+    decision only slice plans are reviewed and gated; a one-piece ruling sends
+    the run straight to the spec phase, and no command lets the spec author
+    return it to shaping. The remedy is a design change, recorded as a gap
+    in the spec's amendments and in ARCHITECTURE §9.
+
 ## What the plan phase does
 
 Three runs, two repositories, two policies, two round limits:

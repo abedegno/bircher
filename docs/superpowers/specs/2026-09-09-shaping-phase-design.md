@@ -1479,3 +1479,28 @@ wrong, ruled while building the phase and amended here:
    child (or parent) and what could not be read; the remaining children and
    assertions still run; the tool never exits with a traceback for a read
    failure.
+
+## Amendments from the live proof (2026-09-10)
+
+The two live runs, E8 on `abedegno/bircher-smoke` and E9 on muesli #12
+(`docs/design/front-half-live-log.md`), amend the text in three places.
+
+10. §2 *The effect class* and *Bound to the effect*: the blocked-by link's
+    `issue_id` is sent as a typed field, `gh api … -X POST -F issue_id=<id>`,
+    because the endpoint requires an integer and `-f` sends a string GitHub
+    refuses with 422. The contract admits `-F` only for that endpoint; the
+    binding refuses `-f`; the test fake refuses the string form (bircher #95).
+11. §3 *The shaping round* and §4 *Gates* — **an open gap, not a change.** A
+    one-piece ruling is not reviewed and not gated, and the spec phase has no
+    command that returns a run to `shaping`. On muesli #12 the author ruled a
+    design document and the run built a forty-file implementation, which is
+    the size of change the phase exists to slice. Two remedies fit the design:
+    a policy gate on one-piece rulings (`gates` gains `shape`, and the ruling
+    parks like a slice plan), or a `request_reshape` command available to the
+    spec author that lands the run in `shaping` with the spec's finding as the
+    next round's input, the way `revise_bundle` does for an issue edit. The
+    second keeps the human out of runs that are correctly one piece and is the
+    recommended one. Until one lands, the person's lever is the issue body.
+12. §6 *The proof*: a run that halted and was reconciled fails the zero-touch
+    line honestly; E8 did, on finding 18. The four slice assertions are
+    independent of that line and passed.
