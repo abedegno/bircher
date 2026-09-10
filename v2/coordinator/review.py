@@ -82,7 +82,7 @@ def extract_verdict(text: str, hash8: str | None = None) -> str | None:
 #: `test_the_rendered_prompt_is_byte_identical_to_the_bash` renders both and
 #: compares.
 _PROMPT = r"""Review PR #{pr} in {repo} as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; rm -rf /tmp/review-{pr}-{nonce}-oob; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
+First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-{pr}-{nonce}-oob ] || mv /tmp/review-{pr}-{nonce}-oob /tmp/review-{pr}-{nonce}-oob.stale.$$; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
 You are reviewing EXACTLY commit {co}. If that checkout fails, STOP and report it -- do not review a different commit.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:$PATH &&' (e.g. 'export PATH=/root/bin:$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
