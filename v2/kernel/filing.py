@@ -18,6 +18,7 @@ argv shape and not two.
 from __future__ import annotations
 
 import re
+from urllib.parse import unquote
 
 from kernel import front, slices
 from kernel.authz import NotAuthorized
@@ -37,7 +38,7 @@ _WITH_SLICE = frozenset({"slice_issue", "slice_dependency", "slice_queue"})
 _BLOCKED_BY = re.compile(r"/issues/(\d+)/dependencies/blocked_by$")
 #: `gh issue close` takes an issue number or an issue URL, and they close the
 #: same issue.
-_ISSUE_URL = re.compile(r"/issues/(\d+)$")
+_ISSUE_URL = re.compile(r"/issues/(\d+)")
 _VALUED = frozenset({"--repo", "--title", "--label", "--body", "--add-label", "--remove-label",
                      "--comment", "-X", "-f", "--jq"})
 
@@ -111,12 +112,16 @@ def _issue_operand(tok: str) -> int | None:
     """The issue an operand names: `12`, or a URL/path ending `/issues/12`."""
     if not isinstance(tok, str):
         return None
-    # `gh` reads `#12` as issue 12 and tolerates a trailing slash on the URL;
-    # both closed the parent with no obligation until the final re-review.
-    tok = tok.lstrip("#")
+    # Read the operand the way gh does, generously: gh strips whitespace,
+    # reads `#12` as 12, decodes the URL path and matches `/issues/<n>` WITHOUT
+    # an end anchor, so a trailing slash, a trailing space or any suffix still
+    # names issue 12 (final re-review; Codex's review of 34d6f1b). Demanding an
+    # obligation for a spelling gh would reject costs nothing -- the BINDING
+    # admits only the composer's argv -- so the mandate errs on demanding.
+    tok = unquote(tok).strip().lstrip("#")
     if tok.isdigit():
         return int(tok)
-    m = _ISSUE_URL.search(endpoint_path(tok).rstrip("/"))
+    m = _ISSUE_URL.search(endpoint_path(tok))
     return int(m.group(1)) if m else None
 
 
@@ -311,31 +316,29 @@ def _binding(store, run_id: str, effect_class: str, argv: list[str], intent: dic
         if p.values.get("-f") != [f"issue_id={ids[ob['blocker']]}"]:
             raise NotAuthorized(f"slice_dependency: -f {p.values.get('-f')} is not issue_id={ids[ob['blocker']]}, the blocker's database id")
         return
+    # The four bindings below are the composer's WHOLE argv, byte for byte.
+    # Checking the first four words and a few flag values admitted a second
+    # issue operand (`gh issue edit 41 99 --add-label ...` edits both) and an
+    # unbound `--comment` on the close (Codex's review of 34d6f1b).
     if kind == "slice_queue":
         child = filed_numbers(store, run_id, epoch_n)[ob["slice"]]
-        if ops[:4] != ["gh", "issue", "edit", str(child)] or p.values.get("--repo") != [repo]:
-            raise NotAuthorized(f"slice_queue: the argv does not edit child {child} of {repo}")
-        if p.values.get("--add-label") != ["bircher:queued"] or p.values.get("--remove-label"):
-            raise NotAuthorized("slice_queue: adds exactly bircher:queued and removes nothing")
+        if list(argv) != queue_argv(repo, child):
+            raise NotAuthorized(f"slice_queue: the argv is not exactly the queue label for child {child} of {repo}")
         return
     if kind in ("umbrella", "umbrella_close"):
-        if ops[:4] != ["gh", "issue", "comment", str(parent)] or p.values.get("--repo") != [repo]:
-            raise NotAuthorized(f"{kind}: the comment is not on the parent #{parent} of {repo}")
         numbers = filed_numbers(store, run_id, epoch_n)
         if kind == "umbrella":
             want = slices.umbrella_body(front.accepted_slices_hash(store, run_id, epoch_n)[:8], plan, numbers)
         else:
             states = {s.number: front.current_closure(store, run_id, epoch_n, s.number).payload["state"] for s in plan.slices}
             want = slices.completion_body(plan, numbers, states)
-        if p.values.get("--body") != [want]:
-            raise NotAuthorized(f"{kind}: the body is not the rendered {kind} text")
+        if list(argv) != comment_argv(repo, parent, want):
+            raise NotAuthorized(f"{kind}: the argv is not exactly the rendered {kind} comment (target and body) on the parent #{parent} of {repo}")
         return
     if kind == "umbrella_label":
-        if ops[:4] != ["gh", "issue", "edit", str(parent)] or p.values.get("--repo") != [repo]:
-            raise NotAuthorized(f"umbrella_label: the argv does not edit the parent #{parent}")
-        if p.values.get("--add-label") != ["bircher:sliced"] or p.values.get("--remove-label") != ["bircher:running"]:
-            raise NotAuthorized("umbrella_label: adds bircher:sliced and removes bircher:running, nothing else")
+        if list(argv) != umbrella_label_argv(repo, parent):
+            raise NotAuthorized(f"umbrella_label: the argv is not exactly the label swap (add bircher:sliced, remove bircher:running) on the parent #{parent} of {repo}")
         return
     if kind == "parent_close":
-        if ops[:4] != ["gh", "issue", "close", str(parent)] or p.values.get("--repo") != [repo]:
-            raise NotAuthorized(f"parent_close: the argv does not close the parent #{parent} of {repo}")
+        if list(argv) != close_argv(repo, parent):
+            raise NotAuthorized(f"parent_close: the argv is not exactly the close of the parent #{parent} of {repo}")

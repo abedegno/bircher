@@ -150,6 +150,17 @@ _OTHER_SPELLINGS = [
     ("close-by-url-trailing-slash", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "close", "https://github.com/o/r/issues/12/", "--repo", "o/r"],
      {"parent_close"}),
+    # gh strips whitespace, decodes the path and matches `/issues/<n>` without
+    # an end anchor (Codex's review of 34d6f1b): each of these is issue 12 to gh.
+    ("close-by-url-trailing-space", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/issues/12 ", "--repo", "o/r"],
+     {"parent_close"}),
+    ("close-by-url-with-suffix", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/issues/12/anything", "--repo", "o/r"],
+     {"parent_close"}),
+    ("close-by-url-percent-encoded", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/issues/12%2F", "--repo", "o/r"],
+     {"parent_close"}),
 ]
 
 
@@ -341,6 +352,60 @@ def test_umbrella_and_its_label_wait_for_every_filing_fact(tmp_path):
     with pytest.raises(NotAuthorized, match="remove"):
         perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "u1", {"argv": ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:sliced"], "obligation": ul}, gh)
     assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "u2", {"argv": filing.umbrella_label_argv("o/r", 12), "obligation": ul}, gh) == "ok"
+
+
+def test_label_comment_and_close_bindings_are_the_composers_whole_argv(tmp_path):
+    """The binding is the composer's argv byte for byte. Checking the first
+    four words and a few flag values admitted a second issue operand (`gh issue
+    edit 41 99 --add-label ...` labels both) and an unbound `--comment` on the
+    close (Codex's review of 34d6f1b)."""
+    s, f, g, gh = _sliced(tmp_path)
+    h = front.accepted_slices_hash(s, f.run_id, 0)
+    plan = front.accepted_plan(s, f.run_id)
+    numbers, ids = _file_two(s, f, g, gh)
+    dep = {"kind": "slice_dependency", "run": f.run_id, "epoch": 0, "plan_hash": h, "slice": 2, "blocker": 1}
+    perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "l", {"argv": filing.link_argv("o/r", numbers[2], ids[1]), "obligation": dep}, gh)
+    q1 = {"kind": "slice_queue", "run": f.run_id, "epoch": 0, "plan_hash": h, "slice": 1}
+    um = {"kind": "umbrella", "run": f.run_id, "epoch": 0, "plan_hash": h}
+    ul = {"kind": "umbrella_label", "run": f.run_id, "epoch": 0, "plan_hash": h}
+    body = slices.umbrella_body(h[:8], plan, numbers)
+    n1, n2 = str(numbers[1]), str(numbers[2])
+    variants = [
+        ("queue-second-target", EffectClass.ISSUE_OR_LABEL, q1,
+         ["gh", "issue", "edit", n1, n2, "--repo", "o/r", "--add-label", "bircher:queued"]),
+        ("queue-flags-reordered", EffectClass.ISSUE_OR_LABEL, q1,
+         ["gh", "issue", "edit", n1, "--add-label", "bircher:queued", "--repo", "o/r"]),
+        ("umbrella-label-second-target", EffectClass.ISSUE_OR_LABEL, ul,
+         ["gh", "issue", "edit", "12", n1, "--repo", "o/r", "--add-label", "bircher:sliced", "--remove-label", "bircher:running"]),
+        ("umbrella-comment-flags-reordered", EffectClass.COMMENT, um,
+         ["gh", "issue", "comment", "12", "--body", body, "--repo", "o/r"]),
+    ]
+    before = list(gh.calls)
+    for why, cls, ob, argv in variants:
+        check(cls, argv)                                                          # reachable: the contract admits it
+        with pytest.raises(NotAuthorized, match="not exactly"):
+            perform(s, f.run_id, g, cls, f"v-{why}", {"argv": argv, "obligation": ob}, gh)
+    assert gh.calls == before                                                     # nothing reached GitHub
+    assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "q", {"argv": filing.queue_argv("o/r", numbers[1]), "obligation": q1}, gh) == "ok"
+    assert perform(s, f.run_id, g, EffectClass.COMMENT, "c", {"argv": filing.comment_argv("o/r", 12, body), "obligation": um}, gh)
+    assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "u", {"argv": filing.umbrella_label_argv("o/r", 12), "obligation": ul}, gh) == "ok"
+
+
+def test_parent_close_binding_refuses_an_unbound_comment(tmp_path):
+    s, f, g, gh = _sliced(tmp_path)
+    numbers = f.file_all(g)
+    for n in (1, 2):
+        f._cmd(g, "record_slice_closed", {"slice": n, "closed_at": "t", "state": "merged"})
+    f._cmd(g, "record_children_observed_closed", {"parent_state": "open", "observed_at": "t"})
+    close = {"kind": "parent_close", "run": f.run_id, "epoch": 0}
+    before = list(gh.calls)
+    for argv in (filing.close_argv("o/r", 12) + ["--comment", "done"],           # an unbound closing comment
+                 ["gh", "issue", "close", "--repo", "o/r", "12"]):                 # the composer's words, reordered
+        check(EffectClass.ISSUE_OR_LABEL, argv)
+        with pytest.raises(NotAuthorized, match="not exactly"):
+            perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, f"p-{len(argv)}", {"argv": argv, "obligation": close}, gh)
+    assert gh.calls == before
+    assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "p", {"argv": filing.close_argv("o/r", 12), "obligation": close}, gh) == "closed"
 
 
 def test_completion_pair_needs_filing_complete_and_a_same_generation_observation(tmp_path):
