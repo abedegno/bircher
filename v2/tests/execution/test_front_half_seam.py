@@ -76,6 +76,10 @@ _NEEDED_REAL_FUNCTIONS = [
     # one writes no row at all, and a test asserting the outcome then reads an
     # empty scorecard as "it took some other branch".
     "_refused_mint_row", "_unreadable_state_item",
+    # The two sliced-branch exits (shaping spec §5). REAL for the same reason:
+    # an undefined one writes no row, and a test reading an empty scorecard
+    # cannot tell "took the other branch" from "the helper does not exist".
+    "_finish_sliced_item", "_interrupted_sliced_item",
 ]
 
 
@@ -152,8 +156,18 @@ _kernel_state() {{
   # this knob has to be able to carry. `_kernel_state` prints nothing on every
   # failure it has, and "the kernel would not answer" is a case run_item must
   # handle -- `:-` would have quietly turned it back into `implementing`.
-  if [ -n "${{T_FIND_RUN:-}}" ] && [ "$n" = 1 ]; then
+  #
+  # T_STATE_LOOP, when SET (empty counts), answers the post-loop sliced check
+  # alone and leaves T_STATE_AFTER to the read-back. The two reads had one
+  # answer between them, so "the sliced check says planned and the read-back
+  # says nothing" -- the drive amendment 7 needs at the third seam -- could not
+  # be expressed. Unset, both reads answer T_STATE_AFTER exactly as before.
+  local first_post=1
+  [ -n "${{T_FIND_RUN:-}}" ] && first_post=2
+  if [ "$n" -lt "$first_post" ]; then
     printf '%s' "${{T_STATE_RESUME:-queued}}"
+  elif [ "$n" = "$first_post" ] && [ -n "${{T_STATE_LOOP+set}}" ]; then
+    printf '%s' "${{T_STATE_LOOP}}"
   else
     printf '%s' "${{T_STATE_AFTER-implementing}}"
   fi
@@ -170,6 +184,7 @@ _kernel_run_start() {{
 _kernel_revise_bundle() {{ _log_call _kernel_revise_bundle "$@"; cp "$3" "{revise_copy}" 2>/dev/null; }}
 _kernel_run_base() {{ _log_call _kernel_run_base "$@"; printf '%s' "${{T_RUN_BASE:-}}"; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
+_kernel_sliced_children() {{ _log_call _kernel_sliced_children "$@"; printf '40 41'; }}
 _kernel_bundle_hash() {{ _log_call _kernel_bundle_hash "$@"; printf '%s' "{ctx_hash}"; }}
 _implementer_brief() {{ _log_call _implementer_brief "$@"; printf 'BRIEF(%s)' "$2"; }}
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
@@ -547,7 +562,74 @@ def test_an_unreadable_state_after_a_FAILED_loop_keeps_the_queue_file(tmp_path):
     assert "could not be read" in note, note
 
 
+# --- the two sliced branches, at the run_item level --------------------------
+#
+# `_finish_sliced_item` and `_interrupted_sliced_item` have their own fixtures
+# in the runner's self-test, and `test_lifecycle_wiring.py` scans their rows.
+# Neither says the SEAMS reach them: both `= sliced` comparisons in `run_item`
+# could be mutated to `= slicedx` and every one of those stayed green, because
+# a run that is not sliced takes the planned path and a rc != 0 that is not
+# sliced records `failed` -- both perfectly ordinary outcomes. These two drives
+# are what those comparisons answer to (final review, finding 2).
+
+def test_a_clean_loop_at_sliced_files_the_children_and_spends_no_implementer(tmp_path):
+    """rc 0 at `sliced`: the row is `sliced` and names the children, no
+    implementer seat is spent, no outcome is recorded (the parent waits for its
+    children), and the queue file is retired -- the sweep drives it from here."""
+    d = _drive(tmp_path, env_extra={"BIRCHER_HAVE_LOCK": "1", "T_STATE_AFTER": "sliced"})
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["sliced"], d.calls
+    assert "_kernel_start_implementation" not in d.names, d.names
+    assert "_create_session" not in d.names, d.names
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not (d.queue_dir / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "40 41" in note, note                       # the children the kernel holds
+    assert d.args_of("_kernel_sliced_children") == [d.args_of("_kernel_run_start")[0]]
+
+
+def test_a_failed_loop_at_sliced_escalates_and_keeps_the_queue_file(tmp_path):
+    """rc != 0 at `sliced` with nothing pending: the filing was interrupted.
+    No outcome (the kernel refuses `failed` from `sliced` in any case) and the
+    queue file stays, so the next pass repairs the filing."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1", "T_STATE_AFTER": "sliced",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert "_kernel_start_implementation" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "filing interrupted" in note, note
+
+
 # --- 3. the state read back after start_implementation -----------------------
+
+def test_an_unreadable_state_after_start_implementation_records_nothing(tmp_path):
+    """AMENDMENT 7 at the THIRD seam. The read-back compared `!= implementing`,
+    and the empty string a failed `_kernel_state` prints compares unequal -- so
+    an unreadable kernel scored a terminal `failed` on a run that may be
+    healthily `implementing` and retired its queue file. Neither is recoverable
+    on the next pass. The loop's own state read answers here (`planned`), so
+    what is being driven is the read-back alone."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_STATE_LOOP": "planned", "T_STATE_AFTER": "",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert "_kernel_start_implementation" in d.names, d.names
+    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert "_create_session" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "could not be read after start_implementation" in note, note
+
+
 
 def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp_path):
     d = _drive(tmp_path, env_extra={

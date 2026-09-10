@@ -52,6 +52,10 @@ def test_good_plan_parses():
     assert p.slices[0].non_goals == "the API."
     assert p.edges() == [(2, 1), (3, 1), (3, 2)]
     assert slices.topo_order(p) == [1, 2, 3]
+    # A blocker named twice is ONE blocker: `Depends on: 1, 1` rendered
+    # `Depends on: #40, #40` and yielded two identical `slice_dependency`
+    # obligations (final review, finding 5).
+    assert slices.parse(GOOD.replace(b"Depends on: 1, 2", b"Depends on: 1, 1")).slices[2].depends_on == (1,)
 
 
 def test_a_trailing_section_after_the_last_slice_is_not_parsed():

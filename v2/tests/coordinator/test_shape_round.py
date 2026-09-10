@@ -104,6 +104,12 @@ def test_both_files_the_ruling_is_read(world):
     {seat.SHAPE_OUT: b"Ruling: two pieces\nReasoning: r\nCost if wrong: c\n"},
     {seat.SHAPE_OUT: b"Ruling: one piece\nReasoning:\nCost if wrong: c\n"},
     {seat.SHAPE_OUT: b"preface\nRuling: one piece\nReasoning: r\nCost if wrong: c\n"},
+    # WITH AN ARTEFACT BESIDE IT. The spec's bullet is unconditional over the
+    # artefact's presence: the author wrote a ruling and got it wrong, and
+    # submitting the plan beside it takes the branch they did not choose and
+    # spends the review round on it (final review, finding 4).
+    {seat.SHAPE_OUT: b"Ruling: two pieces\nReasoning: r\nCost if wrong: c\n",
+     seat.ARTIFACT_OUT: SLICES_BYTES},
 ])
 def test_a_ruling_that_does_not_parse_is_the_empty_turn(world, files):
     s, f, fake, ctx = world()
@@ -112,6 +118,7 @@ def test_a_ruling_that_does_not_parse_is_the_empty_turn(world, files):
     assert shape.shape_round(ctx) == "empty_retry"
     assert s.newest_fact("i12-epic-1", EventKind.AUTHOR_EMPTY) is not None
     assert s.run_state("i12-epic-1") == "shaping"
+    assert s.phase_artifact("i12-epic-1", "slices") is None      # nothing was submitted
     _one_pass(ctx)
     assert shape.shape_round(ctx) == "failed"          # the retry's own empty turn is RC_FAILED
 

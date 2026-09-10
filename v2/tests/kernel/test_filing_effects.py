@@ -116,6 +116,49 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
     assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 99)) == frozenset()
 
 
+#: THE SAME FIVE COMMANDS, spelled the way the CONTRACT admits them rather than
+#: the way the kernel composes them. Each does exactly what the canonical form
+#: does -- `check` normalises a `gh api` operand's scheme and authority and
+#: matches the path unanchored, `gh` splits a label value on commas, and `gh
+#: issue close` takes an issue URL -- so each reached the executor through
+#: `perform` with NO obligation at all while the mandate recognised only the
+#: kernel's own spelling (final review, finding 1). What the contract admits
+#: and what the mandate demands are read from ONE normaliser now.
+_OTHER_SPELLINGS = [
+    ("leading-slash-path", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "api", "/repos/o/r/issues/41/dependencies/blocked_by", "-X", "POST", "-f", "issue_id=1040"],
+     {"slice_dependency"}),
+    ("full-url-path", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "api", "https://api.github.com/repos/o/r/issues/41/dependencies/blocked_by",
+      "-X", "POST", "-f", "issue_id=1040"],
+     {"slice_dependency"}),
+    ("comma-joined-queue-label", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", "bircher:queued,bircher:grill"],
+     {"slice_queue"}),
+    ("comma-joined-sliced-label", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:sliced,x",
+      "--remove-label", "bircher:running"],
+     {"umbrella_label"}),
+    ("close-by-url", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/issues/12", "--repo", "o/r"],
+     {"parent_close"}),
+]
+
+
+@pytest.mark.parametrize("why, cls, argv, kinds", _OTHER_SPELLINGS,
+                         ids=[c[0] for c in _OTHER_SPELLINGS])
+def test_a_shape_spelled_otherwise_needs_the_same_kind(tmp_path, why, cls, argv, kinds):
+    s, f, g, gh = _sliced(tmp_path)
+    check(cls, argv)                                  # the contract admits it: this argv is reachable
+    assert filing.required_kinds(s, f.run_id, cls, argv) == frozenset(kinds), why
+    with pytest.raises(NotAuthorized, match="admitted only with an obligation"):      # none
+        perform(s, f.run_id, g, cls, f"k-{why}", {"argv": argv}, gh)
+    with pytest.raises(NotAuthorized, match="admitted only with an obligation"):      # another kind
+        perform(s, f.run_id, g, cls, f"k-other-{why}",
+                {"argv": argv, "obligation": {"kind": "publish", "run": f.run_id, "phase": "spec", "hash": "x"}}, gh)
+    assert gh.calls == []
+
+
 # -- preconditions and bindings for the create -----------------------------------
 
 def test_create_is_bound_to_state_role_epoch_hash_slice_and_body(tmp_path):

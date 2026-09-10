@@ -4569,6 +4569,18 @@ run_item() {
   # created over a refusal is an implementer working a run the kernel never
   # authorized.
   local _st_after; _st_after=$(_kernel_state "$BIRCHER_RUN_ID")
+  # AND THE SAME READ-ONCE RULE AS BOTH POST-LOOP READS (spec amendment 7): an
+  # empty answer is "the kernel would not say", not "some state other than
+  # implementing". It compared unequal, so an unreadable kernel scored a
+  # terminal `failed` on a run that may be healthily `implementing` and retired
+  # its queue file -- neither of which the next pass can undo. The implementer
+  # generation dispatched just above is harmless: no session is created, and the
+  # next pass either resumes at `planned` through `_kernel_implementation_started`
+  # or escalates at `implementing`.
+  if [ -z "$_st_after" ]; then
+    _unreadable_state_item "$item" "$BIRCHER_RUN_ID" "start_implementation"
+    return 0
+  fi
   if [ "$_st_after" != implementing ]; then
     echo "[batch] $item: state after start_implementation is '$_st_after', not implementing; RC_FAILED, no session" >&2
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"

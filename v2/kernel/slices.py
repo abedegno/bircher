@@ -183,6 +183,12 @@ def _fields(n: int, body: list[str]) -> dict[str, str]:
 
 
 def _deps(n: int, value: str) -> tuple[int, ...]:
+    """The blockers a `Depends on:` line names, ONCE EACH, in the order given.
+    A blocker named twice is one blocker: `Depends on: 1, 1` rendered `Depends
+    on: #40, #40` in the child's body and put two identical `slice_dependency`
+    obligations in the epoch, of which the second could never be satisfied --
+    one satisfied effect per obligation keys on the whole dict (final review,
+    finding 5)."""
     if value.strip().lower() == "none":
         return ()
     out = []
@@ -190,7 +196,8 @@ def _deps(n: int, value: str) -> tuple[int, ...]:
         tok = tok.strip()
         if not tok.isdigit():
             raise PlanError(f"slice {n}: Depends on must be `none` or slice numbers, got {value!r}")
-        out.append(int(tok))
+        if int(tok) not in out:
+            out.append(int(tok))
     return tuple(out)
 
 

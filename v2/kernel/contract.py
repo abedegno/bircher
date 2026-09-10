@@ -305,6 +305,29 @@ def _rule_parts(argv: list[str], rule) -> list[str]:
     return argv[lead:]
 
 
+def endpoint_path(operand: str) -> str:
+    """The endpoint a URL-ish operand names, with everything that is not the
+    endpoint removed: the scheme, the authority (host[:port]), the query and
+    the fragment.
+
+    A `gh api` operand carries no scheme at all (`repos/o/r/...`) and already
+    IS the path; a `curl` operand is a full URL; and `gh` accepts the same
+    endpoint with a leading slash or spelled as a full `https://api.github.com`
+    URL. `kernel.filing` reads its shapes through THIS function, so what the
+    contract admits and what the filing mandate recognises cannot drift: five
+    contract-admitted spellings of three commands reached the executor with no
+    obligation while the mandate matched only the kernel's own spelling (final
+    review, finding 1).
+    """
+    target = operand
+    if "://" in target:
+        after_scheme = target.split("://", 1)[1]
+        _, _, after_authority = after_scheme.partition("/")
+        target = "/" + after_authority
+    # Query and fragment are DATA. The path is the endpoint.
+    return target.split("#", 1)[0].split("?", 1)[0]
+
+
 def check(effect_class: str, argv: list[str]) -> Rule:
     """Refuse an argv inconsistent with its declared class; return the rule
     that matched, so a caller can act on WHICH shape was authorized."""
@@ -335,19 +358,13 @@ def check(effect_class: str, argv: list[str]) -> Rule:
             if scheme is not None and scheme not in rule.schemes:
                 reasons.append(f"{rule.sig}: scheme {scheme!r} not permitted")
                 continue
-            # The authority (host[:port]) is transport, not endpoint. A `gh
-            # api` operand carries no scheme at all (`repos/o/r/...`), so the
-            # whole operand already IS the path; a `curl` operand is a full
-            # URL, and ANCHORING url_path (this task) only means something
-            # once the host it was never anchored against is gone -- the old
-            # unanchored `/v1/sessions` matched `http://srv/v1/sessions` as a
-            # substring, which a `^...$` pattern cannot.
-            if scheme is not None:
-                after_scheme = target.split("://", 1)[1]
-                _, _, after_authority = after_scheme.partition("/")
-                target = "/" + after_authority
-            # Query and fragment are DATA. The path is the endpoint.
-            path = target.split("#", 1)[0].split("?", 1)[0]
+            # The authority (host[:port]) is transport, not endpoint, and
+            # ANCHORING url_path (Task 4) only means something once the host it
+            # was never anchored against is gone -- the old unanchored
+            # `/v1/sessions` matched `http://srv/v1/sessions` as a substring,
+            # which a `^...$` pattern cannot. `endpoint_path` is that
+            # normalisation, shared with `kernel.filing`.
+            path = endpoint_path(target)
             if not re.search(rule.url_path, path):
                 reasons.append(
                     f"{rule.sig}: url path {path!r} does not match {rule.url_path!r}")

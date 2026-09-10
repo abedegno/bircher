@@ -15,7 +15,7 @@ plain `curl` — were invisible to all of them, and to the detector built from
 them. The adversarial attention went entirely to the exclusions; the
 *inclusion* set was never questioned. The `curl` pattern is the sixth.
 
-Confirmed against `batch/run-queue.sh` at 9531 lines on 2026-09-10. Line
+Confirmed against `batch/run-queue.sh` at 9543 lines on 2026-09-10. Line
 numbers move: re-run the patterns and reconcile before relying on them.
 
 ```bash
@@ -68,10 +68,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1689 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 7289 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 8222 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
-| 8223 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 8246 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 7301 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 8234 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
+| 8235 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 8258 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 

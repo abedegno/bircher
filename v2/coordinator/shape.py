@@ -39,8 +39,15 @@ def shape_round(ctx) -> str:
     artefact = turn.files.get(seat.ARTIFACT_OUT)
     ruling = slices.parse_ruling(shape_file) if shape_file else None
     if shape_file and ruling is None:
-        # A ruling with no reasoning is not a ruling (spec §3): the empty turn.
+        # A ruling with no reasoning is not a ruling (spec §3): the empty turn,
+        # WHETHER OR NOT an artefact sits beside it. The bullet is
+        # unconditional over the artefact's presence, and falling through to
+        # the submit took the branch the author did not choose -- their ruling
+        # was malformed, not withdrawn -- spending a review round on a plan
+        # written by a turn that had decided not to slice (final review,
+        # finding 4). `_move_aside` retires both files before the re-prompt.
         ctx.log(f"{seat.SHAPE_OUT} does not parse as a ruling; the empty turn: {shape_file[:200]!r}")
+        return author.record_empty(ctx, turn.session_id)
     if ruling is not None:
         if artefact is not None:
             # The ruling is read first; the artefact beside it is ignored, and

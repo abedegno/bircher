@@ -21,14 +21,23 @@ import re
 
 from kernel import front, slices
 from kernel.authz import NotAuthorized
-from kernel.contract import parse
+from kernel.contract import endpoint_path, parse
 from kernel.dispatch import Role, role_for
 from kernel.effect_class import EffectClass
 
 KINDS = front.FILING_KINDS | front.COMPLETION_KINDS
 _WITH_HASH = frozenset({"slice_issue", "slice_dependency", "slice_queue", "umbrella", "umbrella_label"})
 _WITH_SLICE = frozenset({"slice_issue", "slice_dependency", "slice_queue"})
-_BLOCKED_BY = re.compile(r"^repos/([^/]+/[^/]+)/issues/(\d+)/dependencies/blocked_by$")
+#: The endpoint the contract admits for a blocked-by link, matched THE WAY THE
+#: CONTRACT MATCHES IT: over `endpoint_path`, unanchored at the front. The old
+#: `^repos/...` recognised only the kernel's own spelling, so
+#: `/repos/o/r/issues/41/...` and the full `https://api.github.com/repos/...`
+#: URL -- both admitted by the same rule in `contract.CONTRACTS` -- demanded no
+#: obligation at all (final review, finding 1).
+_BLOCKED_BY = re.compile(r"/issues/(\d+)/dependencies/blocked_by$")
+#: `gh issue close` takes an issue number or an issue URL, and they close the
+#: same issue.
+_ISSUE_URL = re.compile(r"/issues/(\d+)$")
 _VALUED = frozenset({"--repo", "--title", "--label", "--body", "--add-label", "--remove-label",
                      "--comment", "-X", "-f", "--jq"})
 
@@ -83,8 +92,36 @@ def _parsed(argv: list[str]):
     return parse(list(argv), _VALUED)
 
 
-def _int(tok: str) -> int | None:
-    return int(tok) if isinstance(tok, str) and tok.isdigit() else None
+def _blocked_by(ops: list[str]) -> tuple[str, int] | None:
+    """`(endpoint, issue)` when *ops* is a `gh api` call on a blocked-by
+    endpoint; None otherwise. The endpoint is the CONTRACT's normalisation with
+    any leading slash dropped, so the three spellings one rule admits --
+    `repos/o/r/...`, `/repos/o/r/...` and `https://api.github.com/repos/o/r/...`
+    -- are one shape here. Every path the contract admits is recognised, and
+    the BINDING is what refuses one that does not name this run's repo and
+    child."""
+    if ops[:2] != ["gh", "api"] or len(ops) < 3:
+        return None
+    path = endpoint_path(ops[2]).lstrip("/")
+    m = _BLOCKED_BY.search(path)
+    return (path, int(m.group(1))) if m else None
+
+
+def _issue_operand(tok: str) -> int | None:
+    """The issue an operand names: `12`, or a URL/path ending `/issues/12`."""
+    if not isinstance(tok, str):
+        return None
+    if tok.isdigit():
+        return int(tok)
+    m = _ISSUE_URL.search(endpoint_path(tok))
+    return int(m.group(1)) if m else None
+
+
+def _labels(p, flag: str) -> set[str]:
+    """The labels a `--add-label`/`--remove-label` flag NAMES. `gh` splits each
+    value on commas, so `--add-label bircher:queued,bircher:grill` adds
+    bircher:queued -- and testing the whole value for membership missed it."""
+    return {lab.strip() for v in p.values.get(flag, []) for lab in v.split(",") if lab.strip()}
 
 
 # -- the mandate -----------------------------------------------------------------
@@ -97,9 +134,9 @@ def required_kinds(store, run_id: str, effect_class: str, argv: list[str]) -> fr
         return frozenset({"slice_issue"})
     p = _parsed(argv)
     ops = list(p.operands)
-    if ops[:2] == ["gh", "api"] and len(ops) > 2 and _BLOCKED_BY.match(ops[2]):
+    if _blocked_by(ops) is not None:
         return frozenset({"slice_dependency"})
-    added = set(p.values.get("--add-label", []))
+    added = _labels(p, "--add-label")
     if "bircher:queued" in added:
         return frozenset({"slice_queue"})
     if "bircher:sliced" in added:
@@ -108,7 +145,7 @@ def required_kinds(store, run_id: str, effect_class: str, argv: list[str]) -> fr
             v.startswith("bircher: sliced ") for v in p.values.get("--body", [])):
         return frozenset({"umbrella", "umbrella_close"})
     if ops[:3] == ["gh", "issue", "close"] and len(ops) > 3 and store.run_state(run_id) == "sliced" \
-            and _int(ops[3]) == front.issue_number(store, run_id):
+            and _issue_operand(ops[3]) == front.issue_number(store, run_id):
         return frozenset({"parent_close"})
     return frozenset()
 
@@ -261,8 +298,9 @@ def _binding(store, run_id: str, effect_class: str, argv: list[str], intent: dic
         return
     if kind == "slice_dependency":
         numbers, ids = filed_numbers(store, run_id, epoch_n), filed_ids(store, run_id, epoch_n)
-        m = _BLOCKED_BY.match(ops[2]) if ops[:2] == ["gh", "api"] and len(ops) > 2 else None
-        if m is None or m.group(1) != repo or int(m.group(2)) != numbers[ob["slice"]]:
+        m = _blocked_by(ops)
+        want = f"repos/{repo}/issues/{numbers[ob['slice']]}/dependencies/blocked_by"
+        if m is None or m[0] != want:
             raise NotAuthorized(f"slice_dependency: the path does not name issue {numbers[ob['slice']]} of {repo}")
         if p.values.get("-f") != [f"issue_id={ids[ob['blocker']]}"]:
             raise NotAuthorized(f"slice_dependency: -f {p.values.get('-f')} is not issue_id={ids[ob['blocker']]}, the blocker's database id")
