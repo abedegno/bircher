@@ -36,7 +36,7 @@ _WITH_SLICE = frozenset({"slice_issue", "slice_dependency", "slice_queue"})
 #: obligation at all (final review, finding 1).
 _BLOCKED_BY = re.compile(r"/issues/(\d+)/dependencies/blocked_by$")
 _VALUED = frozenset({"--repo", "--title", "--label", "--body", "--add-label", "--remove-label",
-                     "--comment", "-X", "-f", "--jq"})
+                     "--comment", "-X", "-f", "-F", "--jq"})
 
 
 # -- composers -------------------------------------------------------------------
@@ -49,8 +49,12 @@ def create_argv(repo: str, title: str, labels: list[str]) -> list[str]:
 
 
 def link_argv(repo: str, child: int, blocker_id: int) -> list[str]:
+    # `-F`, not `-f`: GitHub's dependencies endpoint requires `issue_id` as an
+    # INTEGER and `-f` sends a string -- the first live filing (E8, bircher-smoke
+    # #21, 2026-09-10) got `422 Invalid property /issue_id: "…" is not of type
+    # integer` on its first link. `-F` is gh's typed field: digits become a number.
     return ["gh", "api", f"repos/{repo}/issues/{child}/dependencies/blocked_by", "-X", "POST",
-            "-f", f"issue_id={blocker_id}"]
+            "-F", f"issue_id={blocker_id}"]
 
 
 def queue_argv(repo: str, child: int) -> list[str]:
@@ -310,8 +314,8 @@ def _binding(store, run_id: str, effect_class: str, argv: list[str], intent: dic
         want = f"repos/{repo}/issues/{numbers[ob['slice']]}/dependencies/blocked_by"
         if ops[:2] != ["gh", "api"] or len(ops) < 3 or ops[2] != want:
             raise NotAuthorized(f"slice_dependency: the path is not exactly {want!r}")
-        if p.values.get("-f") != [f"issue_id={ids[ob['blocker']]}"]:
-            raise NotAuthorized(f"slice_dependency: -f {p.values.get('-f')} is not issue_id={ids[ob['blocker']]}, the blocker's database id")
+        if p.values.get("-F") != [f"issue_id={ids[ob['blocker']]}"] or p.values.get("-f"):
+            raise NotAuthorized(f"slice_dependency: -F {p.values.get('-F')} is not issue_id={ids[ob['blocker']]}, the blocker's database id (typed; -f sends a string GitHub refuses)")
         return
     # The four bindings below are the composer's WHOLE argv, byte for byte.
     # Checking the first four words and a few flag values admitted a second

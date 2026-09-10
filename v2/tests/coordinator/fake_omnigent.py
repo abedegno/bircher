@@ -138,7 +138,12 @@ class FakeOmnigent:
             # "issues".
             if path.endswith("/dependencies/blocked_by") and "-X" in argv:
                 n = int(path.split("/")[4])
-                self.issues[n]["blocked_by"].append(int(val("-f").split("=", 1)[1]))
+                # GitHub types this field: `-f` sends a string and the API
+                # answers 422 (seen live on E8). The fake refuses it the same
+                # way, so a composer that regresses to `-f` fails here too.
+                if "-f" in argv or "-F" not in argv:
+                    raise RuntimeError('gh: Invalid request.\n\nInvalid property /issue_id: is not of type `integer`. (HTTP 422)')
+                self.issues[n]["blocked_by"].append(int(val("-F").split("=", 1)[1]))
                 return "{}"
             if "--jq" in argv and val("--jq") == ".id":
                 return f"{1000 + int(path.split('/')[4])}\n"

@@ -245,8 +245,10 @@ CONTRACTS: dict[str, list[Rule]] = {
         # The write half of the endpoint the queue generator reads
         # (`is_unblocked`, issues-to-queue.sh): a blocked-by link between two
         # issues (shaping spec §2).
-        Rule("gh api", url_path=r"/issues/\d+/dependencies/blocked_by$", flags=frozenset({"-X", "-f"}),
-             valued=frozenset({"-X", "-f"}), methods=frozenset({"POST"})),
+        # `-F` only: the endpoint takes `issue_id` as an integer, and `-f` (a
+        # string field) is refused by GitHub with a 422 -- seen live on E8.
+        Rule("gh api", url_path=r"/issues/\d+/dependencies/blocked_by$", flags=frozenset({"-X", "-F"}),
+             valued=frozenset({"-X", "-F"}), methods=frozenset({"POST"})),
     ],
     # The child issue (shaping spec §2 *The effect class*). No --body-file:
     # the executor appends it after this check, from the artefact the intent's
