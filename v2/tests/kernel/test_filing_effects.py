@@ -95,8 +95,8 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
     cases = [
         (EffectClass.ISSUE_CREATE, filing.create_argv("o/r", "T", ["bircher:slice"]), {"slice_issue"}),
         (EffectClass.ISSUE_OR_LABEL, filing.link_argv("o/r", 41, 1040), {"slice_dependency"}),
-        (EffectClass.ISSUE_OR_LABEL, filing.queue_argv("o/r", 41), {"slice_queue"}),
-        (EffectClass.ISSUE_OR_LABEL, filing.umbrella_label_argv("o/r", 12), {"umbrella_label"}),
+        (EffectClass.ISSUE_OR_LABEL, filing.queue_argv("o/r", 41), {"slice_queue", "umbrella_label"}),
+        (EffectClass.ISSUE_OR_LABEL, filing.umbrella_label_argv("o/r", 12), {"slice_queue", "umbrella_label"}),
         (EffectClass.COMMENT, filing.comment_argv("o/r", 12, f"bircher: sliced {h[:8]}\n"), {"umbrella", "umbrella_close"}),
         (EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 12), {"parent_close"}),
     ]
@@ -108,10 +108,11 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
             perform(s, f.run_id, g, cls, f"k-other-{i}",
                     {"argv": argv, "obligation": {"kind": "publish", "run": f.run_id, "phase": "spec", "hash": "x"}}, gh)
     assert gh.calls == []
-    # The runner's own swap is admitted with no obligation, as today.
-    assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL,
-                                 ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:running",
-                                  "--remove-label", "bircher:queued"]) == frozenset()
+    # While sliced, EVERY edit demands a label obligation -- even the runner's
+    # own swap, which no sliced run performs; on an ordinary run (below) the
+    # swap stays admitted with no obligation, as today.
+    swap = ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:running", "--remove-label", "bircher:queued"]
+    assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, swap) == {"slice_queue", "umbrella_label"}
     # EVERY close while the run is sliced demands the parent close, even one
     # naming another issue (gh's operand grammar is not ours to model; the
     # binding admits only the composer's argv) -- and the parent's close on a
@@ -120,16 +121,24 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
     s2 = Store.open(tmp_path / "k2.db")
     f2 = Front(s2, "i12-epic-1", shape=False, issue=ISSUE)                     # born in shaping, never sliced
     assert filing.required_kinds(s2, f2.run_id, EffectClass.ISSUE_OR_LABEL, filing.close_argv("o/r", 12)) == frozenset()
+    assert filing.required_kinds(s2, f2.run_id, EffectClass.ISSUE_OR_LABEL, swap) == frozenset()
+    # ...and before sliced the label is still recognised by NAME, however spelled.
+    for value in ("bircher:queued", "BIRCHER:QUEUED", '"bircher:queued"', "x,bircher:queued"):
+        assert filing.required_kinds(s2, f2.run_id, EffectClass.ISSUE_OR_LABEL,
+                                     ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", value]) == {"slice_queue"}, value
 
 
-#: THE SAME FIVE COMMANDS, spelled the way the CONTRACT admits them rather than
-#: the way the kernel composes them. Each does exactly what the canonical form
-#: does -- `check` normalises a `gh api` operand's scheme and authority and
-#: matches the path unanchored, `gh` splits a label value on commas, and `gh
-#: issue close` takes an issue URL -- so each reached the executor through
-#: `perform` with NO obligation at all while the mandate recognised only the
-#: kernel's own spelling (final review, finding 1). What the contract admits
-#: and what the mandate demands are read from ONE normaliser now.
+#: Conservative mandate coverage: argvs the CONTRACT admits that are NOT the
+#: kernel's own spelling, each of which must demand an obligation kind (and is
+#: then refused at the binding, which admits only the composer's argv). The
+#: first five reach the same GitHub state as the canonical form through
+#: `gh`'s own normalisation -- `check` strips a `gh api` operand's scheme and
+#: authority, `gh` splits a label value on commas, `gh issue close` takes a
+#: URL -- and reached the executor with NO obligation while the mandate
+#: recognised only the kernel's spelling (final review, finding 1). The later
+#: rows are gh grammar the mandate does not model at all: while a run is
+#: `sliced`, EVERY close and EVERY label edit demands its kind, whatever the
+#: operand or value (Codex, three passes).
 _OTHER_SPELLINGS = [
     ("leading-slash-path", EffectClass.ISSUE_OR_LABEL,
      ["gh", "api", "/repos/o/r/issues/41/dependencies/blocked_by", "-X", "POST", "-f", "issue_id=1040"],
@@ -140,11 +149,24 @@ _OTHER_SPELLINGS = [
      {"slice_dependency"}),
     ("comma-joined-queue-label", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", "bircher:queued,bircher:grill"],
-     {"slice_queue"}),
+     {"slice_queue", "umbrella_label"}),
     ("comma-joined-sliced-label", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:sliced,x",
       "--remove-label", "bircher:running"],
-     {"umbrella_label"}),
+     {"slice_queue", "umbrella_label"}),
+    # gh reads a label value as CSV (a quoted field) and GitHub matches label
+    # names without regard to case; and a sliced run edits no issue except
+    # through its two label obligations -- so while sliced EVERY edit demands
+    # one of them, whatever the value says (Codex, third pass).
+    ("csv-quoted-queue-label", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", '"bircher:queued"'],
+     {"slice_queue", "umbrella_label"}),
+    ("upper-cased-queue-label", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", "BIRCHER:QUEUED"],
+     {"slice_queue", "umbrella_label"}),
+    ("any-label-edit-while-sliced", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "edit", "41", "--repo", "o/r", "--add-label", "x"],
+     {"slice_queue", "umbrella_label"}),
     ("close-by-url", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "close", "https://github.com/o/r/issues/12", "--repo", "o/r"],
      {"parent_close"}),

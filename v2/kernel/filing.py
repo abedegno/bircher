@@ -105,10 +105,13 @@ def _blocked_by(ops: list[str]) -> tuple[str, int] | None:
 
 
 def _labels(p, flag: str) -> set[str]:
-    """The labels a `--add-label`/`--remove-label` flag NAMES. `gh` splits each
-    value on commas, so `--add-label bircher:queued,bircher:grill` adds
-    bircher:queued -- and testing the whole value for membership missed it."""
-    return {lab.strip() for v in p.values.get(flag, []) for lab in v.split(",") if lab.strip()}
+    """The labels a `--add-label`/`--remove-label` flag NAMES, best effort:
+    `gh` reads each value as CSV (commas split, quotes wrap a field) and GitHub
+    matches label names without regard to case. Best effort is why, while the
+    run is `sliced`, EVERY `gh issue edit` demands a label obligation below --
+    this recogniser only matters before that state."""
+    return {lab.strip().strip('"').casefold() for v in p.values.get(flag, [])
+            for lab in v.split(",") if lab.strip().strip('"')}
 
 
 # -- the mandate -----------------------------------------------------------------
@@ -123,6 +126,15 @@ def required_kinds(store, run_id: str, effect_class: str, argv: list[str]) -> fr
     ops = list(p.operands)
     if _blocked_by(ops) is not None:
         return frozenset({"slice_dependency"})
+    # EVERY `gh issue edit` while the run is `sliced` demands one of the two
+    # label obligations, whatever its labels say: gh's value grammar (CSV,
+    # quoting, case-insensitive names) is not ours to model (Codex, third
+    # pass), a sliced run edits no issue but its children's queue label and
+    # its own umbrella label, and the bindings admit only the composers' argv.
+    # Before `sliced` the label is recognised by name, so the runner's own
+    # `bircher:running` swap on an ordinary run stays admitted as today.
+    if ops[:3] == ["gh", "issue", "edit"] and store.run_state(run_id) == "sliced":
+        return frozenset({"slice_queue", "umbrella_label"})
     added = _labels(p, "--add-label")
     if "bircher:queued" in added:
         return frozenset({"slice_queue"})
