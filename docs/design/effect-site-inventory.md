@@ -40,8 +40,8 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | 1662 | `gh pr merge --squash --delete-branch` | `merge` |
 | 1866 | `git push origin HEAD:main` | `ref_update` |
 | 2048 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT -f expected_head_sha=$sha` (sweep) | `ref_update` |
-| 2191 | `git push origin $oid:refs/heads/$branch` (publish) | `ref_update` |
-| 2195 | `gh pr create --head $branch --base main` (publish) | `pull_request` |
+| 2192 | `git push origin $oid:refs/heads/$branch` (publish) | `ref_update` |
+| 2196 | `gh pr create --head $branch --base main` (publish) | `pull_request` |
 | 2393 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` (recover-pr) | `ref_update` |
 | 2634 | `gh pr close` | `pull_request` |
 | 3872 | `gh issue comment` | `comment` |

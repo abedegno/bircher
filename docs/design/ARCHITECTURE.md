@@ -177,7 +177,7 @@ Genuinely non-transitioning: `record_implementation_output`,
 `record_run_outcome` is legal from every state except `ended`. `ended` is
 terminal and unreachable-from.
 
-**Effect classes:** `merge`, `comment`, `status_check`, `pull_request`,
+**Effect classes:** `merge`, `comment`, `status_check`, `pull_request`, `issue_create`,
 `issue_or_label`, `ref_update`, `session_control`.
 
 **Fact kinds (the journal):** `run_started`, `command_requested`,
