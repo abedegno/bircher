@@ -324,8 +324,16 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
 def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
     """The four assertions of shaping spec §6 over a parent. `gh_json` is
     the sweep's reader (coordinator.sweep.gh_json) or a fake; it is not
-    called for a run that filed nothing (assertion 4 still runs)."""
+    called for a run that filed nothing (assertion 4 still runs).
+
+    A failed read is a proof failure, not a crash: each `gh_json` call is
+    wrapped so a `ReadFailed` appends a failure line naming the child (or
+    the parent) and what could not be read, and the function carries on
+    with the remaining children and assertions. A read that fails cannot
+    satisfy its own assertion, so the failure line stands in for it -- no
+    further check is attempted for that same read."""
     import collections
+    from coordinator.sweep import ReadFailed
     from kernel import slices
     fails: list[str] = []
     n = front.epoch(store, run_id)
@@ -349,7 +357,11 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         for s in plan.slices:
             if s.number not in filed:
                 continue
-            live = gh_json(["gh", "issue", "view", str(numbers[s.number]), "--repo", repo, "--json", "title,body"])
+            try:
+                live = gh_json(["gh", "issue", "view", str(numbers[s.number]), "--repo", repo, "--json", "title,body"])
+            except ReadFailed as exc:
+                fails.append(f"slice {s.number} (#{numbers[s.number]}): could not read title,body: {exc}")
+                continue
             title, body = slices.render_child(s, parent, h[:8], {d: numbers[d] for d in s.depends_on})
             if live.get("title") != title or (live.get("body") or "").rstrip("\n") != body.rstrip("\n"):
                 fails.append(f"child #{numbers[s.number]}: title or body is not render_child over slice {s.number}")
@@ -357,18 +369,27 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         for s in plan.slices:
             if s.number not in filed:
                 continue
-            links = gh_json(["gh", "api", f"repos/{repo}/issues/{numbers[s.number]}/dependencies/blocked_by"])
+            try:
+                links = gh_json(["gh", "api", f"repos/{repo}/issues/{numbers[s.number]}/dependencies/blocked_by"])
+            except ReadFailed as exc:
+                fails.append(f"slice {s.number} (#{numbers[s.number]}): could not read blocked_by: {exc}")
+                continue
             got = sorted(int(x["number"]) for x in links)
             want = sorted(numbers[d] for d in s.depends_on)
             if got != want:
                 fails.append(f"child #{numbers[s.number]}: blocked-by links {got} are not the plan's {want} (a missing or extra link)")
         # 3. The umbrella names the children.
-        comments = gh_json(["gh", "issue", "view", str(parent), "--repo", repo, "--json", "comments"]).get("comments") or []
-        ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
-        if len(ums) != 1:
-            fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
-        elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
-            fails.append("the umbrella comment does not list exactly the filed children")
+        try:
+            comments = gh_json(["gh", "issue", "view", str(parent), "--repo", repo, "--json", "comments"]).get("comments") or []
+        except ReadFailed as exc:
+            fails.append(f"parent #{parent}: could not read comments: {exc}")
+            comments = None
+        if comments is not None:
+            ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
+            if len(ums) != 1:
+                fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
+            elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
+                fails.append("the umbrella comment does not list exactly the filed children")
     # 4. One decision per epoch, and every filing in the last.
     for f in store.facts_of_kind(run_id, EventKind.SLICE_FILED):
         if f.payload.get("epoch") != n:
@@ -410,7 +431,7 @@ def main(argv=None) -> int:
     fails = assert_journal(store, a.run_id, mode=mode) + assert_sessions(store, a.run_id, server=a.server)
 
     if a.children:
-        from coordinator.sweep import gh_json
+        from coordinator.sweep import ReadFailed, gh_json
         if not a.repo:
             print("--children needs --repo", file=sys.stderr)
             return 2
@@ -420,8 +441,15 @@ def main(argv=None) -> int:
             if not kids:
                 fails.append(f"child #{f.payload['issue']} has no run yet")
                 continue
-            fails += [f"child #{f.payload['issue']} ({kids[-1]}): {x}" for x in
-                      assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)]
+            # Nothing here reads gh today, but a read failure while proving a
+            # child must become a failure line, not an exception escaping
+            # main -- the loop continues over the remaining children either way.
+            try:
+                child_fails = assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)
+            except ReadFailed as exc:
+                fails.append(f"child #{f.payload['issue']} ({kids[-1]}): could not read: {exc}")
+                continue
+            fails += [f"child #{f.payload['issue']} ({kids[-1]}): {x}" for x in child_fails]
 
     if a.issues:
         # The body-content half of this rule (no file, function or acceptance
