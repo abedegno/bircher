@@ -111,9 +111,12 @@ def _issue_operand(tok: str) -> int | None:
     """The issue an operand names: `12`, or a URL/path ending `/issues/12`."""
     if not isinstance(tok, str):
         return None
+    # `gh` reads `#12` as issue 12 and tolerates a trailing slash on the URL;
+    # both closed the parent with no obligation until the final re-review.
+    tok = tok.lstrip("#")
     if tok.isdigit():
         return int(tok)
-    m = _ISSUE_URL.search(endpoint_path(tok))
+    m = _ISSUE_URL.search(endpoint_path(tok).rstrip("/"))
     return int(m.group(1)) if m else None
 
 
@@ -298,10 +301,13 @@ def _binding(store, run_id: str, effect_class: str, argv: list[str], intent: dic
         return
     if kind == "slice_dependency":
         numbers, ids = filed_numbers(store, run_id, epoch_n), filed_ids(store, run_id, epoch_n)
-        m = _blocked_by(ops)
+        # The BINDING is byte-exact on the composer's spelling: the mandate
+        # recognises every spelling the contract admits, but only the kernel's
+        # own -- no scheme, no authority, no query -- is bound, so an obligation
+        # can never be spent on a call aimed at another host (final re-review).
         want = f"repos/{repo}/issues/{numbers[ob['slice']]}/dependencies/blocked_by"
-        if m is None or m[0] != want:
-            raise NotAuthorized(f"slice_dependency: the path does not name issue {numbers[ob['slice']]} of {repo}")
+        if ops[:2] != ["gh", "api"] or len(ops) < 3 or ops[2] != want:
+            raise NotAuthorized(f"slice_dependency: the path is not exactly {want!r}")
         if p.values.get("-f") != [f"issue_id={ids[ob['blocker']]}"]:
             raise NotAuthorized(f"slice_dependency: -f {p.values.get('-f')} is not issue_id={ids[ob['blocker']]}, the blocker's database id")
         return

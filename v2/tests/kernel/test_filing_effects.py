@@ -142,6 +142,14 @@ _OTHER_SPELLINGS = [
     ("close-by-url", EffectClass.ISSUE_OR_LABEL,
      ["gh", "issue", "close", "https://github.com/o/r/issues/12", "--repo", "o/r"],
      {"parent_close"}),
+    # `gh` reads `#12` as issue 12 and tolerates a trailing slash; both closed
+    # the parent with no obligation until the final re-review probed them.
+    ("close-by-hash-number", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "#12", "--repo", "o/r"],
+     {"parent_close"}),
+    ("close-by-url-trailing-slash", EffectClass.ISSUE_OR_LABEL,
+     ["gh", "issue", "close", "https://github.com/o/r/issues/12/", "--repo", "o/r"],
+     {"parent_close"}),
 ]
 
 
@@ -264,6 +272,38 @@ def test_link_binding_and_precondition(tmp_path):
     with pytest.raises(NotAuthorized, match="edge"):                            # not in the plan
         perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "l3", {"argv": filing.link_argv("o/r", numbers[1], ids[2]), "obligation": dict(dep, slice=1, blocker=2)}, gh)
     assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "l4", {"argv": filing.link_argv("o/r", numbers[2], ids[1]), "obligation": dep}, gh) == "ok"
+
+
+#: Spellings the CONTRACT admits and the MANDATE recognises (each demands
+#: `slice_dependency`) but the BINDING refuses even with the correct
+#: obligation: only the composer's own spelling -- no scheme, no authority, no
+#: query -- may spend an obligation, so a journalled link can never be aimed at
+#: another host (final re-review: the first fix bound the normalised path and
+#: `https://evil.example.com/repos/...` was accepted under a legitimate
+#: obligation; `gh api` really sends there).
+_OTHER_LINK_SPELLINGS = [
+    ("leading-slash", "/repos/o/r/issues/{child}/dependencies/blocked_by"),
+    ("full-url", "https://api.github.com/repos/o/r/issues/{child}/dependencies/blocked_by"),
+    ("other-host", "https://evil.example.com/repos/o/r/issues/{child}/dependencies/blocked_by"),
+    ("query", "repos/o/r/issues/{child}/dependencies/blocked_by?x=1"),
+]
+
+
+def test_link_binding_is_byte_exact_on_the_composers_spelling(tmp_path):
+    s, f, g, gh = _sliced(tmp_path)
+    h = front.accepted_slices_hash(s, f.run_id, 0)
+    dep = {"kind": "slice_dependency", "run": f.run_id, "epoch": 0, "plan_hash": h, "slice": 2, "blocker": 1}
+    numbers, ids = _file_two(s, f, g, gh)
+    before = list(gh.calls)
+    for why, path in _OTHER_LINK_SPELLINGS:
+        argv = ["gh", "api", path.format(child=numbers[2]), "-X", "POST", "-f", f"issue_id={ids[1]}"]
+        check(EffectClass.ISSUE_OR_LABEL, argv)                                   # reachable: the contract admits it
+        assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, argv) == {"slice_dependency"}, why
+        with pytest.raises(NotAuthorized, match="not exactly"):                    # ...and the binding refuses it
+            perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, f"lx-{why}", {"argv": argv, "obligation": dep}, gh)
+    assert gh.calls == before                                                     # nothing reached GitHub
+    assert perform(s, f.run_id, g, EffectClass.ISSUE_OR_LABEL, "l-canon",
+                   {"argv": filing.link_argv("o/r", numbers[2], ids[1]), "obligation": dep}, gh) == "ok"
 
 
 def test_queue_label_waits_for_every_create_and_link(tmp_path):
