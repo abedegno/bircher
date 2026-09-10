@@ -4468,7 +4468,7 @@ run_item() {
   # the issue kept bircher:queued for the rest of the run. Under a generation
   # the same pass replays (a retry within it is still the same act) and the
   # next pass, a new generation, attempts it afresh.
-  [ -n "$_iss" ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true
+  [ -n "$_iss" ] && [ "${_st:-}" != sliced ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true  # a sliced run resumed mid-filing owns no running label to swap: the kernel refuses every other edit there
   if [ "$resumed" = 1 ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.

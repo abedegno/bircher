@@ -109,8 +109,9 @@ def test_every_added_argv_shape_needs_its_kind(tmp_path):
                     {"argv": argv, "obligation": {"kind": "publish", "run": f.run_id, "phase": "spec", "hash": "x"}}, gh)
     assert gh.calls == []
     # While sliced, EVERY edit demands a label obligation -- even the runner's
-    # own swap, which no sliced run performs; on an ordinary run (below) the
-    # swap stays admitted with no obligation, as today.
+    # own running-label swap, which a sliced run resumed after an interrupted
+    # filing would otherwise reach (run_item skips it at `sliced`); on an
+    # ordinary run (below) the swap stays admitted with no obligation, as today.
     swap = ["gh", "issue", "edit", "12", "--repo", "o/r", "--add-label", "bircher:running", "--remove-label", "bircher:queued"]
     assert filing.required_kinds(s, f.run_id, EffectClass.ISSUE_OR_LABEL, swap) == {"slice_queue", "umbrella_label"}
     # EVERY close while the run is sliced demands the parent close, even one

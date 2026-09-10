@@ -675,6 +675,22 @@ def test_resume_finds_the_open_run_and_refences_as_operator(tmp_path):
     assert d.args_of("_kernel_start_implementation")[0] == OPEN_RUN
 
 
+def test_a_sliced_resume_skips_the_running_label_swap(tmp_path):
+    """A run resumed at `sliced` (an interrupted filing) owns no running label
+    to swap: the parent already carries what pass 4 gave it, and the kernel
+    refuses every `gh issue edit` on a sliced run except the two composers'
+    (Codex, fourth pass). run_item skips the swap there -- and only there."""
+    d = _resume_drive(tmp_path, T_STATE_RESUME="sliced", T_STATE_AFTER="sliced")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    swaps = [a for n, a in d.calls if n == "_effect" and any(str(x).startswith("running:") for x in a)]
+    assert swaps == [], swaps
+    assert d.outcomes == ["sliced"], d.calls
+    # The ordinary resume still swaps: the guard is about `sliced`, not resumption.
+    (tmp_path / "ordinary").mkdir()
+    d2 = _resume_drive(tmp_path / "ordinary")
+    assert [a for n, a in d2.calls if n == "_effect" and any(str(x).startswith("running:") for x in a)], d2.calls
+
+
 def test_a_resumed_run_binds_the_base_the_KERNEL_recorded(tmp_path):
     """`validate_review` compares the binding's `base_sha` against
     `store.run_base_sha(run_id)` BEFORE the implementation-phase early return,
