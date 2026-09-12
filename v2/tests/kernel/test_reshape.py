@@ -602,6 +602,34 @@ def test_a_plan_an_earlier_visit_rejected_may_be_resubmitted(tmp_path):
     assert front.submissions(s, f.run_id, "slices", 0, visit=2) == subs[-1:]
 
 
+def test_an_earlier_visit_can_be_read_after_a_later_one_exists(tmp_path):
+    """The visit filters select ONE visit, not that visit and every later
+    one. No other test asks an older visit a question once a newer visit
+    exists, so `== visit` relaxed to `>= visit` passes the whole suite --
+    in both readers. The proof's assertion 4 walks every visit of every
+    epoch in order, so it is the first caller that would meet the
+    difference, and it would meet it as a wrong verdict rather than as an
+    error."""
+    s, f = _new(tmp_path)
+    f.shape_round(SLICES_BYTES)                                   # submission, visit 1
+    f.review_round("request_revision", findings=b"findings from visit one")
+    f.shape_round(reasoning="one piece after all", cost="the spec would find one surface")
+    f.request_reshape("three parts")                              # opens visit 2
+    f.shape_round(SLICES_BYTES)                                   # submission, visit 2
+    f.review_round("request_revision", findings=b"findings from visit two")
+
+    subs = front.submissions(s, f.run_id, "slices", 0)
+    assert [x.payload["visit"] for x in subs] == [1, 2]
+    assert front.submissions(s, f.run_id, "slices", 0, visit=1) == subs[:1]
+    assert front.submissions(s, f.run_id, "slices", 0, visit=2) == subs[1:]
+
+    v1 = front.newest_review_verdict(s, f.run_id, "slices", 0, visit=1)
+    v2 = front.newest_review_verdict(s, f.run_id, "slices", 0, visit=2)
+    assert v1 is not None and v2 is not None and v1.seq < v2.seq
+    assert s.read_blob(v1.payload["findings_hash"]) == b"findings from visit one"
+    assert s.read_blob(v2.payload["findings_hash"]) == b"findings from visit two"
+
+
 def test_a_spec_is_deduped_across_visits_not_within_one(tmp_path):
     """Only phase `slices` is visit-scoped, and this is the history that
     proves it rather than asserting it.
