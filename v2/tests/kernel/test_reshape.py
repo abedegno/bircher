@@ -7,7 +7,7 @@ from kernel.authz import NotAuthorized
 from kernel.dispatch import Role
 from kernel.events import EventKind
 from kernel.store import Store
-from tests.kernel.front import ISSUE, SLICES_BYTES, Front
+from tests.kernel.front import ISSUE, SLICES_BYTES, SPEC_BYTES, Front
 
 
 # The four fixtures of the plan's *Shared test fixtures* section go here,
@@ -600,6 +600,35 @@ def test_a_plan_an_earlier_visit_rejected_may_be_resubmitted(tmp_path):
     subs = front.submissions(s, f.run_id, "slices", 0)
     assert [x.payload["visit"] for x in subs] == [1, 2]
     assert front.submissions(s, f.run_id, "slices", 0, visit=2) == subs[-1:]
+
+
+def test_a_spec_is_deduped_across_visits_not_within_one(tmp_path):
+    """Only phase `slices` is visit-scoped, and this is the history that
+    proves it rather than asserting it.
+
+    A hand-back from a REVISION turn is legal, and the spec says so: such an
+    epoch "legitimately holds a spec submission" written before the
+    hand-back. So an epoch can hold a spec in visit 1, be handed back, be
+    disputed, be resolved by the person, and reach `queued` again in visit 2
+    -- where the spec author may resubmit. That resubmission must still be
+    deduped against visit 1's spec, because a spec that did not change is
+    not a revision whatever the shaper did in between.
+
+    Scoping the dedupe to the current visit for EVERY phase -- which reads
+    as a harmless simplification -- admits it. Nothing else in the suite
+    notices: this is the only reachable history where an epoch holds a
+    submission of a non-shaping phase in an earlier visit."""
+    s, f = _new(tmp_path)
+    f.shape_round()                                        # one piece, visit 1
+    f.author_round(SPEC_BYTES)                             # a spec in visit 1
+    f.review_round("request_revision", findings=b"this looks like three things")
+    f.request_reshape("three parts: a store, an API, a page")   # the revision turn hands back
+    f.shape_round(reasoning="still one piece", cost="the spec would find one surface")
+    f.approve_one_piece()                                  # the person resolves it
+    assert s.run_state(f.run_id) == "queued"
+    assert front.shaping_visit(s, f.run_id, 0) == 2
+    with pytest.raises(NotAuthorized, match="identical to the prior artefact"):
+        f.author_round(SPEC_BYTES)
 
 
 def test_the_same_plan_twice_in_one_visit_is_still_refused(tmp_path):
