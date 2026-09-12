@@ -144,7 +144,7 @@ stated per command and not inherited:
 | `PARK_REASONS` and `_check_park` (revision 16) | gain `disagreement`, legal only while the dispute is unresolved; `park_notice_body`, `PARK_NEEDS` and `park_prompt` key their text on it |
 | `_is_round_cause` (revision 16) | admits a `model_ruling` whose `question_id` is `shape`, and no other ruling; with that cause `_findings_for` returns nothing; `author_brief` renders the question in an epoch with no hand-back, or the resolution after one, as its own section |
 | `front.shaping_visit`, `front.visit_of` (revision 16) | the visit counter, and the prefix walk that attributes a fact without a `visit` to its visit |
-| the one-ruling guard of `record_one_piece`, `front.shape_ruling` (visit optional), `_check_submit`'s identical-resubmission guard for `slices`, the proof's assertion 4, `choose_author_vendor`'s same-phase rotation for `slices`, `issue_review_brief`'s prior findings for `slices`, `author_brief`'s previous-draft block for `slices`, and `shape_round`'s round counter with `author._copy`'s name `slices-v<visit>-r<n>.md` (revision 16) | the seven readers that move from the epoch to the shaping visit; every other reader of `front.epoch` is unchanged, by the *visits, not epochs* ruling |
+| the one-ruling guard of `record_one_piece`, `front.shape_ruling` (visit optional), `_check_submit`'s identical-resubmission guard for `slices`, the proof's assertion 4, `choose_author_vendor`'s same-phase rotation for `slices`, `issue_review_brief`'s prior findings for `slices`, `author_brief`'s previous-draft block for `slices`, and `shape_round`'s round counter with `author._copy`'s name `slices-v<visit>-r<n>.md` (revision 16) | the eight readers that move from the epoch to the shaping visit; every other reader of `front.epoch` is unchanged, by the *visits, not epochs* ruling |
 | `COMMAND_NAMES`, `OUTPUT_COMMANDS`, `EventKind`, `SCHEMA_VERSIONS` (revision 16) | `request_reshape` joins the first two (the observed-turn-and-stop check comes with the second) and `approve_one_piece` the first; `reshape_requested` joins `EventKind` and `SCHEMA_VERSIONS` (version 1) — an undeclared kind is a `KeyError` in `append_fact`, not a refusal — the two tests that enumerate the kinds (`test_store_front.py`, `test_slices_grammar.py`) iterate their own literal dicts and cannot go red, so both gain `reshape_requested` for completeness; the guard that already covers `append_fact` is `test_store.py`'s test parametrised over `sorted(SCHEMA_VERSIONS)`, which gains the kind as a passing case |
 | `HUMAN_COMMANDS` / `HUMAN_EXECUTABLE` (revision 16) | `approve_one_piece` joins both — this is what "as `human`" binds to; `request_reshape` joins neither |
 | `choose_author_vendor` (revision 16) | precedence: an existing current-cause session; then every spec author round of an epoch holding a `shape` ruling and no spec `review_verdict` yet — the first, and the one after a resolution — is the vendor that is not the newest `shape` ruling's actor, and every **shaping** author round of a hand-back visit is the handed-back ruling's vendor, or the other vendor when the hand-back's actor is that vendor, and every **shaping** author round of a direction-opened visit is the vendor that is not the disputed ruling's actor — for the whole visit, verdicts or none; spec rounds inside those visits take the spec-round clause, never these; in those visits rotation moves only the shaping reviewer seat |
@@ -328,7 +328,7 @@ disagreement is unresolved (below). `front.shaping_visit(store, run_id,
 epoch_n)` counts them from the journal prefix — for a direction, whether the
 disagreement was unresolved at the moment the direction was recorded, so a
 later `revise_bundle` never erases a visit — and `shape_ruling` takes a visit
-as well as an epoch. Seven readers move from the epoch to the visit, and the site
+as well as an epoch. Eight readers move from the epoch to the visit, and the site
 table names them: the one-ruling guard on `record_one_piece`,
 `front.shape_ruling` (whose visit argument is optional — `request_reshape`'s
 refusal and assertion 4's walk ask the epoch), `_check_submit`'s
@@ -853,8 +853,9 @@ turn of the epoch asks.
 **The input boundary.** The question-turn's brief is the frozen snapshot, the
 policy, the skill and the question. The snapshot is the kernel's
 (`bundle.snapshot`), which drops the pipeline's notices by their seven status
-prefixes before hashing — `bircher: parked `, where a disagreement notice
-quotes both seats, among them — and keeps a person's comment that happens to
+prefixes before hashing — `bircher: parked `, the disagreement notice among
+them (what that notice says is §4's; the two seats' reasoning is quoted in
+the session prompt, not on the issue) — and keeps a person's comment that happens to
 begin `bircher:`; the brief adds no filter of its own. The residual channels
 are stated rather than hidden: the seats' worktrees are siblings under
 `<workspaces_root>/<run_id>/<generation>`, so the shaper's `bircher/shape.md`
@@ -1109,8 +1110,9 @@ instead is stated in §9.
 
 ## §5 Runner
 
-Seven changes — three of them to `run_item`, two to the queue generator —
-and one changed note on a path that already exists:
+Six changes — three of them to `run_item`, one to the queue generator —
+plus one changed note on a path that already exists and one restatement of
+delivered behaviour:
 
 - `_preflight_labels` checks `bircher:slice` and `bircher:sliced` beside
   `running` and `escalated`.
@@ -1200,8 +1202,14 @@ before the next round — the run at `queued` after `approve_one_piece`, or at
 `shaping` with the dispute resolved — takes today's path too: that is the
 front half's existing cost for a crash after any gate approval, the decision
 is in the journal, and re-queuing shapes again; revision 16 neither widens
-that window nor covers it. The generator's journal sweep reads the dispute
-in-process, and the fourth change makes its failure visible: the
+that window nor covers it. **The blocked check applies to label-derived items only** (revision 16): the
+generator unions its journal-derived resumptions — the current-park
+condition, the `sliced` run owing a filing, and the new unresolved dispute
+with no park — into the queue *after* `is_unblocked`, because an open run is
+past its sequencing and a sibling blocker reopened while it was parked would
+otherwise withhold it every wave with nothing on the issue to say so. A
+label-derived issue is checked as today. The generator's journal sweep reads
+the dispute in-process, and the last change makes its failure visible: the
 sweep's `2>/dev/null` goes, the non-fatal fallback stays, and a failed sweep
 prints "issues-to-queue: journal sweep failed (<err>); the queue was
 generated from labels alone" on stderr, where the wave's log carries it —
@@ -2066,7 +2074,7 @@ wrong output propagates unchecked — is E9's diagnosis:
 **Rulings taken in this revision**, each with its cost if wrong:
 
 - *Visits, not epochs.* A hand-back opens a shaping visit inside the epoch
-  rather than a new epoch, so seven readers change meaning (§2, the site
+  rather than a new epoch, so eight readers change meaning (§2, the site
   table) and every other reader of `front.epoch` keeps its. Costs if wrong: an
   eighth reader that should have been per visit surfaces on the first
   hand-back history — in the proof, or in a brief's content — and the fix is
@@ -2395,3 +2403,21 @@ carried by both reviewers.
 6. **Low — the site table attributed the per-visit round counter to `author_brief`, which computes none.** Accepted; `shape_round`'s counter and `author._copy`'s name, named separately (§2).
 7. **Low — §5's `is_unblocked` bullet described code superseded on 2026-09-10.** Accepted; restated as delivered (§5).
 8. **Low — on the hand-back visit's first round the reasoning rendered twice, through both the cause and the standing section, arming the dispositions block on a turn whose endings include a ruling.** Accepted; with a `reshape_requested` cause `_findings_for` returns nothing and the standing section carries it (§2).
+
+## Dispositions — revision 16, round 13 (Codex: PASS, no findings; the Claude-side pass: PASS, three lows, 2026-09-12)
+
+**Both reviewers PASS.** Codex found nothing and confirmed all eight round-12
+dispositions carried; the Claude-side pass confirmed the same eight and found
+three lows, all accepted and fixed here.
+
+1. **Low — §3 said the disagreement notice on the issue quotes both seats, which §2's site table and §4 give to the session prompt.** Accepted; §3 names the notice and points at §4 for what it says.
+2. **Low — two counts drifted when round 12 split entries: §5's "seven changes … two to the queue generator" (the `is_unblocked` bullet became a restatement, not a change) and "seven readers" over eight rows.** Accepted; six changes with one restatement, and eight readers in all three places.
+3. **Low — §5 did not say that the journal-derived resumptions are unioned after `is_unblocked`; as written a reopened sibling blocker would withhold a parked or disputed run every wave, with only a log line to show it.** Accepted; the blocked check applies to label-derived items only, stated with its reason (§5).
+
+**The revision is complete at thirteen rounds.** Codex: FAIL through round 11,
+PASS at 12 and 13. The Claude-side pass (rounds 3–13, Kimi being out of
+quota): FAIL through round 12, PASS at 13. Findings by round: 5, 5, 18, 19,
+18, 15, 8, 7, 8, 8, 6, 9, 3. Two mechanisms were replaced during review
+rather than patched — shaping visits inside the epoch, and a destination
+computed from the journal — and four rules were reversed or rescoped by
+findings the reviewers verified by executing the kernel.
