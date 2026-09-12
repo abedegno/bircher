@@ -80,6 +80,16 @@ def choose_author_vendor(ctx) -> str:
 def _findings_for(ctx) -> bytes:
     cause = phases.round_cause(ctx)
     store = ctx.store
+    # Revision 16: two causes render their own section instead of findings.
+    # The hand-back's reasoning is the shaping brief's standing section, and
+    # the shape ruling is the question-turn's cause, which carries nothing.
+    # Returning the reasoning here would render it twice and arm both the
+    # dispositions block and the previous-draft block on the one round whose
+    # intended endings include a ruling with no artefact.
+    if cause.kind in (EventKind.RESHAPE_REQUESTED, EventKind.MODEL_RULING):
+        return b""
+    if cause.kind == EventKind.AUTHOR_EMPTY and cause.payload.get("detail"):
+        return b""                      # the parse-failure section renders it
     if cause.kind == EventKind.REVIEW_VERDICT and cause.payload.get("findings_hash"):
         return store.read_blob(cause.payload["findings_hash"])
     if cause.kind == EventKind.HUMAN_DIRECTION:
@@ -89,6 +99,63 @@ def _findings_for(ctx) -> bytes:
     if cause.kind == EventKind.COMMAND_REJECTED:
         return cause.payload.get("detail", "").encode()
     return b""
+
+
+#: The fresh-perspective question (shaping spec §3, revision 16): rendered
+#: once, on the spec round whose cause is the shape ruling. Its own section,
+#: not a finding -- the author has nothing to disposition yet.
+QUESTION = (
+    "\n## Before you write anything\n\n"
+    "Is this one piece of work? One piece is a single capability a reviewer could\n"
+    "see working end to end. If the spec you are about to write would specify more\n"
+    "than one such capability, do not write it. Write `%s` instead and end the\n"
+    "turn.\n" % seat.RESHAPE_OUT)
+
+#: The hand-back's grammar (shaping spec §3, revision 16), shared by three
+#: renderings: the question turn, the availability instruction on every later
+#: composed spec turn, and the malformed-retry section -- one copy, so the
+#: three cannot drift into three different readings of what the kernel parses.
+HAND_BACK_GRAMMAR = (
+    "Write the file whole somewhere else in the worktree and rename it into place:\n"
+    "a watched file counts as landed the moment it is non-empty. Write exactly\n"
+    "this, with the first non-blank line exactly `%s`:\n\n"
+    "    %s\n"
+    "    Reasoning: <why this is more than one piece; name the pieces you see>\n"
+    % (slices.RESHAPE_LINE, slices.RESHAPE_LINE))
+
+
+def _question_section(ctx) -> str | None:
+    """The fresh-perspective question (shaping spec §3). A rendering of the
+    round's CAUSE, never a predicate on the epoch: the first spec turn after
+    the shape ruling, and a crash-resume of that turn, whose cause is
+    unchanged. An epoch that holds a hand-back has had its question."""
+    from kernel.slices import SHAPE_QUESTION
+    cause = phases.round_cause(ctx)
+    if not (cause.kind == EventKind.MODEL_RULING
+            and cause.payload.get("question_id") == SHAPE_QUESTION):
+        return None
+    if front.epoch_facts(ctx.store, ctx.run_id, EventKind.RESHAPE_REQUESTED, ctx.epoch()):
+        return None
+    return QUESTION + "\n" + HAND_BACK_GRAMMAR
+
+
+def _resolution_section(ctx) -> str | None:
+    """The person's decision, rendered as its own section rather than as a
+    finding (shaping spec §3): the spec round in an epoch whose dispute was
+    resolved is briefed with what they decided and writes the spec."""
+    d = front.dispute(ctx.store, ctx.run_id)
+    if d is None or d.resolution is None:
+        return None
+    if phases.round_cause(ctx).id != d.resolution.id:
+        return None
+    if d.resolution.kind == EventKind.HUMAN_RULING:
+        what = "A person approved the shaper's ruling: this is one piece of work."
+    else:
+        what = ("A person directed the shaper:\n\n> %s\n\nand the shaper then ruled:\n\n> %s"
+                % (d.resolution.payload["text"], d.disputed.payload["reasoning"]))
+    return ("\n## The shape was disputed and resolved\n\n"
+            "You handed this run back as an epic. The shaper reconsidered and reaffirmed\n"
+            "one piece. %s\n\nWrite the spec.\n" % what)
 
 
 def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
@@ -122,6 +189,59 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
         parts.append("\n## The definition of a slice\n\n> %s\n\nA slice plan names no files, tasks or acceptance tests.\n" % COARSE)
     else:
         parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
+    # Revision 16: the question and the resolution are their own sections,
+    # not findings -- the round that carries either has nothing to
+    # disposition, and `suppress` says so to the dispositions and
+    # previous-draft blocks below. Reading the CAUSE, not the epoch: the
+    # reviewers found the same defect three times by reading "does this
+    # epoch hold a ruling" instead of "is the ruling this round's cause".
+    resolution = _resolution_section(ctx) if phase == "spec" else None
+    question = resolution or (_question_section(ctx) if phase == "spec" else None)
+    suppress = question is not None
+    reopened_findings = None
+    if resolution is not None:
+        # A spec was reviewed before the hand-back: its findings are not
+        # dropped by the hand-back, and a reviewer's outstanding catch still
+        # reaches the author -- re-rendered beneath the resolution, not
+        # through `_findings_for`, whose HUMAN_DIRECTION branch would render
+        # the person's DIRECTION text here, not the reviewer's findings.
+        verdict = front.newest_review_verdict(store, run_id, "spec", ctx.epoch())
+        d = front.dispute(store, run_id)
+        if verdict is not None and d is not None and verdict.seq < d.hand_back.seq:
+            suppress = False
+            reopened_findings = store.read_blob(verdict.payload["findings_hash"])
+    if phase == "slices":
+        # The hand-back's reasoning, standing in every visit after it, ahead
+        # of whatever the round's cause renders -- so a direction typed into
+        # the reshaping session does not displace it.
+        d = front.dispute(store, run_id)
+        if d is not None:
+            parts.append("\n## Why this was handed back\n\nThe spec author disputed the shape:\n\n> %s\n"
+                         % d.hand_back.payload["reasoning"])
+    if question is not None:
+        parts.append(question)
+    cause = phases.round_cause(ctx)
+    if cause.kind == EventKind.AUTHOR_EMPTY and cause.payload.get("detail"):
+        parts.append("\n## Your previous turn's file did not parse\n\n%s\n\n%s\n"
+                     % (cause.payload["detail"], HAND_BACK_GRAMMAR))
+        suppress = True
+    if phase == "spec":
+        n = ctx.epoch()
+        # The availability instruction: every composed spec turn of an epoch
+        # that holds a shape ruling and no hand-back yet, so a revision turn
+        # briefed with a reviewer's "several pieces" finding can act on it.
+        if (front.shape_ruling(store, run_id, n) is not None
+                and not front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, n)
+                and question is None):
+            parts.append("\n## Handing back\n\nIf this issue is more than one piece of work, do not write the\n"
+                         "spec. Hand it back instead and end the turn.\n\n%s\n" % HAND_BACK_GRAMMAR)
+        answers = front.epoch_facts(store, run_id, EventKind.HUMAN_ANSWER, n)
+        if answers:
+            # Standing, because a hand-back from the `grill: human` resume
+            # turn is legal and the next seat is another vendor's: without
+            # this the person's answers reach nobody.
+            parts.append("\n## The answers already given\n\n%s\n"
+                         % "\n\n".join(a.payload["answer"] for a in answers))
     pol = policy_of(store, run_id)
     parts.append("\n## Policy\n\n```json\n%s\n```\n" % json.dumps(to_payload(pol), indent=1))
     # The policy as an instruction, not as data. The skill describes both
@@ -141,8 +261,16 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     parts.append("\n## Issue snapshot\n\n```json\n%s\n```\n" % store.read_blob(front.bundle_hash(store, run_id)).decode())
     if phase == "plan":
         parts.append("\n## The accepted spec\n\n%s\n" % store.read_blob(store.phase_artifact(run_id, "spec")).decode())
-    prior = front.newest_submission(store, run_id, phase, ctx.epoch())
-    findings = _findings_for(ctx)
+    # `suppress`: the question turn and the resolution turn (revision 16)
+    # have nothing to disposition, and the malformed-hand-back retry's
+    # detail is rendered above, not as a finding -- none of the three arms
+    # the dispositions block or shows a previous draft. `reopened_findings`
+    # overrides `suppress` on the one path where the resolution re-renders a
+    # reviewer's own findings from before the hand-back.
+    prior = None if suppress else front.newest_submission(
+        store, run_id, phase, ctx.epoch(),
+        visit=(front.shaping_visit(store, run_id, ctx.epoch()) if phase == "slices" else None))
+    findings = reopened_findings if reopened_findings is not None else (b"" if suppress else _findings_for(ctx))
     if prior is not None and findings:
         parts.append("\n## Your previous draft\n\n%s\n" % store.read_blob(prior.payload["hash"]).decode())
     if findings:

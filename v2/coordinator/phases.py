@@ -62,13 +62,22 @@ ROUND_CAUSE_KINDS = frozenset({
     EventKind.RUN_STARTED, EventKind.BUNDLE_REVISED, EventKind.REVIEW_VERDICT,
     EventKind.HUMAN_RULING, EventKind.HUMAN_DIRECTION, EventKind.AUTHOR_EMPTY,
     EventKind.PARKED, EventKind.COMMAND_REJECTED,
+    # Revision 16: the hand-back calls for the next shaping round.
+    EventKind.RESHAPE_REQUESTED,
 })
 
 
 def _is_round_cause(f) -> bool:
     if f.kind == EventKind.COMMAND_REJECTED:
         return f.payload.get("command_name") in ("submit_spec", "submit_plan", "submit_slices",
-                                                  "record_one_piece") and f.actor != "human"
+                                                  "record_one_piece", "request_reshape") and f.actor != "human"
+    if f.kind == EventKind.MODEL_RULING:
+        # Revision 16: a SHAPE ruling calls for the spec round that asks the
+        # fresh-perspective question. A grill ruling stays what it is -- the
+        # author answering its own question inside a turn -- and admitting it
+        # here would make every grill ruling start a round.
+        from kernel.slices import SHAPE_QUESTION
+        return f.payload.get("question_id") == SHAPE_QUESTION
     return f.kind in ROUND_CAUSE_KINDS
 
 
