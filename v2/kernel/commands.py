@@ -332,6 +332,17 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
         )
     elif cmd.name == "approve_one_piece":
         d = front.dispute(store, cmd.run_id, epoch_n)
+        if d is None or d.disputed is None:
+            # Unreachable: `authorize` refuses this command unless the epoch
+            # holds an unresolved disagreement, which is exactly a hand-back
+            # plus a ruling after it. Stated rather than assumed, because the
+            # alternative is an AttributeError one line down -- a crash where
+            # the kernel's contract is a refusal, and a refusal is what every
+            # caller is written to handle.
+            raise NotAuthorized(
+                "approve_one_piece reached the journal with no disputed ruling to resolve; "
+                "authorize() is the gate and it did not hold"
+            )
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
             causal_command_id=cmd.idempotency_key,
@@ -343,8 +354,13 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             # approval opens no visit of its own, and stamping the current
             # count would attribute the resolution to a visit that does not
             # exist.
+            # `cursor_item_id` as every human ruling carries it: the proof's
+            # `assert_sessions` collects it from EVERY human_ruling fact as
+            # its read-watermark, so a ruling without one silently corrupts
+            # that check the first time a live run records this fact.
             payload={"ruling": "approve_one_piece", "phase": "slices", "epoch": epoch_n,
-                     "visit": front.visit_of(store, cmd.run_id, d.disputed.seq)},
+                     "visit": front.visit_of(store, cmd.run_id, d.disputed.seq),
+                     "cursor_item_id": cmd.payload.get("cursor_item_id")},
         )
     elif cmd.name == "record_review" and actor == HUMAN_ACTOR:
         store.append_fact(

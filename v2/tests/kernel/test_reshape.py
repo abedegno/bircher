@@ -471,6 +471,40 @@ def test_the_approval_refuses_its_four_ways(tmp_path):
         g.approve_one_piece()
 
 
+def test_the_approval_carries_the_replys_cursor(tmp_path):
+    """Every human ruling carries the cursor of the item it was read from,
+    and this one is no exception. The proof's `assert_sessions` collects
+    `cursor_item_id` from EVERY `human_ruling` fact as its read-watermark, so
+    a ruling that omits it does not fail here -- it silently corrupts that
+    check the first time a live run records one."""
+    s, f = _disagreed(tmp_path)
+    f.approve_one_piece(cursor="item-77")
+    r = s.facts_of_kind(f.run_id, EventKind.HUMAN_RULING)[-1]
+    assert r.payload["cursor_item_id"] == "item-77"
+    # The same key every sibling ruling writes, under the same name.
+    s2, g = _new(tmp_path, "sib.db")
+    g.shape_round(SLICES_BYTES)
+    g.review_round("accept")
+    g.approve()
+    sib = s2.facts_of_kind(g.run_id, EventKind.HUMAN_RULING)[-1]
+    assert "cursor_item_id" in sib.payload
+
+
+def test_the_approval_refuses_rather_than_crashes_without_a_dispute(tmp_path):
+    """`_side_fact` computes the visit from the disputed ruling. If the
+    authorization gate above it ever stopped holding, the next line would be
+    an AttributeError -- a crash where this kernel's contract is a refusal,
+    and a refusal is what every caller is written to handle."""
+    from kernel.commands import Command, _side_fact
+    s, f = _new(tmp_path)
+    assert front.dispute(s, f.run_id) is None
+    cmd = Command(name="approve_one_piece", run_id=f.run_id,
+                  expected_version=s.run_version(f.run_id), idempotency_key="k-no-dispute",
+                  generation=0, payload={"cursor_item_id": "i-h"})
+    with pytest.raises(NotAuthorized, match="no disputed ruling to resolve"):
+        _side_fact(s, cmd, actor="human")
+
+
 def test_the_approval_is_refused_away_from_shaping(tmp_path):
     """The refusal table's third row: the dispute is a shaping-state park, and
     at any later state a reply is read as it is today, so a stale dispute can
