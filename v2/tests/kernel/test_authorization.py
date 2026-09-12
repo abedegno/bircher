@@ -176,6 +176,11 @@ def test_every_command_declares_its_legal_states():
             # reason a pass stopped, and an author's report of an empty turn.
             # None moves the run.
             "record_turn_ended", "park", "record_author_empty",
+            # Revision 16: a one-piece ruling proceeds to `queued`, unless it
+            # is the ruling that lands a shaping visit's dispute, when it
+            # stays at `shaping` for the person to decide. Computed in
+            # `_one_piece_destination`, as a review's destination is.
+            "record_one_piece",
             # The human's four. record_human_answer and record_human_direction
             # observe without transitioning, like record_turn_ended and park.
             # approve_artifact's destination depends on which phase's artefact

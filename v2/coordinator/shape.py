@@ -12,8 +12,10 @@ from kernel.dispatch import Role, SeatsExhausted
 
 
 def shape_round(ctx) -> str:
-    """One shaping turn: `one_piece` (the ruling recorded, the run at
-    `queued`), `submitted` (a slice plan at `slices_submitted`),
+    """One shaping turn: `one_piece` (the ruling recorded -- the run at
+    `queued`, or held at `shaping` when this ruling lands a visit's dispute
+    and the person decides, revision 16), `submitted` (a slice plan at
+    `slices_submitted`),
     `empty_retry`, `direction`, `budget`, `stall`, `reauthor` or `failed` --
     the author round's vocabulary, so the loop parks the same way."""
     store, run_id = ctx.store, ctx.run_id

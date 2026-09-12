@@ -103,7 +103,13 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # leave `shaping` by different doors; the ungated advance is the
     # coordinator's own fact, separate from the reviewer's accept, because
     # the transition that authorises filing must be its own fact.
-    "record_one_piece": (frozenset({"shaping"}), "queued"),
+    # Revision 16: the destination is COMPUTED, so the table declares none,
+    # exactly as `record_review` does. A ruling proceeds to `queued` unless it
+    # is the one that lands a visit's dispute, in which case it stays at
+    # `shaping` for the person (`_one_piece_destination`). Leaving `"queued"`
+    # here would state a destination that is wrong half the time to every
+    # reader of the table.
+    "record_one_piece": (frozenset({"shaping"}), None),
     "submit_slices": (frozenset({"shaping"}), "slices_submitted"),
     # Revision 16: the spec author's hand-back. From `queued`, the spec
     # author's own state, back to `shaping` -- a new VISIT of the same epoch,

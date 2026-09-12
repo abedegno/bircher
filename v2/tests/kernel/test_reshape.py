@@ -376,9 +376,9 @@ def test_while_unresolved_three_commands_are_refused(tmp_path):
     s, f = _shaped(tmp_path)
     f.request_reshape("three parts")
     f.shape_round(reasoning="still one", cost="the spec would find one surface")
-    with pytest.raises(NotAuthorized):
+    with pytest.raises(NotAuthorized, match="the shape is disputed"):
         f.shape_round(SLICES_BYTES)
-    with pytest.raises(NotAuthorized):
+    with pytest.raises(NotAuthorized, match="the shape is disputed"):
         f.grant()
 
 
@@ -412,7 +412,7 @@ def test_grant_round_is_refused_while_unresolved_even_with_a_park(tmp_path):
     g = f._dispatch(Role.OPERATOR, "coordinator")
     f._cmd(g, "park", {"reason": "gate", "session_id": None, "cursor_item_id": None,
                        "findings_hash": None, "verdict": None, "reviewer": None})
-    with pytest.raises(NotAuthorized):
+    with pytest.raises(NotAuthorized, match="the shape is disputed"):
         f.grant()
 
 
