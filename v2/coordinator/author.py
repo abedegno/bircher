@@ -142,17 +142,32 @@ def _question_section(ctx) -> str | None:
 def _resolution_section(ctx) -> str | None:
     """The person's decision, rendered as its own section rather than as a
     finding (shaping spec §3): the spec round in an epoch whose dispute was
-    resolved is briefed with what they decided and writes the spec."""
+    resolved is briefed with what they decided and writes the spec.
+
+    Fix round 1, B1/B3: the spec names TWO facts as "the resolution" the spec
+    round's cause can be -- "the person's `approve_one_piece`, or the `shape`
+    ruling recorded after their direction". `dispute`'s own `resolution`
+    field is the approval on one path and the DIRECTION on the other, never
+    the post-direction ruling; matching the round's cause against
+    `d.resolution.id` unconditionally is why the direction path never
+    rendered. `front.ruling_after_direction` is the fifth fact `Dispute`
+    does not carry, and quoting IT rather than `d.disputed` is what fixes
+    B3 too: `d.disputed` is the ruling the direction OVERRULED, not the one
+    that followed it."""
     d = front.dispute(ctx.store, ctx.run_id)
     if d is None or d.resolution is None:
         return None
-    if phases.round_cause(ctx).id != d.resolution.id:
-        return None
+    cause = phases.round_cause(ctx)
     if d.resolution.kind == EventKind.HUMAN_RULING:
+        if cause.id != d.resolution.id:
+            return None
         what = "A person approved the shaper's ruling: this is one piece of work."
     else:
+        ruling = front.ruling_after_direction(ctx.store, ctx.run_id)
+        if ruling is None or cause.id != ruling.id:
+            return None
         what = ("A person directed the shaper:\n\n> %s\n\nand the shaper then ruled:\n\n> %s"
-                % (d.resolution.payload["text"], d.disputed.payload["reasoning"]))
+                % (d.resolution.payload["text"], ruling.payload["reasoning"]))
     return ("\n## The shape was disputed and resolved\n\n"
             "You handed this run back as an epic. The shaper reconsidered and reaffirmed\n"
             "one piece. %s\n\nWrite the spec.\n" % what)
@@ -190,25 +205,31 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     else:
         parts.append("\n## Files\n\nArtefact: `%s`\nQuestions: `%s`\n" % (seat.ARTIFACT_OUT, seat.QUESTIONS_OUT))
     # Revision 16: the question and the resolution are their own sections,
-    # not findings -- the round that carries either has nothing to
-    # disposition, and `suppress` says so to the dispositions and
-    # previous-draft blocks below. Reading the CAUSE, not the epoch: the
-    # reviewers found the same defect three times by reading "does this
-    # epoch hold a ruling" instead of "is the ruling this round's cause".
+    # not findings. Reading the CAUSE, not the epoch: the reviewers found the
+    # same defect three times by reading "does this epoch hold a ruling"
+    # instead of "is the ruling this round's cause".
     resolution = _resolution_section(ctx) if phase == "spec" else None
     question = resolution or (_question_section(ctx) if phase == "spec" else None)
-    suppress = question is not None
     reopened_findings = None
     if resolution is not None:
         # A spec was reviewed before the hand-back: its findings are not
         # dropped by the hand-back, and a reviewer's outstanding catch still
         # reaches the author -- re-rendered beneath the resolution, not
         # through `_findings_for`, whose HUMAN_DIRECTION branch would render
-        # the person's DIRECTION text here, not the reviewer's findings.
+        # the person's DIRECTION text here, not the reviewer's findings. On
+        # BOTH resolution paths (fix round 1, B2): `resolution` is truthy for
+        # the direction path too now, so this reads the same regardless of
+        # which fact resolved the dispute.
+        #
+        # Guarded on `findings_hash` (fix round 1, minor 4), matching
+        # `_findings_for`'s own REVIEW_VERDICT branch: a `review_ruling` is
+        # expected to carry one, but nothing here enforces it, and reading
+        # it unguarded would crash a resolution brief over a defect
+        # somewhere else entirely.
         verdict = front.newest_review_verdict(store, run_id, "spec", ctx.epoch())
         d = front.dispute(store, run_id)
-        if verdict is not None and d is not None and verdict.seq < d.hand_back.seq:
-            suppress = False
+        if (verdict is not None and verdict.payload.get("findings_hash")
+                and d is not None and verdict.seq < d.hand_back.seq):
             reopened_findings = store.read_blob(verdict.payload["findings_hash"])
     if phase == "slices":
         # The hand-back's reasoning, standing in every visit after it, ahead
@@ -224,7 +245,6 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     if cause.kind == EventKind.AUTHOR_EMPTY and cause.payload.get("detail"):
         parts.append("\n## Your previous turn's file did not parse\n\n%s\n\n%s\n"
                      % (cause.payload["detail"], HAND_BACK_GRAMMAR))
-        suppress = True
     if phase == "spec":
         n = ctx.epoch()
         # The availability instruction: every composed spec turn of an epoch
@@ -261,16 +281,24 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
     parts.append("\n## Issue snapshot\n\n```json\n%s\n```\n" % store.read_blob(front.bundle_hash(store, run_id)).decode())
     if phase == "plan":
         parts.append("\n## The accepted spec\n\n%s\n" % store.read_blob(store.phase_artifact(run_id, "spec")).decode())
-    # `suppress`: the question turn and the resolution turn (revision 16)
-    # have nothing to disposition, and the malformed-hand-back retry's
-    # detail is rendered above, not as a finding -- none of the three arms
-    # the dispositions block or shows a previous draft. `reopened_findings`
-    # overrides `suppress` on the one path where the resolution re-renders a
-    # reviewer's own findings from before the hand-back.
-    prior = None if suppress else front.newest_submission(
+    # Fix round 1, Q1: no separate `suppress` flag. Requirement 2's
+    # suppression -- no dispositions block, no previous draft, on the
+    # question turn, the resolution turn (unless reopened) and the
+    # parse-failure retry -- is already `_findings_for`'s doing: its early
+    # returns for `MODEL_RULING`/`RESHAPE_REQUESTED` and `AUTHOR_EMPTY` with
+    # a `detail`, and its unconditional fallthrough for the plain
+    # `HUMAN_RULING` (`approve_one_piece`) resolution, which no branch here
+    # matches at all. A flag re-stating that here bound nothing a mutation
+    # of `_findings_for` itself did not already trip (Task 7 fix round 1,
+    # Q1): every cause it would have suppressed already yields empty
+    # `findings`, and the previous-draft block below needs `findings` truthy
+    # regardless of what `prior` is. `reopened_findings` is the one real
+    # override, for the resolution that re-renders a reviewer's findings
+    # from before the hand-back.
+    prior = front.newest_submission(
         store, run_id, phase, ctx.epoch(),
         visit=(front.shaping_visit(store, run_id, ctx.epoch()) if phase == "slices" else None))
-    findings = reopened_findings if reopened_findings is not None else (b"" if suppress else _findings_for(ctx))
+    findings = reopened_findings if reopened_findings is not None else _findings_for(ctx)
     if prior is not None and findings:
         parts.append("\n## Your previous draft\n\n%s\n" % store.read_blob(prior.payload["hash"]).decode())
     if findings:

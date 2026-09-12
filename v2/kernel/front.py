@@ -425,6 +425,29 @@ def dispute(store, run_id: str, epoch_n: int | None = None) -> Dispute | None:
     return Dispute(handed_back, hand_back, disputed, resolution)
 
 
+def ruling_after_direction(store, run_id: str, epoch_n: int | None = None):
+    """The `shape` ruling the directed visit's shaper recorded (shaping spec
+    §3 *the spec round's question*, revision 16 fix round 1): "the spec
+    round's cause is the resolution -- the person's `approve_one_piece`, OR
+    the `shape` ruling recorded after their direction". `dispute`'s own
+    `resolution` field IS that direction, not the ruling that answers it --
+    the ruling is a fifth fact `Dispute` does not carry, so this is the one
+    place that finds it, rather than every caller re-deriving it.
+
+    `None` when there is no dispute, the resolution is the approval (nothing
+    follows a `human_ruling` to look for), or the directed shaper has not
+    ruled yet -- it may submit a slice plan instead, which is that visit's
+    submission, not a ruling."""
+    from kernel.slices import SHAPE_QUESTION
+    d = dispute(store, run_id, epoch_n)
+    if d is None or d.resolution is None or d.resolution.kind != EventKind.HUMAN_DIRECTION:
+        return None
+    n = epoch(store, run_id) if epoch_n is None else epoch_n
+    rulings = [f for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, n)
+               if f.payload.get("question_id") == SHAPE_QUESTION and f.seq > d.resolution.seq]
+    return rulings[-1] if rulings else None
+
+
 def unresolved_disagreement(store, run_id: str, epoch_n: int | None = None) -> bool:
     """`dispute`'s boolean: a hand-back, a ruling after it, no resolution."""
     d = dispute(store, run_id, epoch_n)

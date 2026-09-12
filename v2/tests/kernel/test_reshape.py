@@ -343,6 +343,38 @@ def test_the_dispute_names_four_facts_in_order(tmp_path):
     assert front.unresolved_disagreement(s, f.run_id) is False
 
 
+def test_ruling_after_direction_is_none_off_the_approval_path(tmp_path):
+    """`front.ruling_after_direction` (revision 16 fix round 1, B1/B3): the
+    fifth fact `Dispute` does not carry, for the OTHER resolution path.
+    `None` before any dispute, while the disputed ruling stands unresolved,
+    and when the resolution is the approval rather than a direction --
+    there is no "ruling after the direction" to find on any of these."""
+    s, f = _shaped(tmp_path)
+    assert front.ruling_after_direction(s, f.run_id) is None      # no dispute at all
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")   # the disputed ruling
+    assert front.ruling_after_direction(s, f.run_id) is None      # unresolved; no direction yet
+    f.approve_one_piece()
+    assert front.ruling_after_direction(s, f.run_id) is None      # resolved by approval, not a direction
+
+
+def test_ruling_after_direction_finds_the_fifth_fact_dispute_does_not_carry(tmp_path):
+    """`dispute`'s own `resolution` field IS the direction on this path, not
+    the ruling that answers it -- a caller quoting `d.disputed` instead
+    would render the ruling the direction OVERRULED, not the one that
+    followed it."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one, first look", cost="the spec would find one surface")  # disputed
+    f.direct("slice it")
+    assert front.ruling_after_direction(s, f.run_id) is None      # the direction opened the visit; no ruling in it yet
+    f.shape_round(reasoning="agreed, one piece after all", cost="the spec would find one surface")
+    ruling = front.ruling_after_direction(s, f.run_id)
+    assert ruling is not None and ruling.payload["reasoning"] == "agreed, one piece after all"
+    d = front.dispute(s, f.run_id)
+    assert ruling.id != d.disputed.id                             # not the ruling the direction overruled
+
+
 def test_a_direction_before_the_disputed_ruling_is_not_the_resolution(tmp_path):
     s, f = _shaped(tmp_path)
     f.request_reshape("three parts")

@@ -5,9 +5,15 @@ human answers, and the parse-failure section. Every one is rendered from the
 round's CAUSE, never from a predicate on the epoch -- the table the brief
 carries, and the rule the reviewers found broken three times before it was
 written down.
+
+Fix round 1: a review found the resolution section unreachable on the
+direction-resolved path (B1/B2/B3, below) and nine assertions in this file
+that could not fail against the histories the first pass's fixtures built.
+Each fix is noted at its test; `conftest.py`'s docstring names the fixtures
+built to carry the weight.
 """
 from coordinator import author, phases
-from kernel import slices
+from kernel import front, slices
 
 
 def test_the_question_renders_for_the_shape_ruling_cause_only(fake):
@@ -20,19 +26,52 @@ def test_the_question_renders_for_the_shape_ruling_cause_only(fake):
     # `author_brief` itself renders is a real assertion.
     assert "## Dispositions are required" not in brief
     assert "## Your previous draft" not in brief
-    assert "the spec would find one surface" not in brief      # the ruling's own words
+    # Fix round 1, Q3: the ruling's own reasoning AND cost, both distinctive
+    # text `ruled_one_piece` now actually writes (conftest.py) -- the first
+    # pass's fixture used `Front`'s own defaults, which no assertion named,
+    # so a mutation that leaked both fields into the question left this
+    # green.
+    assert "the export flow and the import flow are one thing" not in brief
+    assert "the spec would find one surface" not in brief
+
+
+def test_the_question_turn_carries_no_earlier_epochs_draft(fake):
+    """Fix round 1, Q4 line 22: `ruled_one_piece` alone has no submission
+    anywhere in its journal, so "no previous draft" could not fail no
+    matter how `prior` was scoped. Here a first epoch's spec was drafted,
+    reviewed and approved before the issue was revised; the second epoch's
+    question turn must not show it."""
+    f = fake.ruled_one_piece_after_an_earlier_epochs_accepted_spec()
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "is this one piece of work?" in brief.casefold()
+    assert "## Your previous draft" not in brief
+    assert "The thing, specified." not in brief   # the first epoch's accepted spec (SPEC_BYTES)
 
 
 def test_the_question_survives_a_crash_resume_of_its_turn(fake):
+    """Fix round 1, Q6: a SECOND dispatch and session for the SAME round
+    cause -- the coordinator's actual resume path -- not the same pure call
+    made twice with nothing between it, which proves only that
+    `author_brief` writes nothing."""
     f = fake.ruled_one_piece()
-    author.author_brief(f.ctx, phase="spec")
-    brief = author.author_brief(f.ctx, phase="spec").decode()   # same cause, second pass
+    cause_id = phases.round_cause(f.ctx).id
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "is this one piece of work?" in brief.casefold()
+    f.crash_resume()
+    assert phases.round_cause(f.ctx).id == cause_id       # the resume changed nothing about the cause
+    brief = author.author_brief(f.ctx, phase="spec").decode()
     assert "is this one piece of work?" in brief.casefold()
 
 
-def test_the_question_is_not_asked_on_four_other_causes(fake):
+def test_the_question_is_not_asked_on_five_other_causes(fake):
+    """`direction_resolved_one_piece`'s cause is ALSO a `model_ruling{shape}`
+    -- the same kind the question renders from -- but its epoch holds a
+    hand-back, which is exactly the guard `_question_section` needs and
+    `after_approve_one_piece` alone does not exercise (that one's cause is
+    a `review_verdict`, never a shape ruling at all)."""
     for f in (fake.refused_submission_retry(), fake.empty_turn_retry(),
-              fake.revision_turn(), fake.after_approve_one_piece()):
+              fake.revision_turn(), fake.after_approve_one_piece(),
+              fake.direction_resolved_one_piece()):
         brief = author.author_brief(f.ctx, phase="spec").decode()
         assert "is this one piece of work?" not in brief.casefold()
 
@@ -53,7 +92,6 @@ def test_the_resolution_section_renders_without_a_dispositions_block(fake):
     # resolved" (a heading capitalises its first word); the phrase itself,
     # not its case, is the thing under test.
     assert "the shape was disputed and resolved" in brief.casefold()
-    assert "## Dispositions are required" not in brief
     assert "is this one piece of work?" not in brief.casefold()
 
 
@@ -77,33 +115,102 @@ def test_the_resolution_is_not_repeated_on_a_later_round(fake):
     assert "the shape was disputed and resolved" not in brief.casefold()
 
 
+def test_the_resolution_renders_on_the_direction_path_with_the_ruling_that_followed(fake):
+    """Fix round 1, B1/B3: the spec names TWO facts the spec round's cause
+    can be -- "the person's `approve_one_piece`, or the `shape` ruling
+    recorded after their direction". On the direction path `dispute`'s own
+    `resolution` field is the DIRECTION, not the ruling that answers it;
+    the first pass matched the round's cause against `resolution.id`
+    unconditionally, so this path never rendered at all. And where the
+    resolution's `else` branch fires, it must quote the ruling that
+    FOLLOWED the direction, not `d.disputed` -- the ruling the direction
+    OVERRULED (B3): both are asserted here, by their distinct reasoning."""
+    f = fake.direction_resolved_one_piece(
+        direction_text="split it into three",
+        ruling_reasoning="on reflection, only the export flow is its own piece")
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "the shape was disputed and resolved" in brief.casefold()
+    assert "split it into three" in brief
+    assert "on reflection, only the export flow is its own piece" in brief
+    assert "the login and export flows are one thing" not in brief   # the OVERRULED ruling's words (B3)
+    assert "## Dispositions are required" not in brief
+    assert "is this one piece of work?" not in brief.casefold()
+
+
+def test_the_resolution_re_renders_findings_on_the_direction_path_too(fake):
+    """Fix round 1, B2: "on both paths" -- a spec reviewed before the
+    hand-back must have its findings and its draft re-rendered beneath the
+    resolution whether the dispute resolves by approval or by direction.
+    The first pass computed `reopened_findings` only where `resolution` was
+    non-None, which B1 alone made unreachable on this path."""
+    f = fake.direction_resolved_with_prior_review(findings=b"the auth section is thin")
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "the shape was disputed and resolved" in brief.casefold()
+    assert "the auth section is thin" in brief
+    assert "## Dispositions are required" in brief
+    assert "## Your previous draft" in brief
+
+
 def test_the_shaping_brief_carries_the_hand_backs_reasoning_every_round(fake):
+    """Fix round 1, Q5 (part 1): the standing section persists across a
+    genuine retry -- a fresh round cause (an empty turn), not the same pure
+    call made twice with nothing between it, which would prove
+    determinism, not a retry."""
     f = fake.handed_back(reasoning="the issue names a store, an API and a page")
-    for _ in range(2):                                    # the visit's first round and its retry
-        brief = author.author_brief(f.ctx, phase="slices").decode()
-        assert "a store, an API and a page" in brief
-    f.direct("slice it")                                  # a direction opens the next visit
+    brief = author.author_brief(f.ctx, phase="slices").decode()
+    assert "a store, an API and a page" in brief
+    f.empty_turn()
+    brief = author.author_brief(f.ctx, phase="slices").decode()
+    assert "a store, an API and a page" in brief
+
+
+def test_the_standing_section_never_shows_an_earlier_visits_draft(fake):
+    """Fix round 1, Q4 line 89 / Q5 (part 3): `handed_back` alone never has
+    a submission in any visit, and a bare hand-back's own cause carries no
+    findings either way, so "not in brief" could not fail regardless of
+    `prior`'s visit scoping -- the previous-draft block needs `findings`
+    truthy too. Here visit 1 holds a rejected plan and visit 2 gets a
+    direction that resolves nothing and stays in visit 2 as real findings
+    (`_findings_for`'s `HUMAN_DIRECTION` branch): `findings` is truthy with
+    no submission yet in visit 2, which is the history where an unscoped
+    `prior` would actually differ from a scoped one."""
+    f = fake.handed_back_after_a_rejected_visit_one_plan(
+        reasoning="the issue names a store, an API and a page")
+    brief = author.author_brief(f.ctx, phase="slices").decode()
+    assert "a store, an API and a page" in brief
+    assert "consider the auth flow too" in brief          # this round's own findings, the direction
+    assert "## Your previous draft" not in brief          # visit 1's rejected plan must not leak in as visit 2's
+
+
+def test_a_resolving_direction_opens_the_next_visit_ahead_of_its_own_findings(fake):
+    """Fix round 1, Q5 (part 2): `handed_back` alone has no disputed ruling,
+    so a direction there resolves nothing and opens no visit
+    (`front._visit_boundaries`'s direction branch requires `disputed`) --
+    the spec's "the one a resolving direction opens" was asserted but never
+    built. Here the disputed ruling exists first, so the direction is a
+    real resolution."""
+    f = fake.handed_back_and_disputed(reasoning="the issue names a store, an API and a page")
+    assert front.shaping_visit(f.store, f.run_id, 0) == 2
+    f.direct("slice it")
+    assert front.shaping_visit(f.store, f.run_id, 0) == 3
     brief = author.author_brief(f.ctx, phase="slices").decode()
     assert "a store, an API and a page" in brief
     assert brief.index("a store, an API and a page") < brief.index("slice it")
-    assert "## Your previous draft" not in brief          # never an earlier visit's
 
 
 def test_a_composed_spec_turn_carries_the_availability_instruction(fake):
+    """Fix round 1, Q4 lines 95/96: `"Ruling: epic" in brief` and `"rename
+    it into place" in brief` are satisfied by `skills/spec-author/SKILL.md`'s
+    own "## Handing back" section on its own (shaping spec §3 -- "the
+    grammar reaches the seat two ways, or it reaches nobody"), unconditional
+    on any state, so a version of this test carrying both beside the count
+    assertions below proves nothing beyond what the count already proves.
+    Counting is the one check the skill's baseline copy cannot satisfy by
+    itself."""
     f = fake.revision_turn()
     brief = author.author_brief(f.ctx, phase="spec").decode()
-    assert "Ruling: epic" in brief
-    assert "rename it into place" in brief
     f2 = fake.handed_back()
     brief2 = author.author_brief(f2.ctx, phase="spec").decode()
-    # NOT plain presence: `skills/spec-author/SKILL.md` carries its own
-    # "## Handing back" section, with the same grammar and much of the same
-    # wording, unconditionally (shaping spec §3 -- "the grammar reaches the
-    # seat two ways, or it reaches nobody"), so every spec brief already
-    # contains one copy regardless of state -- "Ruling: epic" and "rename it
-    # into place" both live there too. What the runtime instruction adds is
-    # a SECOND "## Handing back" section; counting is the one check the
-    # skill's own baseline copy cannot satisfy by itself.
     assert brief.count("## Handing back") == 2
     assert brief2.count("## Handing back") == 1
 
@@ -134,6 +241,11 @@ def test_the_rendered_block_parses_back(fake):
 
 
 def test_the_epochs_human_answers_are_a_standing_section(fake):
+    """Fix round 1, Q7: the fixture now reaches a REAL spec round at
+    `queued` (the person's approval resolves the dispute) rather than
+    composing a `phase="spec"` brief while the run actually sat at
+    `shaping` -- the seat the spec's clause is about is a spec turn after
+    the dispute resolves, not a mismatched phase on a shaping-state run."""
     f = fake.answered_then_handed_back_from_the_resume_turn()
     brief = author.author_brief(f.ctx, phase="spec").decode()   # a seat of the other vendor
     assert "## The answers already given" in brief
@@ -144,9 +256,23 @@ def test_a_malformed_hand_back_retry_names_it_and_shows_the_grammar(fake):
     f = fake.malformed_reshape()
     brief = author.author_brief(f.ctx, phase="spec").decode()
     assert "your previous turn's file did not parse" in brief.casefold()
-    assert "Ruling: epic" in brief
+    # Fix round 1, Q4 line 147: the skill's own "## Handing back" section
+    # already contains "Ruling: epic" (and the availability instruction
+    # adds a second copy, since this epoch holds a shape ruling and no
+    # hand-back -- shaping spec §3's own stated redundancy, "the grammar
+    # reaches the seat two ways"). A plain `in brief` check is satisfied by
+    # either and proves nothing about THIS section specifically; scoping to
+    # the text between this section's own heading and the next one does.
+    section = brief.split("## Your previous turn's file did not parse", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    assert "\n    Ruling: epic\n" in section
     assert "## Dispositions are required" not in brief
-    assert "## Your previous draft" not in brief
+    # NOT "## Your previous draft" not in brief (fix round 1, Q4 line 149):
+    # `malformed_reshape` never submits a spec, so `prior` is `None`
+    # whatever `_findings_for` does with this cause -- unbindable here for
+    # the same reason line 22 and line 56 were (see
+    # `test_the_hand_back_cause_renders_no_findings`'s own note); removed
+    # rather than kept as a check that cannot fail.
 
 
 def test_the_round_cause_admits_the_shape_ruling_and_not_a_grill_ruling(fake):
@@ -163,7 +289,7 @@ def test_the_hand_back_cause_renders_no_findings(fake):
     explicit early return, and removing the latter reds nothing here.
     `test_the_shaping_brief_carries_the_hand_backs_reasoning_every_round` is
     what actually exercises the "twice" risk the explicit branch's comment
-    names, through `author_brief`'s `suppress` wiring rather than through
+    names, through `author_brief`'s section ordering rather than through
     this function alone."""
     f = fake.handed_back()
     assert author._findings_for(f.ctx) == b""
