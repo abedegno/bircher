@@ -222,26 +222,29 @@ def test_the_hand_back_is_legal_from_queued_and_moves_to_shaping(tmp_path):
 
 
 def test_the_hand_back_refuses_empty_or_whitespace_reasoning(tmp_path):
-    """The first row of the refusal table, pinned on its own for a clean
-    signal: the same assertion is the first line of
-    `test_the_hand_back_refuses_its_four_ways`, but that test is already red
-    for an unrelated reason (`approve_one_piece`, Task 4), so its own
-    pass/fail state cannot show whether THIS guard is what is pinning it."""
+    """The refusal table's first row (spec §2), pinned on its own.
+
+    The plan had all four rows in one test. Its later assertions sat behind a
+    call to `approve_one_piece`, which does not exist yet, so they never ran
+    and the guards they named were covered by nothing. One test per row is
+    what makes a mutation's red name the guard it removed."""
     s, f = _shaped(tmp_path)
     with pytest.raises(NotAuthorized, match="reasoning"):
         f.request_reshape("   ")
 
 
 def test_the_hand_back_refuses_a_second_one_in_the_same_epoch(tmp_path):
-    """`test_the_hand_back_refuses_its_four_ways` reaches the once-per-epoch
-    guard by way of `approve_one_piece`, which does not exist until Task 4 --
-    so that assertion is written but does not run yet. Pinned here by a path
-    that needs nothing from Task 4: `_one_piece_destination` is also not yet
-    wired (a later task), so today `record_one_piece` sends the run to
-    `queued` unconditionally, dispute or none -- the same destination the
-    hand-back's own transition assumes. A ruling after the hand-back
-    therefore reaches `queued` on its own, and a second `request_reshape`
-    there is refused by the same epoch that already holds the first one."""
+    """The refusal table's third row: one hand-back per bundle.
+
+    Reached by a path that needs nothing from a later task.
+    `_one_piece_destination` is not wired yet, so `record_one_piece` still
+    sends every ruling to `queued`, dispute or none; a ruling after the
+    hand-back therefore reaches `queued` on its own and a second
+    `request_reshape` there meets the epoch that already holds the first.
+    The other path to this row -- a run returned to `queued` by the person's
+    `approve_one_piece`, which leaves the ruling in place -- is the same
+    guard reached differently, and is pinned in the task that adds that
+    command."""
     s, f = _shaped(tmp_path)
     f.request_reshape("three parts")
     f.shape_round(reasoning="still one", cost="the spec would find one surface")
@@ -251,15 +254,13 @@ def test_the_hand_back_refuses_a_second_one_in_the_same_epoch(tmp_path):
 
 
 def test_the_hand_back_refuses_a_run_with_no_shape_ruling_in_its_epoch(tmp_path):
-    """The fourth row of the refusal table, pinned on its own: the assertion
-    inside `test_the_hand_back_refuses_its_four_ways` sits after the
-    `approve_one_piece` call that AttributeErrors on today's driver, so it
-    never runs there either, even though this row does not depend on
-    `approve_one_piece` at all. A run that was never shaped has nothing to
-    hand back to. Unreachable through today's transitions --
-    `record_one_piece` is the only way out of `shaping` -- so the state is
-    set directly, exactly as a v1 database written before the shaping phase
-    existed holds it."""
+    """The refusal table's second row: a run that was never shaped has
+    nothing to hand back to.
+
+    Unreachable through today's transitions -- `record_one_piece` is the only
+    way out of `shaping` -- so the state is set directly, exactly as a v1
+    database written before the shaping phase existed holds it. The guard is
+    kept for those databases, and this is the only way to execute it."""
     s2 = Store.open(tmp_path / "k2.db")
     g = Front(s2, "i13-v1-1", issue=ISSUE, shape=False)
     s2.set_run_state(g.run_id, "queued")
