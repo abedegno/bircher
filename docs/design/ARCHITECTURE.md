@@ -566,7 +566,7 @@ of the runner/coordinator split and should NOT be patched in place.
 | 14 | ~~an exhausted allowance records `request_revision`~~ | **CLOSED** | a bound-exhausted failure records `reject`, so the run ends in `reviewing` and `recover` calls it terminal | — |
 | 12 | v1 checkout 277 commits behind (measured 2026-08-31) — and **nothing schedules either version**, so there is no live v1 to cut over FROM | operational | a decision to start running v2 on a schedule | gap 11 is the same decision |
 | 16 | author worktrees accumulate under `/workspaces/<run>/<gen>`; nothing prunes them | low, a cost rather than a correctness residual — no later turn reads a stale one | the operator, by hand | Out of scope |
-| 17 | a one-piece shaping ruling has no gate, and the spec phase cannot hand a run back to `shaping` — muesli #12 was ruled a design document and built as a forty-file implementation (live log E9, finding 20) | design | a `request_reshape` command from the spec phase, or a policy gate on one-piece rulings (shaping spec, amendment 11) | a spec revision |
+| 17 | a one-piece shaping ruling has no gate, and the spec phase cannot hand a run back to `shaping` — muesli #12 was ruled a design document and built as a forty-file implementation (live log E9, finding 20) | design | **designed** as shaping spec revision 16 (2026-09-12): `request_reshape` from the spec author, who sees the issue and a question rather than the ruling; a disagreement gate; `approve_one_piece` | implementation |
 
 ### The repair loop, as of 2026-08-31
 

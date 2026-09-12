@@ -82,6 +82,8 @@ against the spec.
 |---|---|---|---|
 | — (no run) | `create_run` | `shaping` | unchanged otherwise: snapshot, `policy_frozen`, base sha; **refused for an issue an earlier run may have filed children for** (below) |
 | `shaping` | `record_one_piece` | `queued` | the model ruling; the run proceeds as today |
+| `queued`, this epoch holding a `shape` ruling | `request_reshape` | `shaping`, epoch + 1 | **the spec author's hand-back** (revision 16): the run is shaped again with the spec author's reasoning as the next round's findings; once per run |
+| `shaping`, parked after a reshape | `approve_one_piece` as `human` | `queued` | **the person's decision when the two seats disagree** (revision 16); a direction is the other way out, as at any shaping park |
 | `shaping` | `submit_slices` | `slices_submitted` | the artefact, hashed, PUT to the store |
 | `slices_submitted` | `record_review(accept)` | `slices_accepted` | the reviewer's verdict, bound as every verdict is |
 | `slices_submitted` | `record_review(request_revision)` | `shaping` | the reviewer's; one revision destination, as every phase has |
@@ -284,6 +286,42 @@ slices, hash}`. The spec phase has no equivalent because its ungated path is
 separates the two because filing children is an effect with an obligation
 (§3), and the transition that authorises it must be its own fact.
 
+### `request_reshape(reasoning)` and `approve_one_piece` (revision 16)
+
+The hand-back the live proof found missing (E9, finding 20): a one-piece
+ruling anchored a spec, a plan and a forty-file implementation, and nothing
+downstream could return the run to `shaping`. The spec author is the fresh
+perspective (§3, *the spec round's question*); this command is how it acts.
+
+`request_reshape` is a model ruling with a transition, `record_one_piece`'s
+mirror. Legal from `queued` under an `author` dispatch whose actor is the
+vendor of the round's session, after the turn is observed ended and its stop
+satisfied. Refused when:
+
+| Refused when | Why |
+|---|---|
+| the reasoning is empty or whitespace | a hand-back without its reasoning gives the next shaping round nothing to answer |
+| the current epoch holds no `shape` ruling | nothing to hand back to: a v1 run born in `queued` was never shaped, and a run that reached `queued` through `approve_one_piece` has had the person's decision |
+| a `reshape_requested` already exists in the run | one hand-back per run; the second disagreement is the person's (below) |
+| a `human_direction` of the run is newer than the calling generation's dispatch | the journal-order guard every author-round command carries |
+
+Records `reshape_requested {epoch, reasoning}` and moves the run to
+`shaping`. **An epoch begins at `create_run`, at every `bundle_revised`, and
+at every `reshape_requested`**: the next shaping round is a new epoch, so its
+ruling is that epoch's one decision and the proof's per-epoch assertions (§6)
+hold unchanged. The shaping round that follows carries the reasoning as its
+findings, the way a revision carries the reviewer's.
+
+**When the shaper rules one piece again** — a `record_one_piece` in a run that
+holds a `reshape_requested` — the ruling is recorded and the run parks at
+`shaping` with reason `gate` and phase `slices`, whatever the policy's gates:
+two seats have disagreed on the shape, and that is a person's decision, not
+a third seat's. `approve_one_piece`, a human command legal only at that park,
+records `human_ruling {approve, phase: slices, one_piece: true}` and moves the
+run to `queued`; the spec round that follows sees the person's decision and
+asks its question no more. A direction at the park is the existing way out
+(§4). The bound is therefore one model hand-back and one human decision per
+run, and a run can never cycle between the two seats.
 ### `record_slice_filed`, `record_filing_complete`, `record_slice_closed`, `record_slice_reopened`, `record_children_observed_closed`
 
 Every fact has an issuing command with legal states, a role and refusals, and
@@ -546,6 +584,41 @@ the previous plan, the findings and the dispositions requirement, as every
 phase does. The skill is `skills/shape-author/SKILL.md`, a sibling of
 `spec-author`.
 
+### The spec round's question (revision 16)
+
+The spec author is the phase's fresh perspective. A wrong early ruling anchors
+everything downstream — the mechanism GVS5H names for its own scaffold
+(`docs/design/front-half-live-log.md`, E9; the paper's remedy is a seat that
+sees the raw problem with none of the prior notes) — so the spec author's
+brief, when the run's current epoch holds a one-piece ruling, carries **the
+frozen issue and a question, and not the ruling**:
+
+> Before writing anything: is this one piece of work? One piece is a single
+> capability a reviewer could see working end to end (§1). If the spec you
+> are about to write would specify more than one such capability, do not
+> write it. Write `bircher/reshape.md` instead and end the turn.
+
+The shaper's ruling, reasoning and cost-if-wrong stay in the journal for the
+person and the proof; the spec author does not read them, so its answer is
+its own. The brief carries neither question nor mention after
+`approve_one_piece`: the person has decided.
+
+The spec round gains a second watched path, `bircher/reshape.md`, read before
+`bircher/artifact.md` as `shape.md` is read before the plan. Its grammar is
+the ruling file's, with the other ruling:
+
+```
+Ruling: epic
+Reasoning: <one or more lines>
+```
+
+The parser is `slices.parse_reshape`, beside `parse_ruling`, with the same
+rules: the first non-blank line exactly `Ruling: epic`, a non-empty
+`Reasoning:` block, anything else not a hand-back. At the turn's end:
+`reshape.md` parsing → `request_reshape`, the round returns `reshaped`, and
+the next pass runs the shaping round from `shaping`; an `artifact.md` beside
+it is moved aside, the hand-back is read first. A `reshape.md` that does not
+parse is the empty turn.
 ### The review round
 
 `review_round` at `slices_submitted` is the review round at `spec_submitted`
@@ -717,6 +790,15 @@ questions (§3), and `record_model_question` is refused from every shaping
 state — the states stay out of its from-set (§2, *which state set each site
 reads*).
 
+**The disagreement gate** (revision 16). When the shaper rules one piece a
+second time after the spec author's hand-back, the run parks at `shaping`
+regardless of `gates`. The notice names the phase `slices`, quotes both
+seats — the shaper's reasoning and the spec author's — and says what to type:
+`approve` proceeds as one piece (`approve_one_piece`); a direction starts the
+next shaping round with the person's words as its findings. Nothing else
+resolves it: the coordinator does not dispatch a third seat, and a policy
+without a slice gate does not bypass a disagreement, because the gate was
+never the policy's — it is the disagreement's.
 A revised *epic* — a person editing the issue after its children are filed —
 is not re-sliced: `revise_bundle` is refused from `sliced`. What a person does
 instead is stated in §9.
@@ -865,12 +947,23 @@ prompted or stopped) and `assert_sessions`, the server-side half that checks
 the satisfied creates against the live session listing, apply to it as to
 any run, over its shaping and review seats. The children are proved as ordinary runs.
 
+**Revision 16 and the proof.** Assertion 4 counts one decision per epoch;
+`reshape_requested` starts an epoch, so a run that was handed back holds one
+ruling in each of two epochs and passes. A `human_ruling {approve, one_piece}`
+is a human fact: zero-touch mode fails a run that carried one, approval mode
+admits it, as for every gate. The proof gains a fifth line: a run that holds a
+`reshape_requested` and no later `shape` ruling, or two `reshape_requested`,
+is a defect in the kernel's guards.
 ## §7 Failure table
 
 | Situation | What happens |
 |---|---|
 | Shaper writes both `shape.md` and `artifact.md` | the ruling is read; the artefact is ignored and moved aside before any re-prompt |
 | Shaper writes a six-slice plan | `submit_slices` refused; the refusal is the next round's findings, as the grill refusal is |
+| Spec author writes `reshape.md` on a v1 run born in `queued` | `request_reshape` refused (no `shape` ruling in the epoch); the refusal is the next round's findings and the spec round runs again |
+| Spec author writes `reshape.md` twice in one run | refused the second time (one hand-back per run); the spec author's next turn is briefed without the question, since the person decided or the shaper's second ruling is parked |
+| Shaper rules one piece after a hand-back | recorded, and the run parks at `shaping` for the person (revision 16); the wave's next firing reads `approve` or a direction |
+| Spec author's `reshape.md` beside an `artifact.md` | the hand-back is read, the artefact moved aside; a spec written against a shape the author itself disputed is not submitted |
 | Reviewer rejects three times | `bound_exhausted`, the park, the notice: the person grants a round (legal at `slices_submitted` with a park), corrects, or cancels — or directs "one piece" |
 | A slice plan is rejected and the next author rules one piece | legal; the run proceeds to `queued`; the epoch's decision is the newer fact (§2), and the proof reads it so |
 | A person directs during a live shaping turn | the turn is displaced; its ruling or plan is refused by the direction guard whichever it was; the direction is the next round's findings |
@@ -1031,6 +1124,17 @@ brief names the wrong hash.
 Every new condition's mutation is executed, not argued; the review package for
 each task states which line was mutated and which test went red.
 
+**Revision 16 adds**, in `test_shaping_states.py` and `test_shape_round.py`'s
+twins for the spec round: `request_reshape` legal only from `queued` with a
+`shape` ruling in the epoch, once per run, under the round's vendor, after the
+turn ended, refused over a newer direction; the epoch increments and the next
+shaping round's brief carries the reasoning; `record_one_piece` after a
+hand-back parks at `shaping` whatever the gates; `approve_one_piece` legal only
+at that park, moving to `queued`, refused elsewhere and as any non-human
+actor; the spec brief carries the question and not the ruling when the epoch
+holds a one-piece ruling, and neither after `approve_one_piece`; `parse_reshape`
+accepts the grammar and refuses a missing reasoning; the proof's fifth line
+reds on a planted second `reshape_requested`.
 ## §9 Out of scope
 
 Recursive slicing, refused by the kernel. Any estimate of slice size in lines
@@ -1500,7 +1604,48 @@ The two live runs, E8 on `abedegno/bircher-smoke` and E9 on muesli #12
     spec author that lands the run in `shaping` with the spec's finding as the
     next round's input, the way `revise_bundle` does for an issue edit. The
     second keeps the human out of runs that are correctly one piece and is the
-    recommended one. Until one lands, the person's lever is the issue body.
+    recommended one. **Resolved by revision 16 (2026-09-12), below.**
 12. §6 *The proof*: a run that halted and was reconciled fails the zero-touch
     line honestly; E8 did, on finding 18. The four slice assertions are
     independent of that line and passed.
+
+## Revision 16 (2026-09-12) — the hand-back, the fresh-perspective question, and two open questions
+
+Amendment 11's remedy, designed. Three things folded in from the live proof
+and from GVS5H (`slee-persis/GVS5H`, *Zero-Shot Self-Orchestration with
+Ledger-Based Control*, ICLR 2027 submission), whose own diagnosis of its
+failures — a wrong early plan anchors every later call, and a confidently
+wrong output propagates unchecked — is E9's diagnosis:
+
+1. **The spec author is a fresh perspective** (§3, *the spec round's
+   question*): it sees the frozen issue and an explicit question, not the
+   shaper's ruling, and can hand the run back with `bircher/reshape.md`.
+2. **`request_reshape`** (§2): the hand-back command, once per run, starting
+   a new epoch; **`approve_one_piece`** and the disagreement gate (§2, §4):
+   two seats disagreeing on the shape is a person's decision whatever the
+   policy, and the bound is one hand-back and one decision per run.
+3. **Two open questions**, recorded here so they are decided with evidence
+   rather than now:
+
+   - **Verification before acceptance at the child level.** GVS5H's verifier
+     overrides the manager's "done" with a test run, and its proposed
+     extension runs generated tests before accepting any worker output. Bircher
+     has the first at the merge gate and nothing at the child level: a filed
+     child's acceptance is prose in its body. The candidate change is a slice
+     grammar block, `Acceptance check:`, one runnable assertion per slice
+     where one exists, rendered into the child and named to the child's
+     cross-review as a thing to run. Decide after the first three epics have
+     merged their children: if a child merged that its own slice text would
+     have refused, the block earns its place; if every child's review already
+     caught the miss, it does not.
+   - **Caps on what a seat is handed.** GVS5H caps its plan at 4,000 and its
+     notes at 8,000 characters and shows a model given a large budget talks
+     past the point of having an answer. Bircher's briefs and review packages
+     are uncapped, tens of kilobytes on the front half. The experiment is a
+     cap per seat with the remainder reachable on request, one smoke issue per
+     cap, measured by whether verdict quality holds; decide after it runs.
+
+Not folded in: the manager–worker loop itself, where the model that did the
+work decides it is done, checked only against public tests, with no effect
+boundary and no second vendor. The fourteen review rounds above were about
+exactly those gaps.
