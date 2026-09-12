@@ -160,7 +160,9 @@ def test_author_empty_names_the_current_author_session_and_retries_once(tmp_path
         f._cmd(g1, "record_author_empty", {"session": "s-not-it"})
     f._cmd(g1, "record_author_empty", {"session": s1})
     empty = s.newest_fact("r-1", EventKind.AUTHOR_EMPTY)
-    assert empty.payload == {"session": s1, "phase": "spec", "epoch": 0, "generation": g1}
+    # `detail` (Task 6, revision 16) defaults to "" when the caller's payload
+    # carries none -- a plain empty turn, not a malformed hand-back's.
+    assert empty.payload == {"session": s1, "phase": "spec", "epoch": 0, "generation": g1, "detail": ""}
     # The retry: a fresh session whose cause is that fact.
     g2 = f._dispatch(Role.AUTHOR, "claude")
     s2 = f._session(g2, empty.id)
@@ -170,6 +172,22 @@ def test_author_empty_names_the_current_author_session_and_retries_once(tmp_path
     # Naming the older session is refused: it is not the newest author session.
     with pytest.raises(NotAuthorized, match="newest"):
         f._cmd(g2, "record_author_empty", {"session": s1})
+
+
+def test_author_empty_detail_must_be_a_string_or_absent(tmp_path):
+    """Task 6, revision 16: `detail` is the coordinator's own reason a
+    hand-back did not parse -- shape-checked here (a string or absent) since
+    there is no kernel object to verify the prose against."""
+    s = _store(tmp_path)
+    f = Front(s, "r-1")
+    g = f._dispatch(Role.AUTHOR, "claude")
+    sid = f._session(g, f._newest_id())
+    f._end_turn(g, sid, "file")
+    with pytest.raises(NotAuthorized, match="detail must be a string"):
+        f._cmd(g, "record_author_empty", {"session": sid, "detail": 12})
+    f._cmd(g, "record_author_empty", {"session": sid, "detail": "reshape.md did not parse: ..."})
+    empty = s.newest_fact("r-1", EventKind.AUTHOR_EMPTY)
+    assert empty.payload["detail"] == "reshape.md did not parse: ..."
 
 
 def test_author_empty_needs_the_author_role_and_a_front_state(tmp_path):

@@ -1212,6 +1212,12 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         from kernel import front
         if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
             raise NotAuthorized("record_author_empty must come from an attempt dispatched in the author role")
+        # `detail` (revision 16) is the coordinator's own prose, asserted
+        # like `park`'s `reason` and `cursor_item_id` -- shape-checked here,
+        # not verified, because there is no kernel object to verify it
+        # against.
+        if cmd.payload.get("detail") is not None and not isinstance(cmd.payload.get("detail"), str):
+            raise NotAuthorized("record_author_empty detail must be a string or absent")
         sid = cmd.payload.get("session")
         seat = front.newest_seat(store, cmd.run_id, Role.AUTHOR, phase_of(current), front.epoch(store, cmd.run_id))
         if seat is None or seat["session"]["id"] != sid:

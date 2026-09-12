@@ -281,8 +281,13 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.AUTHOR_EMPTY, actor=actor,
             causal_command_id=cmd.idempotency_key,
+            # `detail` (revision 16): the coordinator's own reason a
+            # malformed hand-back was the empty turn, carried to the fact so
+            # the retry's brief (Task 7) can render it; absent for a plain
+            # empty turn, as before.
             payload={"session": cmd.payload["session"], "phase": phase,
-                     "epoch": epoch_n, "generation": cmd.generation},
+                     "epoch": epoch_n, "generation": cmd.generation,
+                     "detail": cmd.payload.get("detail", "")},
         )
     elif cmd.name == "park":
         p = cmd.payload

@@ -121,6 +121,18 @@ def test_ruling_grammar():
     assert slices.parse_ruling(b"") is None
 
 
+def test_parse_reshape_accepts_the_grammar():
+    r = slices.parse_reshape(b"Ruling: epic\nReasoning: the issue names a store, an API and a page.\n")
+    assert r.reasoning.startswith("the issue names")
+
+
+def test_parse_reshape_refuses_four_ways():
+    assert slices.parse_reshape(b"Ruling: one piece\nReasoning: x\n") is None   # the other ruling
+    assert slices.parse_reshape(b"Ruling: epic\n") is None                      # no reasoning
+    assert slices.parse_reshape(b"Ruling: epic\nReasoning:   \n") is None       # empty reasoning
+    assert slices.parse_reshape(b"Some preamble\nRuling: epic\nReasoning: x\n") is None
+
+
 def test_render_child_is_exact_and_strict():
     p = slices.parse(GOOD)
     title, body = slices.render_child(p.slices[2], 12, "abcd1234", {1: 40, 2: 41})

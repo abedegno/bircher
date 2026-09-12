@@ -9,7 +9,7 @@ import re
 from coordinator import phases, seat
 from coordinator.human import take_listing            # Task 19; a stub until then
 from coordinator.session import AgentMismatch
-from kernel import front
+from kernel import front, slices
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.dispatch import Role, SeatsExhausted
@@ -174,15 +174,23 @@ def _copy(ctx, phase: str, rnd: int, data: bytes) -> None:
     (d / f"{phase}-r{rnd}.md").write_bytes(data)
 
 
-def record_empty(ctx, session_id: str) -> str:
+def record_empty(ctx, session_id: str, detail: str = "") -> str:
     """`record_author_empty` for a turn that produced nothing: `empty_retry`,
     or `failed` when the kernel refuses it. The kernel refuses a second empty
     turn in a row (the seat's own create was itself caused by an
     author_empty): that is RC_FAILED, and the reason belongs in the log
     rather than only in the journal. Shared by the author round and the
-    shaping round -- the same refusal, the same two outcomes."""
+    shaping round -- the same refusal, the same two outcomes.
+
+    *detail* (revision 16): a malformed hand-back is an empty turn WITH a
+    reason -- a plain empty turn says nothing wrong was tried, a malformed
+    one says something was tried and misread, and the retry's brief (Task 7)
+    needs to tell those apart to say what to fix rather than what to do."""
+    payload = {"session": session_id}
+    if detail:
+        payload["detail"] = detail
     try:
-        seat.command(ctx, "record_author_empty", {"session": session_id})
+        seat.command(ctx, "record_author_empty", payload)
     except NotAuthorized as exc:
         ctx.log(f"author_empty refused: {exc}")
         return "failed"
@@ -224,12 +232,26 @@ def author_round(ctx) -> str:
         prior_seat = front.newest_seat(store, run_id, Role.AUTHOR, phase, n)
         resume = prior_seat["session"]["id"] if prior_seat else None
     vendor = choose_author_vendor(ctx)
-    watched = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT] if grill == "human" else [seat.ARTIFACT_OUT]
+    # Revision 16: the spec round watches the hand-back beside the artefact
+    # -- `bircher/reshape.md` ends the turn exactly as the artefact does.
+    # `questions.md` is READ but not watched under grill=model, so the
+    # skill's "write the questions and continue" does not end the turn
+    # early (as today); under grill=human it is watched too, as today. The
+    # read order -- reshape, then questions, then artefact -- is the plan
+    # phase's business only through `read=None` falling back to `watched`;
+    # the plan author is never asked to hand a run back.
+    if phase == "spec":
+        watched = ([seat.ARTIFACT_OUT, seat.QUESTIONS_OUT] if grill == "human"
+                   else [seat.ARTIFACT_OUT]) + [seat.RESHAPE_OUT]
+        read = [seat.RESHAPE_OUT, seat.QUESTIONS_OUT, seat.ARTIFACT_OUT]
+    else:
+        watched = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT] if grill == "human" else [seat.ARTIFACT_OUT]
+        read = None
     try:
         turn = seat.run_turn(ctx, role=Role.AUTHOR, vendor=vendor, session_obligation=session_ob,
                              prompt_cause=(answer.id if answer is not None else cause.id),
                              prompt_text=author_brief(ctx, phase=phase, resume_answer=answer),
-                             watched=watched, read=[seat.ARTIFACT_OUT, seat.QUESTIONS_OUT],
+                             watched=watched, read=read,
                              resume_session=resume)
     except SeatsExhausted:
         return "budget"
@@ -242,6 +264,38 @@ def author_round(ctx) -> str:
     taken = take_listing(ctx, turn.session_id, turn.listing)
     if taken == "direction":
         return "direction"
+    hand_back = turn.files.get(seat.RESHAPE_OUT)
+    reshape = slices.parse_reshape(hand_back) if hand_back else None
+    if hand_back and reshape is None:
+        # A hand-back with no reasoning, or the wrong ruling word, is not a
+        # hand-back (spec §3): the empty turn, WHETHER OR NOT an artefact or
+        # a questions file sits beside it -- the same unconditional bullet
+        # `shape.py`'s ruling check reads. WITH a reason, unlike a plain
+        # empty turn: `record_empty`'s `detail` says what to fix, and the
+        # retry's brief renders it (Task 7). `_move_aside` retires every
+        # file of this turn before the re-prompt.
+        ctx.log(f"{seat.RESHAPE_OUT} does not parse; the empty turn: {hand_back[:200]!r}")
+        return record_empty(ctx, turn.session_id,
+                           detail=f"reshape.md did not parse: the first non-blank line must be "
+                                  f"exactly `{slices.RESHAPE_LINE}` and a non-empty `Reasoning:` "
+                                  f"block must follow")
+    if reshape is not None:
+        if turn.files.get(seat.ARTIFACT_OUT) is not None or turn.files.get(seat.QUESTIONS_OUT) is not None:
+            # The hand-back is read first, unconditionally: the shape
+            # decides before the questions are worth asking, and a spec
+            # written against a shape its own author disputed is not
+            # submitted. Neither file is read below; `_move_aside` retires
+            # both before any re-prompt.
+            ctx.log(f"{seat.ARTIFACT_OUT} or {seat.QUESTIONS_OUT} beside a hand-back is ignored")
+        try:
+            seat.command(ctx, "request_reshape", {"reasoning": reshape.reasoning})
+        except NotAuthorized as exc:
+            # A direction mid-turn, or a hand-back this epoch already holds
+            # (authz: "request_reshape: ... already holds a hand-back"):
+            # the same vocabulary `submit_spec`/`submit_slices` refusals use,
+            # through the site both share.
+            return refusal_outcome(ctx, phase, str(exc), ("request_reshape:",))
+        return "reshaped"
     questions = turn.files.get(seat.QUESTIONS_OUT)
     artefact = turn.files.get(seat.ARTIFACT_OUT)
     if questions:

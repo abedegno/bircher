@@ -1,9 +1,11 @@
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from coordinator import author, phases, seat
+from coordinator.author import SKILLS
 from coordinator.effects import KERNEL
 from kernel import front
 from kernel.dispatch import Role
@@ -11,6 +13,10 @@ from kernel.events import EventKind
 from kernel.store import Store
 from tests.coordinator.fake_omnigent import FakeOmnigent
 from tests.kernel.front import SPEC_BYTES, Front
+
+#: A well-formed hand-back (shaping spec §3, revision 16), for the tests
+#: below that write one.
+RESHAPE_BYTES = b"Ruling: epic\nReasoning: the issue names a store, an API and a page.\n"
 
 
 @pytest.fixture
@@ -42,6 +48,56 @@ def _writes(fake, name, data):
         os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
         open(os.path.join(ws, name), "wb").write(data)
     fake.on_prompt = on_prompt
+
+
+class _Fake:
+    """The `world` fixture, plus the conveniences the hand-back tests need:
+    accumulate the files a session's turn writes (`write`, additive --
+    several calls build up one turn's worth), drive one spec round
+    (`spec_round`), and read back what `run_turn` was actually asked to
+    watch and to read -- `last_turn` -- since the two are not the same set
+    and a test that only reads `Turn.files` cannot tell them apart."""
+
+    def __init__(self, store, ctx, run_id, omni, monkeypatch):
+        self.store, self.ctx, self.run_id, self._omni = store, ctx, run_id, omni
+        self._files: dict[str, bytes] = {}
+        self.last_turn = None
+        omni.on_prompt = self._on_prompt
+        original = seat.run_turn
+
+        def wrapped(ctx, *, watched, read=None, **kw):
+            turn = original(ctx, watched=watched, read=read, **kw)
+            self.last_turn = SimpleNamespace(
+                watched=list(watched), read=list(watched) if read is None else list(read),
+                ended=turn.ended, files=turn.files)
+            return turn
+        monkeypatch.setattr(seat, "run_turn", wrapped)
+
+    def _on_prompt(self, sid, text):
+        ws = self._omni.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        for name, data in self._files.items():
+            open(os.path.join(ws, name), "wb").write(data)
+
+    def write(self, path, data):
+        self._files[path] = data
+
+    def spec_round(self):
+        return author.author_round(self.ctx)
+
+    @property
+    def turn_ran_to_its_cap(self) -> bool:
+        return self.last_turn is not None and self.last_turn.ended == "cap"
+
+    @property
+    def parked_reasons(self) -> list:
+        return [f.payload["reason"] for f in self.store.facts_of_kind(self.run_id, EventKind.PARKED)]
+
+
+@pytest.fixture
+def fake(world, monkeypatch):
+    s, f, omni, ctx = world()
+    return _Fake(s, ctx, "r-1", omni, monkeypatch)
 
 
 def test_parse_questions():
@@ -285,3 +341,75 @@ def test_a_first_draft_asks_for_no_dispositions(world):
     the word."""
     s, f, fake, ctx = world()
     assert "## Dispositions are required" not in author.author_brief(ctx, phase="spec").decode()
+
+
+# -- the hand-back (shaping spec §3, revision 16) ----------------------------
+
+def test_the_spec_round_watches_reshape_and_artifact_under_grill_model(fake):
+    ctx = fake.spec_round()
+    assert set(fake.last_turn.watched) == {seat.RESHAPE_OUT, seat.ARTIFACT_OUT}
+    assert seat.QUESTIONS_OUT in fake.last_turn.read
+
+
+def test_a_written_questions_file_does_not_end_the_turn(fake):
+    fake.write(seat.QUESTIONS_OUT, b"1. what about auth?\n")
+    assert fake.spec_round() != "questions_ended_the_turn"
+    assert fake.turn_ran_to_its_cap is True
+
+
+def test_reshape_is_read_before_questions_and_before_the_artifact(fake):
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    fake.write(seat.QUESTIONS_OUT, b"1. what about auth?\n")
+    fake.write(seat.ARTIFACT_OUT, b"# A spec\n")
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.run_state(fake.run_id) == "shaping"
+    assert fake.parked_reasons == []                      # no grill park
+    assert front.submissions(fake.store, fake.run_id, "spec", 0) == []
+
+
+def test_a_hand_back_beside_real_questions_records_none_of_them(fake):
+    """The `questions.md` above never matches `### Q<n>:`, so a version of
+    the coordinator that fell through to processing it anyway would still
+    record nothing and this file's other assertions would not catch it --
+    the shape deciding before the questions are worth asking has to hold
+    even when there is a real question sitting there to record."""
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: sqlite or postgres?\nRecommended: sqlite\n")
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.facts_of_kind(fake.run_id, EventKind.MODEL_QUESTION) == []
+
+
+def test_a_malformed_reshape_is_the_empty_turn_with_its_detail(fake):
+    fake.write(seat.RESHAPE_OUT, b"Ruling: epic\n")
+    assert fake.spec_round() == "empty_retry"
+    e = fake.store.facts_of_kind(fake.run_id, EventKind.AUTHOR_EMPTY)[-1]
+    assert "reshape.md did not parse" in e.payload["detail"]
+
+
+def test_the_skill_carries_the_block_and_the_prohibition():
+    text = (SKILLS / "spec-author" / "SKILL.md").read_text()
+    assert "Ruling: epic" in text and "Reasoning:" in text
+    assert "the first non-blank line must be exactly `Ruling: epic`" in text
+    for forbidden in ("the run's journal", "session history", "`.run/`"):
+        assert forbidden in text
+
+
+def test_the_skills_example_block_parses_for_real():
+    """The substring checks above would still pass if the example under
+    `## Handing back` were reworded into something the real grammar rejects
+    -- a missing colon, the labels swapped, a stray line before `Ruling:`.
+    Parsing the block back out through `slices.parse_reshape` is what
+    actually ties the skill's prose to what the kernel accepts, rather than
+    to words that merely look like it."""
+    text = (SKILLS / "spec-author" / "SKILL.md").read_text()
+    section = text.split("## Handing back", 1)[1]
+    block, started = [], False
+    for line in section.splitlines():
+        if line.startswith("    "):
+            started = True
+            block.append(line[4:])
+        elif started:
+            break
+    from kernel import slices
+    r = slices.parse_reshape("\n".join(block).encode())
+    assert r is not None and r.reasoning, f"the skill's own example does not parse: {block!r}"

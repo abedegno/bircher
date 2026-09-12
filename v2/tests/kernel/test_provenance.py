@@ -185,6 +185,9 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['state']",
         "cmd.payload['observed_at']",
         "cmd.payload['parent_state']",
+        # Task 6 (revision 16): the malformed hand-back's own reason,
+        # shape-checked and rendered to the next seat, verified by nobody.
+        "cmd.payload['detail']",
         # The front half's own three (docs/design/provenance-table.md's
         # "Front half" section, spec §9): prose rows with no single
         # store.X or payload[...] the AST walk could find, added by hand
@@ -258,7 +261,9 @@ def test_the_spec_and_the_table_agree_on_the_count():
              # The shaping phase's four: the sweep's closed-at, state,
              # observed-at and parent-state readings of GitHub.
              "twenty-six": 26, "twenty-seven": 27, "twenty-eight": 28,
-             "twenty-nine": 29}
+             "twenty-nine": 29,
+             # Task 6: the malformed hand-back's own reason.
+             "thirty": 30}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")

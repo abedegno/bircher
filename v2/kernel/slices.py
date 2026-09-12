@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import NamedTuple
 
 #: The definition of coarse, verbatim from spec §1. The shape author's brief
 #: and the slice reviewer's brief both render it from here.
@@ -29,6 +30,9 @@ COARSE = (
 MIN_SLICES, MAX_SLICES = 2, 5
 MIN_SENTENCES, MAX_SENTENCES = 3, 6
 RULING_LINE = "Ruling: one piece"
+#: The spec author's hand-back (shaping spec §3, revision 16): the ruling
+#: file's grammar, with the other ruling word.
+RESHAPE_LINE = "Ruling: epic"
 #: The reserved model_ruling question_id (spec §2): only record_one_piece
 #: writes it, and record_model_question/record_model_ruling refuse it.
 SHAPE_QUESTION = "shape"
@@ -72,6 +76,14 @@ class Plan:
 class Ruling:
     reasoning: str
     cost_if_wrong: str
+
+
+class Reshape(NamedTuple):
+    """The spec author's hand-back (shaping spec §3, revision 16): one field,
+    because the grammar asks for one thing -- a ruling asks for a cost too,
+    a hand-back does not, there is nothing downstream of it to be wrong
+    about."""
+    reasoning: str
 
 
 def sentences(text: str) -> int:
@@ -215,6 +227,33 @@ def topo_order(plan: Plan) -> list[int]:
     return order
 
 
+def _block(labels: tuple[str, ...], lines: list[str]) -> dict[str, str] | None:
+    """The labelled-block reader both ruling grammars share (spec §3 *The
+    ruling file's grammar*, and revision 16's hand-back, the same shape):
+    each of *labels* opens a block that runs to the next label or the end.
+    `None` when a non-blank line precedes the first label or a label
+    repeats -- *lines* is not this grammar and there is nothing to read;
+    otherwise a dict from label to its block, joined and trimmed (a present
+    label's block may still be empty -- a label with nothing after it -- and
+    the caller decides whether that refuses the file). *lines* is assumed
+    already blank-stripped: this is the one reader, so a second one cannot
+    drift from what counts as blank."""
+    blocks: dict[str, list[str]] = {}
+    current = None
+    for line in lines:
+        label = next((lab for lab in labels if line.startswith(lab)), None)
+        if label is not None:
+            if label in blocks:
+                return None
+            current = label
+            blocks[label] = [line[len(label):].strip()]
+        elif current is None:
+            return None
+        else:
+            blocks[current].append(line)
+    return {k: " ".join(x for x in v if x).strip() for k, v in blocks.items()}
+
+
 def parse_ruling(data: bytes) -> Ruling | None:
     """`None` when the file is not a ruling (spec §3 *The ruling file's
     grammar*): the first non-blank line is exactly `Ruling: one piece`;
@@ -225,24 +264,27 @@ def parse_ruling(data: bytes) -> Ruling | None:
     body = [ln.strip() for ln in data.decode("utf-8", "replace").splitlines() if ln.strip()]
     if not body or body[0] != RULING_LINE:
         return None
-    blocks: dict[str, list[str]] = {}
-    current = None
-    for line in body[1:]:
-        label = next((lab for lab in _RULING_LABELS if line.startswith(lab)), None)
-        if label is not None:
-            if label in blocks:
-                return None
-            current = label
-            blocks[label] = [line[len(label):].strip()]
-        elif current is None:
-            return None
-        else:
-            blocks[current].append(line)
-    reasoning = " ".join(x for x in blocks.get("Reasoning:", []) if x).strip()
-    cost = " ".join(x for x in blocks.get("Cost if wrong:", []) if x).strip()
-    if not reasoning or not cost:
+    blocks = _block(_RULING_LABELS, body[1:])
+    if blocks is None:
         return None
-    return Ruling(reasoning, cost)
+    reasoning, cost = blocks.get("Reasoning:", ""), blocks.get("Cost if wrong:", "")
+    return Ruling(reasoning, cost) if reasoning and cost else None
+
+
+def parse_reshape(data: bytes) -> Reshape | None:
+    """The spec author's hand-back (shaping spec §3, revision 16).
+    `parse_ruling`'s rules with the other ruling word: the first non-blank
+    line exactly `Ruling: epic`, a non-empty `Reasoning:` block, anything
+    else not a hand-back. Returning `None` rather than raising: a file that
+    is not a hand-back is the empty turn, and the coordinator says why."""
+    body = [ln.strip() for ln in data.decode("utf-8", "replace").splitlines() if ln.strip()]
+    if not body or body[0] != RESHAPE_LINE:
+        return None
+    blocks = _block(("Reasoning:",), body[1:])
+    if blocks is None:
+        return None
+    reasoning = blocks.get("Reasoning:", "")
+    return Reshape(reasoning) if reasoning else None
 
 
 def render_child(s: Slice, parent: int, hash8: str, filed: dict[int, int]) -> tuple[str, str]:

@@ -22,6 +22,11 @@ QUESTIONS_OUT = "bircher/questions.md"
 #: The shaping round's ruling file (shaping spec §3): read before the artefact.
 SHAPE_OUT = "bircher/shape.md"
 
+#: The spec author's hand-back (shaping spec §3, revision 16): the spec
+#: round's own ruling file, watched beside the artefact and read before
+#: either of the other two.
+RESHAPE_OUT = "bircher/reshape.md"
+
 
 @dataclass
 class Turn:
