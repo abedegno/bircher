@@ -22,6 +22,10 @@ from kernel.enqueue import _run_exists, create_run
 from kernel.events import EventKind
 from kernel.store import Store
 
+#: The shared issue every revision-16 fixture (front.py's docstring, the
+#: plan's *Shared test fixtures* section) births its run against.
+ISSUE = {"number": 12, "title": "Epic", "body": "B", "labels": ["bircher:autonomous"], "comments": []}
+
 SPEC_BYTES = b"# Spec\n\nThe thing, specified.\n"
 PLAN_BYTES = b"# Plan\n\n### Task 1: do the thing\n\n- [ ] Step 1\n"
 SLICES_BYTES = b"""# Slicing T
@@ -229,6 +233,20 @@ class Front:
         h = put_artifact(self.store, plan)
         self._cmd(g, "submit_slices", {"artifact_hash": h})
         return h
+
+    def request_reshape(self, reasoning: str, *, vendor=None, gen: int | None = None):
+        """Revision 16: the spec author's hand-back, from `queued`. Same
+        ceremony as `shape_round`'s ruling turn -- a fresh dispatch, a
+        session, its turn ended -- unless *gen* names an already-dispatched
+        generation (a stale one a later direction interrupts)."""
+        if gen is None:
+            cause = self._newest_id()
+            g = self._dispatch(Role.AUTHOR, vendor or self.author)
+            sid = self._session(g, cause)
+            self._end_turn(g, sid)
+        else:
+            g = gen
+        return self._cmd(g, "request_reshape", {"reasoning": reasoning})
 
     def advance(self) -> None:
         """The coordinator's `advance_ungated` at slices_accepted."""

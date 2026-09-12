@@ -75,6 +75,9 @@ TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
 OUTPUT_COMMANDS = frozenset({
     "submit_spec", "submit_plan", "submit_slices", "record_one_piece",
     "record_author_empty", "record_model_question", "record_model_ruling",
+    # Revision 16: the hand-back ends an author turn too, so it carries the
+    # observed-turn-and-stop check every other output command carries.
+    "request_reshape",
 })
 
 #: Every non-terminal state. `record_run_outcome` and `cancel_run` are legal
@@ -102,6 +105,10 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # the transition that authorises filing must be its own fact.
     "record_one_piece": (frozenset({"shaping"}), "queued"),
     "submit_slices": (frozenset({"shaping"}), "slices_submitted"),
+    # Revision 16: the spec author's hand-back. From `queued`, the spec
+    # author's own state, back to `shaping` -- a new VISIT of the same epoch,
+    # never a new epoch.
+    "request_reshape": (frozenset({"queued"}), "shaping"),
     "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
     # The filing and closing facts (shaping spec §2): no transition; legal
     # only from `sliced`, under the coordinator's or the sweep's operator
@@ -978,8 +985,37 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         _check_author_seat(store, cmd, current)
         _check_no_newer_direction(store, cmd)
         n = front.epoch(store, cmd.run_id)
-        if front.shape_ruling(store, cmd.run_id, n) is not None:
-            raise NotAuthorized(f"a shape ruling already exists in epoch {n}: one decision per epoch (shaping spec §2)")
+        # Revision 16: one decision per VISIT, not per epoch -- a hand-back
+        # opens a visit precisely so a reconsidered ruling can be recorded in
+        # it. Before any hand-back the epoch holds one visit, so this reads
+        # exactly as the old epoch-wide guard did.
+        v = front.shaping_visit(store, cmd.run_id, n)
+        if front.shape_ruling(store, cmd.run_id, n, visit=v) is not None:
+            raise NotAuthorized(
+                f"a shape ruling already exists in epoch {n} visit {v}: one decision per visit (shaping spec §2)"
+            )
+        return next_state
+
+    if cmd.name == "request_reshape":
+        from kernel import front
+        # A literal read: the provenance extractor matches this syntactically,
+        # and the row it adds to the asserted set is stated in the spec's
+        # site table (revision 16).
+        if not _non_empty_str(cmd.payload.get("reasoning")):
+            raise NotAuthorized("request_reshape carries a non-empty reasoning")
+        _check_author_seat(store, cmd, current)
+        _check_no_newer_direction(store, cmd)
+        n = front.epoch(store, cmd.run_id)
+        if front.shape_ruling(store, cmd.run_id, n) is None:
+            raise NotAuthorized(
+                f"request_reshape: epoch {n} holds no shape ruling; there is nothing to hand back to "
+                "(a v1 run born in `queued` was never shaped)"
+            )
+        if front.epoch_facts(store, cmd.run_id, EventKind.RESHAPE_REQUESTED, n):
+            raise NotAuthorized(
+                f"request_reshape: epoch {n} already holds a hand-back; one per bundle, and a second "
+                "disagreement over the same input is the person's (shaping spec §2)"
+            )
         return next_state
 
     if cmd.name == "advance_ungated":

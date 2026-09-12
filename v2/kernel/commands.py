@@ -107,6 +107,12 @@ COMMAND_NAMES = frozenset({
     # The filing and closing facts (shaping spec §2).
     "record_slice_filed", "record_filing_complete", "record_slice_closed",
     "record_slice_reopened", "record_children_observed_closed",
+    # The spec author's hand-back (shaping spec §2 revision 16): a wrongly
+    # one-piece ruling returns the run to `shaping` for a fresh visit. An
+    # author's command, not the human's -- the person's own reconsideration
+    # is `approve_one_piece` (Task 4), issued on the disputed ruling that
+    # follows this one.
+    "request_reshape",
 })
 
 
@@ -167,21 +173,39 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
     if cmd.name in ("submit_spec", "submit_plan", "submit_slices"):
         h = cmd.payload["artifact_hash"]
         rnd = len(front.submissions(store, cmd.run_id, phase, epoch_n)) + 1
+        payload = {"phase": phase, "epoch": epoch_n, "hash": h, "author": actor, "round": rnd}
+        if phase == "slices":
+            # Revision 16: half of "one decision per visit" is the submission,
+            # so the submission says which visit it belongs to.
+            payload["visit"] = front.shaping_visit(store, cmd.run_id, epoch_n)
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor=actor,
-            causal_command_id=cmd.idempotency_key,
-            payload={"phase": phase, "epoch": epoch_n, "hash": h, "author": actor, "round": rnd},
+            causal_command_id=cmd.idempotency_key, payload=payload,
         )
         store.set_phase_artifact(cmd.run_id, phase, h)
     elif cmd.name == "record_one_piece":
         from kernel.slices import SHAPE_QUESTION
         # The existing fact and payload shape (record_model_ruling's), with
         # the reserved question id: the proof's fourth assertion reads it.
+        # Revision 16: the visit this ruling belongs to, so a visit's own
+        # ruling can be told apart from an earlier visit's (front.shape_ruling).
         store.append_fact(
             run_id=cmd.run_id, kind=EventKind.MODEL_RULING, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"epoch": epoch_n, "question_id": SHAPE_QUESTION, "ruling": "one piece",
-                     "reasoning": cmd.payload["reasoning"], "cost_if_wrong": cmd.payload["cost_if_wrong"]},
+                     "reasoning": cmd.payload["reasoning"], "cost_if_wrong": cmd.payload["cost_if_wrong"],
+                     "visit": front.shaping_visit(store, cmd.run_id, epoch_n)},
+        )
+    elif cmd.name == "request_reshape":
+        # The visit this fact OPENS: `shaping_visit` counts boundaries, and
+        # this fact is about to become one, so the visit it opens is the
+        # current count plus one.
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.RESHAPE_REQUESTED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"epoch": epoch_n,
+                     "visit": front.shaping_visit(store, cmd.run_id, epoch_n) + 1,
+                     "reasoning": cmd.payload["reasoning"]},
         )
     elif cmd.name == "advance_ungated":
         store.append_fact(

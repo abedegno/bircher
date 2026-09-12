@@ -280,13 +280,68 @@ def frozen_labels(store, run_id: str) -> list[str]:
     return [] if fact is None else list(fact.payload.get("labels") or [])
 
 
-def shape_ruling(store, run_id: str, epoch_n: int):
-    """The epoch's `model_ruling {question_id: "shape"}`, or None."""
+def shape_ruling(store, run_id: str, epoch_n: int, visit: int | None = None):
+    """The epoch's newest `model_ruling {question_id: "shape"}`, or the one
+    written in `visit` when a visit is named (revision 16), or None."""
     from kernel.slices import SHAPE_QUESTION
+    found = None
     for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, epoch_n):
-        if f.payload.get("question_id") == SHAPE_QUESTION:
-            return f
-    return None
+        if f.payload.get("question_id") != SHAPE_QUESTION:
+            continue
+        if visit is not None and (f.payload.get("visit") or visit_of(store, run_id, f.seq)) != visit:
+            continue
+        found = f
+    return found
+
+
+def _visit_boundaries(store, run_id: str, epoch_n: int) -> list[int]:
+    """The `seq` of every fact that opens a shaping visit in this epoch, in
+    order: each `reshape_requested`, and each `human_direction` recorded while
+    the epoch's dispute was unresolved AT THAT POINT IN THE PREFIX.
+
+    The prefix rule is the whole of it. A direction typed into the reshaping
+    session before the disputed ruling exists resolves nothing and opens
+    nothing; the direction that answers a disputed ruling opens the next
+    visit. Deciding that from the prefix rather than from the journal's
+    current state is what keeps a visit from disappearing when a later
+    `bundle_revised` changes what "unresolved" means (spec §2)."""
+    from kernel.slices import SHAPE_QUESTION
+    facts = [f for f in store.facts_for(run_id)
+             if f.payload.get("epoch") == epoch_n
+             and f.kind in (EventKind.RESHAPE_REQUESTED, EventKind.MODEL_RULING,
+                            EventKind.HUMAN_DIRECTION, EventKind.HUMAN_RULING)]
+    boundaries, hand_back, disputed, resolved = [], False, False, False
+    for f in facts:
+        if f.kind == EventKind.RESHAPE_REQUESTED:
+            boundaries.append(f.seq)
+            hand_back, disputed, resolved = True, False, False
+        elif (f.kind == EventKind.MODEL_RULING
+              and f.payload.get("question_id") == SHAPE_QUESTION and hand_back and not disputed):
+            disputed = True
+        elif f.kind == EventKind.HUMAN_DIRECTION and disputed and not resolved:
+            boundaries.append(f.seq)
+            resolved = True
+        elif (f.kind == EventKind.HUMAN_RULING
+              and f.payload.get("ruling") == "approve_one_piece" and disputed):
+            resolved = True
+    return boundaries
+
+
+def shaping_visit(store, run_id: str, epoch_n: int) -> int:
+    """The epoch's current shaping visit, 1-based (spec §2 *Visits, not epochs*)."""
+    return len(_visit_boundaries(store, run_id, epoch_n)) + 1
+
+
+def visit_of(store, run_id: str, seq: int) -> int:
+    """The visit a fact was written in, for a fact that carries no `visit`
+    (everything written before revision 16). Facts of the phase carry it."""
+    fact = next((f for f in store.facts_for(run_id) if f.seq == seq), None)
+    if fact is None:
+        return 1
+    n = fact.payload.get("epoch")
+    if n is None:
+        return 1
+    return sum(1 for b in _visit_boundaries(store, run_id, n) if b <= seq) + 1
 
 
 # -- the shaping phase (shaping spec §2, §3) ------------------------------------
