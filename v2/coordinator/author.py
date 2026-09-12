@@ -237,16 +237,18 @@ def author_round(ctx) -> str:
     # `questions.md` is READ but not watched under grill=model, so the
     # skill's "write the questions and continue" does not end the turn
     # early (as today); under grill=human it is watched too, as today. The
-    # read order -- reshape, then questions, then artefact -- is the plan
-    # phase's business only through `read=None` falling back to `watched`;
-    # the plan author is never asked to hand a run back.
+    # spec §3 paragraph this implements is about the SPEC round only; the
+    # plan phase's `read` is untouched -- still both files, unconditionally,
+    # as before this revision (`read=None` here would fall back to `watched`,
+    # which drops `questions.md` under grill=model and silently stops a plan
+    # author's questions file from ever being read).
     if phase == "spec":
         watched = ([seat.ARTIFACT_OUT, seat.QUESTIONS_OUT] if grill == "human"
                    else [seat.ARTIFACT_OUT]) + [seat.RESHAPE_OUT]
         read = [seat.RESHAPE_OUT, seat.QUESTIONS_OUT, seat.ARTIFACT_OUT]
     else:
         watched = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT] if grill == "human" else [seat.ARTIFACT_OUT]
-        read = None
+        read = [seat.ARTIFACT_OUT, seat.QUESTIONS_OUT]
     try:
         turn = seat.run_turn(ctx, role=Role.AUTHOR, vendor=vendor, session_obligation=session_ob,
                              prompt_cause=(answer.id if answer is not None else cause.id),

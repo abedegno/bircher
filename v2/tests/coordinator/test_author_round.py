@@ -89,15 +89,23 @@ class _Fake:
     def turn_ran_to_its_cap(self) -> bool:
         return self.last_turn is not None and self.last_turn.ended == "cap"
 
-    @property
-    def parked_reasons(self) -> list:
-        return [f.payload["reason"] for f in self.store.facts_of_kind(self.run_id, EventKind.PARKED)]
+
+@pytest.fixture
+def fake_factory(world, monkeypatch):
+    """`fake`, parameterised: `fake_factory(labels=(...))` builds an
+    independent `_Fake` over its own `world()` call, for the tests that need
+    a policy other than the default (`grill: human`, below) -- `fake` itself
+    stays the single no-argument instance the rest of this file already
+    uses."""
+    def make(**kwargs):
+        s, f, omni, ctx = world(**kwargs)
+        return _Fake(s, ctx, "r-1", omni, monkeypatch)
+    return make
 
 
 @pytest.fixture
-def fake(world, monkeypatch):
-    s, f, omni, ctx = world()
-    return _Fake(s, ctx, "r-1", omni, monkeypatch)
+def fake(fake_factory):
+    return fake_factory()
 
 
 def test_parse_questions():
@@ -346,15 +354,85 @@ def test_a_first_draft_asks_for_no_dispositions(world):
 # -- the hand-back (shaping spec §3, revision 16) ----------------------------
 
 def test_the_spec_round_watches_reshape_and_artifact_under_grill_model(fake):
-    ctx = fake.spec_round()
+    fake.spec_round()
     assert set(fake.last_turn.watched) == {seat.RESHAPE_OUT, seat.ARTIFACT_OUT}
     assert seat.QUESTIONS_OUT in fake.last_turn.read
 
 
 def test_a_written_questions_file_does_not_end_the_turn(fake):
-    fake.write(seat.QUESTIONS_OUT, b"1. what about auth?\n")
-    assert fake.spec_round() != "questions_ended_the_turn"
+    """Fix round 1, finding 3: the brief's first assertion here compared
+    against a string `author_round` can never return -- a tautology no
+    implementation could fail. Replaced with a well-formed question, so the
+    outcome is a real, reachable one (`"questions"`) that a broken
+    implementation (say, one that watches `QUESTIONS_OUT` again) would
+    reach a different way -- by the file landing and ending the turn `file`
+    rather than `cap` -- which the second assertion still catches."""
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: what about auth?\nRecommended: use OAuth\n")
+    assert fake.spec_round() == "questions"
     assert fake.turn_ran_to_its_cap is True
+    q = fake.store.newest_fact(fake.run_id, EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
+
+
+def test_the_spec_rounds_read_set_includes_questions_under_grill_model(fake):
+    """Fix round 1, finding 4: the read SET (as opposed to the watched set)
+    had exactly one assertion in the whole suite, and it lived inside the
+    test above (`seat.QUESTIONS_OUT in fake.last_turn.read`) -- one mutation
+    (`read=None` for the spec phase) took out coverage for both at once.
+    Independent of that test: a well-formed `questions.md` sitting beside a
+    complete `artifact.md` must still be recorded, because `read` -- not
+    `watched` -- is what makes the coordinator look at it at all."""
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: which store?\nRecommended: sqlite\n")
+    fake.write(seat.ARTIFACT_OUT, SPEC_BYTES)
+    assert fake.spec_round() == "submitted"
+    q = fake.store.newest_fact(fake.run_id, EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
+
+
+def test_the_human_grills_spec_round_watches_all_three_paths(fake_factory):
+    """Fix round 1, finding 2: under `grill: human`, `RESHAPE_OUT` is
+    appended outside the conditional in `author_round`, so it should be in
+    the watched set alongside both files the `grill: human` branch already
+    watches -- nothing pinned that before this."""
+    fake = fake_factory(labels=("bircher:grill", "bircher:autonomous"))
+    fake.spec_round()
+    assert set(fake.last_turn.watched) == {seat.RESHAPE_OUT, seat.QUESTIONS_OUT, seat.ARTIFACT_OUT}
+
+
+def test_a_hand_back_ends_the_grill_humans_asking_turn(fake_factory):
+    """Fix round 1, finding 2: spec §3 says the hand-back is a legal ending
+    of the `grill: human` asking turn -- an author that decides the issue is
+    an epic before it has anything to ask about should not have to write and
+    answer a question first. `turn_ran_to_its_cap is False` is the part that
+    is actually about WATCHING: `reshape.md` is also in `read`, so an
+    unwatched hand-back would still be picked up once the turn reached its
+    timeout on its own -- the outcome alone does not tell the two apart, and
+    only ending the turn promptly, on the file landing, does."""
+    fake = fake_factory(labels=("bircher:grill", "bircher:autonomous"))
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.run_state(fake.run_id) == "shaping"
+    assert fake.turn_ran_to_its_cap is False
+
+
+def test_the_plan_round_still_reads_questions_under_grill_model(world):
+    """Fix round 1, finding 1 -- a REGRESSION, not a coverage gap: revision
+    16 changes the SPEC round's `read` only (spec §3's paragraph is explicit
+    that the plan phase is untouched). Before this task `author_round`
+    passed `read=[ARTIFACT_OUT, QUESTIONS_OUT]` unconditionally, for every
+    phase; the `else` branch's `read=None` fell back to `watched`, which
+    under `grill: model` is `[ARTIFACT_OUT]` alone -- a plan author's
+    questions file would never be read again, and the round would return
+    `empty_retry` where it should return `questions`."""
+    s, f, fake, ctx = world()
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    assert author.author_round(ctx) == "submitted"
+    f.review_round("accept")
+    assert ctx.phase() == "plan"
+    _writes(fake, seat.QUESTIONS_OUT, b"### Q1: which orm?\nRecommended: none\n")
+    assert author.author_round(ctx) == "questions"
+    q = s.newest_fact("r-1", EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
 
 
 def test_reshape_is_read_before_questions_and_before_the_artifact(fake):
@@ -363,7 +441,13 @@ def test_reshape_is_read_before_questions_and_before_the_artifact(fake):
     fake.write(seat.ARTIFACT_OUT, b"# A spec\n")
     assert fake.spec_round() == "reshaped"
     assert fake.store.run_state(fake.run_id) == "shaping"
-    assert fake.parked_reasons == []                      # no grill park
+    # No grill park: covered by `test_a_hand_back_beside_real_questions_records_none_of_them`
+    # below, not here. `park` is issued from exactly one site in the
+    # coordinator (`phases.stall`, inside `run_loop`), never from
+    # `author_round` itself, so a "no PARKED fact" assertion here would hold
+    # whether or not the hand-back was handled correctly (fix round 1,
+    # finding 4a) -- this test used to carry one, and it could never fail.
+    # Removed rather than kept as documentation once nothing else read it.
     assert front.submissions(fake.store, fake.run_id, "spec", 0) == []
 
 
