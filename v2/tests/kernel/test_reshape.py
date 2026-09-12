@@ -60,6 +60,25 @@ def _rejected_then_disagreed(tmp_path, name="r.db"):
     return s, f
 
 
+def test_the_fixture_actually_varies_the_policy(tmp_path):
+    """B1: the fixture's own assertion only fires when a caller asks for
+    labels that differ from `ISSUE`'s, and until this test no caller did --
+    so the merge it guards was unguarded. Task 3 loops over three gate
+    policies through `_shaped`; if the labels do not reach the frozen bundle,
+    that test proves one policy three times and goes green.
+
+    Three label sets, three different gate sets. Reverting the merge in
+    `_shaped` -- passing `issue=ISSUE, labels=list(labels)` as
+    `Front.__init__`'s signature invites -- reds this."""
+    from kernel.policy import policy_of
+    seen = []
+    for i, labels in enumerate(([], ["bircher:autonomous"], ["bircher:gate-plan"])):
+        s, f = _shaped(tmp_path, f"pol{i}.db", labels)
+        assert front.frozen_labels(s, f.run_id) == labels
+        seen.append(tuple(sorted(policy_of(s, f.run_id).gates)))
+    assert len(set(seen)) == 3, f"three label sets must yield three policies, got {seen}"
+
+
 def test_visit_one_is_the_epoch(tmp_path):
     s, f = _shaped(tmp_path)
     assert front.shaping_visit(s, f.run_id, front.epoch(s, f.run_id)) == 1
