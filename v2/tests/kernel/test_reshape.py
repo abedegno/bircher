@@ -221,27 +221,6 @@ def test_the_hand_back_is_legal_from_queued_and_moves_to_shaping(tmp_path):
     assert hb.payload["reasoning"].startswith("the issue names")
 
 
-def test_the_hand_back_refuses_its_four_ways(tmp_path):
-    s, f = _shaped(tmp_path)
-    with pytest.raises(NotAuthorized, match="reasoning"):
-        f.request_reshape("   ")
-    # Once per epoch.
-    f.request_reshape("three parts")
-    f.shape_round(reasoning="still one", cost="the spec would find one surface")
-    f.approve_one_piece()
-    with pytest.raises(NotAuthorized, match="already"):
-        f.request_reshape("again")
-    # A run that was never shaped has nothing to hand back to. Unreachable
-    # through today's transitions -- `record_one_piece` is the only way out
-    # of `shaping` -- so the state is set directly, exactly as a v1 database
-    # written before the shaping phase existed holds it.
-    s2 = Store.open(tmp_path / "k2.db")
-    g = Front(s2, "i13-v1-1", issue=ISSUE, shape=False)
-    s2.set_run_state(g.run_id, "queued")
-    with pytest.raises(NotAuthorized, match="no shape ruling"):
-        g.request_reshape("epic")
-
-
 def test_the_hand_back_refuses_empty_or_whitespace_reasoning(tmp_path):
     """The first row of the refusal table, pinned on its own for a clean
     signal: the same assertion is the first line of

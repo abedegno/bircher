@@ -111,12 +111,11 @@ COMMAND_NAMES = frozenset({
     # one-piece ruling returns the run to `shaping` for a fresh visit. An
     # author's command, not the human's -- the person's own reconsideration
     # is `approve_one_piece`, issued on the disputed ruling that follows
-    # this one. Both names are declared together (spec §2's site table lists
-    # them as one row of registry growth); `approve_one_piece` has no
-    # transition or refusal yet -- its `_TRANSITIONS` row, its authorize()
-    # branch and its membership in `HUMAN_COMMANDS`/`HUMAN_EXECUTABLE` are
-    # Task 4's.
-    "request_reshape", "approve_one_piece",
+    # this one, and declared WITH its transition rather than ahead of it:
+    # `test_every_command_declares_its_legal_states` reads this set against
+    # `_TRANSITIONS`, so a name here without a row there reds the suite for
+    # however many tasks separate them.
+    "request_reshape",
 })
 
 
