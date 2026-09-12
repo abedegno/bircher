@@ -91,8 +91,35 @@ def test_the_hand_back_opens_a_visit_and_a_direction_while_disputed_opens_anothe
     f.request_reshape("the issue names a store, an API and a page")
     assert front.shaping_visit(s, f.run_id, n) == 2
     f.shape_round(reasoning="still one piece", cost="the spec would find one surface")   # the disputed ruling
+    # Task 3's `_one_piece_destination` parks the disputed ruling at `shaping`
+    # rather than sending it to `queued`; the direction below is recorded AT
+    # `shaping`, which is the qualifier both `_visit_boundaries` and
+    # `front.dispute` now read (revision 16, its mirror is the next test).
+    assert s.run_state(f.run_id) == "shaping"
     f.direct("slice it along the three parts")                               # resolves, and opens visit 3
     assert front.shaping_visit(s, f.run_id, n) == 3
+
+
+def test_a_direction_recorded_at_queued_after_a_disputed_ruling_opens_no_visit(tmp_path):
+    """The mirror of the test above, and the canary for the qualifier both
+    `_visit_boundaries` and `front.dispute` must read the same way: a
+    direction is the resolution only when it is recorded AT `shaping`
+    (spec §2 *The dispute*), not merely after the disputed ruling. A real
+    dispute never lands the run at `queued` -- that is
+    `_one_piece_destination`'s whole job -- so `set_run_state` is the only
+    way to reach this state and exercise the qualifier at all. Removing the
+    qualifier from either function reds this test: `_visit_boundaries` would
+    open a third visit, and `dispute`'s resolution search would call the
+    dispute resolved."""
+    s, f = _shaped(tmp_path)
+    n = front.epoch(s, f.run_id)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")  # disputed
+    assert front.unresolved_disagreement(s, f.run_id) is True
+    s.set_run_state(f.run_id, "queued")
+    f.direct("slice it")
+    assert front.shaping_visit(s, f.run_id, n) == 2            # no third visit opened
+    assert front.unresolved_disagreement(s, f.run_id) is True  # and nothing is resolved
 
 
 def test_a_direction_before_the_disputed_ruling_opens_no_visit(tmp_path):
@@ -236,18 +263,24 @@ def test_the_hand_back_refuses_empty_or_whitespace_reasoning(tmp_path):
 def test_the_hand_back_refuses_a_second_one_in_the_same_epoch(tmp_path):
     """The refusal table's third row: one hand-back per bundle.
 
-    Reached by a path that needs nothing from a later task.
-    `_one_piece_destination` is not wired yet, so `record_one_piece` still
-    sends every ruling to `queued`, dispute or none; a ruling after the
-    hand-back therefore reaches `queued` on its own and a second
-    `request_reshape` there meets the epoch that already holds the first.
-    The other path to this row -- a run returned to `queued` by the person's
-    `approve_one_piece`, which leaves the ruling in place -- is the same
-    guard reached differently, and is pinned in the task that adds that
-    command."""
+    Task 3's `_one_piece_destination` now parks the disputed ruling at
+    `shaping` instead of sending it on to `queued` -- the path this test
+    used before reached `queued` directly off the disputed ruling and no
+    longer does, so `request_reshape` (legal only from `queued`) would
+    refuse on the STATE, not on "already holds a hand-back", and the
+    `match="already"` below would no longer pin the row it names. Resolving
+    the dispute with a direction first, and letting the visit it opens rule
+    again, is the path that actually reaches `queued` with the epoch's
+    hand-back still standing. The other path to this row -- a run returned
+    to `queued` by the person's `approve_one_piece`, which leaves the
+    ruling in place -- is the same guard reached differently, and is
+    pinned in the task that adds that command."""
     s, f = _shaped(tmp_path)
     f.request_reshape("three parts")
     f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    assert s.run_state(f.run_id) == "shaping"          # the disputed ruling parks
+    f.direct("slice it")                               # resolves, and opens visit 3
+    f.shape_round(reasoning="one piece after all", cost="the spec would find one surface")
     assert s.run_state(f.run_id) == "queued"
     with pytest.raises(NotAuthorized, match="already"):
         f.request_reshape("again")
@@ -290,3 +323,107 @@ def test_the_hand_back_carries_the_direction_guard(tmp_path):
 def test_the_kind_is_declared(tmp_path):
     from kernel.events import SCHEMA_VERSIONS
     assert SCHEMA_VERSIONS[EventKind.RESHAPE_REQUESTED] == 1
+
+
+# -- Task 3: front.dispute, the destination, and the three refusals ---------
+
+def test_the_dispute_names_four_facts_in_order(tmp_path):
+    s, f = _shaped(tmp_path)
+    assert front.dispute(s, f.run_id) is None          # no hand-back yet
+    f.request_reshape("three parts")
+    d = front.dispute(s, f.run_id)
+    assert d.handed_back is not None and d.hand_back is not None
+    assert d.disputed is None and d.resolution is None
+    assert front.unresolved_disagreement(s, f.run_id) is False   # no disputed ruling yet
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    d = front.dispute(s, f.run_id)
+    assert d.disputed is not None and d.resolution is None
+    assert front.unresolved_disagreement(s, f.run_id) is True
+    f.direct("slice it")
+    assert front.unresolved_disagreement(s, f.run_id) is False
+
+
+def test_a_direction_before_the_disputed_ruling_is_not_the_resolution(tmp_path):
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.direct("consider the migration")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    assert front.unresolved_disagreement(s, f.run_id) is True
+
+
+def test_the_first_ruling_proceeds_and_the_disputed_one_stays(tmp_path):
+    s, f = _shaped(tmp_path)                 # the first ruling already moved it to `queued`
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    assert s.run_state(f.run_id) == "shaping"          # the disputed ruling stays, and parks
+    f.direct("slice it")
+    f.shape_round(reasoning="one piece after all", cost="the spec would find one surface")
+    assert s.run_state(f.run_id) == "queued"           # the person answered; this one proceeds
+
+
+def test_the_disputed_ruling_stays_at_shaping_whatever_the_gates(tmp_path):
+    """The gate was never the policy's -- it is the disagreement's. Under
+    `bircher:autonomous`, the one policy that merges unattended, the run
+    still waits for a person (spec §2, the revision record's ruling)."""
+    for labels in ([], ["bircher:autonomous"], ["bircher:gate-plan"]):
+        s, f = _shaped(tmp_path, f"g{len(labels)}{labels}.db".replace("/", ""), labels=labels)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one", cost="the spec would find one surface")
+        assert s.run_state(f.run_id) == "shaping"
+
+
+def test_while_unresolved_three_commands_are_refused(tmp_path):
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    with pytest.raises(NotAuthorized):
+        f.shape_round(SLICES_BYTES)
+    with pytest.raises(NotAuthorized):
+        f.grant()
+
+
+def test_a_human_answer_is_refused_from_every_shaping_state(tmp_path):
+    """Not only while a dispute is unresolved: the grill is epoch-scoped and
+    can stand open while a hand-back's visit runs, and an answer recorded at
+    `shaping` would be dropped from the shaper's brief and delivered later to
+    the spec author as the reply to its question (spec §2)."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    assert s.run_state(f.run_id) == "shaping"
+    with pytest.raises(NotAuthorized, match="shaping"):
+        f.answer("slice it along these lines")
+
+
+def test_grant_round_is_refused_while_unresolved_even_with_a_park(tmp_path):
+    """Isolates the grant_round dispute guard from the `grant_round needs a
+    current park` refusal it would otherwise trip on first: `_shaped` plus a
+    hand-back and a disputed ruling records no `park` fact on its own, so
+    without a park of its own this test could not tell a removed dispute
+    guard from the ordinary empty-park refusal both raise NotAuthorized for.
+    Parking (with an ordinary, legal reason -- `disagreement` is not this
+    task's to add) first means grant_round has a park to grant, and the
+    guard under test is the only thing left standing between it and
+    granting the disputed ruling around the person (spec §2, the row 'a
+    retry cannot consume the park in place of the decision')."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    assert s.run_state(f.run_id) == "shaping"
+    g = f._dispatch(Role.OPERATOR, "coordinator")
+    f._cmd(g, "park", {"reason": "gate", "session_id": None, "cursor_item_id": None,
+                       "findings_hash": None, "verdict": None, "reviewer": None})
+    with pytest.raises(NotAuthorized):
+        f.grant()
+
+
+def test_the_human_direction_fact_carries_the_state_it_was_recorded_at(tmp_path):
+    """`record_human_direction` does not transition, so `_side_fact` reads
+    the run's state at the moment the direction lands, not before and not
+    after some later move -- the value `dispute`'s resolution search and
+    `_visit_boundaries`'s direction branch both qualify on (spec §2)."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    assert s.run_state(f.run_id) == "shaping"
+    f.direct("slice it along these lines")
+    d = s.newest_fact(f.run_id, EventKind.HUMAN_DIRECTION)
+    assert d.payload["state"] == "shaping"

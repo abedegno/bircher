@@ -142,7 +142,12 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_merge_outcome": (frozenset({"merge_requested"}), None),
     # The human's commands (spec §2 Commands), reachable only through
     # execute_as_human -- checked in authorize() below.
-    "record_human_answer": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    # Revision 16: FRONT_HALF_STATES only. No shaping seat asks a question,
+    # the grill is epoch-scoped and can stand open while a hand-back's visit
+    # runs, and an answer recorded at `shaping` would be dropped from the
+    # shaper's brief and delivered later to the spec author as the reply to
+    # its question -- refused from every shaping state, dispute or none.
+    "record_human_answer": (FRONT_HALF_STATES, None),
     # The three author-round states.
     "record_human_direction": (frozenset({"queued", "specified", "shaping"}), None),
     # Destination by phase: computed in authorize().
@@ -266,6 +271,20 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
     if phase == "spec":
         return "spec_accepted" if "spec" in gates else "specified"
     return "plan_accepted" if "plan" in gates else "planned"
+
+
+def _one_piece_destination(store, run_id: str) -> str:
+    """Where a one-piece ruling lands, computed from the journal as
+    `_review_destination` computes the reviewer's (revision 16).
+
+    `shaping` when the epoch holds a hand-back and no shape ruling after it
+    yet -- this ruling is the disputed one, and the loop parks it for the
+    person. `queued` otherwise: the first ruling of an epoch, and a ruling
+    recorded after the person's resolution, both proceed. Read `front.dispute`
+    for the one definition; this function adds no derivation of its own."""
+    from kernel import front
+    d = front.dispute(store, run_id)
+    return "shaping" if (d is not None and d.disputed is None) else "queued"
 
 
 #: Outcomes `record_merge_outcome` may report, and where each leaves the run.
@@ -839,6 +858,18 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
     if cmd.name == "record_review" and ruling == "review_ruling" and current in FRONT_HALF_STATES | SHAPING_STATES:
         _require_turn_recorded(store, cmd, Role.REVIEWER)
 
+    # Revision 16: while the dispute is unresolved, at `shaping` only -- a
+    # grill answer at `queued` is untouched by this. A third seat's slice
+    # plan cannot slice the disagreement away, and a retry's grant cannot
+    # consume the park in place of the person's decision (spec §2).
+    if cmd.name in ("submit_slices", "grant_round") and current == "shaping":
+        from kernel import front
+        if front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                f"{cmd.name}: the shape is disputed and waits for the person; a third seat cannot "
+                "slice it away and a retry cannot consume the park (shaping spec §2)"
+            )
+
     if cmd.name in ("record_model_question", "record_model_ruling"):
         from kernel import front
         if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
@@ -994,7 +1025,11 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(
                 f"a shape ruling already exists in epoch {n} visit {v}: one decision per visit (shaping spec §2)"
             )
-        return next_state
+        # Revision 16: the destination is no longer the static `queued` the
+        # table declares -- a ruling that lands the visit's dispute stays at
+        # `shaping` for the person, exactly as a review's destination is
+        # computed rather than looked up (`_review_destination`, above).
+        return _one_piece_destination(store, cmd.run_id)
 
     if cmd.name == "request_reshape":
         from kernel import front

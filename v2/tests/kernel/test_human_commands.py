@@ -164,7 +164,10 @@ def test_answer_and_direction_carry_the_epoch_and_phase(tmp_path):
         _human(s, "r-1", "record_human_answer", {"question_ids": [], "answer": "", "cursor_item_id": None})
     _human(s, "r-1", "record_human_direction", {"text": "use sqlite", "cursor_item_id": "i-8"})
     d = s.newest_fact("r-1", EventKind.HUMAN_DIRECTION)
-    assert d.payload == {"phase": "spec", "epoch": 0, "text": "use sqlite", "cursor_item_id": "i-8"}
+    # Revision 16: `state` is the run's state at the moment the direction
+    # landed -- `queued` here, since record_human_direction never transitions.
+    assert d.payload == {"phase": "spec", "epoch": 0, "text": "use sqlite",
+                         "state": "queued", "cursor_item_id": "i-8"}
     f.author_round(SPEC_BYTES)
     with pytest.raises(NotAuthorized, match="not legal from state 'spec_submitted'"):
         _human(s, "r-1", "record_human_direction", {"text": "x", "cursor_item_id": None})

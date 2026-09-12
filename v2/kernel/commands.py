@@ -299,6 +299,11 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             run_id=cmd.run_id, kind=EventKind.HUMAN_DIRECTION, actor=actor,
             causal_command_id=cmd.idempotency_key,
             payload={"phase": phase, "epoch": epoch_n, "text": cmd.payload["text"],
+                     # Revision 16: the state the direction was recorded AT.
+                     # `phase` cannot stand in -- all three shaping states
+                     # share the phase `slices`, and only a direction at
+                     # `shaping` resolves a dispute.
+                     "state": store.run_state(cmd.run_id),
                      "cursor_item_id": cmd.payload.get("cursor_item_id")},
         )
     elif cmd.name == "approve_artifact":

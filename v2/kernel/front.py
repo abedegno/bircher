@@ -7,6 +7,7 @@ writes.
 from __future__ import annotations
 
 import json
+from typing import NamedTuple
 
 from kernel.events import EventKind
 from kernel.policy import policy_of, policy_version  # noqa: F401
@@ -318,7 +319,14 @@ def _visit_boundaries(store, run_id: str, epoch_n: int) -> list[int]:
         elif (f.kind == EventKind.MODEL_RULING
               and f.payload.get("question_id") == SHAPE_QUESTION and hand_back and not disputed):
             disputed = True
-        elif f.kind == EventKind.HUMAN_DIRECTION and disputed and not resolved:
+        elif (f.kind == EventKind.HUMAN_DIRECTION and disputed and not resolved
+              and f.payload.get("state") == "shaping"):
+            # Recorded AT `shaping`, not merely after the disputed ruling:
+            # `front.dispute`'s resolution search reads the same qualifier
+            # (revision 16), and a direction typed elsewhere -- reachable
+            # only by forcing the state, since `_one_piece_destination` never
+            # sends a disputed ruling anywhere else -- would otherwise open a
+            # visit `dispute` does not agree is resolved.
             boundaries.append(f.seq)
             resolved = True
         elif (f.kind == EventKind.HUMAN_RULING
@@ -350,6 +358,59 @@ def visit_of(store, run_id: str, seq: int) -> int:
     if n is None:
         return 1
     return sum(1 for b in _visit_boundaries(store, run_id, n) if b <= seq) + 1
+
+
+class Dispute(NamedTuple):
+    """The four facts of a shape dispute, in journal order (spec §2 *The
+    dispute*). Any of the last three may be None; `handed_back` and
+    `hand_back` are present whenever a Dispute is returned at all."""
+    handed_back: object          # the newest `shape` ruling BEFORE the hand-back
+    hand_back: object            # the epoch's `reshape_requested`
+    disputed: object | None      # the first `shape` ruling AFTER it
+    resolution: object | None    # the first approve_one_piece or direction at `shaping` after that
+
+
+def dispute(store, run_id: str, epoch_n: int | None = None) -> Dispute | None:
+    """The epoch's dispute, or None when it holds no hand-back. The current
+    epoch by default; any epoch for the proof, which walks them all.
+
+    This is the ONE definition. The destination, the refusals, the
+    coordinator's classifier and notices, the runner, the queue generator and
+    the proof's fifth line all read it; a second derivation is how the review
+    found three incompatible answers to "is this dispute resolved"."""
+    from kernel.slices import SHAPE_QUESTION
+    n = epoch(store, run_id) if epoch_n is None else epoch_n
+    facts = [f for f in store.facts_for(run_id) if f.payload.get("epoch") == n]
+    hand_back = next((f for f in facts if f.kind == EventKind.RESHAPE_REQUESTED), None)
+    if hand_back is None:
+        return None
+    rulings = [f for f in facts if f.kind == EventKind.MODEL_RULING
+               and f.payload.get("question_id") == SHAPE_QUESTION]
+    handed_back = next((f for f in reversed(rulings) if f.seq < hand_back.seq), None)
+    disputed = next((f for f in rulings if f.seq > hand_back.seq), None)
+    resolution = None
+    if disputed is not None:
+        # The bound is exact: a direction that answers the dispute is one
+        # recorded AT `shaping` after the disputed ruling, not merely one
+        # that comes later in the journal (a direction to the reshaping
+        # session, between the hand-back and the disputed ruling, resolves
+        # nothing -- `f.seq > disputed.seq` is what excludes it) and not one
+        # recorded at a state this dispute never sent the run to (the
+        # qualifier `_visit_boundaries`'s own direction branch reads too, so
+        # the two derivations of "the resolution" cannot disagree).
+        resolution = next(
+            (f for f in facts
+             if f.seq > disputed.seq
+             and ((f.kind == EventKind.HUMAN_RULING and f.payload.get("ruling") == "approve_one_piece")
+                  or (f.kind == EventKind.HUMAN_DIRECTION and f.payload.get("state") == "shaping"))),
+            None)
+    return Dispute(handed_back, hand_back, disputed, resolution)
+
+
+def unresolved_disagreement(store, run_id: str, epoch_n: int | None = None) -> bool:
+    """`dispute`'s boolean: a hand-back, a ruling after it, no resolution."""
+    d = dispute(store, run_id, epoch_n)
+    return d is not None and d.disputed is not None and d.resolution is None
 
 
 # -- the shaping phase (shaping spec §2, §3) ------------------------------------

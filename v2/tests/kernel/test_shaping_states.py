@@ -37,8 +37,13 @@ def test_the_sets_and_the_phase_map():
 def test_membership_per_command():
     both = authz.FRONT_HALF_STATES | authz.SHAPING_STATES
     legal = authz.legal_states_for
-    for name in ("park", "record_human_answer", "record_prompt_item", "dismiss_human_item"):
+    for name in ("park", "record_prompt_item", "dismiss_human_item"):
         assert legal(name) == both, name
+    # Revision 16: record_human_answer is the one exception -- refused from
+    # every shaping state, dispute or none, because no shaping seat asks a
+    # question and the grill is epoch-scoped (shaping spec §2
+    # *request_reshape, approve_one_piece, and the disagreement*).
+    assert legal("record_human_answer") == authz.FRONT_HALF_STATES
     assert legal("record_human_direction") == frozenset({"queued", "specified", "shaping"})
     assert legal("record_model_question") == authz.FRONT_HALF_STATES
     assert legal("record_model_ruling") == authz.FRONT_HALF_STATES
