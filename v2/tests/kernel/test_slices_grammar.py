@@ -38,7 +38,8 @@ def test_new_kinds_declared_with_schema_version():
     for attr, value in {"ARTIFACT_ADVANCED": "artifact_advanced", "SLICE_FILED": "slice_filed",
                         "FILING_COMPLETE": "filing_complete", "SLICE_CLOSED": "slice_closed",
                         "SLICE_REOPENED": "slice_reopened",
-                        "CHILDREN_OBSERVED_CLOSED": "children_observed_closed"}.items():
+                        "CHILDREN_OBSERVED_CLOSED": "children_observed_closed",
+                        "RESHAPE_REQUESTED": "reshape_requested"}.items():
         assert getattr(EventKind, attr) == value
         assert SCHEMA_VERSIONS[value] == 1
 

@@ -16,6 +16,7 @@ NEW_KINDS = {
     "HUMAN_DIRECTION": "human_direction",
     "HUMAN_ITEM_DISMISSED": "human_item_dismissed",
     "PROMPT_ITEM": "prompt_item",
+    "RESHAPE_REQUESTED": "reshape_requested",
 }
 
 

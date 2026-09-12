@@ -125,8 +125,11 @@ def test_the_command_interface_is_closed_and_explicit():
         # Revision 16: the spec author's hand-back (shaping spec §2). A
         # wrongly one-piece ruling moved the run past shaping with no way
         # back; this is the fresh perspective's correction, an author's
-        # command from `queued` to a new visit of `shaping`.
-        "request_reshape",
+        # command from `queued` to a new visit of `shaping`. approve_one_piece
+        # is the person's side of the same disagreement -- declared here with
+        # its sibling, wired (transition, refusal, human-command membership)
+        # in the task that follows.
+        "request_reshape", "approve_one_piece",
     ])
 
 

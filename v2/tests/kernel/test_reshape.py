@@ -4,6 +4,7 @@ import pytest
 
 from kernel import front
 from kernel.authz import NotAuthorized
+from kernel.dispatch import Role
 from kernel.events import EventKind
 from kernel.store import Store
 from tests.kernel.front import ISSUE, SLICES_BYTES, Front
@@ -210,3 +211,102 @@ def test_a_revise_bundle_opens_a_new_epoch_whose_visits_restart_at_one(tmp_path)
     assert front.shaping_visit(s, f.run_id, 1) == 1
     # The old epoch's boundary is still counted -- revise_bundle erased nothing.
     assert front.shaping_visit(s, f.run_id, 0) == 2
+
+
+def test_the_hand_back_is_legal_from_queued_and_moves_to_shaping(tmp_path):
+    s, f = _shaped(tmp_path)
+    f.request_reshape("the issue names a store, an API and a page")
+    assert s.run_state(f.run_id) == "shaping"
+    hb = s.facts_of_kind(f.run_id, EventKind.RESHAPE_REQUESTED)[-1]
+    assert hb.payload["reasoning"].startswith("the issue names")
+
+
+def test_the_hand_back_refuses_its_four_ways(tmp_path):
+    s, f = _shaped(tmp_path)
+    with pytest.raises(NotAuthorized, match="reasoning"):
+        f.request_reshape("   ")
+    # Once per epoch.
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    f.approve_one_piece()
+    with pytest.raises(NotAuthorized, match="already"):
+        f.request_reshape("again")
+    # A run that was never shaped has nothing to hand back to. Unreachable
+    # through today's transitions -- `record_one_piece` is the only way out
+    # of `shaping` -- so the state is set directly, exactly as a v1 database
+    # written before the shaping phase existed holds it.
+    s2 = Store.open(tmp_path / "k2.db")
+    g = Front(s2, "i13-v1-1", issue=ISSUE, shape=False)
+    s2.set_run_state(g.run_id, "queued")
+    with pytest.raises(NotAuthorized, match="no shape ruling"):
+        g.request_reshape("epic")
+
+
+def test_the_hand_back_refuses_empty_or_whitespace_reasoning(tmp_path):
+    """The first row of the refusal table, pinned on its own for a clean
+    signal: the same assertion is the first line of
+    `test_the_hand_back_refuses_its_four_ways`, but that test is already red
+    for an unrelated reason (`approve_one_piece`, Task 4), so its own
+    pass/fail state cannot show whether THIS guard is what is pinning it."""
+    s, f = _shaped(tmp_path)
+    with pytest.raises(NotAuthorized, match="reasoning"):
+        f.request_reshape("   ")
+
+
+def test_the_hand_back_refuses_a_second_one_in_the_same_epoch(tmp_path):
+    """`test_the_hand_back_refuses_its_four_ways` reaches the once-per-epoch
+    guard by way of `approve_one_piece`, which does not exist until Task 4 --
+    so that assertion is written but does not run yet. Pinned here by a path
+    that needs nothing from Task 4: `_one_piece_destination` is also not yet
+    wired (a later task), so today `record_one_piece` sends the run to
+    `queued` unconditionally, dispute or none -- the same destination the
+    hand-back's own transition assumes. A ruling after the hand-back
+    therefore reaches `queued` on its own, and a second `request_reshape`
+    there is refused by the same epoch that already holds the first one."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    assert s.run_state(f.run_id) == "queued"
+    with pytest.raises(NotAuthorized, match="already"):
+        f.request_reshape("again")
+
+
+def test_the_hand_back_refuses_a_run_with_no_shape_ruling_in_its_epoch(tmp_path):
+    """The fourth row of the refusal table, pinned on its own: the assertion
+    inside `test_the_hand_back_refuses_its_four_ways` sits after the
+    `approve_one_piece` call that AttributeErrors on today's driver, so it
+    never runs there either, even though this row does not depend on
+    `approve_one_piece` at all. A run that was never shaped has nothing to
+    hand back to. Unreachable through today's transitions --
+    `record_one_piece` is the only way out of `shaping` -- so the state is
+    set directly, exactly as a v1 database written before the shaping phase
+    existed holds it."""
+    s2 = Store.open(tmp_path / "k2.db")
+    g = Front(s2, "i13-v1-1", issue=ISSUE, shape=False)
+    s2.set_run_state(g.run_id, "queued")
+    with pytest.raises(NotAuthorized, match="no shape ruling"):
+        g.request_reshape("epic")
+
+
+def test_the_hand_back_carries_the_direction_guard(tmp_path):
+    """Every author-turn-ending command refuses over a direction newer than
+    its own dispatch (spec §2).
+
+    `Front` has no `_author_turn` helper; `request_reshape`'s own `gen=`
+    escape hatch is how a test holds a stale, already-dispatched generation
+    to call it with -- the same dispatch/session/end_turn ceremony
+    `request_reshape` performs for itself when `gen` is None, done here by
+    hand so the direction can land in between."""
+    s, f = _shaped(tmp_path)
+    cause = f._newest_id()
+    gen = f._dispatch(Role.AUTHOR, f.author)
+    sid = f._session(gen, cause)
+    f._end_turn(gen, sid)
+    f.direct("do it this way instead")
+    with pytest.raises(NotAuthorized, match="direction"):
+        f.request_reshape("three parts", gen=gen)
+
+
+def test_the_kind_is_declared(tmp_path):
+    from kernel.events import SCHEMA_VERSIONS
+    assert SCHEMA_VERSIONS[EventKind.RESHAPE_REQUESTED] == 1

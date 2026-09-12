@@ -110,9 +110,13 @@ COMMAND_NAMES = frozenset({
     # The spec author's hand-back (shaping spec §2 revision 16): a wrongly
     # one-piece ruling returns the run to `shaping` for a fresh visit. An
     # author's command, not the human's -- the person's own reconsideration
-    # is `approve_one_piece` (Task 4), issued on the disputed ruling that
-    # follows this one.
-    "request_reshape",
+    # is `approve_one_piece`, issued on the disputed ruling that follows
+    # this one. Both names are declared together (spec §2's site table lists
+    # them as one row of registry growth); `approve_one_piece` has no
+    # transition or refusal yet -- its `_TRANSITIONS` row, its authorize()
+    # branch and its membership in `HUMAN_COMMANDS`/`HUMAN_EXECUTABLE` are
+    # Task 4's.
+    "request_reshape", "approve_one_piece",
 })
 
 
