@@ -34,9 +34,13 @@ HUMAN_ACTOR = "human"
 #: through both paths; `ruling` says which.
 HUMAN_COMMANDS = frozenset({
     "record_human_answer", "record_human_direction", "approve_artifact", "grant_round",
+    # Revision 16: the person's resolution of a shape disagreement -- the
+    # other side of `request_reshape`, which is an author's command and
+    # never reaches here.
+    "approve_one_piece",
 })
 
-#: Every name `execute_as_human` will run: the four human-only commands, plus
+#: Every name `execute_as_human` will run: the five human-only commands, plus
 #: `record_review` (reachable through both paths -- `ruling` says which) and
 #: `cancel_run` (the spec's `kernel cancel` path, spec §4 Fallback/§5; a later
 #: task's CLI records it through execute_as_human). Anything else -- park,
@@ -44,7 +48,7 @@ HUMAN_COMMANDS = frozenset({
 #: actor's command, and execute_as_human refuses it before `_submit` ever
 #: sees it: without this, a caller could run ANY command as `human` with no
 #: dispatch behind it, which is exactly the unfenced write capability
-#: `execute_as_human` exists to grant to four commands, not the whole set.
+#: `execute_as_human` exists to grant to five commands, not the whole set.
 HUMAN_EXECUTABLE = HUMAN_COMMANDS | frozenset({"record_review", "cancel_run"})
 
 COMMAND_NAMES = frozenset({
@@ -116,6 +120,9 @@ COMMAND_NAMES = frozenset({
     # `_TRANSITIONS`, so a name here without a row there reds the suite for
     # however many tasks separate them.
     "request_reshape",
+    # The person's side of the same disagreement (shaping spec §2 revision
+    # 16), declared here with its `_TRANSITIONS` row for the same reason.
+    "approve_one_piece",
 })
 
 
@@ -322,6 +329,22 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             payload={"ruling": "grant_round", "phase": phase, "epoch": epoch_n,
                      "park_seq": park.seq,
                      "cursor_item_id": cmd.payload.get("cursor_item_id")},
+        )
+    elif cmd.name == "approve_one_piece":
+        d = front.dispute(store, cmd.run_id, epoch_n)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            # `approve_one_piece`, never `approve`: `accepted_slices_hash`
+            # filters on the word `approve`, and a slice plan the epoch
+            # happens to hold must not become the accepted one because a
+            # person resolved a ruling, not approved an artefact. The visit
+            # is the DISPUTED ruling's, read through `visit_of` -- the
+            # approval opens no visit of its own, and stamping the current
+            # count would attribute the resolution to a visit that does not
+            # exist.
+            payload={"ruling": "approve_one_piece", "phase": "slices", "epoch": epoch_n,
+                     "visit": front.visit_of(store, cmd.run_id, d.disputed.seq)},
         )
     elif cmd.name == "record_review" and actor == HUMAN_ACTOR:
         store.append_fact(

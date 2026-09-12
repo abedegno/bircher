@@ -37,8 +37,19 @@ def test_the_sets_and_the_phase_map():
 def test_membership_per_command():
     both = authz.FRONT_HALF_STATES | authz.SHAPING_STATES
     legal = authz.legal_states_for
-    for name in ("park", "record_prompt_item", "dismiss_human_item"):
+    # `approve_one_piece` joins this group for the same reason `park` and
+    # `dismiss_human_item` are here: the states allowed are broad, and the
+    # command's own block in `authorize` -- not this table -- is what
+    # actually gates it (revision 16).
+    for name in ("park", "record_prompt_item", "dismiss_human_item", "approve_one_piece"):
         assert legal(name) == both, name
+    # Revision 16: the two commands that resolve a shape disagreement.
+    # `request_reshape` is the author's, from `queued` alone, to a new visit
+    # of `shaping`; `approve_one_piece` is the person's, landing statically
+    # at `queued` once its own checks pass.
+    assert legal("request_reshape") == frozenset({"queued"})
+    assert authz.next_state_for("request_reshape") == "shaping"
+    assert authz.next_state_for("approve_one_piece") == "queued"
     # Revision 16: record_human_answer is the one exception -- refused from
     # every shaping state, dispute or none, because no shaping seat asks a
     # question and the grill is epoch-scoped (shaping spec §2

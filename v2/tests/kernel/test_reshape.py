@@ -427,3 +427,110 @@ def test_the_human_direction_fact_carries_the_state_it_was_recorded_at(tmp_path)
     f.direct("slice it along these lines")
     d = s.newest_fact(f.run_id, EventKind.HUMAN_DIRECTION)
     assert d.payload["state"] == "shaping"
+
+
+# -- Task 4: approve_one_piece and the disagreement park --------------------
+
+def test_the_approval_resolves_and_moves_to_queued(tmp_path):
+    s, f = _disagreed(tmp_path)            # ruling -> hand-back -> disputed ruling
+    assert s.run_state(f.run_id) == "shaping"
+    f.approve_one_piece()
+    assert s.run_state(f.run_id) == "queued"
+    assert front.unresolved_disagreement(s, f.run_id) is False
+    r = s.facts_of_kind(f.run_id, EventKind.HUMAN_RULING)[-1]
+    assert r.payload["ruling"] == "approve_one_piece"
+    assert r.payload["phase"] == "slices"
+    # The visit is the DISPUTED ruling's (visit 2: visit 1 is the handed-back
+    # ruling, the hand-back opens visit 2, the disputed ruling is recorded in
+    # it) -- read through `visit_of`, not the approval's own turn, which
+    # opens no visit. `_disagreed` is the smallest dispute there is (one
+    # hand-back, one disputed ruling), so this is already a two-visit
+    # history, not a one-visit one: the disputed ruling can never be visit 1,
+    # since the hand-back that produces it always opens visit 2 first.
+    assert r.payload["epoch"] == 0 and r.payload["visit"] == 2
+
+
+def test_the_approval_refuses_its_four_ways(tmp_path):
+    s, f = _disagreed(tmp_path)
+    with pytest.raises(NotAuthorized, match="cursor"):
+        f.approve_one_piece(cursor=None)
+    with pytest.raises(NotAuthorized, match="human"):
+        f.approve_one_piece(as_model=True)
+    f.approve_one_piece()
+    with pytest.raises(NotAuthorized, match="unresolved"):   # a second approval
+        f.approve_one_piece()
+    s2, g = _shaped(tmp_path, "b.db")                         # no dispute at all
+    with pytest.raises(NotAuthorized, match="unresolved"):
+        g.approve_one_piece()
+
+
+def test_the_approval_is_refused_away_from_shaping(tmp_path):
+    """The refusal table's third row, distinct from "unresolved": reachable
+    only by forcing the run's state, because an unresolved dispute and a
+    state other than `shaping` never coexist through any legal transition --
+    the ruling that disputes it PARKS at `shaping`, and nothing else can move
+    the run while the dispute stands. Defense for a database moved by hand,
+    exactly as `test_the_hand_back_refuses_a_run_with_no_shape_ruling_in_its_epoch`
+    exercises its own state guard the same way."""
+    s, f = _disagreed(tmp_path)
+    assert front.unresolved_disagreement(s, f.run_id) is True
+    s.set_run_state(f.run_id, "queued")
+    with pytest.raises(NotAuthorized, match="shaping-state park"):
+        f.approve_one_piece()
+
+
+def test_the_approval_does_not_accept_a_slice_plan(tmp_path):
+    """`accepted_slices_hash` filters on ruling == 'approve'; the approval's
+    own word keeps it out of that filter.
+
+    The epoch here never holds an ACCEPTED plan -- a slice plan and a
+    one-piece dispute cannot coexist past `sliced` in one epoch, so
+    `accepted_slices_hash` reads None before this call regardless of which
+    word the approval uses, and the bare `is None` below would pass under
+    the mutation this test exists to catch. The direct read of the fact's
+    own `ruling` is what actually reds when the word changes."""
+    s, f = _rejected_then_disagreed(tmp_path)   # a slices submission exists, rejected
+    f.approve_one_piece()
+    r = s.facts_of_kind(f.run_id, EventKind.HUMAN_RULING)[-1]
+    assert r.payload["ruling"] == "approve_one_piece"
+    assert front.accepted_slices_hash(s, f.run_id, 0) is None
+
+
+def test_the_disagreement_park_is_bounded_to_an_unresolved_dispute(tmp_path):
+    s, f = _disagreed(tmp_path)
+    f.park(reason="disagreement", phase="slices")            # legal
+    assert front.current_park(s, f.run_id).payload["reason"] == "disagreement"
+    s2, g = _shaped(tmp_path, "c.db")
+    g.request_reshape("three parts")                          # hand-back, no disputed ruling
+    with pytest.raises(NotAuthorized, match="disagreement"):
+        g.park(reason="disagreement", phase="slices")
+
+
+def test_dismiss_human_item_leaves_the_dispute_standing(tmp_path):
+    """A refused token is dismissed so the cursor moves past it; the
+    dismissal is not a resolution."""
+    s, f = _disagreed(tmp_path)
+    f.dismiss_human_item()
+    assert front.unresolved_disagreement(s, f.run_id) is True
+    assert s.run_state(f.run_id) == "shaping"
+
+
+def test_the_park_is_refused_when_the_dispute_resolved_in_the_gap(tmp_path):
+    """The window `run_loop` catches: a person's approval lands between
+    `stall`'s listing and its `park`."""
+    s, f = _disagreed(tmp_path)
+    f.approve_one_piece()
+    with pytest.raises(NotAuthorized, match="disagreement"):
+        f.park(reason="disagreement", phase="slices")
+
+
+def test_the_hand_back_is_refused_after_an_approval(tmp_path):
+    """One hand-back per bundle. A run returned to `queued` by the person's
+    approval is refused by the once-per-epoch row, not by the absence of a
+    ruling -- the approval leaves the ruling in place (spec §2, the second
+    refusal row)."""
+    s, f = _disagreed(tmp_path)
+    f.approve_one_piece()
+    assert s.run_state(f.run_id) == "queued"
+    with pytest.raises(NotAuthorized, match="already"):
+        f.request_reshape("again")

@@ -62,6 +62,11 @@ def phase_of(state: str) -> str | None:
 PARK_REASONS = frozenset({
     "grill", "no_verdict", "bound_exhausted", "gate", "budget_exhausted",
     "identical_resubmission",
+    # Revision 16: the two seats disagree on the shape and a person decides.
+    # Bounded in `_check_park` to a run whose dispute is unresolved, so the
+    # notice and the prompt can key on it and no ordinary gate park carries
+    # its text.
+    "disagreement",
 })
 
 #: spec §3 *The turn's end is a fact*: the four ways a turn ends.
@@ -115,6 +120,17 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # author's own state, back to `shaping` -- a new VISIT of the same epoch,
     # never a new epoch.
     "request_reshape": (frozenset({"queued"}), "shaping"),
+    # Revision 16: the person's resolution of the same disagreement. The
+    # allowed states are broad, as `park`'s and `dismiss_human_item`'s are
+    # below -- not `{"shaping"}` alone -- because the dispute (the journal)
+    # and the state (the run's current row) are two different things, and a
+    # resolved dispute has already moved the state to `queued`: narrowing
+    # this set would let the generic "not legal from state" check above fire
+    # first for a second approval or a never-disputed run, and that message
+    # carries no "unresolved" for a caller -- or a test's `match=` -- to
+    # read. `authorize`'s own block checks the dispute before the state, in
+    # the spec's refusal-row order (spec §2 revision 16).
+    "approve_one_piece": (FRONT_HALF_STATES | SHAPING_STATES, "queued"),
     "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
     # The filing and closing facts (shaping spec §2): no transition; legal
     # only from `sliced`, under the coordinator's or the sweep's operator
@@ -760,9 +776,23 @@ def _check_cursor(cmd) -> None:
 
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
-    of the six the loop has, not free text the coordinator invents."""
+    of the seven the loop has, not free text the coordinator invents."""
     if cmd.payload.get("reason") not in PARK_REASONS:
         raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
+    if cmd.payload.get("reason") == "disagreement":
+        from kernel import front
+        # `disagreement` is the first park reason whose legality depends on
+        # journal state beyond its own from-set: a person's approval can
+        # land between the coordinator's listing and this park, resolving
+        # the dispute in the gap the two calls leave open. Refusing here --
+        # not merely noting it -- is what lets `run_loop` (a later task)
+        # catch the refusal, re-read the dispute and continue the pass
+        # instead of parking a person on a decision already made.
+        if not front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                "park disagreement: the run holds no unresolved disagreement; the dispute was resolved "
+                "between the listing and this park, and the pass continues without parking"
+            )
     # Three literal `.get(...)` reads, not a loop over a variable key: the
     # provenance extractor matches `cmd.payload.get("literal")` syntactically,
     # and a dynamic key defeats it -- these three rows would then be unbound
@@ -1222,6 +1252,36 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             )
         _check_cursor(cmd)
         return None
+
+    if cmd.name == "approve_one_piece":
+        from kernel import front
+        # The actor check needed here nowhere: `approve_one_piece` is in
+        # HUMAN_COMMANDS, and the generic check at the top of this function
+        # already refuses any ruling other than `human_ruling` before a
+        # dispatched attempt ever reaches this block or the state check
+        # below -- the same gate `approve_artifact` and `grant_round` above
+        # rely on with no actor check of their own.
+        #
+        # Spec order otherwise: the dispute before the state, so a second
+        # approval and a run that was never disputed -- both of which reach
+        # this command from `queued`, the broadened allowed-set's doing --
+        # read "unresolved", not the state check's "not legal from state".
+        if not front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                "approve_one_piece: this epoch holds no unresolved disagreement -- no hand-back, no disputed "
+                "ruling yet, or a resolution already recorded (a second approval is this refusal)"
+            )
+        if current != "shaping":
+            raise NotAuthorized(
+                f"approve_one_piece is refused from {current!r}: the dispute is a shaping-state park, and at "
+                "any later state the reply is read as today (spec §2)"
+            )
+        if not isinstance(cmd.payload.get("cursor_item_id"), str):
+            raise NotAuthorized(
+                "approve_one_piece carries the reply's cursor_item_id: it is the one check the kernel can "
+                "make, and stricter than the other human commands, which tolerate its absence"
+            )
+        return next_state
 
     if cmd.name == "record_implementation_output":
         if role_for(store, cmd.run_id, cmd.generation) != Role.IMPLEMENTER:

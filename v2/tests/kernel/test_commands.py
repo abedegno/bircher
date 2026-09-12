@@ -129,6 +129,7 @@ def test_the_command_interface_is_closed_and_explicit():
         # side of the same disagreement, `approve_one_piece`, is declared
         # with its transition and not before it.
         "request_reshape",
+        "approve_one_piece",
     ])
 
 

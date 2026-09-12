@@ -346,6 +346,49 @@ class Front:
     def direct(self, text: str, cursor: str | None = "i-h") -> None:
         self.human("record_human_direction", {"text": text, "cursor_item_id": cursor})
 
+    def approve_one_piece(self, *, cursor: str | None = "i-h", as_model: bool = False) -> None:
+        """The person's resolution of a shape disagreement (shaping spec §2
+        revision 16). `as_model=True` drives it through the FENCED path
+        instead -- a dispatched generation's own attempt, which the
+        `HUMAN_COMMANDS` ruling gate in `authorize` refuses before anything
+        command-specific is even checked."""
+        payload = {"cursor_item_id": cursor}
+        if as_model:
+            g = self._dispatch(Role.AUTHOR, self.author)
+            self._cmd(g, "approve_one_piece", payload)
+        else:
+            self.human("approve_one_piece", payload)
+
+    def park(self, *, reason: str, phase: str | None = None, session_id: str | None = None,
+             cursor_item_id: str | None = None, findings_hash: str | None = None,
+             verdict: str | None = None, reviewer: str | None = None) -> None:
+        """The coordinator's own park (`coordinator/phases.py`'s `stall`),
+        dispatched as operator. *phase* names the caller's own context for
+        readability -- `park`'s payload carries no such field; the kernel
+        computes the recorded phase from state, as `_side_fact` does for
+        every command."""
+        g = self._dispatch(Role.OPERATOR, "coordinator")
+        self._cmd(g, "park", {"reason": reason, "session_id": session_id,
+                              "cursor_item_id": cursor_item_id, "findings_hash": findings_hash,
+                              "verdict": verdict, "reviewer": reviewer})
+
+    def dismiss_human_item(self) -> None:
+        """A refused human token, dismissed so the coordinator's cursor moves
+        past it (spec §2 Commands). Manufactures its own target: a
+        `record_human_answer` refused at `shaping` -- refused from every
+        shaping state, dispute or none -- is both the rejection this
+        dismisses and the reply whose cursor names it."""
+        from kernel.authz import NotAuthorized
+        sid = self._newest_author_session()
+        try:
+            self.answer("an answer shaping refuses to record")
+        except NotAuthorized:
+            pass
+        rej = self.store.facts_of_kind(self.run_id, EventKind.COMMAND_REJECTED)[-1]
+        g = self._dispatch(Role.OPERATOR, "coordinator")
+        self._cmd(g, "dismiss_human_item",
+                  {"session_id": sid, "cursor_item_id": "i-h", "rejection": rej.id})
+
     def to_specified(self) -> "Front":
         self.author_round(SPEC_BYTES)
         self.review_round("accept")
