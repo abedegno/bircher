@@ -61,7 +61,7 @@ test in this plan**; its real API is smaller than a reader expects:
 | a reviewer's verdict | `f.review_round("accept")` / `f.review_round("request_revision", findings=b"…")` |
 | the person's gate approval, grant, answer, direction | `f.approve()`, `f.grant()`, `f.answer(text)`, `f.direct(text)` |
 | any human command | `f.human(name, payload)` |
-| the policy's labels | `Front(..., labels=["bircher:autonomous"])` |
+| the policy's labels | `Front(..., issue={**ISSUE, "labels": [...]})` — **never** `labels=[...]` beside an `issue=`. `Front.__init__` uses its `labels` parameter only to build a *default* issue, so once an issue is given the argument is dead and every run silently gets `ISSUE`'s own labels. The Task 1 review caught a three-policy test that would have proved one policy three times and gone green |
 
 There is no `rule_one_piece`, `submit_slices`, `reject` or `park` method —
 `shape_round` and `review_round` are those. Five methods are added by this
@@ -82,10 +82,14 @@ module-level fixtures that every later kernel task reuses. They are written
 ```python
 def _shaped(tmp_path, name="k.db", labels=("bircher:autonomous",)):
     """A run at `queued` through a one-piece ruling: the state a hand-back
-    is legal from. The driver's default `shape=True` rules it at birth."""
+    is legal from. The driver's default `shape=True` rules it at birth.
+
+    The labels are merged INTO the issue; passing them beside it is the trap
+    the table above names."""
     s = Store.open(tmp_path / name)
-    f = Front(s, "i12-epic-1", issue=ISSUE, labels=list(labels))
+    f = Front(s, "i12-epic-1", issue={**ISSUE, "labels": list(labels)})
     assert s.run_state(f.run_id) == "queued"
+    assert front.frozen_labels(s, f.run_id) == list(labels)
     return s, f
 
 
@@ -579,8 +583,8 @@ def test_the_disputed_ruling_stays_at_shaping_whatever_the_gates(tmp_path):
     """The gate was never the policy's -- it is the disagreement's. Under
     `bircher:autonomous`, the one policy that merges unattended, the run
     still waits for a person (spec §2, the revision record's ruling)."""
-    for labels in ([], ["bircher:autonomous"], ["bircher:gate-plan"]):
-        s, f = _shaped(tmp_path, f"g{len(labels)}{labels}.db".replace("/", ""), labels=labels)
+    for i, labels in enumerate(([], ["bircher:autonomous"], ["bircher:gate-plan"])):
+        s, f = _shaped(tmp_path, f"g{i}.db", labels)
         f.request_reshape("three parts")
         f.shape_round(reasoning="still one", cost="the spec would find one surface")
         assert s.run_state(f.run_id) == "shaping"
