@@ -144,11 +144,11 @@ stated per command and not inherited:
 | `_is_round_cause` (revision 16) | admits a `model_ruling` whose `question_id` is `shape`, and no other ruling; with that cause `_findings_for` renders the question in an epoch with no hand-back, the resolution after one, and nothing else |
 | `front.shaping_visit`, `front.visit_of` (revision 16) | the visit counter, and the prefix walk that attributes a fact without a `visit` to its visit |
 | the one-ruling guard of `record_one_piece`, `front.shape_ruling` (visit optional), `_check_submit`'s identical-resubmission guard for `slices`, the proof's assertion 4, `choose_author_vendor`'s same-phase rotation for `slices`, `issue_review_brief`'s prior findings for `slices`, `author_brief`'s previous-draft block and the round counter (`slices-rN.md`) for `slices` (revision 16) | the seven readers that move from the epoch to the shaping visit; every other reader of `front.epoch` is unchanged, by the *visits, not epochs* ruling |
-| `COMMAND_NAMES`, `OUTPUT_COMMANDS`, `EventKind` (revision 16) | `request_reshape` joins the first two (the observed-turn-and-stop check comes with the second) and `approve_one_piece` the first; `reshape_requested` joins `EventKind` |
+| `COMMAND_NAMES`, `OUTPUT_COMMANDS`, `EventKind`, `SCHEMA_VERSIONS` (revision 16) | `request_reshape` joins the first two (the observed-turn-and-stop check comes with the second) and `approve_one_piece` the first; `reshape_requested` joins `EventKind` and `SCHEMA_VERSIONS` (version 1) — an undeclared kind is a `KeyError` in `append_fact`, not a refusal — and the two tests that enumerate the kinds (`test_store_front.py`, `test_slices_grammar.py`) are expected reds, as the prefix pin is |
 | `HUMAN_COMMANDS` / `HUMAN_EXECUTABLE` (revision 16) | `approve_one_piece` joins both — this is what "as `human`" binds to; `request_reshape` joins neither |
 | `choose_author_vendor` (revision 16) | precedence: an existing current-cause session; then the epoch's first spec seat is the vendor that is not the `shape` ruling's actor, and the first author round of a hand-back visit is the handed-back ruling's vendor; then rotation from reviewers within the visit |
 | `assert_journal`'s approval filter (revision 16) | admits `human_ruling {approve}` and `{approve_one_piece}`, and `parked {reason: gate}` and `{reason: disagreement}` |
-| `author_brief` (revision 16) | a cause of `model_ruling {shape}` in an epoch with no hand-back renders the question as its own section, not under `## Findings to address`, and suppresses the dispositions block and the previous-draft block; in a hand-back visit the hand-back's reasoning is a standing section on every round, ahead of what the cause renders; the availability of `bircher/reshape.md` is rendered on every spec turn of an epoch that holds a `shape` ruling and no hand-back |
+| `author_brief` (revision 16) | a cause of `model_ruling {shape}` in an epoch with no hand-back renders the question as its own section, not under `## Findings to address`, and suppresses the dispositions block and the previous-draft block; in every visit after the epoch's hand-back the hand-back's reasoning is a standing section on every round, ahead of what the cause renders; the availability of `bircher/reshape.md` is rendered on every spec turn of an epoch that holds a `shape` ruling and no hand-back |
 | `run_loop` at `shaping` (revision 16) | catches a refused `disagreement` park, re-reads the dispute and continues |
 | `take_listing` / `classify_batch` (revision 16) | at `shaping` the dispute is read before the grill, so an unanswered question in the epoch cannot make `approve` an answer; at any other state the reading is unchanged |
 | `park_notice_body` and its `PARK_NEEDS` line; `park_prompt` (revision 16) | keyed on reason `disagreement`: the notice on the issue says the shaper reaffirmed one piece after the spec author handed the run back and a person decides — it does not claim a reviewer accepted anything; the session prompt quotes both seats |
@@ -326,7 +326,7 @@ disagreement is unresolved (below). `front.shaping_visit(store, run_id,
 epoch_n)` counts them from the journal prefix — for a direction, whether the
 disagreement was unresolved at the moment the direction was recorded, so a
 later `revise_bundle` never erases a visit — and `shape_ruling` takes a visit
-as well as an epoch. Six readers move from the epoch to the visit, and the site
+as well as an epoch. Seven readers move from the epoch to the visit, and the site
 table names them: the one-ruling guard on `record_one_piece`,
 `front.shape_ruling` (whose visit argument is optional — `request_reshape`'s
 refusal and assertion 4's walk ask the epoch), `_check_submit`'s
@@ -335,9 +335,11 @@ rejected may be resubmitted after a hand-back), the proof's assertion 4 (one
 decision per visit — a ruling, or the accepted plan — with rejected
 submissions before a ruling admitted), `choose_author_vendor`'s same-phase
 rotation for `slices` (within the visit, after the hand-back rule below),
-and `issue_review_brief`'s prior findings for `slices` (the visit's own, so a
+`issue_review_brief`'s prior findings for `slices` (the visit's own, so a
 reviewer is not told to expect dispositions of findings the visit's author
-never saw).
+never saw), and `author_brief`'s previous-draft block and round counter
+(`slices-rN.md`) for `slices` (the visit's own draft, never an earlier
+visit's rejected plan).
 Every fact of the phase carries the `visit` it was written in — the ruling,
 the hand-back and a `slices` submission alike — and `front.visit_of`
 attributes any other fact by the prefix walk; a fact written before this
@@ -418,7 +420,7 @@ visit}` — its own ruling word, so `accepted_slices_hash`'s filter on `ruling
 | the actor is not `human` | the decision is the person's; `approve_one_piece` is in the human command sets and no other |
 | the epoch holds no unresolved dispute | nothing to approve: no hand-back, no disputed ruling yet, or a resolution already recorded — a second approval is this row |
 | the state is not `shaping` | the dispute is a shaping-state park; at any later state the reply is read as today |
-| `cursor_item_id` is absent or not the reply's | the human command's binding to what the person actually sent, as every human command's |
+| `cursor_item_id` is absent or not a string | the one check the kernel can make, and stricter than the other human commands, which tolerate absence. That the cursor is the reply's — the last item of the listing the coordinator read — is the coordinator's observation, as for every human command; `assert_sessions` reads the recorded cursors as its watermark, and nothing in the kernel verifies authorship |
 
 A `human_direction` at
 the park is the resolution too: it starts the next shaping round **and opens
@@ -784,7 +786,8 @@ the question renders for the ruling cause only; the instruction that
 `bircher/reshape.md` is available — and what it is for — renders on every
 spec turn of an epoch that holds a `shape` ruling and no hand-back, so a
 revision turn briefed with a reviewer's "several pieces" finding has the
-instruction to act on it. In a visit opened by a hand-back, the hand-back's
+instruction to act on it. In every visit after the epoch's hand-back — the one
+it opened and the one a resolving direction opens — the hand-back's
 reasoning is a standing section of every shaping round's brief, ahead of
 whatever the round's cause renders, so a direction typed into the reshaping
 session does not displace it.
@@ -811,8 +814,16 @@ or `.run/`. That is a composition and an instruction, not an enforcement: the
 fresh perspective is expected, not guaranteed, and its effect is measured
 under the third open question rather than assumed.
 
-The spec round gains a second watched path, `bircher/reshape.md`, read before
-`bircher/artifact.md` as `shape.md` is read before the plan. Its grammar is
+The spec round has three watched paths, and their order is stated:
+`bircher/reshape.md` is read first, before `bircher/questions.md` and before
+`bircher/artifact.md`, as `shape.md` is read before the plan. A `questions.md`
+or an `artifact.md` beside a parsing `reshape.md` is ignored and moved aside:
+the shape decides before the questions are worth asking, and under the
+default `grill: model` — whose skill says to write the questions and continue
+to the artefact in one turn — an author that hands back writes `reshape.md`
+and ends the turn, as the question says. Under `grill: human` the
+question-turn's brief carries the question first and the ask-first section
+after it, and the hand-back is a legal ending of the asking turn. Its grammar is
 the ruling file's, with the other ruling:
 
 ```
@@ -824,8 +835,8 @@ The parser is `slices.parse_reshape`, beside `parse_ruling`, with the same
 rules: the first non-blank line exactly `Ruling: epic`, a non-empty
 `Reasoning:` block, anything else not a hand-back. At the turn's end:
 `reshape.md` parsing → `request_reshape`, the round returns `reshaped`, and
-the next pass runs the shaping round from `shaping`; an `artifact.md` beside
-it is moved aside, the hand-back is read first. A `reshape.md` that does not
+the next pass runs the shaping round from `shaping`; an `artifact.md` or a
+`questions.md` beside it is moved aside, the hand-back is read first. A `reshape.md` that does not
 parse is the empty turn.
 
 ### The review round
@@ -1116,10 +1127,10 @@ front half's existing cost for a crash after any gate approval, the decision
 is in the journal, and re-queuing shapes again; revision 16 neither widens
 that window nor covers it. The generator's journal sweep reads the dispute
 in-process; a sweep that fails is logged and the wave says the queue was
-generated from labels alone. Both read one new kernel query,
-`front.unresolved_disagreement`, through `coordinator.cli disagreement --db
---run-id` and `kernel-client.sh`'s `_kernel_unresolved_disagreement`, and
-both are self-test cases.
+generated from labels alone. Both read one new kernel query, `front.unresolved_disagreement`: the
+runner's branch through `coordinator.cli disagreement --db --run-id` and
+`kernel-client.sh`'s `_kernel_unresolved_disagreement`, the generator
+in-process inside its existing sweep; both are self-test cases.
 ## §6 Proof
 
 `prove_front_half` gains four assertions, run over a parent and its children
@@ -1241,6 +1252,7 @@ proof checks against the turn's end and its stop.
 | `approve` typed before the park is recorded | `stall`'s pre-read reads it as `approve_one_piece` from the disagreement state, takes it, and returns without a park; the run is at `queued` |
 | The issue is revised while a hand-back is unresolved | `revise_bundle` starts a new epoch; the abandoned epoch owes no resolution and the proof's fifth line skips it |
 | Spec author's `reshape.md` beside an `artifact.md` | the hand-back is read, the artefact moved aside; a spec written against a shape the author itself disputed is not submitted |
+| Spec author's `reshape.md` beside a `questions.md` (the default skill writes questions and continues in one turn) | the hand-back is read first; the questions are moved aside and no grill park is recorded — the shape decides before the questions are worth asking |
 | Reviewer rejects three times | `bound_exhausted`, the park, the notice: the person grants a round (legal at `slices_submitted` with a park), corrects, or cancels — or directs "one piece" |
 | A slice plan is rejected and the next author rules one piece | legal; the run proceeds to `queued` — unless the epoch holds a hand-back and no `shape` ruling after it yet, when it parks (revision 16); the visit's one decision (§6, assertion 4(b)), and the proof reads it so |
 | A person directs during a live shaping turn | the turn is displaced; its ruling or plan is refused by the direction guard whichever it was; the direction is the next round's findings |
@@ -1433,7 +1445,9 @@ refused-submission retry, an empty-turn retry, a revision turn or a post-
 approval turn; the question-turn's brief carries no ruling text, with a
 planted human `bircher:` comment retained through the real snapshot path,
 and its seat is not the ruling's vendor. `parse_reshape` accepts the grammar
-and refuses a missing reasoning; `park_notice_body` and `park_prompt` render
+and refuses a missing reasoning; the spec round reads `reshape.md` before
+`questions.md` and before `artifact.md`, and a `reshape.md` beside both
+hands back with neither a grill park nor a submission; `park_notice_body` and `park_prompt` render
 the `disagreement` park without claiming a reviewer's acceptance, and an
 ordinary gate park carries none of that text; `_is_round_cause` admits the
 shape ruling and not a grill ruling; a direction recorded before the disputed
@@ -1930,7 +1944,7 @@ The two live runs, E8 on `abedegno/bircher-smoke` and E9 on muesli #12
     line honestly; E8 did, on finding 18. The four slice assertions are
     independent of that line and passed.
 
-## Revision 16 (2026-09-12) — the hand-back, the fresh-perspective question, and three open questions
+## Revision 16 (2026-09-12) — the hand-back, the fresh-perspective question, and four open questions
 
 Amendment 11's remedy, designed. Three things folded in from the live proof
 and from GVS5H (`slee-persis/GVS5H`, *Zero-Shot Self-Orchestration with
@@ -1948,7 +1962,7 @@ wrong output propagates unchecked — is E9's diagnosis:
    decision whatever the policy; the bound is one model hand-back per bundle
    and no autonomous cycle — every further round of the disagreement costs
    the person a message.
-3. **Three open questions**, recorded so they are decided with evidence
+3. **Four open questions**, recorded so they are decided with evidence
    rather than now (below).
 
 **Rulings taken in this revision**, each with its cost if wrong:
@@ -2178,3 +2192,23 @@ brief, the proof's filter, the vendor anchor and the runner's edges.
 - **F7, low — two names for one predicate, and the generator's sweep failure was swallowed.** Accepted. `unresolved_disagreement` is `dispute`'s boolean, read in-process by the generator; a failed sweep is logged and the wave says the queue came from labels alone (§2, §5).
 - **F8, low — `approve_one_piece` had no refusal table.** Accepted; four rows (§2).
 - **F9, low — the reconsidering vendor is a rule reversed twice on argument.** Accepted; it is the fourth open question, with the current choice as its default and the measure stated (the revision record).
+
+## Dispositions — revision 16, round 7 (Codex and the Claude-side pass, 2026-09-12)
+
+Two findings from Codex and six from the Claude-side pass, overlapping in
+two; all accepted. All fifteen round-6 dispositions were confirmed carried
+by both reviewers.
+
+**Codex, round 7.**
+
+1. **Medium — the approval's cursor refusal row promised a check the kernel cannot make: `_check_cursor` validates shape only, and the cursor is the coordinator's observation.** Accepted (with Claude-side 3) — the design's own "observed versus asserted" rule, applied to this text. The row refuses an absent or non-string cursor, and says that the cursor being the reply's is the coordinator's observation, read by `assert_sessions` as a watermark and verified by nothing in the kernel (§2).
+2. **Low — "six readers" and "three open questions" against seven and four.** Accepted (with Claude-side 4); reconciled, and the seventh reader is in the §2 enumeration.
+
+**The Claude-side pass, round 7.**
+
+1. **High — the spec round has three watched paths and no stated order; under the default `grill: model` the skill writes `questions.md` and continues in the same turn, the existing reader handles questions first, and a `reshape.md` beside a `questions.md` would be moved aside unread on the turn the revision exists for.** Accepted. `reshape.md` is read first, before `questions.md` and `artifact.md`; a `questions.md` beside a parsing hand-back is moved aside and no grill park is recorded; under `grill: human` the question precedes the ask-first section and the hand-back is a legal ending of the asking turn (§3, §7, §8).
+2. **Medium — `reshape_requested` must join `SCHEMA_VERSIONS`, unnamed; an undeclared kind is a `KeyError` in `append_fact`, executed, which nothing in the loop catches.** Accepted; the registry and its two pin tests are named (§2 site table).
+3. **Medium — the cursor row stated a guard the kernel cannot verify.** Accepted (with Codex 1).
+4. **Medium — §2's prose said six readers and omitted the seventh, so an implementer working from it would reintroduce round 6's F5.** Accepted; the prose enumerates all seven (§2).
+5. **Low — §5 said the generator reads the dispute in-process and, in the next sentence, through the CLI.** Accepted; the CLI sentence is scoped to the runner's branch (§5).
+6. **Low — the hand-back's standing section was scoped to the visit the hand-back opened, and a resolving direction opens a different one.** Accepted; every visit after the epoch's hand-back (§3, the site table).
