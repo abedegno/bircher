@@ -334,7 +334,15 @@ def shaping_visit(store, run_id: str, epoch_n: int) -> int:
 
 def visit_of(store, run_id: str, seq: int) -> int:
     """The visit a fact was written in, for a fact that carries no `visit`
-    (everything written before revision 16). Facts of the phase carry it."""
+    (everything written before revision 16). Facts of the phase carry it.
+
+    A fact with no `epoch` in its payload reads as visit 1 by design, not by
+    the general rule §2 states ("attributes any other fact by the prefix
+    walk"): the epoch is in principle derivable by counting `bundle_revised`
+    facts with a smaller seq, but every declared consumer of this function
+    (`model_ruling`, `artifact_submitted`, and a fact written before this
+    revision, which §6 assertion 4 attributes by this exact shortcut) already
+    carries `epoch`, so the shortcut costs nothing today."""
     fact = next((f for f in store.facts_for(run_id) if f.seq == seq), None)
     if fact is None:
         return 1

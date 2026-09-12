@@ -14,10 +14,20 @@ from tests.kernel.front import ISSUE, SLICES_BYTES, Front
 
 def _shaped(tmp_path, name="k.db", labels=("bircher:autonomous",)):
     """A run at `queued` through a one-piece ruling: the state a hand-back
-    is legal from. The driver's default `shape=True` rules it at birth."""
+    is legal from. The driver's default `shape=True` rules it at birth.
+
+    `labels` is merged INTO the issue, not passed beside it: `Front.__init__`
+    only falls back to its own `labels=` parameter when no `issue` is given,
+    so `issue=ISSUE, labels=list(labels)` would silently keep `ISSUE`'s own
+    `bircher:autonomous` regardless of what a caller asked for -- every
+    caller of this fixture would get the same policy no matter which labels
+    it named. The assertion below is the fixture proving that to itself,
+    once, rather than a caller discovering it by way of a policy that never
+    varied."""
     s = Store.open(tmp_path / name)
-    f = Front(s, "i12-epic-1", issue=ISSUE, labels=list(labels))
+    f = Front(s, "i12-epic-1", issue={**ISSUE, "labels": list(labels)})
     assert s.run_state(f.run_id) == "queued"
+    assert front.frozen_labels(s, f.run_id) == list(labels)
     return s, f
 
 
@@ -111,3 +121,73 @@ def test_a_fact_written_before_the_revision_is_visit_one(tmp_path):
     n = front.epoch(s, f.run_id)
     ruling = front.shape_ruling(s, f.run_id, n)
     assert front.visit_of(s, f.run_id, ruling.seq) == 1
+
+
+def _strip_visit_key(store, seq: int) -> None:
+    """Rewrite one fact's payload with its `visit` key removed -- the shape
+    a pre-revision-16 journal actually has, which no fixture in this file
+    otherwise produces (every fact this driver writes now stamps one).
+    Facts are append-only by a database trigger (`schema.sql`'s
+    `facts_no_update`); this drops it for the one direct write and restores
+    it, so the store's invariant holds for every fact but the one under
+    test."""
+    import json
+    row = store._conn.execute(
+        "SELECT payload_json FROM facts WHERE seq = ?", (seq,)
+    ).fetchone()
+    payload = json.loads(row[0])
+    del payload["visit"]
+    store._conn.execute("DROP TRIGGER facts_no_update")
+    store._conn.execute(
+        "UPDATE facts SET payload_json = ? WHERE seq = ?", (json.dumps(payload), seq)
+    )
+    store._conn.execute(
+        "CREATE TRIGGER facts_no_update BEFORE UPDATE ON facts "
+        "BEGIN SELECT RAISE(ABORT, 'facts are append-only'); END"
+    )
+
+
+def test_visit_of_agrees_with_every_stamp_and_finds_a_stripped_one(tmp_path):
+    """`visit_of` is the function seven later tasks read (spec §2: "attributes
+    any other fact by the prefix walk"), and it is pinned by nothing until
+    this: the walk must reproduce every fact's OWN stamp -- the invariant a
+    `b <= seq` -> `b < seq` typo silently breaks, attributing a boundary fact
+    to the visit it CLOSES rather than the one it OPENS -- and it must still
+    get the right answer for a fact that carries no stamp at all, the shape
+    of every fact written before this revision."""
+    s, f = _shaped(tmp_path)
+    n = front.epoch(s, f.run_id)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one piece", cost="the spec would find one surface")  # visit 2's ruling
+
+    # 1. Every fact that carries a `visit` agrees with the walk, at its own seq.
+    stamped = [fct for fct in s.facts_for(f.run_id) if "visit" in fct.payload]
+    assert len(stamped) >= 3       # the hand-back and the two rulings, at least
+    for fct in stamped:
+        assert front.visit_of(s, f.run_id, fct.seq) == fct.payload["visit"], (fct.kind, fct.seq)
+
+    # 2. A fact with NO `visit` key -- the pre-revision-16 shape. The walk
+    # still attributes it correctly, and a NAMED-visit read of it depends on
+    # shape_ruling's `or visit_of(...)` fallback, not the (now-absent) stamp.
+    disputed = front.shape_ruling(s, f.run_id, n, visit=2)
+    assert disputed is not None and disputed.payload["visit"] == 2
+    _strip_visit_key(s, disputed.seq)
+    assert front.visit_of(s, f.run_id, disputed.seq) == 2
+    restripped = front.shape_ruling(s, f.run_id, n, visit=2)
+    assert restripped is not None and restripped.seq == disputed.seq
+
+
+def test_a_revise_bundle_opens_a_new_epoch_whose_visits_restart_at_one(tmp_path):
+    """`_visit_boundaries` scopes to `f.payload.get("epoch") == epoch_n`: the
+    reason a later `revise_bundle` cannot carry an earlier epoch's boundaries
+    into the new one, and the reason visits restart at 1 in each epoch (spec
+    §2 -- the sentence the prefix walk exists to satisfy)."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    assert front.shaping_visit(s, f.run_id, 0) == 2
+    f.revise(dict(ISSUE, body="changed"), reshape=False)
+    assert s.run_state(f.run_id) == "shaping" and f.epoch() == 1
+    # The new epoch is untouched by the old one's hand-back.
+    assert front.shaping_visit(s, f.run_id, 1) == 1
+    # The old epoch's boundary is still counted -- revise_bundle erased nothing.
+    assert front.shaping_visit(s, f.run_id, 0) == 2
