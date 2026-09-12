@@ -705,10 +705,17 @@ def _check_submit(store, cmd, state: str) -> None:
     h = cmd.payload.get("artifact_hash")
     if not isinstance(h, str) or not store.has_artifact(h):
         raise NotAuthorized(f"{cmd.name} names an artefact the kernel does not hold: {h!r}")
-    if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n)):
+    # Revision 16: for `slices` the dedupe is per VISIT. A plan an earlier
+    # visit rejected may be resubmitted after a hand-back -- the shaper
+    # reconsidered and stands by it, which is a decision, not the loop
+    # spinning. Every other phase dedupes per epoch as before.
+    visit = front.shaping_visit(store, cmd.run_id, epoch_n) if phase == "slices" else None
+    if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n, visit=visit)):
         raise NotAuthorized(
             f"identical to the prior artefact: {h[:12]}... was already submitted "
-            f"for {phase} in epoch {epoch_n}; a resubmission that did not change is not a revision"
+            f"for {phase} in epoch {epoch_n}"
+            + (f" visit {visit}" if visit is not None else "")
+            + "; a resubmission that did not change is not a revision"
         )
     if cmd.name == "submit_plan":
         if h == store.phase_artifact(cmd.run_id, "spec"):

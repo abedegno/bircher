@@ -412,7 +412,12 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
         # fact records the template and the prior hash, so the proof
         # re-renders exactly what was issued.
         template = _brief.TEMPLATE_VERSION
-        prev = front.newest_review_verdict(store, cmd.run_id, phase, epoch_n)
+        # Revision 16: for `slices` the prior findings are the VISIT's own, so
+        # a reviewer is not told to expect dispositions of findings the
+        # visit's author never saw.
+        prev = front.newest_review_verdict(
+            store, cmd.run_id, phase, epoch_n,
+            visit=(front.shaping_visit(store, cmd.run_id, epoch_n) if phase == "slices" else None))
         prior_hash = prev.payload.get("findings_hash") if prev is not None else None
         rendered = _brief.render(
             phase=phase, artefact=store.read_blob(artifact_hash), bundle=store.read_blob(bundle_h),

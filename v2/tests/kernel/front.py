@@ -321,6 +321,16 @@ class Front:
         payload.update(override)
         self._cmd(g, "record_review", payload)
 
+    def issue_review_brief(self, phase: str | None = None) -> bytes:
+        """`issue_review_brief` on its own, for a test that wants the
+        rendered bytes rather than a driven verdict -- `review_round` issues
+        one too, but folds it straight into a `record_review` a caller here
+        cannot intercept."""
+        phase = phase or self.phase()
+        g = self._dispatch(Role.REVIEWER, self.reviewer)
+        self._cmd(g, "issue_review_brief", {"phase": phase})
+        return self.store.read_blob(fq.brief_for(self.store, self.run_id, g).payload["brief_hash"])
+
     # -- the human's commands ---------------------------------------------------
 
     def human(self, name: str, payload: dict):

@@ -85,23 +85,41 @@ def bundle_hash(store, run_id: str) -> str | None:
     return None if enq is None else enq.payload.get("bundle_hash")
 
 
-def submissions(store, run_id: str, phase: str, epoch_n: int) -> list:
-    return [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
-            if f.payload["phase"] == phase and f.payload["epoch"] == epoch_n]
+def submissions(store, run_id: str, phase: str, epoch_n: int, visit: int | None = None) -> list:
+    """The phase's submissions in the epoch, newest last.
+
+    *visit* filters to one shaping visit and is passed only for phase
+    `slices` (revision 16): visits partition the shaping work, and a spec
+    draft hidden behind a hand-back is not what the partition is for. A
+    submission written before this revision carries no `visit`; `visit_of`
+    attributes it, and gives it visit 1."""
+    out = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+           if f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n]
+    if visit is None:
+        return out
+    return [f for f in out if f.payload.get("visit", visit_of(store, run_id, f.seq)) == visit]
 
 
-def newest_submission(store, run_id: str, phase: str, epoch_n: int):
-    subs = submissions(store, run_id, phase, epoch_n)
+def newest_submission(store, run_id: str, phase: str, epoch_n: int, visit: int | None = None):
+    subs = submissions(store, run_id, phase, epoch_n, visit=visit)
     return subs[-1] if subs else None
 
 
-def newest_review_verdict(store, run_id: str, phase: str, epoch_n: int):
+def newest_review_verdict(store, run_id: str, phase: str, epoch_n: int, visit: int | None = None):
     """The newest reviewer verdict of this phase and epoch, or None. Human
     rulings are not verdicts: a `human_ruling` carries no findings a next
-    round could disposition."""
+    round could disposition.
+
+    *visit* narrows to one shaping visit, for phase `slices` only (revision
+    16, the same partition `submissions` applies). A verdict's payload
+    carries no `visit` of its own -- it is the reviewer's judgement, not the
+    author's submission -- so `visit_of`'s prefix walk is the only way to
+    place one; there is no stamped shortcut to fall back to here."""
     vs = [f for f in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT)
           if f.payload.get("ruling") == "review_ruling"
           and f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n]
+    if visit is not None:
+        vs = [v for v in vs if visit_of(store, run_id, v.seq) == visit]
     return vs[-1] if vs else None
 
 

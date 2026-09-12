@@ -580,3 +580,56 @@ def test_the_hand_back_is_refused_after_an_approval(tmp_path):
     assert s.run_state(f.run_id) == "queued"
     with pytest.raises(NotAuthorized, match="already"):
         f.request_reshape("again")
+
+
+# -- Task 5: the visit-scoped readers ----------------------------------------
+
+def test_a_plan_an_earlier_visit_rejected_may_be_resubmitted(tmp_path):
+    # `shape_round`'s *plan* argument goes to `submit_slices`, which the
+    # slices grammar gates: SLICES_BYTES parses, PLAN_BYTES (a `### Task`
+    # plan, meant for `submit_plan`) does not -- so this is the slice plan,
+    # despite the name every other fixture here uses for it.
+    s, f = _new(tmp_path)
+    f.shape_round(SLICES_BYTES)
+    f.review_round("request_revision")                                   # request_revision, back to shaping
+    f.shape_round(reasoning="one piece after all", cost="the spec would find one surface")
+    f.request_reshape("three parts")
+    # Visit 2: the same bytes are a fresh submission, not the loop spinning.
+    f.shape_round(SLICES_BYTES)
+    assert s.run_state(f.run_id) == "slices_submitted"
+    subs = front.submissions(s, f.run_id, "slices", 0)
+    assert [x.payload["visit"] for x in subs] == [1, 2]
+    assert front.submissions(s, f.run_id, "slices", 0, visit=2) == subs[-1:]
+
+
+def test_the_same_plan_twice_in_one_visit_is_still_refused(tmp_path):
+    s, f = _new(tmp_path)
+    f.shape_round(SLICES_BYTES)
+    f.review_round("request_revision")
+    with pytest.raises(NotAuthorized, match="identical"):
+        f.shape_round(SLICES_BYTES)
+
+
+def test_the_round_budget_is_per_epoch_and_a_hand_back_spends_none(tmp_path):
+    """`max_rounds` counts the reviewer's request_revision facts. A hand-back
+    spends none, and the visit it opens draws on the same budget (spec §2)."""
+    s, f = _new(tmp_path)
+    before = front.rounds_used(s, f.run_id, "slices", 0)
+    f.shape_round(reasoning="one piece", cost="the spec would find one surface")
+    f.request_reshape("three parts")
+    assert front.rounds_used(s, f.run_id, "slices", 0) == before
+    f.shape_round(SLICES_BYTES)
+    f.review_round("request_revision")
+    assert front.rounds_used(s, f.run_id, "slices", 0) == before + 1
+
+
+def test_the_review_brief_carries_the_visits_own_prior_findings(tmp_path):
+    s, f = _new(tmp_path)
+    f.shape_round(SLICES_BYTES)
+    f.review_round("request_revision", findings=b"visit one findings")
+    f.shape_round(reasoning="one piece", cost="the spec would find one surface")
+    f.request_reshape("three parts")
+    f.shape_round(SLICES_BYTES)
+    brief = f.issue_review_brief("slices")
+    assert b"visit one findings" not in brief
+    assert front.newest_review_verdict(s, f.run_id, "slices", 0, visit=2) is None
