@@ -130,7 +130,15 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # carries no "unresolved" for a caller -- or a test's `match=` -- to
     # read. `authorize`'s own block checks the dispute before the state, in
     # the spec's refusal-row order (spec §2 revision 16).
-    "approve_one_piece": (FRONT_HALF_STATES | SHAPING_STATES, "queued"),
+    # Revision 16: the person's resolution of a shape disagreement. From
+    # `shaping` alone (spec §2's third refusal row) -- the dispute IS a
+    # shaping-state park, and at any later state a reply is read as it is
+    # today, so a stale dispute can never brick a spec or plan gate. The
+    # generic state check is what refuses it elsewhere; declaring a wider
+    # set here so the branch below could phrase its own message would make
+    # the table state a legality that does not exist, and the table is what
+    # a reader asks.
+    "approve_one_piece": (frozenset({"shaping"}), "queued"),
     "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
     # The filing and closing facts (shaping spec §2): no transition; legal
     # only from `sliced`, under the coordinator's or the sweep's operator
@@ -1262,19 +1270,15 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         # below -- the same gate `approve_artifact` and `grant_round` above
         # rely on with no actor check of their own.
         #
-        # Spec order otherwise: the dispute before the state, so a second
-        # approval and a run that was never disputed -- both of which reach
-        # this command from `queued`, the broadened allowed-set's doing --
-        # read "unresolved", not the state check's "not legal from state".
+        # The state is the table's, not this block's: `_TRANSITIONS` admits
+        # `shaping` alone, so the generic check above has already refused
+        # every later state by the time this runs, and a second check here
+        # could never fire. What this block owes is the reason the table
+        # cannot express -- that the epoch holds no unresolved disagreement.
         if not front.unresolved_disagreement(store, cmd.run_id):
             raise NotAuthorized(
                 "approve_one_piece: this epoch holds no unresolved disagreement -- no hand-back, no disputed "
                 "ruling yet, or a resolution already recorded (a second approval is this refusal)"
-            )
-        if current != "shaping":
-            raise NotAuthorized(
-                f"approve_one_piece is refused from {current!r}: the dispute is a shaping-state park, and at "
-                "any later state the reply is read as today (spec §2)"
             )
         if not isinstance(cmd.payload.get("cursor_item_id"), str):
             raise NotAuthorized(

@@ -457,26 +457,38 @@ def test_the_approval_refuses_its_four_ways(tmp_path):
     with pytest.raises(NotAuthorized, match="human"):
         f.approve_one_piece(as_model=True)
     f.approve_one_piece()
-    with pytest.raises(NotAuthorized, match="unresolved"):   # a second approval
+    # A second approval. The first one moved the run to `queued`, so the
+    # table's own state check refuses this before the dispute check is
+    # reached -- the spec names the no-unresolved-dispute row for this case,
+    # and both rows are true of it; the refusal a person meets is the state's.
+    with pytest.raises(NotAuthorized, match="not legal from state 'queued'"):
         f.approve_one_piece()
-    s2, g = _shaped(tmp_path, "b.db")                         # no dispute at all
-    with pytest.raises(NotAuthorized, match="unresolved"):
+    # No dispute at all, reached from `shaping` so the dispute check is what
+    # answers. `_new` is a run that has decided nothing.
+    s2, g = _new(tmp_path, "b.db")
+    assert s2.run_state(g.run_id) == "shaping"
+    with pytest.raises(NotAuthorized, match="no unresolved disagreement"):
         g.approve_one_piece()
 
 
 def test_the_approval_is_refused_away_from_shaping(tmp_path):
-    """The refusal table's third row, distinct from "unresolved": reachable
-    only by forcing the run's state, because an unresolved dispute and a
-    state other than `shaping` never coexist through any legal transition --
-    the ruling that disputes it PARKS at `shaping`, and nothing else can move
-    the run while the dispute stands. Defense for a database moved by hand,
-    exactly as `test_the_hand_back_refuses_a_run_with_no_shape_ruling_in_its_epoch`
-    exercises its own state guard the same way."""
+    """The refusal table's third row: the dispute is a shaping-state park, and
+    at any later state a reply is read as it is today, so a stale dispute can
+    never brick a spec or plan gate.
+
+    Reachable only by forcing the run's state, because an unresolved dispute
+    and a state other than `shaping` never coexist through any legal
+    transition -- the ruling that disputes it is held AT `shaping`, and
+    nothing else can move the run while the dispute stands. The refusal is
+    the transition table's, not a check inside the command: declaring the
+    command legal from the later states so it could phrase its own message
+    would make the table state a legality that does not exist."""
     s, f = _disagreed(tmp_path)
     assert front.unresolved_disagreement(s, f.run_id) is True
-    s.set_run_state(f.run_id, "queued")
-    with pytest.raises(NotAuthorized, match="shaping-state park"):
+    s.set_run_state(f.run_id, "spec_submitted")
+    with pytest.raises(NotAuthorized, match="not legal from state 'spec_submitted'"):
         f.approve_one_piece()
+    assert front.unresolved_disagreement(s, f.run_id) is True
 
 
 def test_the_approval_does_not_accept_a_slice_plan(tmp_path):
