@@ -1380,12 +1380,14 @@ def test_assert_journal_does_not_crash_on_a_submission_missing_its_phase(tmp_pat
 
 
 def test_assert_journal_does_not_crash_on_a_sliced_parents_submission_missing_phase(tmp_path):
-    """The `late_spec` instance of the same crash, reachable only through a
-    sliced parent (the branch that computes it)."""
-    s, f = _parent(tmp_path)
-    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+    """The `late_spec` instance of the same crash -- reachable only through
+    a sliced parent that ALSO holds a hand-back (`late_spec`'s list
+    comprehension is never even evaluated when `hb is None`, so a plain
+    `_parent` fixture never reaches this line at all)."""
+    s, run = _Planted(tmp_path).hand_back_then_sliced()
+    s.append_fact(run_id=run, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
                   payload={"epoch": 0})   # no "phase", no "hash" at all
-    fails = prove.assert_journal(s, f.run_id, mode="zero")    # must not raise
+    fails = prove.assert_journal(s, run, mode="zero")    # must not raise
     assert isinstance(fails, list)
 
 
