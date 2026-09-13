@@ -1418,6 +1418,30 @@ def test_assertion_1_reds_on_a_phantom_filing_sandwiched_between_two_real_ones(t
     assert any("more than one filing" in x for x in fails), fails
 
 
+def test_an_unreadable_parent_number_does_not_hide_the_duplicate_filing_check(tmp_path):
+    """Round 5, RC-1: the round-4 `issue_number` guard widened to `if plan
+    is not None and filed and parent is not None:`, which put D1's own new
+    `dup_filed` check (and assertion 1's plan-match and delivered-create
+    counts) behind a condition none of them need. A journal carrying BOTH
+    defects -- a phantom filing and a `run_enqueued` missing its
+    `bundle_hash` -- must report both, not just whichever one happens to
+    make `parent` unreadable."""
+    s, f = _parent(tmp_path)
+    real = next(x for x in s.facts_of_kind(f.run_id, EventKind.SLICE_FILED) if x.payload.get("slice") == 1)
+    s.append_fact(run_id=f.run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                  payload={**real.payload, "issue": 999, "issue_id": 9999})   # the phantom
+    s.append_fact(run_id=f.run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                  payload=dict(real.payload))                                 # the restatement
+    # A second, forged run_enqueued shadows the real one (facts are
+    # append-only; store.newest_fact picks the newest) -- no bundle_hash at
+    # all, and no bundle_revised fact exists in this fixture to fall back to.
+    s.append_fact(run_id=f.run_id, kind=EventKind.RUN_ENQUEUED, actor="human", causal_command_id=None,
+                  payload={"packet_hash": None})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=_no_gh)
+    assert any("issue number could not be read" in x for x in fails), fails
+    assert any("more than one filing" in x for x in fails), fails
+
+
 def test_by_gate_reds_on_a_second_approval_stamped_the_superseded_epoch(tmp_path):
     """Round 4, D2: `by_gate`/`dup_gates` grouped by the STAMPED epoch, so
     two approvals of the SAME real gate, one stamped a wrong-but-in-range

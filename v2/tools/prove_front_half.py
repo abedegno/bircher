@@ -663,7 +663,7 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             numbers[k] = _need(f, "issue")
         except _BadPayload as exc:
             fails.append(exc.line)
-    if plan is not None and filed and parent is not None:
+    if plan is not None and filed:
         # Round 4, D1: `front.slices_filed` collapses every filing of a
         # slice to its LAST one -- a dict comprehension keyed on the slice
         # number. A phantom filing sandwiched between a real one and its own
@@ -671,6 +671,16 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         # below that reads `filed`. `front.slice_filings` is the same facts,
         # uncollapsed; this is the one place §6's "exactly one" gets to see
         # all of them, not just the newest.
+        #
+        # Round 5, RC-1: this check, the plan-to-number match right below,
+        # and the delivered-create counts need no parent issue number at
+        # all -- only the two checks that actually call `gh_json` on the
+        # PARENT issue (the title/body render, which names it, and
+        # assertion 3's umbrella) do. The round-4 guard widened `and parent
+        # is not None` over this whole block, so a bundle_hash the proof
+        # could not read silently hid D1's own new check along with the
+        # other two -- one unreadable parent number suppressing three
+        # checks that never asked for one.
         dup_filed = {k: len(fs) for k, fs in front.slice_filings(store, run_id, n).items() if len(fs) > 1}
         if dup_filed:
             fails.append(f"slice_filed: more than one filing for slice(s) {dup_filed} (one filing per slice)")
@@ -690,7 +700,12 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             # slice_filed fact was missing "issue" -- already named above by
             # `_need`, and a `numbers[...]` subscript below would otherwise
             # crash on exactly the fact that just failed to build it.
-            if s.number not in filed or s.number not in numbers or any(d not in numbers for d in s.depends_on):
+            # Round 5, RC-1: and skip when the parent number itself could
+            # not be read -- `render_child` needs it, and that failure is
+            # already named above; this check alone, of the three in this
+            # block, actually needs it.
+            if (s.number not in filed or s.number not in numbers
+                    or any(d not in numbers for d in s.depends_on) or parent is None):
                 continue
             try:
                 live = gh_json(["gh", "issue", "view", str(numbers[s.number]), "--repo", repo, "--json", "title,body"])
@@ -700,7 +715,7 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             title, body = slices.render_child(s, parent, h[:8], {d: numbers[d] for d in s.depends_on})
             if live.get("title") != title or (live.get("body") or "").rstrip("\n") != body.rstrip("\n"):
                 fails.append(f"child #{numbers[s.number]}: title or body is not render_child over slice {s.number}")
-        # 2. The dependencies are the links.
+        # 2. The dependencies are the links. No parent number needed.
         for s in plan.slices:
             if s.number not in filed or s.number not in numbers or any(d not in numbers for d in s.depends_on):
                 continue
@@ -713,23 +728,26 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             want = sorted(numbers[d] for d in s.depends_on)
             if got != want:
                 fails.append(f"child #{numbers[s.number]}: blocked-by links {got} are not the plan's {want} (a missing or extra link)")
-        # 3. The umbrella names the children.
-        try:
-            comments = gh_json(["gh", "issue", "view", str(parent), "--repo", repo, "--json", "comments"]).get("comments") or []
-        except ReadFailed as exc:
-            fails.append(f"parent #{parent}: could not read comments: {exc}")
-            comments = None
-        if comments is not None:
-            ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
-            if len(ums) != 1:
-                fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
-            elif any(s.number not in numbers for s in plan.slices):
-                # Round 4: `umbrella_body` subscripts every plan slice's
-                # filed number unconditionally; a slice already named above
-                # (missing "issue") would otherwise crash it here too.
-                fails.append("the umbrella comment could not be checked: a filed slice has no issue number")
-            elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
-                fails.append("the umbrella comment does not list exactly the filed children")
+        # 3. The umbrella names the children -- on the PARENT issue, so this
+        #    one genuinely needs the parent number (round 5, RC-1).
+        if parent is not None:
+            try:
+                comments = gh_json(["gh", "issue", "view", str(parent), "--repo", repo, "--json", "comments"]).get("comments") or []
+            except ReadFailed as exc:
+                fails.append(f"parent #{parent}: could not read comments: {exc}")
+                comments = None
+            if comments is not None:
+                ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
+                if len(ums) != 1:
+                    fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
+                elif any(s.number not in numbers for s in plan.slices):
+                    # Round 4: `umbrella_body` subscripts every plan slice's
+                    # filed number unconditionally; a slice already named
+                    # above (missing "issue") would otherwise crash it here
+                    # too.
+                    fails.append("the umbrella comment could not be checked: a filed slice has no issue number")
+                elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
+                    fails.append("the umbrella comment does not list exactly the filed children")
     # 4. One decision per VISIT, and every filing in the last epoch
     #    (shaping spec §6, revision 16). Three clauses.
     # (a) No filing outside the final epoch: a superseded epoch never filed,
