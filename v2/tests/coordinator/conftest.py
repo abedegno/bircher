@@ -189,12 +189,27 @@ class Scenario:
         f._session(g, cause_id)
         self._sync_sessions()
 
-    def reject_plan(self, findings: bytes = b"needs another slice") -> None:
+    def reject_plan(self, findings: bytes = b"needs another slice", *,
+                    author: str | None = None, reviewer: str | None = None) -> None:
         """A slice plan submitted in the CURRENT visit, then sent back to
         the shaping round with a reviewer's verdict on the record -- the
         history Task 8's vendor tests need to show the `slices` clauses
         hold for the WHOLE visit, verdicts or none (shaping spec §2 *The
-        vendors*), not only the easy case of an empty-turn retry."""
+        vendors*), not only the easy case of an empty-turn retry.
+
+        Fix round 1: *author*/*reviewer*, defaulting to the fixture's own
+        `Front.author`/`Front.reviewer`. With two vendors configured, the
+        ROTATION a clause is meant to be tested against and the plain
+        `_other_than` a clause returns coincide whenever the rejected
+        plan's submitter is left at its default -- `Front.author` never
+        changes, so the reviewer (the only other vendor) always happens to
+        equal what `_other_than` would also give. A test discriminating a
+        `same_phase`-guard mutation needs the two to actually differ, which
+        means controlling who submitted the round that verdict is on."""
+        if author is not None:
+            self.front.author = author
+        if reviewer is not None:
+            self.front.reviewer = reviewer
         self.front.shape_round(SLICES_BYTES)
         self.front.review_round("request_revision", findings=findings)
         self._sync_sessions()
@@ -506,6 +521,7 @@ class Fake:
         return self._scenario(f)
 
     def disagreed(self, *, ruling_vendor: str = "claude", hand_back_vendor: str = "codex",
+                 disputed_vendor: str | None = None,
                  ruling_reasoning: str = "still one piece, the export and import flows are one thing",
                  hand_back_reasoning: str = "the issue names a store, an API and a page",
                  park: bool = True, pending_reply: str | None = None,
@@ -541,12 +557,24 @@ class Fake:
         asked and left unanswered BEFORE the hand-back, still standing once
         the run is back at `shaping`: the history
         `test_approve_is_the_approval_even_in_a_grill_epoch` and
-        `test_the_grill_branch_is_skipped_at_every_shaping_state` need."""
+        `test_the_grill_branch_is_skipped_at_every_shaping_state` need.
+
+        `disputed_vendor` (fix round 1, B3/B4): the DISPUTED (reaffirming)
+        ruling's own vendor, defaulting to `ruling_vendor` -- the shaper
+        reconsidering itself, which is the ordinary case. Set it apart from
+        `ruling_vendor` for a test that needs the handed-back ruling and
+        the disputed one to name DIFFERENT vendors: `park_prompt`'s
+        per-seat attribution is unpinned by any history where all three
+        quoted facts share one of only two names (B3), and the spec
+        clause's "newest, not first, shape ruling" reading needs a real
+        divergence to test against (B4)."""
         labels = ["bircher:autonomous"] if policy is None else [policy, "bircher:autonomous"]
         front = Front(self._store("disagreed"), "r-1", author=ruling_vendor, labels=labels)
         if unanswered_question:
             front.ask_round([("Q1", "which auth flow matters here?")])
         front.request_reshape(hand_back_reasoning, vendor=hand_back_vendor)
+        if disputed_vendor is not None:
+            front.author = disputed_vendor
         front.shape_round(reasoning=ruling_reasoning, cost="the spec would find one surface")
         scenario = self._scenario(front)
         scenario.ruling_reasoning = ruling_reasoning

@@ -104,6 +104,23 @@ def choose_author_vendor(ctx) -> str:
             # A direction-opened visit: the person has just overruled the
             # disputed ruling's vendor, so the visit is not that vendor's to
             # reconsider either.
+            #
+            # Fix round 1, row 6: the `.kind == HUMAN_DIRECTION` check
+            # cannot be independently driven through the kernel -- tried
+            # forging a second `reshape_requested` past `request_reshape`'s
+            # own refusal, and it IS reachable that way, which is the proof
+            # the check is not redundant AS CODE, only unreachable AS
+            # HISTORY. It rests on two invariants elsewhere: `request_reshape`'s
+            # one-hand-back-per-bundle refusal (`kernel/authz.py`, the
+            # `reshape_requested exists in this epoch` row of its table) and
+            # `record_human_direction`'s null destination (`kernel/authz.py`'s
+            # `_TRANSITIONS`, which is why an epoch's only OTHER dispute-side
+            # fact, `approve_one_piece`, moves the run OUT of `shaping`
+            # instead of opening a further visit). Together they mean any
+            # visit past the hand-back's is opened only by a dispute-resolving
+            # direction, so `visit != visit_of(hand_back)` already implies
+            # `d.resolution.kind == HUMAN_DIRECTION` here -- a relaxation of
+            # either invariant is what would make this check load-bearing.
             return _other_than(ctx, d.disputed.actor)
 
     if same_phase:

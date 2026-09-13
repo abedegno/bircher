@@ -423,6 +423,18 @@ def run_loop(ctx: Ctx) -> int:
             # "unresolved" and no park recorded; recording it here costs one
             # wave and never a third seat. After the operator fence above and
             # before any seat below is dispatched.
+            #
+            # Fix round 1, X6: `state == "shaping"` cannot be independently
+            # driven false here either -- dropping it left the full suite
+            # green. The reason is the same invariant `choose_author_vendor`'s
+            # own `.kind == HUMAN_DIRECTION` comment names: `unresolved_disagreement`
+            # only ever becomes true from a `disputed` ruling recorded AT
+            # `shaping` (a ruling never transitions state), and only ever
+            # becomes false again from `approve_one_piece` or a resolving
+            # direction, neither of which leaves it true afterward. There is
+            # no history in which it reads true while the state is anything
+            # else. Left in as the documentation of that assumption a reader
+            # would otherwise have to re-derive.
             if state == "shaping" and park is None and front.unresolved_disagreement(store, run_id):
                 try:
                     if stall(ctx, "disagreement", session_id=_newest_author_session(ctx),
@@ -434,6 +446,21 @@ def run_loop(ctx: Ctx) -> int:
                     # two calls leave open (`_check_park`'s own guard). Not a
                     # crash: re-read the dispute and carry on with the pass.
                     ctx.log(f"disagreement park refused, the dispute resolved in the gap: {exc}")
+                    # Fix round 1, L2: `continue`ing unconditionally back
+                    # into a branch guarded by this SAME refusal's own
+                    # precondition is an infinite-loop shape -- it
+                    # terminates today only because the resolved-in-the-gap
+                    # refusal is the one case that clears
+                    # `unresolved_disagreement`, making the branch's own
+                    # condition false on the next pass. A refusal of any
+                    # OTHER shape (a park payload some future change makes
+                    # invalid, say) would leave the dispute unresolved and
+                    # spin the wave forever. Re-read the journal rather than
+                    # assume: only the gap this branch exists for continues.
+                    if front.unresolved_disagreement(store, run_id):
+                        ctx.log("disagreement park refused for a reason that left the dispute "
+                                "unresolved; failing rather than repeating the same refusal")
+                        return Exit.FAILED
                 continue
             if state == "shaping":
                 from coordinator import shape
