@@ -15,7 +15,7 @@ plain `curl` — were invisible to all of them, and to the detector built from
 them. The adversarial attention went entirely to the exclusions; the
 *inclusion* set was never questioned. The `curl` pattern is the sixth.
 
-Confirmed against `batch/run-queue.sh` at 9543 lines on 2026-09-10. Line
+Confirmed against `batch/run-queue.sh` at 9666 lines on 2026-09-13. Line
 numbers move: re-run the patterns and reconcile before relying on them.
 
 ```bash
@@ -48,7 +48,7 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | 3882 | `gh issue edit --remove-label` | `issue_or_label` |
 | 3883 | `gh issue edit --add-label` | `issue_or_label` |
 | 3899 | `gh issue close` | `issue_or_label` |
-| 4480 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 4508 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 
 **1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
 classified it as `pull_request`. M1-3 split `merge` into its own class
@@ -68,10 +68,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1689 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 7310 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 8252 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
-| 8253 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 8276 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 7357 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 8299 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
+| 8300 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 8323 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 

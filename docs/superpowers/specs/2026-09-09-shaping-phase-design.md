@@ -1116,7 +1116,7 @@ delivered behaviour:
 
 - `_preflight_labels` checks `bircher:slice` and `bircher:sliced` beside
   `running` and `escalated`.
-- **`run_item`'s resume gate** (`run-queue.sh:4318-4328`) resumes a run only
+- **`run_item`'s resume gate** (`run-queue.sh:4439-4448`) resumes a run only
   in an explicit list of front-half states and escalates any other as beyond
   the front half. The list gains `shaping`, `slices_submitted`,
   `slices_accepted` and `sliced`; without that, every resume of a parked
@@ -1124,7 +1124,7 @@ delivered behaviour:
 - **`run_item`'s post-loop branch.** After `phases` exits `0` the runner today
   dispatches an implementer, calls `start_implementation` — legal only from
   `planned` (`authz.py:89`) — and records `failed` when the state is not
-  `implementing` (`run-queue.sh:4451-4465`). A `sliced` run exiting `0` would
+  `implementing` (`run-queue.sh:4640-4647`). A `sliced` run exiting `0` would
   take that path and be scored as a failed implementation. The branch gains a
   case: state `sliced` after the loop records the scorecard row `sliced`,
   naming the children from `slice_filed`, **moves the queue file to
@@ -1139,7 +1139,7 @@ delivered behaviour:
   self-test pins both the resume list and this case.
 - **`run_item`'s non-zero-exit branch.** When `phases` exits non-zero and
   the run holds no pending effect, the runner today records `failed` and
-  moves the file to `processed` unconditionally (`run-queue.sh:4440-4445`).
+  moves the file to `processed` unconditionally (`run-queue.sh:4592-4597`).
   A coordinator that dies between two *confirmed* filing effects — the
   process killed, the host's turn timeout — exits that way with nothing
   pending, and the file would be consumed with the filing half done; under
@@ -1154,7 +1154,7 @@ delivered behaviour:
   rendered — `_kernel_find_run … open` finds nothing and `run_item` mints a
   run, which `create_run` refuses (§2, *an issue is sliced once*). The
   existing refused-mint path records a scorecard row and moves the file to
-  `processed` (`run-queue.sh:4362-4371`); the row's note carries the
+  `processed` (`run-queue.sh:4482-4491`); the row's note carries the
   refusal's text, so it reads "sliced by run i12-…" and not a bare "refused".
   Today the call's output is discarded (`_kernel_run_start … >/dev/null`)
   and the note is a constant; the change is to capture the refusal and put
