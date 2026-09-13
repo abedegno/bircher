@@ -192,7 +192,13 @@ def test_the_brief_does_not_say_the_hand_back_is_spent_before_it_is(fake):
     f = fake.revision_turn()
     brief = author.author_brief(f.ctx, phase="spec").decode()
     assert "## Handing back is no longer available" not in brief
-    assert "## Handing back\n" in brief
+    # The BRIEF's own section, by its own opening line -- not the bare
+    # heading. `author_brief` embeds `skills/spec-author/SKILL.md` verbatim
+    # and that file carries a `## Handing back` heading of its own, so the
+    # heading alone is satisfied by the skill whatever the code does. That
+    # collision has produced four inert assertions on this branch; this is
+    # the last of them.
+    assert "## Handing back\n\nIf this issue is more than one piece of work" in brief
 
 
 def test_the_resolution_renders_on_the_direction_path_with_the_ruling_that_followed(fake):
