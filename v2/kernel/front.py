@@ -77,6 +77,17 @@ def epoch(store, run_id: str) -> int:
     return len(store.facts_of_kind(run_id, EventKind.BUNDLE_REVISED))
 
 
+def epoch_of(store, run_id: str, seq: int) -> int:
+    """The epoch a fact at *seq* belongs to, derived from the journal exactly
+    as `visit_of` derives a fact's visit: count the `bundle_revised` facts
+    that precede it. `epoch()` is this same rule applied to "now" -- every
+    `bundle_revised` fact so far, `len(...)` -- rather than to one fact's own
+    position in the journal (round 3, C1/C2: a fact's `epoch` stamp, like its
+    `visit` stamp, is a claim the journal can check, not one to trust and
+    merely bound to a range)."""
+    return sum(1 for f in store.facts_of_kind(run_id, EventKind.BUNDLE_REVISED) if f.seq < seq)
+
+
 def bundle_hash(store, run_id: str) -> str | None:
     revised = store.newest_fact(run_id, EventKind.BUNDLE_REVISED)
     if revised is not None:

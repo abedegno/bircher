@@ -152,6 +152,7 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     facts = store.facts_for(run_id)
     kinds = [f.kind for f in facts]
     human = [f for f in facts if f.kind in HUMAN]
+    n = front.epoch(store, run_id)
 
     if mode == "zero" and human:
         fails.append(
@@ -185,6 +186,37 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         dup_gates = {k: v for k, v in by_gate.items() if v > 1}
         if dup_gates:
             fails.append(f"more than one approval at the same gate: {dup_gates}")
+
+        # Round 3, C4: admission by RULING WORD alone says nothing about
+        # whether the gate it names ever existed. §6 admits "every gate's
+        # approve" -- a gate, not any fact spelling the word. `approve`
+        # needs a real submission at the (phase, epoch) it names; a real
+        # gate can only be approved after something was actually submitted
+        # to it. `approve_one_piece` and a disagreement park need a real
+        # dispute at their epoch -- `front.dispute` is the one definition,
+        # as everywhere else in this file.
+        def _gate_exists(f) -> bool:
+            p = f.payload
+            ep = p.get("epoch")
+            if not (isinstance(ep, int) and 0 <= ep <= n):
+                return False
+            if f.kind == EventKind.HUMAN_RULING and p.get("ruling") == "approve":
+                phase = p.get("phase")
+                return phase in front.FRONT_PHASES and bool(front.submissions(store, run_id, phase, ep))
+            if f.kind == EventKind.HUMAN_RULING and p.get("ruling") == "approve_one_piece":
+                d = front.dispute(store, run_id, ep)
+                return d is not None and d.disputed is not None
+            if f.kind == EventKind.PARKED and p.get("reason") == "disagreement":
+                d = front.dispute(store, run_id, ep)
+                return d is not None
+            return True
+
+        ungrounded = [f for f in human if f not in extra and not _gate_exists(f)]
+        if ungrounded:
+            fails.append(
+                f"human facts admitted by ruling word alone, at a gate this run never reached: "
+                f"{[(f.kind, f.payload) for f in ungrounded]}"
+            )
     # mode == "human" admits every human fact; everything below still runs.
 
     # Controller amendment (Task 10): commands.py's OWN human_ruling payload
@@ -218,7 +250,6 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         fails.append("the run was reconciled or halted")
 
     from kernel.slices import SHAPE_QUESTION
-    n = front.epoch(store, run_id)
     sliced_parent = bool(front.slices_filed(store, run_id, n))
     # A ruling on a question the AUTHOR raised: the shape ruling every
     # one-piece run carries would satisfy this vacuously (shaping spec §6).
@@ -229,7 +260,7 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
 
     # The FINAL epoch only (shaping spec §6, round 12): a run that submitted
     # a spec before its issue changed and was then sliced is a valid history.
-    subs = {f.payload["phase"]: f.payload["hash"]
+    subs = {f.payload.get("phase"): f.payload.get("hash")
             for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED) if f.payload.get("epoch") == n}
     if sliced_parent:
         hb = next((f for f in front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, n)), None)
@@ -247,7 +278,7 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # this `[]` says the same thing without a value to argue is dead).
         late_spec = [] if hb is None else [
             f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
-            if f.payload.get("epoch") == n and f.payload["phase"] == "spec" and f.seq > hb.seq
+            if f.payload.get("epoch") == n and f.payload.get("phase") == "spec" and f.seq > hb.seq
         ]
         if set(subs) - allowed or "slices" not in subs or late_spec \
                 or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
@@ -559,36 +590,43 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
     accepted_h = front.accepted_slices_hash(store, run_id, n)
 
     def _decision_at(e: int, v: int):
-        """The visit's own decision, per clause (b): its shape ruling (or
-        None), and the submission the acceptance actually followed (empty
-        if none). Shared by clauses (b) and (c) so "the last visit's
-        decision" means exactly the same thing in both places (round 1,
-        M1)."""
-        ruling = front.shape_ruling(store, run_id, e, visit=v)
+        """The visit's own decision, per clause (b): EVERY shape ruling
+        attributed to it (round 3, C3 -- not `front.shape_ruling`'s newest
+        alone: a visit holding two rulings, forged or otherwise, has a
+        decision each, and "at most one" cannot be checked by a reader that
+        already collapsed them to one), and the submission the acceptance
+        actually followed (empty if none). Shared by clauses (b) and (c) so
+        "the last visit's decision" means exactly the same thing in both
+        places (round 1, M1)."""
+        rulings = [f for f in front.epoch_facts(store, run_id, EventKind.MODEL_RULING, e)
+                   if f.payload.get("question_id") == slices.SHAPE_QUESTION
+                   and front.visit_stamp_of(store, run_id, f) == v]
         subs_v = front.submissions(store, run_id, "slices", e, visit=v)
         acc_v = front.newest_review_verdict(store, run_id, "slices", e, visit=v)
         accepted = [x for x in subs_v
-                    if e == n and x.payload["hash"] == accepted_h
+                    if e == n and x.payload.get("hash") == accepted_h
                     and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
-        return ruling, subs_v, accepted
+        return rulings, subs_v, accepted
 
-    # Round 2, B4: every reader in this function keys on `payload["epoch"]`
-    # (`front.epoch_facts`, `front.submissions`, `front.shape_ruling` all
-    # filter `== e` for `e` drawn from `range(n + 1)`), so a fact stamped an
-    # epoch this run never reached -- or no epoch at all, or a value that
-    # merely LOOKS equal to a real one (a string "0" is never `== 0`, but a
-    # bad int like 99 or -1 slips past every filter unnoticed) -- sits in NO
-    # epoch's list and is read by nothing. Checked directly, over every
-    # shape ruling and slices submission in the WHOLE run, not scoped to any
-    # single `e` this loop already trusts.
+    # Round 2, B4 / round 3, C1 and C2: every reader in this function (and
+    # in assert_dispute) keys on `payload["epoch"]`, so a fact stamped an
+    # epoch this run never reached is read by nothing -- the same defect
+    # `visit` had, one key over, and round 2 only bounded `epoch` to a
+    # range rather than deriving it. The journal gives the true epoch as
+    # readily as the true visit: count the `bundle_revised` facts that
+    # precede the fact (`front.epoch_of`, `visit_of`'s own sibling). Checked
+    # over every shape ruling and slices submission in the WHOLE run, not
+    # scoped to any single `e` the rest of this function already trusts.
     all_shape_rulings = [f for f in store.facts_of_kind(run_id, EventKind.MODEL_RULING)
                          if f.payload.get("question_id") == slices.SHAPE_QUESTION]
     all_slices_subs = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
                        if f.payload.get("phase") == "slices"]
     for f in all_shape_rulings + all_slices_subs:
         ep = f.payload.get("epoch")
-        if not (isinstance(ep, int) and 0 <= ep <= n):
-            fails.append(f"{f.kind} (seq {f.seq}) stamped epoch {ep!r}, not one of this run's epochs (0..{n})")
+        derived = front.epoch_of(store, run_id, f.seq)
+        if ep != derived:
+            fails.append(f"{f.kind} (seq {f.seq}) stamped epoch {ep!r}, but the journal's own count of "
+                         f"bundle_revised facts before it gives epoch {derived}")
 
     for e in range(n + 1):
         last = front.shaping_visit(store, run_id, e)
@@ -615,20 +653,23 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
                 fails.append(f"epoch {e}: {f.kind} (seq {f.seq}) stamped visit {f.payload['visit']!r}, but "
                              f"the journal's own prefix walk attributes it to visit {walked}")
         for v in range(1, last + 1):
-            ruling, subs_v, accepted = _decision_at(e, v)
+            rulings, subs_v, accepted = _decision_at(e, v)
             # (b) At most one decision per visit: the ruling, or the
             #     submission the acceptance actually followed. Rejected
             #     submissions BEFORE a ruling in the same visit are
             #     admitted -- an author may write a plan, have it rejected,
-            #     and then rule. A submission AFTER the ruling is not.
+            #     and then rule. A submission AFTER *A* ruling is not
+            #     (round 3, C3: not merely after the newest ruling in the
+            #     visit -- a submission sandwiched between two forged
+            #     rulings still follows the first one).
             #     Identified by the review_verdict {accept} its visit holds,
             #     not by hash equality alone: a plan rejected in visit 1 and
             #     resubmitted in visit 2 leaves the accepted hash sitting in
             #     BOTH visits, and hash equality alone would double-count it.
-            if ruling is not None and accepted:
+            if rulings and accepted:
                 fails.append(f"epoch {e} visit {v}: a shape ruling beside the accepted slice plan "
                              "(one decision per visit)")
-            if ruling is not None and any(x.seq > ruling.seq for x in subs_v):
+            if any(x.seq > r.seq for r in rulings for x in subs_v):
                 fails.append(f"epoch {e} visit {v}: a slice plan was submitted after the shape ruling "
                              "(one decision per visit)")
     # (c) In the final epoch the LAST visit's decision matches the outcome:
@@ -642,8 +683,8 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
     #     the hand-back resolved by slicing, not a second decision in one
     #     visit.
     last = front.shaping_visit(store, run_id, n)
-    ruling, _subs_last, accepted = _decision_at(n, last)
-    decided_by_ruling = ruling is not None
+    rulings, _subs_last, accepted = _decision_at(n, last)
+    decided_by_ruling = bool(rulings)
     decided_by_submission = bool(accepted)
     if bool(filed) != decided_by_submission:
         fails.append(f"final epoch {n} visit {last}: the last visit's decision must be the accepted "
@@ -672,19 +713,22 @@ def assert_dispute(store, run_id: str) -> list[str]:
     lose."""
     fails: list[str] = []
     n = front.epoch(store, run_id)
-    # Round 1, L1 / round 2, B4: `epoch_facts` (and `front.dispute`) key on
-    # `payload["epoch"]` -- a reshape_requested missing that key, or one
-    # bearing an epoch this run never reached (an int outside [0, n], or any
-    # non-int value at all -- a string never equals the int an epoch_facts
-    # filter compares against), matches no `e` in the loop below and is
-    # invisible to every hand-back check. L1 caught only the missing-key
-    # spelling of this; checked directly here for the whole shape, the same
-    # way assertion 4 checks its own facts' epochs above.
+    # Round 1, L1 / round 2, B4 / round 3, C1 and C2: `epoch_facts` (and
+    # `front.dispute`) key on `payload["epoch"]` -- a reshape_requested
+    # stamped an epoch that disagrees with the journal's own count of
+    # `bundle_revised` facts before it (missing, out of range, or merely a
+    # value that LOOKS like a real one) matches no `e` in the loop below and
+    # is invisible to every hand-back check -- including "one hand-back per
+    # bundle", and including the fifth line's own superseded-epoch skip,
+    # which is exactly the epoch a hand-back stamped one back would be
+    # misread as belonging to. `front.epoch_of` is the same derivation
+    # assertion 4 now uses for its own facts.
     for f in store.facts_of_kind(run_id, EventKind.RESHAPE_REQUESTED):
         ep = f.payload.get("epoch")
-        if not (isinstance(ep, int) and 0 <= ep <= n):
-            fails.append(f"reshape_requested {f.id} stamped epoch {ep!r}, not one of this run's epochs "
-                         f"(0..{n}): invisible to every hand-back check")
+        derived = front.epoch_of(store, run_id, f.seq)
+        if ep != derived:
+            fails.append(f"reshape_requested {f.id} stamped epoch {ep!r}, but the journal's own count of "
+                         f"bundle_revised facts before it gives epoch {derived}: invisible to every hand-back check")
     for e in range(n + 1):
         hbs = front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, e)
         if not hbs:
@@ -704,7 +748,7 @@ def assert_dispute(store, run_id: str) -> list[str]:
             fails.append(f"epoch {e}: the hand-back is unanswered -- a disputed ruling with no resolution")
             continue
         between = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
-                   if f.payload.get("epoch") == e and f.payload["phase"] == "spec"
+                   if f.payload.get("epoch") == e and f.payload.get("phase") == "spec"
                    and d.disputed.seq < f.seq < d.resolution.seq]
         if between:
             fails.append(f"epoch {e}: a spec was submitted between the disputed ruling and the resolution")
