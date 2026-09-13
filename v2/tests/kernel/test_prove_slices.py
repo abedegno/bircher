@@ -743,3 +743,151 @@ def test_the_fifth_line_reds_on_a_spec_after_an_unresolved_ruling(planted):
 def test_the_fifth_line_reds_on_a_direction_before_the_disputed_ruling(planted):
     s, run = planted.direction_before_the_disputed_ruling()
     assert any("unanswered" in x for x in prove.assert_dispute(s, run))
+
+
+# -- Fix round 1: B1 (out-of-range visit stamps), M1 (clause (c) is an
+#    iff, not an XOR), B2 (main's assert_dispute wiring), L1
+#    (reshape_requested with no epoch), L4 (exactly one approval per gate) -
+
+
+def test_assertion_4_reds_on_a_ruling_stamped_outside_the_epochs_visits(tmp_path):
+    """Round 1, B1: a fact's own `visit` stamp was invisible to every
+    per-visit read once it lay outside `range(1, last+1)`, `last` being the
+    epoch's real visit count -- clause (c)'s `visit=last` included, which
+    lost the epoch-wide residual the pre-Task-10 code had. Built on the
+    plain sliced-parent fixture (no hand-back at all, last visit 1): a shape
+    ruling forged beside the accepted, filed plan, stamped one visit PAST
+    the epoch's last. Before this fix, `assert_slices`, `assert_dispute` and
+    `assert_journal` all read this run as clean (the reviewer's probe G4)."""
+    s, f = _parent(tmp_path)
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged one past the last visit", "cost_if_wrong": "n/a", "visit": 2})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
+    assert any("outside the epoch" in x for x in fails), fails
+
+
+def test_assertion_4_the_out_of_range_control_at_the_real_visit(tmp_path):
+    """The control for the test above: the SAME forged ruling, stamped at
+    the epoch's real (only) visit, is caught by the pre-existing clause (b)
+    message instead -- proof the new guard is doing new work, not the
+    existing check's job."""
+    s, f = _parent(tmp_path)
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged at the real visit", "cost_if_wrong": "n/a", "visit": 1})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
+    assert any("beside the accepted slice plan" in x for x in fails), fails
+    assert not any("outside the epoch" in x for x in fails), fails
+
+
+def test_assertion_4_reds_on_a_submission_stamped_outside_the_epochs_visits(tmp_path):
+    """Round 1, B1's second instance, clause (b): a one-piece run (last
+    visit 1) with a `slices` submission forged AFTER the ruling, stamped a
+    visit far past the last -- clause (b)'s `submissions(..., visit=v)`
+    never asks for that v, so the submission was invisible before this fix
+    (the reviewer's probe G2)."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)     # birth: one-piece ruling, visit 1
+    h = put_artifact(s, SLICES_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": 7})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
+    assert any("outside the epoch" in x for x in fails), fails
+
+
+def test_assertion_4_the_out_of_range_control_for_a_submission(tmp_path):
+    """The control: the identical forged submission at the real visit gets
+    the pre-existing "submitted after the shape ruling" message (the
+    reviewer's probe G3)."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)
+    h = put_artifact(s, SLICES_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": 1})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
+    assert any("submitted after the shape ruling" in x for x in fails), fails
+    assert not any("outside the epoch" in x for x in fails), fails
+
+
+def test_assertion_4_clause_c_reds_when_the_last_visit_decided_nothing_but_the_epoch_filed(tmp_path):
+    """Round 1, M1: clause (c) implemented "a ruling is absent" (an XOR)
+    where §6 asks "that visit's decision IS the accepted submission" (an
+    iff). A last visit that decided NOTHING -- opened by a second, forged
+    hand-back recorded after the real filing -- with a filing left over
+    from an earlier visit must fail; the old code, asking only "is there a
+    ruling in the last visit", passed it (the reviewer's probe E16)."""
+    s, run = _Planted(tmp_path).hand_back_then_sliced()
+    f = Front(s, run, existing=True)
+    n = f.epoch()
+    v = front.shaping_visit(s, run, n)
+    # One hand-back per bundle is the kernel's own guard; a second is
+    # forged, exactly as the fifth-line tests above forge one to open a
+    # boundary no real command could open here.
+    s.append_fact(run_id=run, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
+                  payload={"epoch": n, "visit": v + 1, "reasoning": "forged: a third visit that decides nothing"})
+    fails = prove.assert_slices(s, run, repo=REPO, gh_json=GH(s, f))
+    assert any("the last visit's decision must be the accepted submission" in x for x in fails), fails
+
+
+def test_the_fifth_line_reds_on_a_reshape_requested_missing_its_epoch(tmp_path):
+    """Round 1, L1: `epoch_facts` (and `front.dispute`) key on
+    `payload["epoch"]`; a reshape_requested that never carries one matches
+    no epoch in the per-epoch loop and was invisible to every check there --
+    caught directly instead."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    s.append_fact(run_id=f.run_id, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
+                  payload={"visit": 2, "reasoning": "forged with no epoch key"})
+    assert any("carries no epoch" in x for x in prove.assert_dispute(s, f.run_id))
+
+
+def test_main_proves_the_parent_hand_back_through_assert_dispute(tmp_path, monkeypatch, capsys):
+    """Round 1, B2: `assert_dispute`'s TOP-level wiring into `main` --
+    deleting either call site left the whole suite green. A run with an
+    unanswered hand-back must fail through `main` with no `--children` at
+    all."""
+    _no_network(monkeypatch)
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.request_reshape("three parts")
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("unanswered" in x for x in out.err.splitlines())
+
+
+def test_main_children_proves_each_childs_hand_back_through_assert_dispute(tmp_path, monkeypatch, capsys):
+    """Round 1, B2's other call site: a child run with an unanswered
+    hand-back of its own must fail `main --children`, even though the
+    PARENT's own history is entirely clean -- the reviewer's own live drive
+    showed a child can carry a full unresolved dispute (refused
+    `submit_slices` by the slice-not-sliceable guard, ruled one piece,
+    `request_reshape` accepted from `queued`)."""
+    _no_network(monkeypatch)
+    s, f = _parent(tmp_path)
+    monkeypatch.setattr("coordinator.sweep.gh_json", GH(s, f))
+    child_issue = {"number": 40, "title": "The store", "body": "b", "labels": ["bircher:autonomous"], "comments": []}
+    Front(s, "i40-x-1", issue=child_issue).request_reshape("reconsider the split")
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x",
+                      "--repo", "o/r", "--children"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("child #40" in x and "unanswered" in x for x in out.err.splitlines())
+
+
+def test_approval_mode_reds_on_a_second_approval_at_the_same_gate(tmp_path):
+    """Round 1, L4: §6 says "exactly one human_ruling {approve} at it ...
+    beside the spec gate's" -- one approval per gate. Revision 16 widened
+    the approval filter's admitted set without adding a count. A second
+    `approve` at the SAME (phase, epoch) is kernel-refused once the phase
+    has already advanced past it, so forged directly."""
+    s = _store_with_confirmed_stops(tmp_path / "b.db")
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES)
+    _accept(f)
+    f.approve()
+    s.append_fact(run_id="r-1", kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={"ruling": "approve", "phase": "spec", "epoch": 0,
+                           "artifact_hash": s.phase_artifact("r-1", "spec"), "cursor_item_id": "i-h2"})
+    assert any("more than one approval" in x for x in prove.assert_journal(s, "r-1", mode="approval"))

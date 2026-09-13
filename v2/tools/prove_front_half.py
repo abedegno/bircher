@@ -24,6 +24,8 @@ was stopped exactly once, not left open or stopped twice over.
 from __future__ import annotations
 
 import argparse
+import collections
+import functools
 import json
 import sys
 
@@ -51,22 +53,20 @@ HUMAN = {EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING, EventKind.PARKED,
 MODES = ("zero", "approval", "human")
 
 
-def _human_ruling_payload_keys(source: str | None = None) -> dict[str, set[str]]:
-    """Every `human_ruling` fact `kernel/commands.py` can write, as the
-    ruling word mapped to the literal keys ITS payload dict declares --
-    walked from the SOURCE (an AST, not a run), so a fifth ruling word is
-    discovered the day it is added to the kernel, not the day someone
-    remembers to update a list here (Task 10, the controller amendment).
-
-    *source* is for a test to substitute a snippet standing in for a
-    regression; `assert_journal` always calls this with none, reading the
-    real module."""
+def _parse_human_ruling_payload_keys(source: str) -> tuple[dict[str, set[str]], list[int]]:
+    """The AST walk, pure over a source string: every `human_ruling` fact's
+    ruling word mapped to the literal keys ITS payload dict declares, and
+    the line number of every `human_ruling`-kind `append_fact` call whose
+    `payload` this walk could NOT read at all -- a variable, a `**spread`,
+    or a dict built above the call, rather than a literal (round 1, L3). The
+    first version of this walk skipped such a call in total silence, which
+    is the same shape of miss the controller amendment exists to close: the
+    one branch built to catch an undocumented ruling word never fires for a
+    payload it cannot see, so a fifth word written this way would still slip
+    through, just one step further back than `approve_one_piece` did."""
     import ast
-    import inspect
-    if source is None:
-        from kernel import commands as _commands
-        source = inspect.getsource(_commands)
     out: dict[str, set[str]] = {}
+    opaque: list[int] = []
     for node in ast.walk(ast.parse(source)):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "append_fact"):
@@ -77,6 +77,7 @@ def _human_ruling_payload_keys(source: str | None = None) -> dict[str, set[str]]
             continue
         payload = kw.get("payload")
         if not isinstance(payload, ast.Dict):
+            opaque.append(getattr(node, "lineno", -1))
             continue
         keys = {k.value for k in payload.keys if isinstance(k, ast.Constant)}
         word = next((v.value for k, v in zip(payload.keys, payload.values)
@@ -84,7 +85,34 @@ def _human_ruling_payload_keys(source: str | None = None) -> dict[str, set[str]]
                     None)
         if word is not None:
             out[word] = keys
-    return out
+    return out, opaque
+
+
+@functools.lru_cache(maxsize=1)
+def _real_human_ruling_payload_keys() -> tuple[dict[str, set[str]], list[int]]:
+    """The real module's read, cached (round 1, nit): `assert_journal` calls
+    this once per run and once per child under `--children`, and
+    `kernel/commands.py`'s source does not change within one process."""
+    import inspect
+    from kernel import commands as _commands
+    return _parse_human_ruling_payload_keys(inspect.getsource(_commands))
+
+
+def _human_ruling_payload_keys(source: str | None = None) -> tuple[dict[str, set[str]], list[int]]:
+    """Every `human_ruling` fact `kernel/commands.py` can write, as the
+    ruling word mapped to the literal keys ITS payload dict declares, paired
+    with the line numbers of any `human_ruling` write this walk could not
+    read at all -- walked from the SOURCE (an AST, not a run), so a fifth
+    ruling word is discovered the day it is added to the kernel, not the day
+    someone remembers to update a list here (Task 10, the controller
+    amendment).
+
+    *source* is for a test to substitute a snippet standing in for a
+    regression; `assert_journal` always calls this with none, reading the
+    real module (cached)."""
+    if source is not None:
+        return _parse_human_ruling_payload_keys(source)
+    return _real_human_ruling_payload_keys()
 
 
 #: Task 10 controller amendment. Task 4 shipped `approve_one_piece`'s
@@ -94,15 +122,19 @@ def _human_ruling_payload_keys(source: str | None = None) -> dict[str, set[str]]
 #: went red; the proof would simply have read a shorter watermark on the
 #: first live run that recorded one. The fix is in `commands.py`; this is
 #: the regression guard for the next one -- the keys the shaping spec's §2
-#: Facts table lists for each ruling word it documents (`approve` "as
-#: today"; `approve_one_piece` new in revision 16), and for the two ruling
-#: words that table does not carry at all (`grant_round`,
-#: `request_revision` -- pre-existing, from an earlier document), the keys
-#: `commands.py` already writes for them, standing in for a Facts table this
-#: design does not own. The WORDS this is checked against are never typed
-#: out a second time: `_human_ruling_payload_keys` walks them from
-#: `commands.py` itself, so a fifth word with no entry below fails on its
-#: own account rather than silently never being checked.
+#: Facts table lists for `approve_one_piece`, new in revision 16. The other
+#: three words are not new, and the table only says `approve` is "as today"
+#: without enumerating it, and does not carry `grant_round` or
+#: `request_revision` at all -- but `docs/design/provenance-table.md`'s
+#: "Caller-presented" and "Asserted" tables document `cursor_item_id` for
+#: `approve_artifact`, `grant_round` and the human's own `record_review`,
+#: and `artifact_hash` for `record_review` (round 1, L2), so those come from
+#: there rather than from `commands.py` itself; only `grant_round`'s
+#: `park_seq` has no design source anywhere and is read from the code. The
+#: WORDS this is checked against are never typed out a second time:
+#: `_human_ruling_payload_keys` walks them from `commands.py` itself, so a
+#: fifth word with no entry below fails on its own account rather than
+#: silently never being checked.
 HUMAN_RULING_KEYS = {
     "approve": {"ruling", "phase", "epoch", "artifact_hash", "cursor_item_id"},
     "grant_round": {"ruling", "phase", "epoch", "park_seq", "cursor_item_id"},
@@ -140,6 +172,19 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         )]
         if extra:
             fails.append(f"human facts beyond the approval: {[f.kind for f in extra]}")
+        # §6: "exactly one human_ruling {approve} at it ... beside the spec
+        # gate's" -- one approval per GATE reached, not a bound on the run
+        # (a fully gated one-piece run legitimately carries one at the spec
+        # gate and another at the plan gate). Revision 16 widened the
+        # admitted ruling words without adding a count (round 1, L4);
+        # grouped by the (phase, epoch) the ruling names, since that is what
+        # "a gate" means to a fact that carries no gate id of its own.
+        approvals = [f for f in human if f.kind == EventKind.HUMAN_RULING
+                     and f.payload.get("ruling") in ("approve", "approve_one_piece")]
+        by_gate = collections.Counter((f.payload.get("phase"), f.payload.get("epoch")) for f in approvals)
+        dup_gates = {k: v for k, v in by_gate.items() if v > 1}
+        if dup_gates:
+            fails.append(f"more than one approval at the same gate: {dup_gates}")
     # mode == "human" admits every human fact; everything below still runs.
 
     # Controller amendment (Task 10): commands.py's OWN human_ruling payload
@@ -150,7 +195,13 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     # just a run that happens to hold a human_ruling fact: a fifth ruling
     # word with a broken payload is a defect whether or not this particular
     # run ever recorded it.
-    for word, keys in _human_ruling_payload_keys().items():
+    ruling_keys, opaque_lines = _human_ruling_payload_keys()
+    if opaque_lines:
+        fails.append(
+            f"commands.py writes a human_ruling fact whose payload this proof cannot read "
+            f"statically (line(s) {opaque_lines}): the controller amendment's check does not cover it"
+        )
+    for word, keys in ruling_keys.items():
         want = HUMAN_RULING_KEYS.get(word)
         if want is None:
             fails.append(
@@ -188,9 +239,14 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # resubmission race). A one-piece run resolved by approve_one_piece
         # keeps the one-piece rule below, because it is not a sliced parent.
         allowed = {"slices"} if hb is None else {"slices", "spec"}
+        # No hb: `hb_seq` is -1, so every spec submission counts as "late" --
+        # harmlessly, since `allowed` already excludes "spec" and any spec
+        # submission trips `set(subs) - allowed` on its own (round 1 nit:
+        # the old `and hb is not None` conjunct read as load-bearing here,
+        # when the outer branch already made it so).
+        hb_seq = hb.seq if hb is not None else -1
         late_spec = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
-                     if f.payload.get("epoch") == n and f.payload["phase"] == "spec"
-                     and hb is not None and f.seq > hb.seq]
+                     if f.payload.get("epoch") == n and f.payload["phase"] == "spec" and f.seq > hb_seq]
         if set(subs) - allowed or "slices" not in subs or late_spec \
                 or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
             fails.append(f"artifact_submitted: a sliced parent's final epoch submits the accepted slice plan "
@@ -433,7 +489,6 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
     with the remaining children and assertions. A read that fails cannot
     satisfy its own assertion, so the failure line stands in for it -- no
     further check is attempted for that same read."""
-    import collections
     from coordinator.sweep import ReadFailed
     from kernel import slices
     fails: list[str] = []
@@ -500,11 +555,44 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             fails.append(f"slice_filed in epoch {f.payload.get('epoch')}, outside the final epoch {n}")
 
     accepted_h = front.accepted_slices_hash(store, run_id, n)
+
+    def _decision_at(e: int, v: int):
+        """The visit's own decision, per clause (b): its shape ruling (or
+        None), and the submission the acceptance actually followed (empty
+        if none). Shared by clauses (b) and (c) so "the last visit's
+        decision" means exactly the same thing in both places (round 1,
+        M1)."""
+        ruling = front.shape_ruling(store, run_id, e, visit=v)
+        subs_v = front.submissions(store, run_id, "slices", e, visit=v)
+        acc_v = front.newest_review_verdict(store, run_id, "slices", e, visit=v)
+        accepted = [x for x in subs_v
+                    if e == n and x.payload["hash"] == accepted_h
+                    and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
+        return ruling, subs_v, accepted
+
     for e in range(n + 1):
         last = front.shaping_visit(store, run_id, e)
+        # Round 1, B1: a fact's own `visit` stamp is bounded by construction
+        # -- `shaping_visit` only grows as the epoch's own boundaries are
+        # recorded, so no fact a real command wrote can carry a stamp
+        # outside [1, last]. The per-visit loop below only ever asks for a
+        # v in that range, so a stamp past it -- a shape ruling one past the
+        # epoch's last visit, or a slices submission at an arbitrary visit
+        # -- was invisible to every read here AND to clause (c)'s
+        # `visit=last`, which is exactly the coverage the pre-revision,
+        # epoch-wide code had and this task's rewrite lost. Named directly,
+        # as its own defect, rather than folded into a wider range: an
+        # impossible stamp is not a visit this loop should trust enough to
+        # read from.
+        stamped = ([f for f in front.epoch_facts(store, run_id, EventKind.MODEL_RULING, e)
+                    if f.payload.get("question_id") == slices.SHAPE_QUESTION]
+                   + front.submissions(store, run_id, "slices", e))
+        for f in stamped:
+            v = f.payload.get("visit")
+            if v is not None and not (1 <= v <= last):
+                fails.append(f"epoch {e}: {f.kind} stamped visit {v}, outside the epoch's {last} counted visit(s)")
         for v in range(1, last + 1):
-            ruling = front.shape_ruling(store, run_id, e, visit=v)
-            subs_v = front.submissions(store, run_id, "slices", e, visit=v)
+            ruling, subs_v, accepted = _decision_at(e, v)
             # (b) At most one decision per visit: the ruling, or the
             #     submission the acceptance actually followed. Rejected
             #     submissions BEFORE a ruling in the same visit are
@@ -514,10 +602,6 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             #     not by hash equality alone: a plan rejected in visit 1 and
             #     resubmitted in visit 2 leaves the accepted hash sitting in
             #     BOTH visits, and hash equality alone would double-count it.
-            acc_v = front.newest_review_verdict(store, run_id, "slices", e, visit=v)
-            accepted = [x for x in subs_v
-                        if e == n and x.payload["hash"] == accepted_h
-                        and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
             if ruling is not None and accepted:
                 fails.append(f"epoch {e} visit {v}: a shape ruling beside the accepted slice plan "
                              "(one decision per visit)")
@@ -525,15 +609,26 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
                 fails.append(f"epoch {e} visit {v}: a slice plan was submitted after the shape ruling "
                              "(one decision per visit)")
     # (c) In the final epoch the LAST visit's decision matches the outcome:
-    #     a slice_filed exists iff that visit's decision is the accepted
-    #     submission, and none exists iff it is a ruling. A ruling in an
-    #     EARLIER visit beside a filing in the last is legal -- it is the
-    #     hand-back resolved by slicing, not a second decision in one visit.
+    #     a slice_filed exists iff that visit's decision is the ACCEPTED
+    #     SUBMISSION, and none exists iff it is a ruling (round 1, M1: not
+    #     merely "no ruling is present", which a filing left over from an
+    #     EARLIER visit already satisfies whether or not the last visit
+    #     decided anything at all -- clause (b)'s own `accepted` is what
+    #     "the accepted submission" means, reused here at v=last). A ruling
+    #     in an earlier visit beside a filing in the last is legal -- it is
+    #     the hand-back resolved by slicing, not a second decision in one
+    #     visit.
     last = front.shaping_visit(store, run_id, n)
-    decided_by_ruling = front.shape_ruling(store, run_id, n, visit=last) is not None
-    if decided_by_ruling == bool(filed):
-        fails.append(f"final epoch {n} visit {last}: the last visit's decision is a slice_filed or a "
-                     "shape ruling, not both and not neither")
+    ruling, _subs_last, accepted = _decision_at(n, last)
+    decided_by_ruling = ruling is not None
+    decided_by_submission = bool(accepted)
+    if bool(filed) != decided_by_submission:
+        fails.append(f"final epoch {n} visit {last}: the last visit's decision must be the accepted "
+                     f"submission whenever a slice_filed exists (filed={bool(filed)}, "
+                     f"decided_by_submission={decided_by_submission})")
+    if (not filed) != decided_by_ruling:
+        fails.append(f"final epoch {n} visit {last}: the last visit's decision must be a shape ruling "
+                     f"whenever no slice_filed exists (filed={bool(filed)}, decided_by_ruling={decided_by_ruling})")
     return fails
 
 
@@ -554,6 +649,14 @@ def assert_dispute(store, run_id: str) -> list[str]:
     lose."""
     fails: list[str] = []
     n = front.epoch(store, run_id)
+    # Round 1, L1: `epoch_facts` (and `front.dispute`) key on
+    # `payload["epoch"]` -- a reshape_requested missing that key matches no
+    # `e` in the loop below at all, the same way an out-of-range `visit`
+    # stamp was invisible to assertion 4 (B1). The §2 Facts table requires
+    # `epoch`; named here directly rather than trusted to the per-epoch scan.
+    for f in store.facts_of_kind(run_id, EventKind.RESHAPE_REQUESTED):
+        if f.payload.get("epoch") is None:
+            fails.append(f"reshape_requested {f.id} carries no epoch: invisible to every hand-back check")
     for e in range(n + 1):
         hbs = front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, e)
         if not hbs:

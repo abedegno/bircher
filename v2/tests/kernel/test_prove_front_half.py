@@ -412,11 +412,14 @@ def test_reshape_requested_joins_the_turn_ordering_check(tmp_path):
 def test_the_controller_check_passes_the_real_commands_module():
     """The pass case for the Task 10 controller amendment: every ruling word
     `commands.py` actually writes today carries at least the keys
-    `prove.HUMAN_RULING_KEYS` says the spec's Facts table (and, for the two
-    words that table does not carry, the code itself) requires of it. No run
-    needed -- the check reads `commands.py`'s source, not a journal."""
-    found = prove._human_ruling_payload_keys()
+    `prove.HUMAN_RULING_KEYS` says the spec's Facts table -- or, for the
+    entries the table does not carry, `docs/design/provenance-table.md` and
+    the code itself (round 1, L2) -- requires of it, and the walk reads
+    every such call statically (no opaque payload). No run needed -- the
+    check reads `commands.py`'s source, not a journal."""
+    found, opaque = prove._human_ruling_payload_keys()
     assert found  # the walk actually found the four branches, not an empty AST
+    assert opaque == []
     for word, want in prove.HUMAN_RULING_KEYS.items():
         assert word in found, f"commands.py no longer writes ruling word {word!r}"
         assert want <= found[word], f"{word!r}: commands.py carries {sorted(found[word])}, want {sorted(want)}"
@@ -440,9 +443,9 @@ def test_the_controller_check_reds_when_a_ruling_drops_a_required_key(tmp_path, 
     _review_round_with_real_brief(f)
     assert prove.assert_journal(s, "r-1", mode="zero") == []      # the baseline: clean today
 
-    real = prove._human_ruling_payload_keys()
+    real, opaque = prove._human_ruling_payload_keys()
     broken = {**real, "approve_one_piece": real["approve_one_piece"] - {"cursor_item_id"}}
-    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: broken)
+    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: (broken, opaque))
     fails = prove.assert_journal(s, "r-1", mode="zero")
     assert any("approve_one_piece" in x and "cursor_item_id" in x for x in fails), fails
 
@@ -464,9 +467,9 @@ def test_the_controller_check_reds_on_a_ruling_word_with_no_required_key_entry(t
     _review_round_with_real_brief(f)
     assert prove.assert_journal(s, "r-1", mode="zero") == []      # the baseline: clean today
 
-    real = prove._human_ruling_payload_keys()
+    real, opaque = prove._human_ruling_payload_keys()
     broken = {**real, "approve_two_pieces": {"ruling", "phase", "epoch"}}
-    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: broken)
+    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: (broken, opaque))
     fails = prove.assert_journal(s, "r-1", mode="zero")
     assert any("approve_two_pieces" in x and "no required-key entry" in x for x in fails), fails
 
@@ -491,7 +494,41 @@ def _side_fact(store, cmd, actor):
             payload={"ruling": "review_ruling", "phase": phase},
         )
 '''
-    found = prove._human_ruling_payload_keys(source=snippet)
+    found, opaque = prove._human_ruling_payload_keys(source=snippet)
     # Only the HUMAN_RULING branch is walked -- the review_ruling literal,
     # under kind=EventKind.REVIEW_VERDICT, is not a human_ruling word at all.
     assert found == {"approve": {"ruling", "phase", "epoch"}}
+    assert opaque == []
+
+
+def test_human_ruling_payload_keys_flags_a_payload_it_cannot_read_statically(tmp_path, monkeypatch):
+    """Round 1, L3: a `human_ruling` write whose `payload` is not a literal
+    dict -- a variable, here -- used to be skipped in total silence, the
+    same shape of miss the whole controller amendment exists to close. The
+    line is now collected as `opaque` and `assert_journal` fails on it
+    directly, rather than reading nothing and reporting nothing."""
+    snippet = '''
+def _side_fact(store, cmd, actor):
+    if cmd.name == "approve_artifact":
+        p = build_payload(cmd)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload=p,
+        )
+'''
+    found, opaque = prove._human_ruling_payload_keys(source=snippet)
+    assert found == {}
+    assert opaque == [5]
+
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    _review_round_with_real_brief(f)
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    assert prove.assert_journal(s, "r-1", mode="zero") == []      # the baseline: clean today
+    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: ({}, [5]))
+    fails = prove.assert_journal(s, "r-1", mode="zero")
+    assert any("cannot read" in x and "line(s) [5]" in x for x in fails), fails
