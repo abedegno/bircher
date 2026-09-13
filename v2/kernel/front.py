@@ -85,6 +85,24 @@ def bundle_hash(store, run_id: str) -> str | None:
     return None if enq is None else enq.payload.get("bundle_hash")
 
 
+def visit_stamp_of(store, run_id: str, f) -> int | None:
+    """The visit *f* belongs to, by the ONE rule (shaping spec §6): "by the
+    `visit` it carries, or ... by `front.visit_of`, the prefix walk" -- for
+    a fact that carries no stamp at all. A stamp of `None` is the fact's own
+    claim, not silence to fall back from: `submissions` used to spell this
+    fallback as `payload.get("visit", visit_of(...))` (the default fires
+    only when the KEY is absent) and `shape_ruling` as
+    `payload.get("visit") or visit_of(...)` (`or` treats a `None` VALUE the
+    same as an absent key) -- two readers of the same stamp disagreeing
+    about what an explicit `None` means is how a `slices` submission stamped
+    `visit: None` passed every check in this file (round 2, B5). One
+    definition now; a caller comparing the result to a wanted visit gets
+    `None` back for a `None` stamp, which correctly matches nothing."""
+    if "visit" in f.payload:
+        return f.payload["visit"]
+    return visit_of(store, run_id, f.seq)
+
+
 def submissions(store, run_id: str, phase: str, epoch_n: int, visit: int | None = None) -> list:
     """The phase's submissions in the epoch, newest last.
 
@@ -97,7 +115,7 @@ def submissions(store, run_id: str, phase: str, epoch_n: int, visit: int | None 
            if f.payload.get("phase") == phase and f.payload.get("epoch") == epoch_n]
     if visit is None:
         return out
-    return [f for f in out if f.payload.get("visit", visit_of(store, run_id, f.seq)) == visit]
+    return [f for f in out if visit_stamp_of(store, run_id, f) == visit]
 
 
 def newest_submission(store, run_id: str, phase: str, epoch_n: int, visit: int | None = None):
@@ -307,7 +325,7 @@ def shape_ruling(store, run_id: str, epoch_n: int, visit: int | None = None):
     for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, epoch_n):
         if f.payload.get("question_id") != SHAPE_QUESTION:
             continue
-        if visit is not None and (f.payload.get("visit") or visit_of(store, run_id, f.seq)) != visit:
+        if visit is not None and visit_stamp_of(store, run_id, f) != visit:
             continue
         found = f
     return found

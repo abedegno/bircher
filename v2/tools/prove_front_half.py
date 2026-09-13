@@ -239,14 +239,16 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # resubmission race). A one-piece run resolved by approve_one_piece
         # keeps the one-piece rule below, because it is not a sliced parent.
         allowed = {"slices"} if hb is None else {"slices", "spec"}
-        # No hb: `hb_seq` is -1, so every spec submission counts as "late" --
-        # harmlessly, since `allowed` already excludes "spec" and any spec
-        # submission trips `set(subs) - allowed` on its own (round 1 nit:
-        # the old `and hb is not None` conjunct read as load-bearing here,
-        # when the outer branch already made it so).
-        hb_seq = hb.seq if hb is not None else -1
-        late_spec = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
-                     if f.payload.get("epoch") == n and f.payload["phase"] == "spec" and f.seq > hb_seq]
+        # No hb: "late" is undefined and moot, since `allowed` already
+        # excludes "spec" outright and any spec submission trips
+        # `set(subs) - allowed` on its own below (round 1's `and hb is not
+        # None` conjunct, and round 2's `hb_seq` sentinel that replaced it,
+        # both read as load-bearing when neither ever changed the outcome --
+        # this `[]` says the same thing without a value to argue is dead).
+        late_spec = [] if hb is None else [
+            f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+            if f.payload.get("epoch") == n and f.payload["phase"] == "spec" and f.seq > hb.seq
+        ]
         if set(subs) - allowed or "slices" not in subs or late_spec \
                 or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
             fails.append(f"artifact_submitted: a sliced parent's final epoch submits the accepted slice plan "
@@ -570,27 +572,48 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
                     and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
         return ruling, subs_v, accepted
 
+    # Round 2, B4: every reader in this function keys on `payload["epoch"]`
+    # (`front.epoch_facts`, `front.submissions`, `front.shape_ruling` all
+    # filter `== e` for `e` drawn from `range(n + 1)`), so a fact stamped an
+    # epoch this run never reached -- or no epoch at all, or a value that
+    # merely LOOKS equal to a real one (a string "0" is never `== 0`, but a
+    # bad int like 99 or -1 slips past every filter unnoticed) -- sits in NO
+    # epoch's list and is read by nothing. Checked directly, over every
+    # shape ruling and slices submission in the WHOLE run, not scoped to any
+    # single `e` this loop already trusts.
+    all_shape_rulings = [f for f in store.facts_of_kind(run_id, EventKind.MODEL_RULING)
+                         if f.payload.get("question_id") == slices.SHAPE_QUESTION]
+    all_slices_subs = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+                       if f.payload.get("phase") == "slices"]
+    for f in all_shape_rulings + all_slices_subs:
+        ep = f.payload.get("epoch")
+        if not (isinstance(ep, int) and 0 <= ep <= n):
+            fails.append(f"{f.kind} (seq {f.seq}) stamped epoch {ep!r}, not one of this run's epochs (0..{n})")
+
     for e in range(n + 1):
         last = front.shaping_visit(store, run_id, e)
-        # Round 1, B1: a fact's own `visit` stamp is bounded by construction
-        # -- `shaping_visit` only grows as the epoch's own boundaries are
-        # recorded, so no fact a real command wrote can carry a stamp
-        # outside [1, last]. The per-visit loop below only ever asks for a
-        # v in that range, so a stamp past it -- a shape ruling one past the
-        # epoch's last visit, or a slices submission at an arbitrary visit
-        # -- was invisible to every read here AND to clause (c)'s
-        # `visit=last`, which is exactly the coverage the pre-revision,
-        # epoch-wide code had and this task's rewrite lost. Named directly,
-        # as its own defect, rather than folded into a wider range: an
-        # impossible stamp is not a visit this loop should trust enough to
-        # read from.
+        # Round 1, B1 / round 2, B3 and B5: the proof used to trust a
+        # fact's `visit` stamp on its own -- first only checking it fell in
+        # [1, last] (round 1), which an IN-RANGE but WRONG stamp still
+        # passed (a ruling truly written in visit 3, forged to visit 2,
+        # where visit 2 already holds a decision of its own to hide
+        # behind), and which a stamp of `None` skipped by construction (the
+        # `is not None` guard). The one ground truth §6 names is
+        # `front.visit_of`'s prefix walk ("by the visit it carries, or ...
+        # by front.visit_of"); a stamp that disagrees with it is a defect in
+        # its own right, compared by `!=` so a stamp of the wrong TYPE
+        # (a string) fails the comparison instead of crashing a `<=` the
+        # way the round-1 range check did.
         stamped = ([f for f in front.epoch_facts(store, run_id, EventKind.MODEL_RULING, e)
                     if f.payload.get("question_id") == slices.SHAPE_QUESTION]
                    + front.submissions(store, run_id, "slices", e))
         for f in stamped:
-            v = f.payload.get("visit")
-            if v is not None and not (1 <= v <= last):
-                fails.append(f"epoch {e}: {f.kind} stamped visit {v}, outside the epoch's {last} counted visit(s)")
+            if "visit" not in f.payload:
+                continue  # no stamp at all: the prefix walk is simply the answer, not a claim to check
+            walked = front.visit_of(store, run_id, f.seq)
+            if f.payload["visit"] != walked:
+                fails.append(f"epoch {e}: {f.kind} (seq {f.seq}) stamped visit {f.payload['visit']!r}, but "
+                             f"the journal's own prefix walk attributes it to visit {walked}")
         for v in range(1, last + 1):
             ruling, subs_v, accepted = _decision_at(e, v)
             # (b) At most one decision per visit: the ruling, or the
@@ -649,14 +672,19 @@ def assert_dispute(store, run_id: str) -> list[str]:
     lose."""
     fails: list[str] = []
     n = front.epoch(store, run_id)
-    # Round 1, L1: `epoch_facts` (and `front.dispute`) key on
-    # `payload["epoch"]` -- a reshape_requested missing that key matches no
-    # `e` in the loop below at all, the same way an out-of-range `visit`
-    # stamp was invisible to assertion 4 (B1). The §2 Facts table requires
-    # `epoch`; named here directly rather than trusted to the per-epoch scan.
+    # Round 1, L1 / round 2, B4: `epoch_facts` (and `front.dispute`) key on
+    # `payload["epoch"]` -- a reshape_requested missing that key, or one
+    # bearing an epoch this run never reached (an int outside [0, n], or any
+    # non-int value at all -- a string never equals the int an epoch_facts
+    # filter compares against), matches no `e` in the loop below and is
+    # invisible to every hand-back check. L1 caught only the missing-key
+    # spelling of this; checked directly here for the whole shape, the same
+    # way assertion 4 checks its own facts' epochs above.
     for f in store.facts_of_kind(run_id, EventKind.RESHAPE_REQUESTED):
-        if f.payload.get("epoch") is None:
-            fails.append(f"reshape_requested {f.id} carries no epoch: invisible to every hand-back check")
+        ep = f.payload.get("epoch")
+        if not (isinstance(ep, int) and 0 <= ep <= n):
+            fails.append(f"reshape_requested {f.id} stamped epoch {ep!r}, not one of this run's epochs "
+                         f"(0..{n}): invisible to every hand-back check")
     for e in range(n + 1):
         hbs = front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, e)
         if not hbs:

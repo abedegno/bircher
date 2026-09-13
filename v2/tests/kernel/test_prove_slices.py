@@ -751,55 +751,56 @@ def test_the_fifth_line_reds_on_a_direction_before_the_disputed_ruling(planted):
 
 
 def test_assertion_4_reds_on_a_ruling_stamped_outside_the_epochs_visits(tmp_path):
-    """Round 1, B1: a fact's own `visit` stamp was invisible to every
-    per-visit read once it lay outside `range(1, last+1)`, `last` being the
-    epoch's real visit count -- clause (c)'s `visit=last` included, which
-    lost the epoch-wide residual the pre-Task-10 code had. Built on the
-    plain sliced-parent fixture (no hand-back at all, last visit 1): a shape
-    ruling forged beside the accepted, filed plan, stamped one visit PAST
-    the epoch's last. Before this fix, `assert_slices`, `assert_dispute` and
+    """Round 1, B1 (generalized in round 2 to a stamp-vs-prefix-walk
+    comparison, B3/B4/B5): a fact's own `visit` stamp was invisible to every
+    per-visit read once it disagreed with `front.visit_of`'s prefix walk --
+    round 1 only checked it fell in `range(1, last+1)`, which an in-range
+    but WRONG stamp still passed. Built on the plain sliced-parent fixture
+    (no hand-back at all, last visit 1): a shape ruling forged beside the
+    accepted, filed plan, stamped one visit PAST the epoch's last -- the
+    walk attributes it to visit 1, same as everything else in this epoch.
+    Before round 1's fix, `assert_slices`, `assert_dispute` and
     `assert_journal` all read this run as clean (the reviewer's probe G4)."""
     s, f = _parent(tmp_path)
     s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
                   payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
                            "reasoning": "forged one past the last visit", "cost_if_wrong": "n/a", "visit": 2})
     fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
-    assert any("outside the epoch" in x for x in fails), fails
+    assert any("prefix walk attributes it to visit" in x for x in fails), fails
 
 
 def test_assertion_4_the_out_of_range_control_at_the_real_visit(tmp_path):
     """The control for the test above: the SAME forged ruling, stamped at
-    the epoch's real (only) visit, is caught by the pre-existing clause (b)
-    message instead -- proof the new guard is doing new work, not the
-    existing check's job."""
+    the epoch's real (only, and correctly-walked) visit, is caught by the
+    pre-existing clause (b) message instead -- proof the new guard is doing
+    new work, not the existing check's job."""
     s, f = _parent(tmp_path)
     s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
                   payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
                            "reasoning": "forged at the real visit", "cost_if_wrong": "n/a", "visit": 1})
     fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
     assert any("beside the accepted slice plan" in x for x in fails), fails
-    assert not any("outside the epoch" in x for x in fails), fails
+    assert not any("prefix walk attributes it to visit" in x for x in fails), fails
 
 
 def test_assertion_4_reds_on_a_submission_stamped_outside_the_epochs_visits(tmp_path):
-    """Round 1, B1's second instance, clause (b): a one-piece run (last
-    visit 1) with a `slices` submission forged AFTER the ruling, stamped a
-    visit far past the last -- clause (b)'s `submissions(..., visit=v)`
-    never asks for that v, so the submission was invisible before this fix
-    (the reviewer's probe G2)."""
+    """Round 1, B1's second instance (clause (b), generalized in round 2): a
+    one-piece run (last visit 1) with a `slices` submission forged AFTER the
+    ruling, stamped a visit far past the last -- the walk attributes it to
+    visit 1 like everything else here (the reviewer's probe G2)."""
     s = Store.open(tmp_path / "a.db")
     f = Front(s, "r-1", issue=ISSUE)     # birth: one-piece ruling, visit 1
     h = put_artifact(s, SLICES_BYTES)
     s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
                   payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": 7})
     fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
-    assert any("outside the epoch" in x for x in fails), fails
+    assert any("prefix walk attributes it to visit" in x for x in fails), fails
 
 
 def test_assertion_4_the_out_of_range_control_for_a_submission(tmp_path):
-    """The control: the identical forged submission at the real visit gets
-    the pre-existing "submitted after the shape ruling" message (the
-    reviewer's probe G3)."""
+    """The control: the identical forged submission at the real (and
+    correctly-walked) visit gets the pre-existing "submitted after the shape
+    ruling" message (the reviewer's probe G3)."""
     s = Store.open(tmp_path / "a.db")
     f = Front(s, "r-1", issue=ISSUE)
     h = put_artifact(s, SLICES_BYTES)
@@ -807,7 +808,7 @@ def test_assertion_4_the_out_of_range_control_for_a_submission(tmp_path):
                   payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": 1})
     fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
     assert any("submitted after the shape ruling" in x for x in fails), fails
-    assert not any("outside the epoch" in x for x in fails), fails
+    assert not any("prefix walk attributes it to visit" in x for x in fails), fails
 
 
 def test_assertion_4_clause_c_reds_when_the_last_visit_decided_nothing_but_the_epoch_filed(tmp_path):
@@ -831,15 +832,15 @@ def test_assertion_4_clause_c_reds_when_the_last_visit_decided_nothing_but_the_e
 
 
 def test_the_fifth_line_reds_on_a_reshape_requested_missing_its_epoch(tmp_path):
-    """Round 1, L1: `epoch_facts` (and `front.dispute`) key on
-    `payload["epoch"]`; a reshape_requested that never carries one matches
-    no epoch in the per-epoch loop and was invisible to every check there --
-    caught directly instead."""
+    """Round 1, L1 (generalized in round 2, B4): `epoch_facts` (and
+    `front.dispute`) key on `payload["epoch"]`; a reshape_requested that
+    never carries one matches no epoch in the per-epoch loop and was
+    invisible to every check there -- caught directly instead."""
     s = Store.open(tmp_path / "a.db")
     f = Front(s, "i12-epic-1", issue=ISSUE)
     s.append_fact(run_id=f.run_id, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
                   payload={"visit": 2, "reasoning": "forged with no epoch key"})
-    assert any("carries no epoch" in x for x in prove.assert_dispute(s, f.run_id))
+    assert any("not one of this run's epochs" in x for x in prove.assert_dispute(s, f.run_id))
 
 
 def test_main_proves_the_parent_hand_back_through_assert_dispute(tmp_path, monkeypatch, capsys):
@@ -891,3 +892,283 @@ def test_approval_mode_reds_on_a_second_approval_at_the_same_gate(tmp_path):
                   payload={"ruling": "approve", "phase": "spec", "epoch": 0,
                            "artifact_hash": s.phase_artifact("r-1", "spec"), "cursor_item_id": "i-h2"})
     assert any("more than one approval" in x for x in prove.assert_journal(s, "r-1", mode="approval"))
+
+
+# -- Fix round 2: B3 (a wrong-but-in-range visit stamp), B4 (a wrong or
+#    absent epoch stamp -- B1/L1's defect, one key over), B5 (a `visit:
+#    None` stamp read two ways by two readers), the crash a string `visit`
+#    caused, and four inert assertions round 1 left behind --------------
+
+
+def test_assertion_4_reds_on_a_ruling_stamped_an_in_range_but_wrong_visit(tmp_path):
+    """Round 2, B3: an IN-RANGE `visit` stamp that disagrees with the
+    journal's own order was invisible to round 1's out-of-range check,
+    which only asked whether the stamp fell in `[1, last]` --
+    `_Planted.ruled_then_directed_then_sliced`'s own docstring calls it "the
+    specific case visit=last exists to get right": visit 1 rules, visit 2
+    rules again (disputed), a direction resolves it and opens visit 3,
+    which files. A shape ruling forged AFTER the filing, stamped visit 2 --
+    an earlier, already-decided, real visit -- must fail: the walk
+    attributes it to visit 3, the one that actually filed. No backstop
+    exists for this shape: the dispute was already resolved by the
+    direction, so the fifth line has nothing to say."""
+    s, run = _Planted(tmp_path).ruled_then_directed_then_sliced()
+    f = Front(s, run, existing=True)
+    s.append_fact(run_id=run, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged after the filing, misattributed to visit 2",
+                           "cost_if_wrong": "n/a", "visit": 2})
+    fails = prove.assert_slices(s, run, repo=REPO, gh_json=GH(s, f))
+    assert any("prefix walk attributes it to visit 3" in x for x in fails), fails
+    assert prove.assert_dispute(s, run) == []      # confirmed: no backstop here
+
+
+def test_assertion_4_reds_on_the_same_ruling_misattributed_to_visit_1(tmp_path):
+    """The other wrong stamp from the same probe: visit 1 already held its
+    own real ruling, and the forged one hiding behind it must still fail."""
+    s, run = _Planted(tmp_path).ruled_then_directed_then_sliced()
+    f = Front(s, run, existing=True)
+    s.append_fact(run_id=run, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged after the filing, misattributed to visit 1",
+                           "cost_if_wrong": "n/a", "visit": 1})
+    fails = prove.assert_slices(s, run, repo=REPO, gh_json=GH(s, f))
+    assert any("prefix walk attributes it to visit 3" in x for x in fails), fails
+
+
+def test_assertion_4_a_ruling_stamped_its_true_visit_is_caught_by_clause_b(tmp_path):
+    """The control: the SAME forged ruling, stamped correctly (visit 3, its
+    real walked visit), passes the new stamp check -- and is caught instead
+    by the pre-existing clause (b), which sees it beside that visit's own
+    accepted, filed submission."""
+    s, run = _Planted(tmp_path).ruled_then_directed_then_sliced()
+    f = Front(s, run, existing=True)
+    s.append_fact(run_id=run, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged after the filing, correctly stamped",
+                           "cost_if_wrong": "n/a", "visit": 3})
+    fails = prove.assert_slices(s, run, repo=REPO, gh_json=GH(s, f))
+    assert not any("prefix walk attributes it to visit" in x for x in fails), fails
+    assert any("beside the accepted slice plan" in x for x in fails), fails
+
+
+@pytest.mark.parametrize("bad_epoch,has_key", [
+    (None, False),   # no epoch key at all
+    (99, True),
+    ("0", True),
+    (-1, True),
+])
+def test_assertion_4_reds_on_a_ruling_stamped_a_wrong_epoch(tmp_path, bad_epoch, has_key):
+    """Round 2, B4: B1's defect one key over. Every reader in assertion 4
+    filters on `payload["epoch"] == e`, so a fact stamped an epoch this run
+    never reached -- absent, out of range, or merely a value that LOOKS
+    like the real one without ever comparing equal to it (a string "0" is
+    never `== 0`) -- sits in no epoch's list and is read by nothing."""
+    s, f = _parent(tmp_path)
+    payload = {"question_id": "shape", "ruling": "one piece",
+               "reasoning": "forged with a bad epoch", "cost_if_wrong": "n/a"}
+    if has_key:
+        payload["epoch"] = bad_epoch
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload=payload)
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
+    assert any("not one of this run's epochs" in x for x in fails), (bad_epoch, has_key, fails)
+
+
+@pytest.mark.parametrize("bad_epoch,has_key", [
+    (None, False),
+    (99, True),
+    ("0", True),
+])
+def test_assertion_4_reds_on_a_submission_stamped_a_wrong_epoch(tmp_path, bad_epoch, has_key):
+    """B4's clause-(b) instance: a `slices` submission stamped an epoch
+    this run never reached."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)
+    h = put_artifact(s, SLICES_BYTES)
+    payload = {"phase": "slices", "hash": h, "author": "claude", "round": 1, "visit": 1}
+    if has_key:
+        payload["epoch"] = bad_epoch
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload=payload)
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
+    assert any("not one of this run's epochs" in x for x in fails), (bad_epoch, has_key, fails)
+
+
+@pytest.mark.parametrize("bad_epoch,has_key", [
+    (None, False),
+    (99, True),
+    ("0", True),
+    (-1, True),
+])
+def test_the_fifth_line_reds_on_a_reshape_requested_stamped_a_wrong_epoch(tmp_path, bad_epoch, has_key):
+    """Round 2, B4's instance inside the fifth line: round 1's L1 fix caught
+    only the missing-key spelling of this; a wrong-but-present epoch value
+    passed the same way, while the identical hand-back at the real epoch
+    was already rejected."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    payload = {"visit": 2, "reasoning": "forged with a bad epoch"}
+    if has_key:
+        payload["epoch"] = bad_epoch
+    s.append_fact(run_id=f.run_id, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
+                  payload=payload)
+    fails = prove.assert_dispute(s, f.run_id)
+    assert any("not one of this run's epochs" in x for x in fails), (bad_epoch, has_key, fails)
+
+
+def test_assertion_4_reds_on_a_submission_stamped_visit_none(tmp_path):
+    """Round 2, B5: `front.submissions`'s per-visit filter used to read
+    `payload.get("visit", visit_of(...))` -- a default that fires only when
+    the KEY is absent, so a payload carrying an EXPLICIT `visit: None`
+    (present, valued `None`) matched no visit at all and was invisible to
+    clause (b). `front.shape_ruling` spelled the same fallback with `or`,
+    which treats a `None` VALUE the same as an absent key -- two readers of
+    one stamp, two answers. `front.visit_stamp_of` is the one definition
+    now, and this proof's own stamp-vs-walk check catches the submission
+    side directly: a stamp of `None` never equals the walk's real (>= 1)
+    answer."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)
+    h = put_artifact(s, SLICES_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": None})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None)
+    assert any("prefix walk attributes it to visit" in x for x in fails), fails
+
+
+def test_assertion_4_does_not_crash_on_a_string_visit_stamp(tmp_path):
+    """Medium, round 2: a `visit` stamp of the wrong TYPE used to raise out
+    of round 1's range check (`1 <= v <= last` on a string), killing the
+    tool mid-proof against `assert_slices`'s own docstring promise that a
+    failed read is a failure line, not a crash. The stamp-vs-walk `!=`
+    comparison never raises regardless of type."""
+    s, f = _parent(tmp_path)
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged with a string visit", "cost_if_wrong": "n/a", "visit": "1"})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))   # must not raise
+    assert any("prefix walk attributes it to visit" in x for x in fails), fails
+
+
+def test_the_final_epoch_conjunct_ignores_a_matching_hash_in_a_superseded_epoch(tmp_path):
+    """Round 2, inert #1: `_decision_at`'s `accepted` filter requires
+    `e == n`. Without it, a superseded epoch's own submission -- reviewed
+    and accepted before the issue changed out from under it -- whose bytes
+    happen to match the FINAL epoch's later, genuinely accepted plan (the
+    same content submitted twice, once before the revision and once after)
+    would itself read as "accepted", and a ruling forged beside it in the
+    OLD epoch would wrongly fire "beside the accepted slice plan". `e == n`
+    keeps "accepted" scoped to the epoch that actually reached `sliced`."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", shape=False, issue=ISSUE)
+    f.shape_round(SLICES_BYTES)                              # epoch 0, visit 1
+    f.review_round("accept")                                 # -> slices_accepted
+    f.revise(dict(ISSUE, body="changed"), reshape=False)      # epoch 1 opens; epoch 0 abandoned mid-accept
+    f.to_sliced(SLICES_BYTES)                                 # epoch 1: the SAME bytes, genuinely accepted
+    f.file_all(f._dispatch(Role.OPERATOR, "coordinator"))
+    assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f)) == []
+    # A ruling forged into the superseded epoch's own visit, beside its
+    # (superseded, coincidentally identical-hash) submission.
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged into the superseded epoch"})
+    assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f)) == []
+
+
+def test_the_shape_question_filter_excludes_a_grill_rulings_bad_stamp(tmp_path):
+    """Round 2, inert #3: the stamp-vs-walk scan filters to
+    `question_id == SHAPE_QUESTION` -- without it, an ordinary grill ruling
+    (no part of the shaping visit system at all) carrying a wildly wrong
+    `visit` stamp would be swept into the same check assertion 4 runs over
+    shape rulings, and it must not be: a grill ruling's `visit` means
+    nothing to §6."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)           # birth: shape ruling, visit 1
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    grill_ruling = s.facts_of_kind(f.run_id, EventKind.MODEL_RULING)[-1]
+    assert grill_ruling.payload["question_id"] != "shape"
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={**grill_ruling.payload, "visit": 999})
+    assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None) == []
+
+
+def test_the_duplicate_approval_key_distinguishes_epochs_not_just_phases(tmp_path):
+    """Round 2, inert #4: the gate key is `(phase, epoch)` -- without the
+    epoch half, two LEGITIMATE approvals of the SAME phase in two DIFFERENT
+    epochs (a spec approved, the issue revised, a fresh spec approved
+    again) would be wrongly grouped as "the same gate twice"."""
+    s = _store_with_confirmed_stops(tmp_path / "b.db")
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES)
+    _accept(f)
+    f.approve()
+    f.revise(dict(ISSUE, body="changed"))
+    f.author_round(SPEC_BYTES + b"\nrevised\n")
+    _accept(f)
+    f.approve()
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert not any("more than one approval" in x for x in fails), fails
+
+
+def test_main_proves_the_parent_through_assert_journal(tmp_path, monkeypatch, capsys):
+    """Round 2: main's parent `assert_journal` call was exercised by
+    nothing (deleting it left the whole suite green) -- a run with a human
+    fact under zero mode must fail `main` with that call's own message, not
+    merely via `assert_sessions` (which `_no_network` fails regardless)."""
+    _no_network(monkeypatch)
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.direct("use postgres")
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("human facts present" in x for x in out.err.splitlines())
+
+
+def test_main_children_proves_each_child_through_assert_journal(tmp_path, monkeypatch, capsys):
+    """The child-loop half of the same wiring."""
+    _no_network(monkeypatch)
+    s, f = _parent(tmp_path)
+    monkeypatch.setattr("coordinator.sweep.gh_json", GH(s, f))
+    child_issue = {"number": 40, "title": "The store", "body": "b", "labels": ["bircher:autonomous"], "comments": []}
+    Front(s, "i40-x-1", issue=child_issue).direct("noted")
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x",
+                      "--repo", "o/r", "--children"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("child #40" in x and "human_direction" in x for x in out.err.splitlines())
+
+
+def test_main_proves_the_parent_through_assert_sessions(tmp_path, monkeypatch, capsys):
+    """main's `assert_sessions` call -- a run whose journal and dispute are
+    both clean must still fail `main` when the server disagrees; with
+    `_no_network` stubbed in, the listing simply cannot be read at all."""
+    _no_network(monkeypatch)
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    from tests.kernel.test_prove_front_half import _review_round_with_real_brief
+    _review_round_with_real_brief(f)
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    assert prove.assert_journal(s, f.run_id, mode="zero") == []   # isolates assert_sessions as the source
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("could not be read" in x for x in out.err.splitlines())
+
+
+def test_main_children_proves_each_child_through_assert_sessions(tmp_path, monkeypatch, capsys):
+    """The child-loop half of `assert_sessions`'s wiring."""
+    _no_network(monkeypatch)
+    s, f = _parent(tmp_path)
+    monkeypatch.setattr("coordinator.sweep.gh_json", GH(s, f))
+    child_issue = {"number": 40, "title": "The store", "body": "b", "labels": ["bircher:autonomous"], "comments": []}
+    Front(s, "i40-x-1", issue=child_issue)
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x",
+                      "--repo", "o/r", "--children"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert any("child #40" in x and "could not be read" in x for x in out.err.splitlines())
