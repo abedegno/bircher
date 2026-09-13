@@ -388,7 +388,11 @@ ruling whose seq follows the hand-back's, in whatever visit it falls
 (the hand-back opens the visit the disputed ruling is usually recorded in);
 the **resolution** is the first `human_ruling {approve_one_piece}` or
 `human_direction` recorded at `shaping` whose seq follows the disputed
-ruling's. A direction recorded between the hand-back and the disputed ruling
+ruling's. The `human_direction` fact carries the state it was recorded at — a
+`state` key `_side_fact` writes from `store.run_state`, since `phase` cannot
+serve here (all three shaping states share the phase `slices`) — and
+`recorded at shaping` above, and in `_visit_boundaries`'s own direction
+branch, both read that key, never the phase. A direction recorded between the hand-back and the disputed ruling
 — a person typing into the reshaping session — is a direction to that visit
 and resolves nothing. `front.dispute(store, run_id, epoch_n=None)` — the current epoch by
 default, any epoch for the proof — returns the four facts or their absence,
