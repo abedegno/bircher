@@ -369,3 +369,129 @@ def test_a_message_the_coordinator_read_past_is_not_an_unrecorded_prompt(tmp_pat
                                    "content": [{"type": "input_text", "text": "and another thing"}]})
     fails = prove.assert_sessions(s, "r-1", fetch=fetch)
     assert any("it-later" in x for x in fails) and not any("it-retry" in x for x in fails), fails
+
+
+# -- Task 10: `reshape_requested` joins the turn-ordering check, and the
+#    controller amendment's structural check over commands.py's own
+#    human_ruling payloads (shaping spec §6, revision 16) -----------------
+
+
+def test_reshape_requested_joins_the_turn_ordering_check(tmp_path):
+    """Revision 16: `request_reshape` ends a turn exactly as `submit_spec`
+    or `record_one_piece` does, so a `reshape_requested` recorded before its
+    own turn's stop was confirmed is the same ordering defect the block
+    above (`test_each_assertion_fails_on_its_defect`) already catches for
+    other output kinds -- it only needed `EventKind.RESHAPE_REQUESTED` added
+    to `output_facts`'s tuple to be READ at all. Built the same way: a fresh
+    run, since a real command would refuse to record output before the
+    round's stop is satisfied (the OUTPUT_COMMANDS guard, kernel/authz.py);
+    only a fact forged straight into the store, ahead of the turn actually
+    ending, can misorder them.
+
+    The passing case for this same addition is not repeated here:
+    `test_prove_slices.py`'s `test_the_phase_set_admits_a_spec_before_the_hand_back`
+    already drives a REAL, properly-ordered `request_reshape` through a full
+    `assert_journal(mode="human") == []` -- if the new tuple entry read the
+    ordering wrong, that clean pass would fail too."""
+    s3 = _store_with_confirmed_stops(tmp_path / "k3.db")
+    f3 = Front(s3, "r-3")
+    g7 = f3._dispatch(Role.AUTHOR, f3.author)
+    sid7 = f3._session(g7, f3._newest_id())
+    n = f3.epoch()
+    forged_key = f"forged-reshape-{g7}"
+    s3.append_fact(run_id="r-3", kind=EventKind.COMMAND_ACCEPTED, actor=f3.author, causal_command_id=forged_key,
+                   payload={"command_name": "request_reshape", "generation": g7, "payload": {}})
+    s3.append_fact(run_id="r-3", kind=EventKind.RESHAPE_REQUESTED, actor=f3.author, causal_command_id=forged_key,
+                   payload={"epoch": n, "visit": front.shaping_visit(s3, "r-3", n) + 1,
+                            "reasoning": "forged ahead of the turn's stop"})
+    f3._end_turn(g7, sid7)  # the stop's effect_confirmed fact lands AFTER the forged output above
+    assert any("is not newer than its turn's stop confirmation" in x
+              for x in prove.assert_journal(s3, "r-3", mode="human"))
+
+
+def test_the_controller_check_passes_the_real_commands_module():
+    """The pass case for the Task 10 controller amendment: every ruling word
+    `commands.py` actually writes today carries at least the keys
+    `prove.HUMAN_RULING_KEYS` says the spec's Facts table (and, for the two
+    words that table does not carry, the code itself) requires of it. No run
+    needed -- the check reads `commands.py`'s source, not a journal."""
+    found = prove._human_ruling_payload_keys()
+    assert found  # the walk actually found the four branches, not an empty AST
+    for word, want in prove.HUMAN_RULING_KEYS.items():
+        assert word in found, f"commands.py no longer writes ruling word {word!r}"
+        assert want <= found[word], f"{word!r}: commands.py carries {sorted(found[word])}, want {sorted(want)}"
+
+
+def test_the_controller_check_reds_when_a_ruling_drops_a_required_key(tmp_path, monkeypatch):
+    """The planted defect: simulates exactly the shape Task 4 shipped --
+    `approve_one_piece`'s payload missing `cursor_item_id` -- by handing
+    `assert_journal` a stand-in for `_human_ruling_payload_keys` whose
+    `approve_one_piece` entry has lost that one key. The check reads
+    `commands.py`'s SOURCE, not this run's journal, so any run at all proves
+    it; a fully clean one isolates the new fail from everything else the run
+    itself might print, and shows the SAME run passing before the plant and
+    failing after it."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    _review_round_with_real_brief(f)
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    assert prove.assert_journal(s, "r-1", mode="zero") == []      # the baseline: clean today
+
+    real = prove._human_ruling_payload_keys()
+    broken = {**real, "approve_one_piece": real["approve_one_piece"] - {"cursor_item_id"}}
+    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: broken)
+    fails = prove.assert_journal(s, "r-1", mode="zero")
+    assert any("approve_one_piece" in x and "cursor_item_id" in x for x in fails), fails
+
+
+def test_the_controller_check_reds_on_a_ruling_word_with_no_required_key_entry(tmp_path, monkeypatch):
+    """The other failure branch: a ruling word `commands.py` writes with NO
+    entry in `prove.HUMAN_RULING_KEYS` at all -- the shape a genuinely NEW
+    ruling word takes the day it is added and nobody has told this proof
+    what it must carry yet. Caught rather than silently skipped, which is
+    the entire point of walking the words from the code instead of a
+    hand-typed list: an undeclared word is a failure, not a pass by
+    omission."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1")
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    f.author_round(SPEC_BYTES, resume=f._newest_author_session())
+    _review_round_with_real_brief(f)
+    f.author_round(PLAN_BYTES)
+    _review_round_with_real_brief(f)
+    assert prove.assert_journal(s, "r-1", mode="zero") == []      # the baseline: clean today
+
+    real = prove._human_ruling_payload_keys()
+    broken = {**real, "approve_two_pieces": {"ruling", "phase", "epoch"}}
+    monkeypatch.setattr(prove, "_human_ruling_payload_keys", lambda: broken)
+    fails = prove.assert_journal(s, "r-1", mode="zero")
+    assert any("approve_two_pieces" in x and "no required-key entry" in x for x in fails), fails
+
+
+def test_human_ruling_payload_keys_walks_an_arbitrary_source_snippet():
+    """`_human_ruling_payload_keys` accepts *source* directly (the seam the
+    two tests above do not use, monkeypatching the whole function instead,
+    because they need to isolate `assert_journal`'s reaction) -- pinned once
+    on its own so the AST walk itself is proven, not just its callers."""
+    snippet = '''
+def _side_fact(store, cmd, actor):
+    if cmd.name == "approve_artifact":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.HUMAN_RULING, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"ruling": "approve", "phase": phase, "epoch": epoch_n},
+        )
+    elif cmd.name == "record_review":
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.REVIEW_VERDICT, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"ruling": "review_ruling", "phase": phase},
+        )
+'''
+    found = prove._human_ruling_payload_keys(source=snippet)
+    # Only the HUMAN_RULING branch is walked -- the review_ruling literal,
+    # under kind=EventKind.REVIEW_VERDICT, is not a human_ruling word at all.
+    assert found == {"approve": {"ruling", "phase", "epoch"}}

@@ -1,18 +1,24 @@
 """Task 11: the four slice assertions and the amended existing checks
-(shaping spec §6)."""
+(shaping spec §6). Task 10 restates assertion 4 in three clauses over
+visits, amends the phase-set and approval checks, and adds the fifth line,
+`assert_dispute` -- all of it revision 16 (the hand-back)."""
 import json
+
+import pytest
 
 from coordinator.sweep import ReadFailed
 from kernel import front, slices
 from kernel.artifacts import put_artifact
 from kernel.dispatch import Role
 from kernel.events import EventKind
+from kernel.policy import policy_of
 from kernel.store import Store
 from tests.kernel.front import PLAN_BYTES, SLICES_BYTES, SPEC_BYTES, Front
 from tests.kernel.test_prove_front_half import _accept, _store_with_confirmed_stops
 from tools import prove_front_half as prove
 
 ISSUE = {"number": 12, "title": "Epic", "body": "B", "labels": ["bircher:autonomous"], "comments": []}
+REPO = "o/r"
 
 
 def _no_network(monkeypatch):
@@ -295,10 +301,11 @@ def test_main_children_continues_past_a_failed_read(tmp_path, monkeypatch, capsy
 
 
 def test_assertion_4_the_final_epoch_check_reds_alone_on_an_undecided_run(tmp_path):
-    """MINOR 2: isolate the final "exactly one decision" check from the
-    per-epoch "shape ruling beside a filing" guard, which structurally
-    cannot fire here -- it only ever activates once a ruling exists in some
-    epoch, and this run has ruled on nothing.
+    """MINOR 2: isolate the final "last visit's decision" check (clause (c),
+    restated over visits by revision 16) from the per-visit "one decision
+    per visit" guard (clause (b)), which structurally cannot fire here -- it
+    only ever activates once a ruling exists in some epoch, and this run has
+    ruled on nothing.
 
     The two shapes fix round 1 suggested for this -- a run that WAS sliced
     and filed, then revised past that decision, still undecided at the new
@@ -326,5 +333,385 @@ def test_assertion_4_the_final_epoch_check_reds_alone_on_an_undecided_run(tmp_pa
     f = Front(s, "r-1", shape=False, issue=ISSUE)
     assert f.state() == "shaping"
     fails = prove.assert_slices(s, "r-1", repo="o/r", gh_json=None)
-    assert any("exactly one decision" in x for x in fails)
-    assert not any("beside a filing" in x for x in fails)
+    assert any("the last visit's decision" in x for x in fails)
+    assert not any("one decision per visit" in x for x in fails)
+
+
+# -- Task 10: assertion 4 over visits, the phase-set and approval amendments,
+#    and the fifth line, `assert_dispute` (shaping spec §6, revision 16) ----
+
+
+class _Planted:
+    """The shared history builders §8 asks for: each returns `(store,
+    run_id)` after driving the hand-back mechanics real commands construct,
+    or -- where the kernel's own guards make a history unreachable any other
+    way, exactly as `test_assertion_4_..._reds_on_a_planted_ruling` above
+    already does for the pre-visit code -- forging the one fact the kernel
+    would have refused, directly into the store.
+
+    `self.gh` is the sweep's fake `gh_json` reader (this file's `GH`) for
+    whichever run last filed anything; a builder that never slices leaves it
+    at `None`, which is fine -- assertion 4 alone runs without it for a run
+    that never filed (`assert_slices`'s own `if plan is not None and
+    filed:` guard), and none of these builders that skip filing are ever
+    checked through anything else."""
+
+    def __init__(self, tmp_path):
+        self._tmp_path = tmp_path
+        self._n = 0
+        self.gh = None
+
+    def _db(self) -> Store:
+        self._n += 1
+        return _store_with_confirmed_stops(self._tmp_path / f"planted-{self._n}.db")
+
+    def _advance_or_approve(self, s: Store, f: Front) -> None:
+        if "slices" in policy_of(s, f.run_id).gates:
+            f.approve()
+        else:
+            f.advance()
+
+    def _file(self, s: Store, f: Front) -> None:
+        g = f._dispatch(Role.OPERATOR, "coordinator")
+        f.file_all(g)
+        self.gh = GH(s, f)
+
+    # -- assertion 4 ----------------------------------------------------
+
+    def hand_back_then_sliced(self):
+        """Visit 1: the one-piece ruling every hand-back needs to exist
+        (`request_reshape`'s own guard). Visit 2, the hand-back's own: no
+        ruling at all -- the shaper reconsiders and slices directly. The
+        plain answered-hand-back history: clause (c) and the fifth line
+        both pass it."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("the issue names a store, an API and a page")
+        f.shape_round(SLICES_BYTES)
+        _accept(f)
+        self._advance_or_approve(s, f)
+        self._file(s, f)
+        return s, f.run_id
+
+    def rejected_then_ruled(self):
+        """A plan rejected, then ruled, in the SAME visit -- no hand-back
+        needed at all for clause (b)'s "rejected submissions before a
+        ruling are admitted": visit 1 holds both, in order."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE, shape=False)
+        f.shape_round(SLICES_BYTES)
+        f.review_round("request_revision", findings=b"one piece")
+        f.shape_round()
+        return s, f.run_id
+
+    def rejected_then_resubmitted_same_hash_and_accepted(self):
+        """The exact case clause (b) exists to get right and hash equality
+        alone gets wrong: visit 1 submits a plan, it is REJECTED, and the
+        shaper rules one piece over it (so a hand-back has something to
+        answer). Visit 2 (the hand-back's own) resubmits the IDENTICAL
+        bytes -- legal, since `_check_submit`'s dedupe is per visit, not per
+        epoch -- and it is accepted and filed. Both visits now hold a
+        submission of the SAME hash; only visit 2's carries an `accept`
+        verdict in ITS OWN visit. A hash-only reader would find the hash in
+        visit 1 too, beside a ruling, and misreport a collision that never
+        happened."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE, shape=False)
+        f.shape_round(SLICES_BYTES)
+        f.review_round("request_revision", findings=b"reconsider the split")
+        f.shape_round()                      # visit 1's ruling, over the rejected plan
+        f.request_reshape("the split still looks right; asking again")
+        f.shape_round(SLICES_BYTES)           # visit 2: the SAME bytes, a different visit
+        _accept(f)
+        self._advance_or_approve(s, f)
+        self._file(s, f)
+        return s, f.run_id
+
+    def submission_after_ruling_same_visit(self):
+        """The kernel refuses this at the door: `submit_slices` at `shaping`
+        is refused while `front.unresolved_disagreement` holds
+        (kernel/authz.py's `authorize`, "a third seat cannot slice it
+        away"), and a NON-disputed ruling leaves `shaping` outright -- so
+        there is no state a real command could record a slice plan from,
+        after a ruling in its own visit. Forged directly, as the existing
+        per-epoch test above already forges a beside-the-filing ruling."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one piece", cost="the spec would find one surface")  # visit 2, disputed
+        n = f.epoch()
+        v = front.shaping_visit(s, f.run_id, n)
+        h = put_artifact(s, SLICES_BYTES)
+        s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                      payload={"phase": "slices", "epoch": n, "hash": h, "author": "claude", "round": 1, "visit": v})
+        return s, f.run_id
+
+    def ruled_then_directed_then_sliced(self):
+        """Visit 1: the initial ruling. Visit 2 (the hand-back's own): a
+        second ruling -- disputed. A direction resolves it and opens visit
+        3, whose shaper slices instead of ruling again. The ruling in an
+        earlier visit, the filing in the last: clause (c) says this is
+        legal, and it is the specific case `visit=last` exists to get
+        right (an epoch-wide read would find visit 2's ruling and call it
+        the decision, though visit 3 -- the last -- decided by filing)."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one piece", cost="the spec would find one surface")
+        f.direct("slice it along the three parts")
+        f.shape_round(SLICES_BYTES)
+        _accept(f)
+        self._advance_or_approve(s, f)
+        self._file(s, f)
+        return s, f.run_id
+
+    def filed_then_ruled(self):
+        """The reverse of the history above, and NOT reachable any other
+        way: once a parent has filed children the kernel has no legal path
+        back to an undecided epoch (see
+        `test_assertion_4_the_final_epoch_check_reds_alone_on_an_undecided_run`'s
+        docstring above, which hit the same wall). A shape ruling forged
+        after the filing, in the filing's own (and only) visit, is a
+        journal no real command sequence can write -- the last visit's
+        decision cannot be both a filing and a ruling -- and clause (c) is
+        exactly what notices."""
+        s, run_id = self.hand_back_then_sliced()
+        f = Front(s, run_id, existing=True)
+        n = f.epoch()
+        v = front.shaping_visit(s, run_id, n)
+        s.append_fact(run_id=run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                      payload={"epoch": n, "question_id": "shape", "ruling": "one piece",
+                               "reasoning": "forged after the filing", "cost_if_wrong": "n/a", "visit": v})
+        return s, run_id
+
+    # -- the phase-set amendment -----------------------------------------
+
+    def revision_turn_hand_back_then_sliced(self):
+        """A hand-back from a REVISION turn: the epoch's spec was already
+        submitted once, rejected, and the spec author's SECOND turn hands
+        back instead of resubmitting. The phase-set amendment admits the
+        spec submission that precedes the hand-back."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.author_round(SPEC_BYTES)
+        _accept(f, "request_revision")
+        f.request_reshape("the issue names a store, an API and a page")
+        f.shape_round(SLICES_BYTES)
+        _accept(f)
+        self._advance_or_approve(s, f)
+        self._file(s, f)
+        return s, f.run_id
+
+    def spec_after_the_hand_back_then_sliced(self):
+        """The mirror case the amendment must still refuse: a `spec`
+        submission forged AFTER the hand-back. The kernel never reaches
+        `shaping` (where the forged fact's epoch and phase would need to
+        come from a submit_spec) with a hand-back already standing and a
+        spec still to submit, so this is forged directly onto an otherwise
+        clean answered hand-back."""
+        s, run_id = self.hand_back_then_sliced()
+        hb = s.facts_of_kind(run_id, EventKind.RESHAPE_REQUESTED)[-1]
+        h = put_artifact(s, SPEC_BYTES)
+        s.append_fact(run_id=run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                      payload={"phase": "spec", "epoch": hb.payload["epoch"], "hash": h,
+                               "author": "claude", "round": 1})
+        return s, run_id
+
+    # -- the approval-filter amendment ------------------------------------
+
+    def disagreed_then_approved_then_merged(self):
+        """A hand-back, a disputed ruling, the coordinator's own park
+        (`reason: disagreement`), and the person's `approve_one_piece` --
+        then an ordinary run to completion. Approval mode's two new
+        admissions together, with nothing else to trip on."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one piece", cost="the spec would find one surface")
+        f.park(reason="disagreement")
+        f.approve_one_piece()
+        f.ask_round([("q1", "?")], rulings={"q1": "yes"})   # the model_ruling assert_journal needs
+        f.author_round(SPEC_BYTES)
+        _accept(f)
+        if f.state() == "spec_accepted":
+            f.approve()
+        f.author_round(PLAN_BYTES)
+        _accept(f)
+        if f.state() == "plan_accepted":
+            f.approve()
+        return s, f.run_id
+
+    def disagreed_then_directed_then_merged(self):
+        """The other resolution: a direction, not an approval. Still a
+        human fact approval mode must refuse -- it is legal at `shaping` as
+        the OTHER way to resolve a disagreement, but a directed run proves
+        only under `--expect-human`, like every other directed run."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one piece", cost="the spec would find one surface")
+        f.park(reason="disagreement")
+        f.direct("slice it along the three parts")
+        f.shape_round(reasoning="one piece after all", cost="the spec would find one surface")
+        f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+        f.author_round(SPEC_BYTES)
+        _accept(f)
+        if f.state() == "spec_accepted":
+            f.approve()
+        f.author_round(PLAN_BYTES)
+        _accept(f)
+        if f.state() == "plan_accepted":
+            f.approve()
+        return s, f.run_id
+
+    # -- the fifth line, assert_dispute ------------------------------------
+
+    def hand_back_then_revise_bundle(self):
+        """The hand-back stands unresolved when the issue changes: a new
+        epoch supersedes it (`revise_bundle` is legal from `shaping`,
+        hand-back or none). The fifth line owes the abandoned epoch
+        nothing -- a person's issue edit IS the resolution the old epoch
+        never got a chance to reach."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.revise(dict(ISSUE, body="changed"), reshape=False)
+        return s, f.run_id
+
+    def two_hand_backs_in_one_epoch(self):
+        """One hand-back per bundle is the kernel's own guard
+        (`request_reshape`'s "already holds a hand-back" refusal,
+        kernel/authz.py) -- a second is forged directly, the same way the
+        existing per-epoch test above forges a beside-the-filing ruling."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        n = f.epoch()
+        v = front.shaping_visit(s, f.run_id, n)
+        s.append_fact(run_id=f.run_id, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
+                      payload={"epoch": n, "visit": v + 1, "reasoning": "a second, forged hand-back"})
+        return s, f.run_id
+
+    def spec_between_the_disputed_ruling_and_nothing(self):
+        """A `spec` forged into the window revision 16 protects: after the
+        disputed ruling, before its resolution. The kernel never reaches
+        `shaping` -- where the forged fact's phase would have to come from
+        a `submit_spec` -- with a disputed ruling standing over it, so this
+        is forged too; the direction that follows is real, and is what
+        gives the forged fact a resolution to fall BEFORE."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.shape_round(reasoning="still one", cost="the spec would find one surface")   # the disputed ruling
+        h = put_artifact(s, SPEC_BYTES)
+        n = f.epoch()
+        s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                      payload={"phase": "spec", "epoch": n, "hash": h, "author": "claude", "round": 1})
+        f.direct("slice it")   # the resolution, recorded after the forged spec
+        return s, f.run_id
+
+    def direction_before_the_disputed_ruling(self):
+        """A direction typed BEFORE any ruling answers the hand-back
+        resolves nothing and opens no visit
+        (test_reshape.py's `test_a_direction_before_the_disputed_ruling_opens_no_visit`
+        pins this at the kernel level); the ruling that follows is left
+        disputed with no resolution after it -- `front.dispute`'s own
+        `f.seq > disputed.seq` ordering is what keeps the earlier direction
+        from being mistaken for the later ruling's answer."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        f.direct("consider the migration too")
+        f.shape_round(reasoning="still one", cost="the spec would find one surface")
+        return s, f.run_id
+
+
+@pytest.fixture
+def planted(tmp_path):
+    return _Planted(tmp_path)
+
+
+def test_assertion_4_passes_the_hand_back_then_slice_history(planted):
+    s, run = planted.hand_back_then_sliced()
+    assert prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh) == []
+
+
+def test_assertion_4_passes_a_rejected_plan_then_a_ruling_in_one_visit(planted):
+    s, run = planted.rejected_then_ruled()
+    assert prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh) == []
+
+
+def test_assertion_4_identifies_the_acceptance_by_the_verdict_it_followed_not_hash_alone(planted):
+    """The plan's own scenario (task-10-brief.md step 4): a plan rejected in
+    visit 1 and resubmitted, byte for byte, and accepted in visit 2. Both
+    visits hold the accepted hash; only visit 2's is the acceptance. A
+    hash-only reader would find visit 1's rejected copy too, beside its
+    ruling, and misreport "a shape ruling beside the accepted slice plan"
+    for a visit that never accepted anything."""
+    s, run = planted.rejected_then_resubmitted_same_hash_and_accepted()
+    assert prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh) == []
+
+
+def test_assertion_4_reds_on_a_submission_after_a_ruling_in_its_visit(planted):
+    s, run = planted.submission_after_ruling_same_visit()
+    assert any("one decision per visit" in x for x in prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh))
+
+
+def test_assertion_4_passes_a_ruling_in_an_earlier_visit_beside_a_filing(planted):
+    """The hand-back resolved by slicing: a ruling in an earlier visit, the
+    filing in the last."""
+    s, run = planted.ruled_then_directed_then_sliced()
+    assert prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh) == []
+
+
+def test_assertion_4_reds_on_a_filing_beside_a_newer_ruling(planted):
+    s, run = planted.filed_then_ruled()
+    fails = prove.assert_slices(s, run, repo=REPO, gh_json=planted.gh)
+    assert any("the last visit's decision" in x for x in fails)
+
+
+def test_the_phase_set_admits_a_spec_before_the_hand_back(planted):
+    s, run = planted.revision_turn_hand_back_then_sliced()
+    assert prove.assert_journal(s, run, mode="human") == []
+
+
+def test_the_phase_set_reds_on_a_spec_after_the_hand_back(planted):
+    s, run = planted.spec_after_the_hand_back_then_sliced()
+    assert any("artifact_submitted" in x for x in prove.assert_journal(s, run, mode="human"))
+
+
+def test_approval_mode_admits_the_approval_and_its_park(planted):
+    s, run = planted.disagreed_then_approved_then_merged()
+    assert prove.assert_journal(s, run, mode="approval") == []
+    assert any("human facts present" in x for x in prove.assert_journal(s, run, mode="zero"))
+
+
+def test_approval_mode_still_refuses_a_direction(planted):
+    s, run = planted.disagreed_then_directed_then_merged()
+    assert any("beyond the approval" in x for x in prove.assert_journal(s, run, mode="approval"))
+
+
+def test_the_fifth_line_passes_an_answered_hand_back(planted):
+    s, run = planted.hand_back_then_sliced()
+    assert prove.assert_dispute(s, run) == []
+
+
+def test_the_fifth_line_skips_a_superseded_hand_back(planted):
+    s, run = planted.hand_back_then_revise_bundle()
+    assert prove.assert_dispute(s, run) == []
+
+
+def test_the_fifth_line_reds_on_a_second_hand_back_in_one_epoch(planted):
+    s, run = planted.two_hand_backs_in_one_epoch()
+    assert any("a second reshape_requested" in x for x in prove.assert_dispute(s, run))
+
+
+def test_the_fifth_line_reds_on_a_spec_after_an_unresolved_ruling(planted):
+    s, run = planted.spec_between_the_disputed_ruling_and_nothing()
+    fails = prove.assert_dispute(s, run)
+    assert any("between the disputed ruling and the resolution" in x for x in fails)
+
+
+def test_the_fifth_line_reds_on_a_direction_before_the_disputed_ruling(planted):
+    s, run = planted.direction_before_the_disputed_ruling()
+    assert any("unanswered" in x for x in prove.assert_dispute(s, run))

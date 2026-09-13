@@ -51,6 +51,66 @@ HUMAN = {EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING, EventKind.PARKED,
 MODES = ("zero", "approval", "human")
 
 
+def _human_ruling_payload_keys(source: str | None = None) -> dict[str, set[str]]:
+    """Every `human_ruling` fact `kernel/commands.py` can write, as the
+    ruling word mapped to the literal keys ITS payload dict declares --
+    walked from the SOURCE (an AST, not a run), so a fifth ruling word is
+    discovered the day it is added to the kernel, not the day someone
+    remembers to update a list here (Task 10, the controller amendment).
+
+    *source* is for a test to substitute a snippet standing in for a
+    regression; `assert_journal` always calls this with none, reading the
+    real module."""
+    import ast
+    import inspect
+    if source is None:
+        from kernel import commands as _commands
+        source = inspect.getsource(_commands)
+    out: dict[str, set[str]] = {}
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "append_fact"):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        kind = kw.get("kind")
+        if not (isinstance(kind, ast.Attribute) and kind.attr == "HUMAN_RULING"):
+            continue
+        payload = kw.get("payload")
+        if not isinstance(payload, ast.Dict):
+            continue
+        keys = {k.value for k in payload.keys if isinstance(k, ast.Constant)}
+        word = next((v.value for k, v in zip(payload.keys, payload.values)
+                     if isinstance(k, ast.Constant) and k.value == "ruling" and isinstance(v, ast.Constant)),
+                    None)
+        if word is not None:
+            out[word] = keys
+    return out
+
+
+#: Task 10 controller amendment. Task 4 shipped `approve_one_piece`'s
+#: `human_ruling` fact silently missing `cursor_item_id` -- the key
+#: `assert_sessions` reads from EVERY human_ruling fact, generically, as its
+#: read-watermark (this file, `assert_sessions`'s `cursors` set). Nothing
+#: went red; the proof would simply have read a shorter watermark on the
+#: first live run that recorded one. The fix is in `commands.py`; this is
+#: the regression guard for the next one -- the keys the shaping spec's §2
+#: Facts table lists for each ruling word it documents (`approve` "as
+#: today"; `approve_one_piece` new in revision 16), and for the two ruling
+#: words that table does not carry at all (`grant_round`,
+#: `request_revision` -- pre-existing, from an earlier document), the keys
+#: `commands.py` already writes for them, standing in for a Facts table this
+#: design does not own. The WORDS this is checked against are never typed
+#: out a second time: `_human_ruling_payload_keys` walks them from
+#: `commands.py` itself, so a fifth word with no entry below fails on its
+#: own account rather than silently never being checked.
+HUMAN_RULING_KEYS = {
+    "approve": {"ruling", "phase", "epoch", "artifact_hash", "cursor_item_id"},
+    "grant_round": {"ruling", "phase", "epoch", "park_seq", "cursor_item_id"},
+    "request_revision": {"ruling", "phase", "epoch", "artifact_hash", "cursor_item_id"},
+    "approve_one_piece": {"ruling", "phase", "epoch", "visit", "cursor_item_id"},
+}
+
+
 def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     """The journal-only half of the §8 proof. Every check reads facts and
     satisfied effects already in the store; nothing here fetches a session."""
@@ -67,13 +127,41 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
             f"{[(f.kind, f.payload.get('ruling') or f.payload.get('reason')) for f in human]}"
         )
     if mode == "approval":
+        # Revision 16: `approve_one_piece` is the person's resolution of a
+        # shape disagreement -- admitted beside the ordinary `approve` -- and
+        # its own park, `reason: disagreement`, beside the gate's. A
+        # DIRECTION stays OUT of this set even so: it is legal at `shaping`
+        # as the other way to resolve a disagreement, but a run resolved by
+        # a direction proves only under `--expect-human`, as every directed
+        # run does (shaping spec §6).
         extra = [f for f in human if not (
-            (f.kind == EventKind.HUMAN_RULING and f.payload.get("ruling") == "approve")
-            or (f.kind == EventKind.PARKED and f.payload.get("reason") == "gate")
+            (f.kind == EventKind.HUMAN_RULING and f.payload.get("ruling") in ("approve", "approve_one_piece"))
+            or (f.kind == EventKind.PARKED and f.payload.get("reason") in ("gate", "disagreement"))
         )]
         if extra:
             fails.append(f"human facts beyond the approval: {[f.kind for f in extra]}")
     # mode == "human" admits every human fact; everything below still runs.
+
+    # Controller amendment (Task 10): commands.py's OWN human_ruling payload
+    # literals, checked against the spec's Facts table -- not this run's
+    # journal, which can only ever hold whatever the code just wrote, bug or
+    # no bug (see HUMAN_RULING_KEYS's comment for why a per-fact check would
+    # never have caught the bug it exists for). Runs for every proof, not
+    # just a run that happens to hold a human_ruling fact: a fifth ruling
+    # word with a broken payload is a defect whether or not this particular
+    # run ever recorded it.
+    for word, keys in _human_ruling_payload_keys().items():
+        want = HUMAN_RULING_KEYS.get(word)
+        if want is None:
+            fails.append(
+                f"human_ruling {word!r}: commands.py writes it, but this proof carries no "
+                "required-key entry for it (Task 10 controller amendment)"
+            )
+        elif not want <= keys:
+            fails.append(
+                f"human_ruling {word!r}: commands.py's payload carries {sorted(keys)}, missing "
+                f"{sorted(want - keys)} the spec's Facts table lists for it"
+            )
 
     if EventKind.EFFECT_RECONCILED in kinds or store.reconciliation_evidence(run_id) is not None:
         fails.append("the run was reconciled or halted")
@@ -93,8 +181,20 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     subs = {f.payload["phase"]: f.payload["hash"]
             for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED) if f.payload.get("epoch") == n}
     if sliced_parent:
-        if set(subs) != {"slices"} or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
-            fails.append(f"artifact_submitted: a sliced parent's final epoch submits exactly the accepted slice plan: {subs}")
+        hb = next((f for f in front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, n)), None)
+        # Revision 16: a hand-back from a REVISION turn means the epoch
+        # legitimately holds a spec submission -- before the hand-back,
+        # never after it (the spec author's second-turn choice, not a
+        # resubmission race). A one-piece run resolved by approve_one_piece
+        # keeps the one-piece rule below, because it is not a sliced parent.
+        allowed = {"slices"} if hb is None else {"slices", "spec"}
+        late_spec = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+                     if f.payload.get("epoch") == n and f.payload["phase"] == "spec"
+                     and hb is not None and f.seq > hb.seq]
+        if set(subs) - allowed or "slices" not in subs or late_spec \
+                or subs["slices"] != front.accepted_slices_hash(store, run_id, n):
+            fails.append(f"artifact_submitted: a sliced parent's final epoch submits the accepted slice plan "
+                         f"and at most a spec preceding its hand-back: {subs}")
     elif (not {"spec", "plan"} <= set(subs) or not set(subs) <= {"slices", "spec", "plan"}
           or subs["spec"] == subs["plan"]):
         fails.append(f"artifact_submitted for spec and plan with different hashes (and at most a slice plan): {subs}")
@@ -141,6 +241,7 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         f for f in store.facts_of_kind(
             run_id, EventKind.ARTIFACT_SUBMITTED, EventKind.AUTHOR_EMPTY,
             EventKind.MODEL_QUESTION, EventKind.MODEL_RULING, EventKind.REVIEW_VERDICT,
+            EventKind.RESHAPE_REQUESTED,  # revision 16: the hand-back is a turn's output too
         )
         if f.kind != EventKind.REVIEW_VERDICT or f.payload.get("ruling") == "review_ruling"
     ]
@@ -390,21 +491,92 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
                 fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
             elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
                 fails.append("the umbrella comment does not list exactly the filed children")
-    # 4. One decision per epoch, and every filing in the last.
+    # 4. One decision per VISIT, and every filing in the last epoch
+    #    (shaping spec §6, revision 16). Three clauses.
+    # (a) No filing outside the final epoch: a superseded epoch never filed,
+    #     since revise_bundle is refused from `sliced`.
     for f in store.facts_of_kind(run_id, EventKind.SLICE_FILED):
         if f.payload.get("epoch") != n:
             fails.append(f"slice_filed in epoch {f.payload.get('epoch')}, outside the final epoch {n}")
+
+    accepted_h = front.accepted_slices_hash(store, run_id, n)
     for e in range(n + 1):
-        ruling = front.shape_ruling(store, run_id, e)
-        if ruling is None:
+        last = front.shaping_visit(store, run_id, e)
+        for v in range(1, last + 1):
+            ruling = front.shape_ruling(store, run_id, e, visit=v)
+            subs_v = front.submissions(store, run_id, "slices", e, visit=v)
+            # (b) At most one decision per visit: the ruling, or the
+            #     submission the acceptance actually followed. Rejected
+            #     submissions BEFORE a ruling in the same visit are
+            #     admitted -- an author may write a plan, have it rejected,
+            #     and then rule. A submission AFTER the ruling is not.
+            #     Identified by the review_verdict {accept} its visit holds,
+            #     not by hash equality alone: a plan rejected in visit 1 and
+            #     resubmitted in visit 2 leaves the accepted hash sitting in
+            #     BOTH visits, and hash equality alone would double-count it.
+            acc_v = front.newest_review_verdict(store, run_id, "slices", e, visit=v)
+            accepted = [x for x in subs_v
+                        if e == n and x.payload["hash"] == accepted_h
+                        and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
+            if ruling is not None and accepted:
+                fails.append(f"epoch {e} visit {v}: a shape ruling beside the accepted slice plan "
+                             "(one decision per visit)")
+            if ruling is not None and any(x.seq > ruling.seq for x in subs_v):
+                fails.append(f"epoch {e} visit {v}: a slice plan was submitted after the shape ruling "
+                             "(one decision per visit)")
+    # (c) In the final epoch the LAST visit's decision matches the outcome:
+    #     a slice_filed exists iff that visit's decision is the accepted
+    #     submission, and none exists iff it is a ruling. A ruling in an
+    #     EARLIER visit beside a filing in the last is legal -- it is the
+    #     hand-back resolved by slicing, not a second decision in one visit.
+    last = front.shaping_visit(store, run_id, n)
+    decided_by_ruling = front.shape_ruling(store, run_id, n, visit=last) is not None
+    if decided_by_ruling == bool(filed):
+        fails.append(f"final epoch {n} visit {last}: the last visit's decision is a slice_filed or a "
+                     "shape ruling, not both and not neither")
+    return fails
+
+
+def assert_dispute(store, run_id: str) -> list[str]:
+    """The fifth §6 line (revision 16): the hand-back was answered.
+
+    Over each epoch that holds a `reshape_requested` and is not superseded
+    by a later `bundle_revised` -- a superseded bundle owes nothing, since
+    the person's issue edit is the resolution the old epoch never got a
+    chance to reach. The hand-back must be answered: by a slice plan
+    accepted and filed after it, or by a disputed ruling followed by its
+    resolution (`front.dispute` is the one definition of both -- the
+    destination, the refusals, the coordinator's notices and this line all
+    read it, so a second derivation cannot disagree with it the way three
+    incompatible ones once did). And no `spec` submission may fall between
+    the disputed ruling and the resolution -- the window revision 16
+    protects, where a crash loses nothing because no decision yet exists to
+    lose."""
+    fails: list[str] = []
+    n = front.epoch(store, run_id)
+    for e in range(n + 1):
+        hbs = front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, e)
+        if not hbs:
             continue
-        subs = front.submissions(store, run_id, "slices", e)
-        if subs and ruling.seq < subs[-1].seq:
-            fails.append(f"epoch {e}: a slice plan was submitted after the shape ruling (one decision per epoch)")
-        if front.slices_filed(store, run_id, e):
-            fails.append(f"epoch {e}: a shape ruling beside a filing (one decision per epoch)")
-    if bool(front.shape_ruling(store, run_id, n)) == bool(filed):
-        fails.append(f"final epoch {n}: exactly one decision, a slice_filed or a shape ruling")
+        if len(hbs) > 1:
+            fails.append(f"epoch {e}: a second reshape_requested; one hand-back per bundle is the kernel's guard")
+        if e != n:
+            continue                      # superseded: the epoch owes nothing
+        d = front.dispute(store, run_id, e)
+        filed_after = [f for f in front.epoch_facts(store, run_id, EventKind.SLICE_FILED, e)
+                       if f.seq > d.hand_back.seq]
+        if d.disputed is None:
+            if not filed_after:
+                fails.append(f"epoch {e}: the hand-back is unanswered -- no disputed ruling and no filing after it")
+            continue
+        if d.resolution is None:
+            fails.append(f"epoch {e}: the hand-back is unanswered -- a disputed ruling with no resolution")
+            continue
+        between = [f for f in store.facts_of_kind(run_id, EventKind.ARTIFACT_SUBMITTED)
+                   if f.payload.get("epoch") == e and f.payload["phase"] == "spec"
+                   and d.disputed.seq < f.seq < d.resolution.seq]
+        if between:
+            fails.append(f"epoch {e}: a spec was submitted between the disputed ruling and the resolution")
     return fails
 
 
@@ -428,7 +600,8 @@ def main(argv=None) -> int:
 
     store = Store.open(a.db)
     mode = "human" if a.expect_human else "approval" if a.expect_approval else "zero"
-    fails = assert_journal(store, a.run_id, mode=mode) + assert_sessions(store, a.run_id, server=a.server)
+    fails = (assert_journal(store, a.run_id, mode=mode) + assert_sessions(store, a.run_id, server=a.server)
+             + assert_dispute(store, a.run_id))
 
     if a.children:
         from coordinator.sweep import ReadFailed, gh_json
@@ -445,7 +618,8 @@ def main(argv=None) -> int:
             # child must become a failure line, not an exception escaping
             # main -- the loop continues over the remaining children either way.
             try:
-                child_fails = assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)
+                child_fails = (assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)
+                               + assert_dispute(store, kids[-1]))
             except ReadFailed as exc:
                 fails.append(f"child #{f.payload['issue']} ({kids[-1]}): could not read: {exc}")
                 continue
