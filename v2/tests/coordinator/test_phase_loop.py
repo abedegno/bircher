@@ -84,13 +84,18 @@ def test_model_no_gates_reaches_planned_untouched(world, monkeypatch):
     assert "human_answer" not in kinds and "human_ruling" not in kinds and "parked" not in kinds
     subs = s.facts_of_kind("r-1", EventKind.ARTIFACT_SUBMITTED)
     assert [x.payload["phase"] for x in subs] == ["spec", "plan"]
-    # spec §3 Rotation: a phase's first artefact is authored by the vendor
-    # that did NOT review the previous phase's last accepted artefact -- codex
-    # reviewed the spec, so claude authors the plan and codex reviews it. What
-    # the rotation is FOR holds either way: no vendor reviews its own artefact.
-    assert [x.payload["author"] for x in subs] == ["claude", "claude"]
+    # Revision 16: the epoch's first spec seat is the vendor that is NOT the
+    # shape ruling's actor (shaping spec §2 *The vendors*) -- this run was
+    # shaped by "claude" (Front's default author), so codex authors the spec.
+    # Codex's spec is then reviewed by claude (the only other vendor
+    # configured), and spec §3 Rotation carries that into the plan phase: a
+    # phase's first artefact is authored by the vendor that did NOT review
+    # the previous phase's last accepted artefact -- so codex, not claude,
+    # authors the plan too, and claude reviews it. What the rotation is FOR
+    # holds either way: no vendor reviews its own artefact.
+    assert [x.payload["author"] for x in subs] == ["codex", "codex"]
     verdicts = s.facts_of_kind("r-1", EventKind.REVIEW_VERDICT)
-    assert [v.payload["reviewer_identity"] for v in verdicts] == ["codex", "codex"]
+    assert [v.payload["reviewer_identity"] for v in verdicts] == ["claude", "claude"]
     assert all(v.payload["reviewer_identity"] != x.payload["author"] for v, x in zip(verdicts, subs))
     assert [a[3] for a in gh] == ["1", "1"] and all("bircher: published" in a[-1] for a in gh)
     # Every session prompted, ended, stopped -- and ENDED is asserted, not
@@ -156,10 +161,12 @@ def test_grill_human_parks_on_questions_and_continues_in_the_same_session(world,
                for r in front.satisfied_effects(s, "r-1", "sess-create")
                if r["intent"]["obligation"]["phase"] == "spec"}
     # One AUTHOR session in the spec phase: the reviewer's own spec-phase
-    # session is the codex one, and the server names the BUNDLE (ruling 14),
-    # so the vendor is read off the bundle name rather than compared to it.
+    # session is the claude one -- revision 16's fresh-perspective rule gives
+    # the spec to codex (not the "claude" that shaped this run), leaving
+    # claude to review it -- and the server names the BUNDLE (ruling 14), so
+    # the vendor is read off the bundle name rather than compared to it.
     assert authors == {sid} | {x for x in authors
-                               if front.vendor_of(fake.sessions[x]["agent_name"]) == "codex"}
+                               if front.vendor_of(fake.sessions[x]["agent_name"]) == "claude"}
     assert s.run_state("r-1") == "planned"
 
 

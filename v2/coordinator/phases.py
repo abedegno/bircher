@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from coordinator import sessions
 from coordinator.effects import perform_effect
 from kernel import front
-from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, phase_of
+from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, NotAuthorized, phase_of
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
 
@@ -225,6 +225,12 @@ PARK_NEEDS = {
     "budget_exhausted": "Reply with the single word `retry` in the session below, or give corrections.",
     "no_verdict": "Reply with the single word `retry` in the session below, or give corrections.",
     "identical_resubmission": "Reply with the single word `retry` in the session below, or give corrections.",
+    # Revision 16 (shaping spec §4 *The disagreement gate*): the person's
+    # decision, not a reviewer's -- so the wording says so, and says what a
+    # bare "disagreement" does not.
+    "disagreement": ("The shaper and the spec author disagree on whether this is one piece "
+                     "of work. Reply with the single word `approve` to accept one piece, or "
+                     "say how to slice it. This is your decision, not a reviewer's."),
 }
 
 
@@ -245,6 +251,17 @@ def park_notice_body(ctx: Ctx, park) -> str:
     sid = park.payload.get("session_id")
     ui = os.environ.get("BIRCHER_OMNIGENT_UI", "").rstrip("/")
     where = f"{ui}/c/{sid}" if (ui and sid) else (f"session `{sid}`" if sid else "the run's newest session")
+    if reason == "disagreement":
+        # NOT "the reviewer accepted": nothing was accepted. Two seats
+        # disagree and the person decides (shaping spec §4 *The
+        # disagreement gate*); the generic body below says "waiting for you
+        # at the phase", which reads as an ordinary gate and says nothing
+        # about why.
+        return (f"bircher: parked disagreement\n\n"
+                f"The spec author handed this issue back as an epic; the shaper reconsidered and "
+                f"reaffirmed that it is one piece of work.\n\n{PARK_NEEDS['disagreement']}\n\n"
+                f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the "
+                "moment you send it, so nothing appears to happen until one runs.")
     return (f"bircher: parked {reason}\n\n"
             f"This run is waiting for you at the **{park.payload.get('phase')}** phase.\n\n"
             f"{PARK_NEEDS.get(reason, 'Open the session below and reply.')}\n\n"
@@ -399,6 +416,25 @@ def run_loop(ctx: Ctx) -> int:
                 if human.human_pass(ctx, park) == "parked":
                     return Exit.PARKED
                 continue
+            # Revision 16: the park is the disagreement's NOTICE, not its
+            # definition (shaping spec §2 *The park is the disagreement's
+            # notice, not its definition*). A pass that died between the
+            # disputed ruling and its park left the journal saying
+            # "unresolved" and no park recorded; recording it here costs one
+            # wave and never a third seat. After the operator fence above and
+            # before any seat below is dispatched.
+            if state == "shaping" and park is None and front.unresolved_disagreement(store, run_id):
+                try:
+                    if stall(ctx, "disagreement", session_id=_newest_author_session(ctx),
+                             findings_hash=None, verdict=None, reviewer=None) == "parked":
+                        return Exit.PARKED
+                except NotAuthorized as exc:
+                    # The dispute was resolved between `stall`'s listing and
+                    # its park -- a person's command landing in the gap the
+                    # two calls leave open (`_check_park`'s own guard). Not a
+                    # crash: re-read the dispute and carry on with the pass.
+                    ctx.log(f"disagreement park refused, the dispute resolved in the gap: {exc}")
+                continue
             if state == "shaping":
                 from coordinator import shape
                 out = shape.shape_round(ctx)
@@ -429,6 +465,12 @@ def run_loop(ctx: Ctx) -> int:
                         return Exit.PARKED
                 elif out == "failed":
                     return Exit.FAILED
+                elif out == "reshaped":
+                    # The spec author handed the run back; the next
+                    # iteration reads `shaping` and runs the shaping round
+                    # (named here so an unexpected outcome still falls to
+                    # the `failed` arm above rather than to this one).
+                    continue
                 continue
             if state in ("slices_submitted", "spec_submitted", "plan_submitted"):
                 out = review.review_round(ctx)

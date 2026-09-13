@@ -66,6 +66,46 @@ def choose_author_vendor(ctx) -> str:
     verdicts = [v for v in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT)
                 if v.payload.get("ruling") == "review_ruling"]
     same_phase = [v for v in verdicts if v.payload["phase"] == phase and v.payload["epoch"] == n]
+
+    # Revision 16, in precedence order (shaping spec §2 *The vendors*). The
+    # adopted-seat clause above is first and unchanged.
+    d = front.dispute(store, run_id)
+    if phase == "spec":
+        # Every spec author round of an epoch that holds a shape ruling
+        # takes the vendor that is NOT the newest shape ruling's actor -- the
+        # epoch's first spec turn, and the spec round after a resolution,
+        # both of which would otherwise fall through to `default_author`,
+        # which is the shaper's own vendor. It yields to the same-phase
+        # rotation once a spec review_verdict exists in the epoch: by then
+        # the fresh perspective has already been had, and a revision turn's
+        # author is whoever the rotation names.
+        ruling = front.shape_ruling(store, run_id, n)
+        if ruling is not None and not same_phase:
+            return _other_than(ctx, ruling.actor)
+    elif phase == "slices" and d is not None:
+        # Both clauses below hold for the WHOLE visit a hand-back or a
+        # direction opens, reviewer verdicts or none: an empty-turn retry
+        # has a new cause and would otherwise fall through to
+        # `default_author`, and a rejected plan followed by the ordinary
+        # rotation would hand the round right back to the vendor the rule
+        # excludes. `same_phase` is deliberately not read here -- within
+        # the visit only the REVIEWER seat rotates, and it is always the
+        # vendor that did not author, so cross-vendor review still holds.
+        visit = front.shaping_visit(store, run_id, n)
+        if front.visit_of(store, run_id, d.hand_back.seq) == visit:
+            # The hand-back's own visit: the handed-back ruling's vendor
+            # reconsiders with the spec author's counter-argument in hand --
+            # unless that vendor is the hand-back's own actor, in which case
+            # "reconsidering" would be one vendor arguing with itself, and
+            # the other vendor takes the visit instead.
+            want = d.handed_back.actor
+            return _other_than(ctx, want) if want == d.hand_back.actor else want
+        if d.resolution is not None and d.resolution.kind == EventKind.HUMAN_DIRECTION:
+            # A direction-opened visit: the person has just overruled the
+            # disputed ruling's vendor, so the visit is not that vendor's to
+            # reconsider either.
+            return _other_than(ctx, d.disputed.actor)
+
     if same_phase:
         return same_phase[-1].payload["reviewer_identity"]
     if phase == "plan":
@@ -75,6 +115,14 @@ def choose_author_vendor(ctx) -> str:
             other = [x for x in vendors if x != spec_accepts[-1].payload["reviewer_identity"]]
             return other[0] if other else vendors[0]
     return ctx.default_author
+
+
+def _other_than(ctx, vendor: str) -> str:
+    """The other configured vendor (revision 16): the smallest one that is
+    not *vendor*, so the choice is deterministic when more than two are
+    configured, and *vendor* itself when there is nothing else to pick."""
+    others = [v for v in sorted(ctx.agent_ids) if v != vendor]
+    return others[0] if others else vendor
 
 
 def _findings_for(ctx) -> bytes:

@@ -7,7 +7,7 @@ import json
 from coordinator import seat, sessions
 from coordinator.session import LookupFailed, list_items
 from kernel import front
-from kernel.authz import NotAuthorized, phase_of
+from kernel.authz import SHAPING_STATES, NotAuthorized, phase_of
 from kernel.canon import content_hash
 from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
 from kernel.policy import policy_of
@@ -108,7 +108,7 @@ def _is_cancellation_notice(item) -> bool:
     return str(item.get("response_id", "")).startswith("cancel_")
 
 
-def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, str]:
+def classify_batch(items: list, *, state: str, grill_open: bool, dispute: bool = False) -> tuple[str, str]:
     """What one batch of human messages IS (spec §4), given the run's state.
 
     A batch is ONE fact, never several: an answer while questions are open;
@@ -117,6 +117,16 @@ def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, s
     the bare `retry` that grants a round. The token has to be the WHOLE
     message, trimmed and case-folded -- `approve?` is a question and
     `approve.` is prose, and neither of them is a ruling.
+
+    `dispute` (revision 16, shaping spec §2 *The dispute*, §4 *The
+    disagreement gate*): true while the epoch's shape dispute is unresolved.
+    It is read only at `shaping`, and it takes precedence over an open
+    grill there -- the grill is epoch-scoped and can stand open (a
+    question asked before the hand-back, still unanswered) while a
+    hand-back's visit runs, and `record_human_answer` is refused from every
+    shaping state regardless: reading a reply at `shaping` as an answer
+    would record a fact the kernel refuses and drop the person's word on
+    the dispute along with it.
     """
     if not items:
         # A batch with no messages in it is not a fact of any kind. Raised
@@ -126,9 +136,19 @@ def classify_batch(items: list, *, state: str, grill_open: bool) -> tuple[str, s
         raise ValueError("classify_batch needs at least one message: an empty batch is not a fact")
     texts = [it["text"].strip() for it in items]
     joined = "\n\n".join(texts)
-    if grill_open:
+    if grill_open and state not in SHAPING_STATES:
         return "answer", joined
     single = texts[0].casefold() if len(texts) == 1 else None
+    if dispute and state == "shaping":
+        # `approve`, which is a gate's approval elsewhere, is the person's
+        # ruling here; `retry` -- `grant_round` elsewhere -- is refused (the
+        # kernel's own guard on `grant_round` at `shaping` while the dispute
+        # is unresolved) and answered by `reply_refusals` like any refused
+        # token; anything else is a direction, which starts the next
+        # shaping round and opens a new visit.
+        if single == APPROVE:
+            return "approve_one_piece", ""
+        return ("retry", "") if single == RETRY else ("direction", joined)
     if single == RETRY:
         return "retry", ""
     if state in ("slices_submitted", "slices_accepted", "spec_submitted", "spec_accepted",
@@ -185,7 +205,11 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
     questions = front.epoch_facts(store, run_id, EventKind.MODEL_QUESTION, n) if grill_open else []
     answers = front.epoch_facts(store, run_id, EventKind.HUMAN_ANSWER, n)
     newer_q = [q for q in questions if not answers or q.seq > answers[-1].seq]
-    kind, text = classify_batch(items, state=state, grill_open=bool(newer_q))
+    # Revision 16: the dispute is read only at `shaping`, and it takes
+    # precedence over `newer_q` there (`classify_batch`'s own guard) -- see
+    # its docstring for why an open grill must not swallow the reply.
+    kind, text = classify_batch(items, state=state, grill_open=bool(newer_q),
+                                dispute=front.unresolved_disagreement(store, run_id))
     cur = listing[-1]["id"]
     key = f"human:{run_id}:{items[-1]['id']}"
     phase = phase_of(state)
@@ -197,6 +221,8 @@ def take_listing(ctx, session_id: str, listing: list) -> str | None:
         elif kind == "approve":
             result = _human(ctx, "approve_artifact", {"artifact_hash": store.phase_artifact(run_id, phase),
                                                       "cursor_item_id": cur}, key)
+        elif kind == "approve_one_piece":
+            result = _human(ctx, "approve_one_piece", {"cursor_item_id": cur}, key)
         elif kind == "retry":
             result = _human(ctx, "grant_round", {"cursor_item_id": cur}, key)
         elif kind == "revision":
@@ -309,6 +335,20 @@ def park_prompt(ctx, park) -> bytes:
     reason, phase = park.payload["reason"], park.payload["phase"]
     if reason == "grill":
         return b""                                       # the author's own questions are the prompt
+    if reason == "disagreement":
+        # Naming each seat's vendor is the point (shaping spec §2 *The
+        # vendors*): a person can see whether the disagreement crosses
+        # vendors or is one vendor contradicting itself. There is no
+        # artefact to quote here -- the shaper's ruling and the spec
+        # author's hand-back are the whole of what the person needs.
+        d = front.dispute(store, run_id)
+        return (f"{NOT_FOR_THE_AGENT}\n\n"
+                f"Two seats disagree about the shape of this issue and you decide.\n\n"
+                f"**{d.handed_back.actor} ruled one piece:**\n\n> {d.handed_back.payload['reasoning']}\n\n"
+                f"**{d.hand_back.actor} handed it back as an epic:**\n\n> {d.hand_back.payload['reasoning']}\n\n"
+                f"**{d.disputed.actor} reconsidered and reaffirmed one piece:**\n\n"
+                f"> {d.disputed.payload['reasoning']}\n\n"
+                f"Reply with the single word `approve` to accept one piece, or say how to slice it.").encode()
     h = store.phase_artifact(run_id, phase)
     art = store.read_blob(h).decode("utf-8", "replace") if h else "(no artefact yet)"
     # The prompt lands in a LIVE agent session, because that is where the

@@ -66,8 +66,14 @@ def shape_round(ctx) -> str:
     if artefact is None:
         return author.record_empty(ctx, turn.session_id)
     h = put_artifact(store, artefact)
-    rnd = len(front.submissions(store, run_id, "slices", n)) + 1
-    author._copy(ctx, "slices", rnd, artefact)
+    # Revision 16: the round counter and the copy's name are both the
+    # VISIT's, not the epoch's (shaping spec §2 *Visits, not epochs*) --
+    # moving only the counter and leaving `_copy`'s name epoch-numbered was
+    # the defect the site table names: a new visit's first plan would
+    # overwrite the last visit's `slices-r1.md`.
+    visit = front.shaping_visit(store, run_id, n)
+    rnd = len(front.submissions(store, run_id, "slices", n, visit=visit)) + 1
+    author._copy(ctx, f"slices-v{visit}", rnd, artefact)
     try:
         seat.command(ctx, "submit_slices", {"artifact_hash": h})
     except NotAuthorized as exc:

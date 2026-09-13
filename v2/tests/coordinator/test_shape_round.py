@@ -87,7 +87,10 @@ def test_slice_plan_ending(world):
     assert shape.shape_round(ctx) == "submitted"
     assert s.run_state("i12-epic-1") == "slices_submitted"
     assert s.read_blob(s.phase_artifact("i12-epic-1", "slices")) == SLICES_BYTES
-    assert os.path.exists(os.path.join(ctx.bundle_dir, "i12-epic-1", "slices-r1.md"))
+    # Revision 16: the copy is named by VISIT, not merely by round (shaping
+    # spec §2 *Visits, not epochs*) -- this run's first and only visit is 1,
+    # so the file is "slices-v1-r1.md", not the pre-revision "slices-r1.md".
+    assert os.path.exists(os.path.join(ctx.bundle_dir, "i12-epic-1", "slices-v1-r1.md"))
 
 
 def test_both_files_the_ruling_is_read(world):

@@ -122,7 +122,11 @@ def test_an_artefact_turn_submits_and_writes_the_copy(world, tmp_path):
     assert author.author_round(ctx) == "submitted"
     assert s.run_state("r-1") == "spec_submitted"
     sub = s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED)
-    assert sub.payload["author"] == "claude" and sub.payload["round"] == 1
+    # Revision 16: the epoch's first spec seat is the vendor that is NOT the
+    # shape ruling's actor (shaping spec §2 *The vendors*) -- `world`'s run
+    # is shaped by "claude" (Front's default author), so codex, not the
+    # fixture's `default_author`, authors the fresh-perspective spec.
+    assert sub.payload["author"] == "codex" and sub.payload["round"] == 1
     copy = tmp_path / "bundle" / "r-1" / "spec-r1.md"
     assert copy.read_bytes() == SPEC_BYTES
     sid = list(fake.sessions)[0]
@@ -135,14 +139,20 @@ def test_the_brief_carries_findings_on_a_revision_and_the_spec_for_a_plan(world)
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    # Revision 16: the epoch's first spec seat is the vendor that is not the
+    # shape ruling's actor (shaping spec §2 *The vendors*) -- "claude" shaped
+    # this run (Front's default author), so "codex" authors the
+    # fresh-perspective spec, and "claude" is left to review it.
+    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "codex"
+    f.reviewer = "claude"
     f.review_round("request_revision", findings=b"needs a threat model")
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES + b"\n## Threats\n")
     assert author.author_round(ctx) == "submitted"
     sid = list(fake.sessions)[-1]
     text = fake.sessions[sid]["items"][0]["content"][0]["text"]
     assert "needs a threat model" in text and SPEC_BYTES.decode() in text
-    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "codex"   # rotation
-    f.reviewer = "claude"                                                # the other vendor reviews
+    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "claude"   # rotation
+    f.reviewer = "codex"                                                # the other vendor reviews
     f.review_round("accept")
     _writes(fake, seat.ARTIFACT_OUT, b"# Plan\n\n### Task 1: x\n")
     assert author.author_round(ctx) == "submitted"
@@ -228,6 +238,7 @@ def test_identical_resubmission_reauthors_once_then_stalls(world):
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
     f.review_round("request_revision")
     assert author.author_round(ctx) == "reauthor"
     rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
@@ -323,6 +334,7 @@ def test_the_revision_author_rotates_by_default(world):
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     assert author.author_round(ctx) == "submitted"
     first = front.submissions(s, "r-1", "spec", 0)[0].payload["author"]
+    f.reviewer = "claude" if first == "codex" else "codex"   # independence (revision 16 rotates the author)
     f.review_round("request_revision")
     assert author.choose_author_vendor(ctx) != first, "the reviewer authors the revision"
 
@@ -335,6 +347,7 @@ def test_a_revision_brief_requires_dispositions(world):
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
     f.review_round("request_revision")
     brief = author.author_brief(ctx, phase="spec").decode()
     assert "## Findings to address" in brief
@@ -427,6 +440,7 @@ def test_the_plan_round_still_reads_questions_under_grill_model(world):
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     assert author.author_round(ctx) == "submitted"
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
     f.review_round("accept")
     assert ctx.phase() == "plan"
     _writes(fake, seat.QUESTIONS_OUT, b"### Q1: which orm?\nRecommended: none\n")
