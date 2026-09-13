@@ -9369,12 +9369,18 @@ print(json.loads(open(sys.argv[1]).read().splitlines()[-1])["note"])' "$gdir/min
   local jdir; jdir=$(mktemp -d)
   cat > "$jdir/gh" <<'SH'
 #!/usr/bin/env bash
-# "issue list" answers with NOTHING, as the real --jq filter would for an
-# empty result -- not the literal text "[]", which `for n in $queued_nums`
-# would then iterate as a single (bogus) issue number and mask the sweep's
-# own failure line behind is_unblocked's "blockers unreadable" noise.
+# "issue list" answers with ONE labelled issue (34) -- not empty text and not
+# the literal "[]" (which `for n in $queued_nums` would word-split into a
+# single bogus issue number and mask the sweep's own failure line behind
+# is_unblocked's "blockers unreadable" noise). One real number is what lets
+# this case prove BOTH halves of the failure message: the sweep fails, AND
+# the queue is still generated from labels alone (fix round 1, F6).
 case "$*" in
-  *"issue list"*) printf '' ;;
+  *"issue list"*) printf '34\n' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "T" ;;
+  *"--json body"*) echo "B" ;;
+  *"--json comments"*) echo '[]' ;;
   *) echo '[]' ;;
 esac
 SH
@@ -9387,6 +9393,12 @@ SH
     *"journal sweep failed"*) ;;
     *) echo "FAIL issues-to-queue: the sweep's failure must print a line, got: $jout"; exit 1 ;;
   esac
+  # THE OTHER HALF of the same message (fix round 1, F6): a failed sweep only
+  # empties parked_nums (the `|| parked_nums=""` fallback), so the label path
+  # must still run to completion. Without this line the case proved the
+  # sentence prints and said nothing about whether it is TRUE.
+  ls "$jdir/queue"/i34-*.md >/dev/null 2>&1 \
+    || { echo "FAIL issues-to-queue: a labelled issue must still be queued when the journal sweep fails"; exit 1; }
   rm -rf "$jdir"
   echo "issues-to-queue journal sweep failure is visible OK"
 

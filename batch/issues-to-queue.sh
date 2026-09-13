@@ -118,18 +118,30 @@ print(" ".join(dict.fromkeys(out)))' 2>"${TMP_SWEEP_ERR:-/dev/null}") || parked_
   [ -z "$parked_nums" ] || echo "parked runs to resume: $parked_nums" >&2
 fi
 [ "$DRY" = 1 ] || : > "$QUEUE/.manifest"
+# EMITTED, not queued_nums membership (fix round 1, finding F1). An issue
+# is_unblocked SKIPPED is still a member of queued_nums -- the label swap to
+# `running` can fail (`_effect … || true`), or a person can re-add the label
+# -- so testing membership there read a blocked label-derived item as
+# "already handled" and the journal loop below dropped it too. That is the
+# one reachable case in which a sibling blocker withholds a resumption that
+# is past its own sequencing, which is exactly the outcome this union order
+# exists to prevent. emitted_nums is what actually reached _emit_item.
+emitted_nums=""
 for n in $queued_nums; do
   is_unblocked "$n" || { echo "skip #$n (blocked)"; continue; }
   _emit_item "$n"
+  emitted_nums="$emitted_nums $n"
 done
 # Journal-derived resumptions are unioned in AFTER is_unblocked, not before
 # (shaping spec §5): the blocked check applies to label-derived items only.
 # An open run is past its sequencing -- a sibling blocker reopened while it
 # sat parked or disputed would otherwise withhold it every wave, with
 # nothing on the issue itself to say why. A label-derived issue above is
-# still checked, as today.
+# still checked, as today. The dedupe below reads emitted_nums, not
+# queued_nums, for the same reason: an issue is_unblocked skipped never
+# reached _emit_item, and the journal path is its only way in this wave.
 for n in $parked_nums; do
-  case " $queued_nums " in *" $n "*) continue ;; esac
+  case " $emitted_nums " in *" $n "*) continue ;; esac
   _emit_item "$n"
 done
 echo "queued $count issue(s)"

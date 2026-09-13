@@ -644,6 +644,16 @@ def test_a_failed_loop_at_shaping_with_the_dispute_unresolved_keeps_the_queue_fi
     assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
     note = d.args_of("json_row")[7]
     assert "awaits the person" in note, note
+    # Fix round 1, F5: the call site's argument order (`item rc run_id`)
+    # binds nothing without a POSITIONAL check. Swapping `$_prc` and
+    # `$BIRCHER_RUN_ID` at the call site left the note reading "phases
+    # rc=<run id> at shaping … run '1' stays open" -- a bare
+    # `run_id in note` substring check is satisfied either way, since the
+    # swapped run id still appears somewhere in the string; only checking
+    # WHERE each value landed catches the swap.
+    run_id = d.args_of("_kernel_run_start")[0]
+    assert "phases rc=1 at shaping" in note, note
+    assert f"run '{run_id}' stays open" in note, note
 
 
 def test_an_unreadable_dispute_at_shaping_keeps_the_queue_file(tmp_path):
