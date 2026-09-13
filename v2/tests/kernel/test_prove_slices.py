@@ -1366,6 +1366,190 @@ def test_approval_mode_reds_on_a_disagreement_park_with_no_dispute(tmp_path):
     assert any("admitted by ruling word alone" in x for x in fails), fails
 
 
+# ---------------------------------------------------------------------------
+# Fix round 4: D1-D4, the five inert assertions, and the visit-stamp
+# judgment call (task-10-rereview-3.md).
+# ---------------------------------------------------------------------------
+
+def test_gate_park_passes_a_real_park_at_a_real_submission(tmp_path):
+    """Round 4: the "gate" park now grounds the same way "approve" does --
+    a real submission at the (phase, epoch) it names -- closing the
+    `_gate_exists` fallthrough's unexercised `return True`. The positive
+    case first: a genuine gate park (the coordinator's own `stall(ctx,
+    "gate", ...)`, `coordinator/phases.py`) must still pass cleanly."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES)
+    _accept(f)
+    assert f.state() == "spec_accepted"
+    f.park(reason="gate")
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert not any("ruling word alone" in x for x in fails), fails
+
+
+def test_gate_park_reds_on_a_park_with_no_submission(tmp_path):
+    """The planted defect the positive case above is paired with: a "gate"
+    park naming a phase/epoch nothing was ever submitted to -- admitted by
+    the park's `reason` word alone under the old fallthrough."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    s.append_fact(run_id=f.run_id, kind=EventKind.PARKED, actor="coordinator", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "reason": "gate", "session_id": None,
+                           "cursor_item_id": None, "findings_hash": None, "verdict": None, "reviewer": None,
+                           "generation": 1})
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert any("admitted by ruling word alone" in x for x in fails), fails
+
+
+def test_assertion_1_reds_on_a_phantom_filing_sandwiched_between_two_real_ones(tmp_path):
+    """Round 4, D1: `front.slices_filed`'s dict comprehension collapses
+    every filing of a slice to its LAST one -- a phantom filing sandwiched
+    between the real filing and its own restatement is invisible to that
+    collapse, and so to assertion 1's checks, since the restatement's issue
+    number is the real one all along. `front.slice_filings`, uncollapsed,
+    is what the "one filing per slice" check reads instead."""
+    s, f = _parent(tmp_path)
+    real = next(x for x in s.facts_of_kind(f.run_id, EventKind.SLICE_FILED) if x.payload.get("slice") == 1)
+    s.append_fact(run_id=f.run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                  payload={**real.payload, "issue": 999, "issue_id": 9999})   # the phantom
+    s.append_fact(run_id=f.run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                  payload=dict(real.payload))                                 # the restatement
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=GH(s, f))
+    assert any("more than one filing" in x for x in fails), fails
+
+
+def test_by_gate_reds_on_a_second_approval_stamped_the_superseded_epoch(tmp_path):
+    """Round 4, D2: `by_gate`/`dup_gates` grouped by the STAMPED epoch, so
+    two approvals of the SAME real gate, one stamped a wrong-but-in-range
+    epoch, landed in different buckets and were not counted as a
+    duplicate. Grouped by `front.epoch_of`'s derivation instead, both land
+    in the same bucket regardless of what either stamp claims."""
+    # A plain `labels=()` run, not `_two_epoch_sliced_parent`'s (whose issue
+    # carries `bircher:autonomous`, which clears every gate -- ruling 5 --
+    # and so never reaches a real `approve` to duplicate against).
+    s = _store_with_confirmed_stops(tmp_path / "a.db")
+    f = Front(s, "r-1", shape=False, labels=())
+    f.shape_round(SLICES_BYTES)                              # epoch 0: a plan waits, undecided
+    f.revise({"number": 1, "title": "T", "body": "changed", "labels": [], "comments": []}, reshape=False)
+    f.to_sliced(SLICES_BYTES)                                 # epoch 1: sliced, real approve (slices IS gated)
+    before = prove.assert_journal(s, f.run_id, mode="approval")
+    assert not any("more than one approval" in x for x in before), before
+    h = front.accepted_slices_hash(s, f.run_id, 1)
+    # In range for the OLD check (0 <= 0 <= n=1), but its own seq comes
+    # after the run's one bundle_revised fact, so the journal's derived
+    # epoch for it is 1 -- the very gate the real approval already answered.
+    s.append_fact(run_id=f.run_id, kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={"ruling": "approve", "phase": "slices", "epoch": 0,
+                           "artifact_hash": h, "cursor_item_id": None})
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert any("more than one approval" in x for x in fails), fails
+
+
+def test_no_model_ruling_check_reds_on_a_ruling_naming_no_real_question(tmp_path):
+    """Round 4, D3: a `model_ruling` naming a `question_id` no
+    `model_question` fact ever asked used to satisfy "the author ruled on a
+    question" by the ruling WORD alone -- the same admission-by-word-alone
+    shape `_gate_exists` (round 3, C4) and the controller amendment
+    already close elsewhere in this file, left open here."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE, shape=False)
+    f.shape_round()   # the real one-piece ruling (question_id "shape"), exempted regardless
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "nonexistent", "ruling": "yes",
+                           "reasoning": "forged", "cost_if_wrong": "n/a"})
+    fails = prove.assert_journal(s, f.run_id, mode="zero")
+    assert any("no model_ruling" in x for x in fails), fails
+
+
+def test_clause_b_reds_on_a_ruling_beside_an_accepted_plan_in_a_superseded_epoch(tmp_path):
+    """Round 4, D4: `_decision_at`'s old `e == n` conjunct collapsed clause
+    (b)'s "within EACH epoch" (spec §6(b)) to just the final epoch -- a
+    shape ruling beside an ACCEPTED slice plan in a SUPERSEDED epoch (one
+    later revised away before it could be filed) was invisible everywhere
+    but the last epoch. Unreachable through any real command in sequence (a
+    real `approve` lands the run at `sliced`, from which `revise_bundle` is
+    refused) -- forged directly, the same way the reviewer's own
+    construction was."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", shape=False, issue=ISSUE)
+    h = put_artifact(s, SLICES_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "hash": h, "author": "claude", "round": 1, "visit": 1})
+    s.append_fact(run_id=f.run_id, kind=EventKind.REVIEW_VERDICT, actor="codex", causal_command_id=None,
+                  payload={"ruling": "review_ruling", "phase": "slices", "epoch": 0, "verdict": "accept",
+                           "artifact_hash": h, "findings_hash": None, "generation": 1})
+    s.append_fact(run_id=f.run_id, kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={"ruling": "approve", "phase": "slices", "epoch": 0,
+                           "artifact_hash": h, "cursor_item_id": None})
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "beside the accepted plan", "cost_if_wrong": "n/a", "visit": 1})
+    f.revise(dict(ISSUE, body="changed"), reshape=False)   # epoch 1 opens; epoch 0 superseded
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=_no_gh)
+    assert any("a shape ruling beside the accepted slice plan" in x for x in fails), fails
+
+
+def test_the_extra_filter_keeps_an_extra_fact_out_of_the_ungrounded_report(tmp_path):
+    """Round 4, inert #4: with `_gate_exists` now denying by default (the
+    fallthrough closed), an `extra` fact would ALSO fail `_gate_exists` --
+    none of its four branches match a fact `extra` already excludes -- and
+    be reported a second time by `ungrounded` without this filter. Kept
+    because of that, not because it was already redundant under the old
+    admit-by-default fallthrough."""
+    s = _store_with_confirmed_stops(tmp_path / "k.db")
+    f = Front(s, "r-1", labels=())
+    f.author_round(SPEC_BYTES); _accept(f); f.approve()
+    f.answer("noted")
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert any("beyond the approval" in x for x in fails)
+    assert not any("admitted by ruling word alone" in x for x in fails), fails
+
+
+def test_phase_set_check_reds_on_a_final_slices_submission_with_the_wrong_hash(tmp_path):
+    """Round 4, inert #5: the hash-equality conjunct
+    (`subs["slices"] != front.accepted_slices_hash(...)`) -- no existing
+    history plants a final-epoch slices submission whose hash differs from
+    what was actually accepted and filed, so nothing distinguished this
+    conjunct from the three ahead of it in the same `or`."""
+    s, f = _parent(tmp_path)
+    assert prove.assert_journal(s, f.run_id, mode="zero") == []
+    wrong = put_artifact(s, SLICES_BYTES + b"\n# a different plan\n")
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": 0, "hash": wrong, "author": "claude", "round": 9, "visit": 1})
+    fails = prove.assert_journal(s, f.run_id, mode="zero")
+    assert any("artifact_submitted: a sliced parent's final epoch" in x for x in fails), fails
+
+
+def test_the_visit_stamp_check_now_covers_reshape_requested(tmp_path):
+    """Round 4 judgment call: compare, not delete -- the same walk already
+    used for model_ruling/artifact_submitted, extended to reshape_requested
+    (no exploit was found; a written, unread stamp is the same gap this
+    loop exists to close for the other two kinds)."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    f.request_reshape("three parts")
+    hb = s.newest_fact(f.run_id, EventKind.RESHAPE_REQUESTED)
+    before = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=_no_gh)
+    assert not any("stamped visit" in x for x in before), before
+    s.append_fact(run_id=f.run_id, kind=EventKind.RESHAPE_REQUESTED, actor="claude", causal_command_id=None,
+                  payload={**hb.payload, "visit": 99})
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=_no_gh)
+    assert any("reshape_requested" in x and "stamped visit" in x for x in fails), fails
+
+
+def test_the_visit_stamp_check_now_covers_approve_one_piece(tmp_path):
+    """The other half of the same judgment call: `approve_one_piece`'s own
+    `visit` (commands.py: "the DISPUTED ruling's, read through visit_of")."""
+    s, run_id = _Planted(tmp_path).disagreed_then_approved_then_merged()
+    assert prove.assert_slices(s, run_id, repo=REPO, gh_json=_no_gh) == []
+    real = next(x for x in s.facts_of_kind(run_id, EventKind.HUMAN_RULING)
+                if x.payload.get("ruling") == "approve_one_piece")
+    s.append_fact(run_id=run_id, kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={**real.payload, "visit": 99})
+    fails = prove.assert_slices(s, run_id, repo=REPO, gh_json=_no_gh)
+    assert any("human_ruling" in x and "stamped visit" in x for x in fails), fails
+
+
 def test_assert_journal_does_not_crash_on_a_submission_missing_its_phase(tmp_path):
     """Medium, round 3: an artifact_submitted with no `phase` key used to
     raise `KeyError` out of `subs`'s dict comprehension, and `main` calls
