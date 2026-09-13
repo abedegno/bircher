@@ -348,6 +348,26 @@ class Fake:
         s.empty_turn(detail=detail)
         return s
 
+    def malformed_reshape_with_a_prior_submission(self) -> Scenario:
+        """Fix round 2, item 1: `malformed_reshape` alone never submits
+        anything, so the previous-draft guard's `and findings` half (drop
+        it and the whole suite stays green) has nothing to leak -- `prior`
+        is `None` regardless of the guard. `author_brief`'s parse-failure
+        branch is phase-agnostic (only the spec round supplies a `detail`
+        today; minor finding 3), so this builds the same shape in the
+        SHAPING round instead: a plan submitted and rejected, then a
+        malformed retry in the SAME visit, where `prior` is genuinely
+        non-`None`."""
+        f = Front(self._store("malformed_with_prior"), "r-1", shape=False)
+        f.shape_round(SLICES_BYTES)
+        f.review_round("request_revision", findings=b"visit one's own findings")
+        s = Scenario(f)
+        detail = (f"reshape.md did not parse: the first non-blank line must be "
+                  f"exactly `{RESHAPE_LINE}` and a non-empty `Reasoning:` "
+                  f"block must follow")
+        s.empty_turn(detail=detail)
+        return s
+
 
 @pytest.fixture
 def fake(tmp_path):

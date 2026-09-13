@@ -348,7 +348,15 @@ def test_ruling_after_direction_is_none_off_the_approval_path(tmp_path):
     fifth fact `Dispute` does not carry, for the OTHER resolution path.
     `None` before any dispute, while the disputed ruling stands unresolved,
     and when the resolution is the approval rather than a direction --
-    there is no "ruling after the direction" to find on any of these."""
+    there is no "ruling after the direction" to find on any of these.
+
+    The third assertion does not, on its own, pin the `HUMAN_RULING` kind
+    guard (fix round 2): under the current kernel invariants (one
+    hand-back per bundle; approval opens no visit) no command sequence
+    puts a shape ruling after an approval, so the `seq > resolution.seq`
+    filter alone already returns `[]` here, guard or no guard --
+    `test_ruling_after_direction_ignores_a_ruling_after_an_approval` below
+    is what actually exercises the guard, by appending the fact directly."""
     s, f = _shaped(tmp_path)
     assert front.ruling_after_direction(s, f.run_id) is None      # no dispute at all
     f.request_reshape("three parts")
@@ -356,6 +364,29 @@ def test_ruling_after_direction_is_none_off_the_approval_path(tmp_path):
     assert front.ruling_after_direction(s, f.run_id) is None      # unresolved; no direction yet
     f.approve_one_piece()
     assert front.ruling_after_direction(s, f.run_id) is None      # resolved by approval, not a direction
+
+
+def test_ruling_after_direction_ignores_a_ruling_after_an_approval(tmp_path):
+    """Fix round 2: the `HUMAN_RULING` kind guard, pinned for real. No
+    command sequence reaches a shape ruling after an approval-resolved
+    dispute (one hand-back per bundle; approval opens no visit for another
+    one to land in), so the test above never exercises the guard -- its
+    `seq` filter alone already returns `[]`. A fact appended directly
+    (bypassing the command layer, exactly as `_strip_visit_key` does
+    above) is what actually tests it: a ruling recorded after the
+    approval must still not be mistaken for the answer to a direction
+    that never happened."""
+    from kernel.slices import SHAPE_QUESTION
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one", cost="the spec would find one surface")
+    f.approve_one_piece()
+    n = front.epoch(s, f.run_id)
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"question_id": SHAPE_QUESTION, "ruling": "one piece",
+                           "reasoning": "a ruling appended after the approval", "cost_if_wrong": "n/a",
+                           "epoch": n, "visit": front.shaping_visit(s, f.run_id, n)})
+    assert front.ruling_after_direction(s, f.run_id) is None
 
 
 def test_ruling_after_direction_finds_the_fifth_fact_dispute_does_not_carry(tmp_path):
@@ -371,8 +402,74 @@ def test_ruling_after_direction_finds_the_fifth_fact_dispute_does_not_carry(tmp_
     f.shape_round(reasoning="agreed, one piece after all", cost="the spec would find one surface")
     ruling = front.ruling_after_direction(s, f.run_id)
     assert ruling is not None and ruling.payload["reasoning"] == "agreed, one piece after all"
+    # NOT `assert ruling.id != d.disputed.id` (fix round 2): under this
+    # fixture the two rulings' reasoning always differs, so the assertion
+    # above already proves `ruling` is not `d.disputed` -- any mutation
+    # that made them the same fact would fail there first. The test right
+    # below gives the two rulings the SAME words, so identity is the only
+    # thing left to tell them apart.
+
+
+def test_ruling_after_direction_is_a_different_fact_even_with_the_same_words(tmp_path):
+    """The id, not the content, is what proves `ruling_after_direction`
+    returns the ruling that followed the direction and not the one it
+    overruled: with identical reasoning on both rulings, a check on the
+    text alone could not tell them apart."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one piece", cost="the spec would find one surface")   # disputed
+    f.direct("slice it")
+    f.shape_round(reasoning="still one piece", cost="the spec would find one surface")   # same words, after the direction
+    ruling = front.ruling_after_direction(s, f.run_id)
     d = front.dispute(s, f.run_id)
-    assert ruling.id != d.disputed.id                             # not the ruling the direction overruled
+    assert ruling is not None
+    assert ruling.id != d.disputed.id
+    assert ruling.seq > d.disputed.seq
+
+
+def test_ruling_after_direction_picks_the_ruling_nearest_the_direction(tmp_path):
+    """Fix round 2: `rulings[0]`, not `rulings[-1]`. Under the current
+    kernel invariants (one hand-back per bundle; a direction opens a visit
+    only while its dispute is unresolved, which resolving it closes for
+    good) no command sequence puts TWO shape rulings after one direction,
+    so neither choice reds via the command layer alone -- facts appended
+    directly construct the case the spec's own wording names: "the ruling
+    recorded after their direction", the one that answers it, not some
+    later, unrelated one."""
+    from kernel.slices import SHAPE_QUESTION
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one, first look", cost="the spec would find one surface")
+    f.direct("slice it")
+    n = front.epoch(s, f.run_id)
+    visit = front.shaping_visit(s, f.run_id, n)
+    first = s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                          payload={"question_id": SHAPE_QUESTION, "ruling": "one piece",
+                                   "reasoning": "the ruling that actually answers the direction",
+                                   "cost_if_wrong": "n/a", "epoch": n, "visit": visit})
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                 payload={"question_id": SHAPE_QUESTION, "ruling": "one piece",
+                          "reasoning": "an unrelated later ruling, not this direction's answer",
+                          "cost_if_wrong": "n/a", "epoch": n, "visit": visit})
+    ruling = front.ruling_after_direction(s, f.run_id)
+    assert ruling is not None and ruling.id == first
+
+
+def test_ruling_after_direction_ignores_a_grill_ruling(tmp_path):
+    """Fix round 2: the `question_id == SHAPE_QUESTION` filter. A grill
+    `model_ruling` recorded in the directed visit is not a shape ruling,
+    and returning it would hand a resolution brief a grill answer's text
+    that has nothing to do with the dispute -- or raise, if a grill
+    ruling's payload shape ever differed from a shape ruling's."""
+    s, f = _shaped(tmp_path)
+    f.request_reshape("three parts")
+    f.shape_round(reasoning="still one, first look", cost="the spec would find one surface")
+    f.direct("slice it")
+    n = front.epoch(s, f.run_id)
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                 payload={"question_id": "Q1", "ruling": "sqlite", "reasoning": "simplest",
+                          "cost_if_wrong": "low", "epoch": n, "visit": front.shaping_visit(s, f.run_id, n)})
+    assert front.ruling_after_direction(s, f.run_id) is None
 
 
 def test_a_direction_before_the_disputed_ruling_is_not_the_resolution(tmp_path):

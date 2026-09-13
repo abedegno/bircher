@@ -437,7 +437,17 @@ def ruling_after_direction(store, run_id: str, epoch_n: int | None = None):
     `None` when there is no dispute, the resolution is the approval (nothing
     follows a `human_ruling` to look for), or the directed shaper has not
     ruled yet -- it may submit a slice plan instead, which is that visit's
-    submission, not a ruling."""
+    submission, not a ruling.
+
+    Fix round 2: `rulings[0]`, not `rulings[-1]`. The spec's own words are
+    "the ruling recorded after their direction" -- the one that answers it,
+    not whichever is newest. The two read the same under every history the
+    current kernel invariants can reach (one hand-back per bundle, and a
+    direction opens a visit only while its dispute is unresolved, which
+    resolving it closes for good -- so at most one shape ruling ever
+    follows a direction), which is exactly why the choice was unpinned
+    rather than provably safe; `rulings[0]` is the one that matches the
+    sentence being implemented."""
     from kernel.slices import SHAPE_QUESTION
     d = dispute(store, run_id, epoch_n)
     if d is None or d.resolution is None or d.resolution.kind != EventKind.HUMAN_DIRECTION:
@@ -445,7 +455,7 @@ def ruling_after_direction(store, run_id: str, epoch_n: int | None = None):
     n = epoch(store, run_id) if epoch_n is None else epoch_n
     rulings = [f for f in epoch_facts(store, run_id, EventKind.MODEL_RULING, n)
                if f.payload.get("question_id") == SHAPE_QUESTION and f.seq > d.resolution.seq]
-    return rulings[-1] if rulings else None
+    return rulings[0] if rulings else None
 
 
 def unresolved_disagreement(store, run_id: str, epoch_n: int | None = None) -> bool:

@@ -36,16 +36,32 @@ def test_the_question_renders_for_the_shape_ruling_cause_only(fake):
 
 
 def test_the_question_turn_carries_no_earlier_epochs_draft(fake):
-    """Fix round 1, Q4 line 22: `ruled_one_piece` alone has no submission
-    anywhere in its journal, so "no previous draft" could not fail no
-    matter how `prior` was scoped. Here a first epoch's spec was drafted,
-    reviewed and approved before the issue was revised; the second epoch's
-    question turn must not show it."""
+    """Fix round 1, Q4 line 22 / fix round 2, item 2: `ruled_one_piece`
+    alone has no submission anywhere in its journal, so "no previous
+    draft" could not fail no matter how `prior` was scoped -- and even
+    WITH a first epoch's accepted spec sitting in the store, the
+    QUESTION TURN's own cause (`model_ruling{shape}`) makes
+    `_findings_for` return empty findings unconditionally (pinned by
+    `test_the_hand_back_cause_renders_no_findings`'s sibling for
+    `RESHAPE_REQUESTED`, the same branch), so the previous-draft gate
+    stays shut regardless of what `prior` computes to -- a single
+    mutation to `prior`'s epoch scoping cannot be observed on the
+    question turn alone (the re-review's D1/D2: only the COMPOUND breaks
+    it). What CAN be observed on `author_brief`'s own epoch handling: a
+    REAL round in the second epoch, whose findings are genuine (a
+    revision), must show the second epoch's own draft and never the
+    first's."""
     f = fake.ruled_one_piece_after_an_earlier_epochs_accepted_spec()
     brief = author.author_brief(f.ctx, phase="spec").decode()
     assert "is this one piece of work?" in brief.casefold()
     assert "## Your previous draft" not in brief
     assert "The thing, specified." not in brief   # the first epoch's accepted spec (SPEC_BYTES)
+
+    f.front.author_round(b"# Spec\n\nThe second epoch's own draft.\n")
+    f.front.review_round("request_revision", findings=b"needs a diagram")
+    revision_brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "The second epoch's own draft." in revision_brief
+    assert "The thing, specified." not in revision_brief   # never the first epoch's
 
 
 def test_the_question_survives_a_crash_resume_of_its_turn(fake):
@@ -63,17 +79,37 @@ def test_the_question_survives_a_crash_resume_of_its_turn(fake):
     assert "is this one piece of work?" in brief.casefold()
 
 
-def test_the_question_is_not_asked_on_five_other_causes(fake):
-    """`direction_resolved_one_piece`'s cause is ALSO a `model_ruling{shape}`
-    -- the same kind the question renders from -- but its epoch holds a
-    hand-back, which is exactly the guard `_question_section` needs and
-    `after_approve_one_piece` alone does not exercise (that one's cause is
-    a `review_verdict`, never a shape ruling at all)."""
+def test_the_question_is_not_asked_on_four_other_causes(fake):
+    """Fix round 2, item 2: `direction_resolved_one_piece` was dropped from
+    this loop. Its cause IS a `model_ruling{shape}`, but `author_brief`
+    computes `question = resolution or (_question_section(ctx) ...)`, and
+    `resolution` is non-`None` on that fixture -- so `_question_section`
+    is never even CALLED there, and the assertion held for a reason that
+    had nothing to do with the guard it was meant to exercise (the
+    re-review's finding: deleting `_question_section`'s own
+    `RESHAPE_REQUESTED` guard left the whole suite green). See
+    `test_the_question_is_not_asked_a_second_time_in_a_handed_back_epoch`
+    below for the guard, exercised on a fixture where `_question_section`
+    is actually reached."""
     for f in (fake.refused_submission_retry(), fake.empty_turn_retry(),
-              fake.revision_turn(), fake.after_approve_one_piece(),
-              fake.direction_resolved_one_piece()):
+              fake.revision_turn(), fake.after_approve_one_piece()):
         brief = author.author_brief(f.ctx, phase="spec").decode()
         assert "is this one piece of work?" not in brief.casefold()
+
+
+def test_the_question_is_not_asked_a_second_time_in_a_handed_back_epoch(fake):
+    """Fix round 2, item 2: `_question_section`'s `RESHAPE_REQUESTED` guard,
+    pinned on a fixture that actually reaches it. `handed_back_and_
+    disputed`'s round cause is the DISPUTED ruling itself -- a
+    `model_ruling{shape}`, the same kind the question renders from -- and
+    the dispute is still unresolved, so `_resolution_section` returns
+    `None` and `author_brief`'s `resolution or _question_section(ctx)`
+    actually calls `_question_section` this time. Its epoch already holds
+    the hand-back: without the guard, the shaper's own reconsideration
+    would be asked the fresh-perspective question a second time."""
+    f = fake.handed_back_and_disputed()
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "is this one piece of work?" not in brief.casefold()
 
 
 def test_the_question_turn_keeps_a_persons_bircher_comment(fake):
@@ -86,6 +122,22 @@ def test_the_question_turn_keeps_a_persons_bircher_comment(fake):
 
 
 def test_the_resolution_section_renders_without_a_dispositions_block(fake):
+    """Fix round 2, item 1: the dispositions check is RESTORED. Fix round 1
+    removed it on the reasoning that no branch of `_findings_for` matches a
+    plain `HUMAN_RULING` cause "either way" -- reading "no branch matches
+    today" as "no branch could be made to match", the exact structural-
+    invariant mistake this branch has been burned by before. The re-review
+    found two single-edit counterexamples that leak content into a
+    `## Findings to address` / `## Dispositions are required` pair on
+    exactly this turn: `_findings_for`'s terminal `return b""` rendering
+    `cause.payload.get("ruling")` (which for THIS cause is the literal
+    string `approve_one_piece`), or a `HUMAN_RULING` branch inserted above
+    `HUMAN_DIRECTION`. This assertion is the only thing in the suite that
+    catches either. (No `"## Your previous draft" not in brief` here: prior
+    is always `None` on this fixture -- nothing was ever drafted before the
+    hand-back -- so that half stays inert regardless; it is exercised for
+    real by `test_the_parse_failure_retry_suppresses_a_real_previous_draft`
+    below, on a turn that actually has one to suppress.)"""
     f = fake.approved_one_piece()
     brief = author.author_brief(f.ctx, phase="spec").decode()
     # casefold: the section's own heading is "## The shape was disputed and
@@ -93,6 +145,7 @@ def test_the_resolution_section_renders_without_a_dispositions_block(fake):
     # not its case, is the thing under test.
     assert "the shape was disputed and resolved" in brief.casefold()
     assert "is this one piece of work?" not in brief.casefold()
+    assert "## Dispositions are required" not in brief
 
 
 def test_the_resolution_re_renders_a_prior_reviewers_findings(fake):
@@ -273,6 +326,22 @@ def test_a_malformed_hand_back_retry_names_it_and_shows_the_grammar(fake):
     # the same reason line 22 and line 56 were (see
     # `test_the_hand_back_cause_renders_no_findings`'s own note); removed
     # rather than kept as a check that cannot fail.
+    # `test_the_parse_failure_retry_suppresses_a_real_previous_draft` below
+    # is where that half is exercised for real.
+
+
+def test_the_parse_failure_retry_suppresses_a_real_previous_draft(fake):
+    """Fix round 2, item 1: catches C2 (`if prior is not None and findings:`
+    weakened to `if prior is not None:`, which leaves the whole suite
+    green against `malformed_reshape` -- it never submits anything, so
+    `prior` is `None` regardless of the guard). Here a plan WAS submitted
+    and rejected in the SAME visit as the malformed retry, so `prior` is
+    genuinely non-`None`; the guard, not the absence of a draft, is what
+    keeps it from rendering."""
+    f = fake.malformed_reshape_with_a_prior_submission()
+    brief = author.author_brief(f.ctx, phase="slices").decode()
+    assert "your previous turn's file did not parse" in brief.casefold()
+    assert "## Your previous draft" not in brief
 
 
 def test_the_round_cause_admits_the_shape_ruling_and_not_a_grill_ruling(fake):
