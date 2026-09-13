@@ -91,7 +91,7 @@ against the spec.
 | `shaping` | `submit_slices` | `slices_submitted` | the artefact, hashed, PUT to the store |
 | `slices_submitted` | `record_review(accept)` | `slices_accepted` | the reviewer's verdict, bound as every verdict is |
 | `slices_submitted` | `record_review(request_revision)` | `shaping` | the reviewer's; one revision destination, as every phase has |
-| `slices_accepted` | `record_review(request_revision)` as `human` | `shaping` | **the human's correction at the gate.** `_review_destination`'s human clause (`authz.py:190`) today returns `queued` for `spec` and `specified` otherwise; it gains a `slices` case returning `shaping`, and a test that a correction at the slice gate does not land in `specified` |
+| `slices_accepted` | `record_review(request_revision)` as `human` | `shaping` | **the human's correction at the gate.** `_review_destination`'s human clause (`authz.py:255`) today returns `queued` for `spec` and `specified` otherwise; it gains a `slices` case returning `shaping`, and a test that a correction at the slice gate does not land in `specified` |
 | `slices_accepted` | `approve_artifact` | `sliced` | the human gate, when `slices ∈ gates` |
 | `slices_accepted` | `advance_ungated` | `sliced` | the coordinator's transition when `slices ∉ gates`; refused when it is |
 | `sliced` | `record_slice_filed`, `record_filing_complete`, `record_slice_closed`, `record_slice_reopened` | `sliced` | no transition; the filing and closing facts (below) |
@@ -104,7 +104,7 @@ against the spec.
 
 **Existing commands whose from-sets gain states.** The front-half design's
 tables list each command's legal states explicitly, and the code enforces them
-(`_TRANSITIONS`, `authz.py:84-155`); every one below is a stated change, so no
+(`_TRANSITIONS`, `authz.py:102-221`); every one below is a stated change, so no
 implementer discovers it as a refusal:
 
 | Command | Gains | Why |
@@ -122,7 +122,7 @@ implementer discovers it as a refusal:
 
 **Which state set each site reads.** The new states do not join
 `FRONT_HALF_STATES`: that set is the from-set of `record_model_question` and
-`record_model_ruling` (`authz.py:133-134`), and joining it would legalise
+`record_model_ruling` (`authz.py:198-199`), and joining it would legalise
 both from the shaping states — the second of them writing the very
 `model_ruling` fact shape `record_one_piece` records, with none of its
 guards. A new set **`SHAPING_STATES = {shaping, slices_submitted,
@@ -137,8 +137,8 @@ stated per command and not inherited:
 | `record_human_direction` | `{queued, specified, shaping}`: the three author-round states |
 | `record_model_question`, `record_model_ruling` | `FRONT_HALF_STATES` unchanged: refused from every shaping state. `record_model_ruling` also refuses `question_id: "shape"` from anywhere — the id is reserved to `record_one_piece`, so no path writes a shape ruling without that command's guards, and §6's fourth assertion reads only vetted decisions |
 | `revise_bundle` | `FRONT_HALF_STATES \| SHAPING_STATES`, destination `shaping` |
-| `_review_destination`'s human guard (`authz.py:183`) | admits `SHAPING_STATES` too; its `slices` case returns `shaping` |
-| `_review_destination`'s reviewer clauses (`authz.py:212`, `:216`) | each gains a `slices` case: `request_revision` returns `shaping`; `accept` returns `slices_accepted` **whatever the gates** — the ungated path leaves through `advance_ungated`, not through the accept, because the transition that authorises filing must be its own fact (below). Without the case an accepted slice plan would land in `planned` |
+| `_review_destination`'s human guard (`authz.py:256`) | admits `SHAPING_STATES` too; its `slices` case returns `shaping` |
+| `_review_destination`'s reviewer clauses (`authz.py:285`, `:290`) | each gains a `slices` case: `request_revision` returns `shaping`; `accept` returns `slices_accepted` **whatever the gates** — the ungated path leaves through `advance_ungated`, not through the accept, because the transition that authorises filing must be its own fact (below). Without the case an accepted slice plan would land in `planned` |
 | `front.dispute` (revision 16) | the handed-back ruling (the newest `shape` ruling before the hand-back), the hand-back, the disputed ruling (the first `shape` ruling after it) and the resolution (the first `approve_one_piece` or direction at `shaping` after the disputed ruling), within the epoch; `unresolved_disagreement` is its boolean; the one predicate every other site reads, the generator in-process |
 | `_one_piece_destination` (revision 16) | `shaping` when the epoch holds a hand-back and no `shape` ruling after it yet, `queued` otherwise — a destination computed from the journal, as `_review_destination`'s are |
 | `PARK_REASONS` and `_check_park` (revision 16) | gain `disagreement`, legal only while the dispute is unresolved; `park_notice_body`, `PARK_NEEDS` and `park_prompt` key their text on it |
@@ -154,9 +154,9 @@ stated per command and not inherited:
 | `docs/design/provenance-table.md`, and the pins that read it (revision 16) | five amendments, and the three edits outside this spec they force: `test_provenance.py`'s residual set (an exact equality over the asserted rows) gains `cmd.payload['detail']`, its count-word map gains `"thirty"`, and `docs/design/2026-08-23-v2-kernel-design.md`'s "Twenty-nine rows are asserted after Milestone 1" sentence — its count, its enumeration and its "Nineteen are residuals to close" tally — is amended; a new permanent asserted residual is a decision the residual set exists to force, and this one is taken here. The amendments: `cmd.payload['reasoning']` gains `request_reshape` with its own reason (a hand-back answers no question, so the model-question check does not cover it; the reasoning is asserted, rendered to the next seat and to the person, verified by nobody) and `record_one_piece`'s own reason (the shape question is never asked, so the same check never covered it — a revision-15 omission), the same correction on `cmd.payload['cost_if_wrong']`, whose row carries the same false reason for the same command; `cmd.payload['cursor_item_id']` gains `approve_one_piece`, whose check is stricter than `_check_cursor` (absence refused); `record_author_empty` gains `detail`, a coordinator-asserted string rendered to the next seat and verified by nobody; `cmd.payload['reason']` for `park` notes that `disagreement` is the first reason bound to a kernel object, by `_check_park` |
 | `take_listing` / `classify_batch` (revision 16) | at every shaping state the grill branch is skipped — no shaping seat asks a question, and the grill is epoch-scoped — and the dispute is read only to choose between `approve_one_piece` and a direction; at any other state the reading is unchanged |
 | `park_notice_body` and its `PARK_NEEDS` line; `park_prompt` (revision 16) | keyed on reason `disagreement`: the notice on the issue says the shaper reaffirmed one piece after the spec author handed the run back and a person decides — it does not claim a reviewer accepted anything; the session prompt quotes both seats, and both name each seat's vendor |
-| `approve_artifact`'s destination (`authz.py:928`, `"specified" if phase == "spec" else "planned"`) | gains a `slices` case returning `sliced`; the same else-branch trap as the two above |
+| `approve_artifact`'s destination (`authz.py:1255`, `_APPROVAL_DESTINATION[phase]`) | gains a `slices` case returning `sliced`; the same else-branch trap as the two above |
 | `front.FRONT_PHASES` (`front.py:56`) and `projection.FRONT_PHASES` (`projection.py:22`) — the two phase lists that say which verdicts are the front half's | **both gain `slices`.** `projection.is_front_verdict` feeds `observe.revisions_used` and `recover.decide`, which exist so the back half never spends its repair allowance on, or reads its own review from, a front-half verdict; a one-piece run that needed two slice-plan rounds carries `review_verdict {phase: slices}` facts into its back half, and without the entry each would spend a repair round. `front.FRONT_PHASES` gates the proof's verdict-binding block (`tools/prove_front_half.py:185`), and without the entry the slice review — the only review a sliced parent has — would never be re-rendered against its brief, contradicting §6. One list would be better than two; this design does not merge them, and states both |
-| the reviewer-binding check (`authz.py:738`) | `FRONT_HALF_STATES \| SHAPING_STATES`: the review turn at `slices_submitted` must have ended like any other |
+| the reviewer-binding check (`authz.py:899`) | `FRONT_HALF_STATES \| SHAPING_STATES`: the review turn at `slices_submitted` must have ended like any other |
 | `_ALL_ACTIVE` | gains the three shaping states and `sliced`: `cancel_run` and `record_run_outcome` are legal from them, so the runner's `failed` on a non-zero exit in a shaping state and a person's cancel both have a state to act from. From `sliced`, `record_run_outcome` accepts only the outcome `sliced` (below) |
 | `_PHASE_OF_STATE` | the three shaping states and `sliced` map to `slices` |
 | `_LOOP_STATES` (`coordinator/phases.py`) | gains the three shaping states and `sliced` |
@@ -197,7 +197,7 @@ newer: a `shape` ruling newer than every `artifact_submitted` of phase
 `slices` in that epoch, or a `slice_filed`. §6's fourth assertion reads it
 that way.
 
-The outcome set `_RUN_OUTCOMES` (`authz.py:249`, checked at `:971-973`) gains
+The outcome set `_RUN_OUTCOMES` (`authz.py:340`, checked at `:1324-1326`) gains
 **`sliced`**. `record_run_outcome(sliced)` is legal only from `sliced`, under
 an `operator` dispatch, and only when the kernel can see a `filing_complete`
 fact for the current epoch and, **for every slice of the accepted plan** — the
@@ -287,7 +287,7 @@ this command as to every output-recording command). Refused when:
 | Refused when | Why |
 |---|---|
 | either string is empty or whitespace | a ruling without its reasoning is the "MUST state" placeholder; its cost-if-wrong is what a person reads when the spec phase later shows the issue was an epic after all |
-| a `human_direction` of the run is newer than the calling generation's dispatch | **the same journal-order guard `_check_submit` gives `submit_slices` (`authz.py:582-598`)**; without it an interrupted author's ruling would advance the run to `queued` after a person had directed "slice it along these lines". Human commands do not supersede the author's generation by themselves; the guard is what does |
+| a `human_direction` of the run is newer than the calling generation's dispatch | **the same journal-order guard `_check_submit` gives `submit_slices` (`authz.py:656-675`, `_check_no_newer_direction`)**; without it an interrupted author's ruling would advance the run to `queued` after a person had directed "slice it along these lines". Human commands do not supersede the author's generation by themselves; the guard is what does |
 | a `shape` ruling already exists in this visit | one decision per visit by ruling (revision 16); a second is an identical resubmission |
 | the state is `slices_accepted` or `sliced` | the decision has been taken (above) |
 
@@ -1127,7 +1127,7 @@ delivered behaviour:
   shaping-phase run is escalated before the loop is called.
 - **`run_item`'s post-loop branch.** After `phases` exits `0` the runner today
   dispatches an implementer, calls `start_implementation` — legal only from
-  `planned` (`authz.py:89`) — and records `failed` when the state is not
+  `planned` (`authz.py:141`) — and records `failed` when the state is not
   `implementing` (`run-queue.sh:4640-4647`). A `sliced` run exiting `0` would
   take that path and be scored as a failed implementation. The branch gains a
   case: state `sliced` after the loop records the scorecard row `sliced`,
