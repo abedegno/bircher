@@ -1489,3 +1489,171 @@ def test_between_ignores_a_spec_forged_before_the_disputed_ruling(tmp_path):
     f.shape_round(reasoning="still one", cost="n/a")   # the disputed ruling, AFTER the forged spec
     f.direct("slice it")                                # the resolution
     assert prove.assert_dispute(s, f.run_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Fix round 4: the crash class, closed by one helper (`prove._need`) rather
+# than patched key by key. The tests below are the class-level proof the
+# coordinator asked for: not one instance reproduced and fixed, but a walk
+# over the fact kinds the proof reads and the keys it reads off them, each
+# stripped from a REAL, otherwise-passing fact and checked to fail cleanly
+# rather than crash.
+# ---------------------------------------------------------------------------
+
+def _forged(s, run_id, kind, template, *, drop=None, **override):
+    """Append a fact of *kind* to *run_id*, its payload CLONED from
+    *template* (a real fact's payload, borrowed from a working fixture that
+    shares this same store -- so every hash it carries still names a real
+    blob) with *drop* removed and *override* applied on top. Facts are
+    append-only (the store enforces it, `facts_no_update`/`facts_no_delete`
+    in schema.sql) -- this is how a test gets a fact that is otherwise real
+    but missing exactly one key, without touching the fact a passing
+    fixture actually wrote."""
+    p = dict(template)
+    p.update(override)
+    if drop is not None:
+        del p[drop]
+    s.append_fact(run_id=run_id, kind=kind, actor="claude", causal_command_id=None, payload=p)
+
+
+def _no_fetch(*_a, **_k):
+    raise RuntimeError("no network in this test")
+
+
+def _no_gh(_argv):
+    raise ReadFailed("no network in this test")
+
+
+def test_a_missing_payload_key_reds_not_crashes(tmp_path):
+    """Round 4: the crash class. The round-4 review found roughly twenty
+    payload keys that still crashed the tool outright -- eight on
+    `review_brief_issued` alone -- after three rounds of fixing them one
+    instance at a time. The fix is `prove._need`, one helper applied
+    everywhere a fact's payload crosses from a claim to a read; this is the
+    test that proves the CLASS is closed, not just the member the last
+    review happened to name: every case below builds a bare run and forges
+    one fact CLONED from a real, working fixture's (`_parent`'s) own facts,
+    with exactly one key dropped, then asserts the proof reports a failure
+    line NAMING that key rather than raising.
+
+    One shared store (`_parent`'s), not one per case: `review_round`'s
+    facts point at real content-addressed blobs, and a forged fact that
+    borrows their hashes needs those same blobs still in the artifact
+    table it reads from. Each case gets its OWN run id within that store,
+    so one case's forged fact cannot answer another's read."""
+    s, tmpl = _parent(tmp_path)
+    verdict_tmpl = s.facts_of_kind(tmpl.run_id, EventKind.REVIEW_VERDICT)[-1].payload
+    brief_tmpl = s.facts_of_kind(tmpl.run_id, EventKind.REVIEW_BRIEF_ISSUED)[-1].payload
+    policy_tmpl = s.newest_fact(tmpl.run_id, EventKind.POLICY_FROZEN).payload
+
+    cases = []  # (label, key, build) -- build(run_id, issue_no) -> fails
+
+    def review_case(key, *, on):
+        def build(run_id, issue_no):
+            Front(s, run_id, issue={**ISSUE, "number": issue_no}, shape=False)
+            _forged(s, run_id, EventKind.REVIEW_BRIEF_ISSUED, brief_tmpl, drop=key if on == "brief" else None)
+            _forged(s, run_id, EventKind.REVIEW_VERDICT, verdict_tmpl, drop=key if on == "verdict" else None)
+            return prove.assert_journal(s, run_id, mode="zero")
+        return key, build
+
+    for label, args in [
+        ("review_verdict.generation", dict(key="generation", on="verdict")),
+        ("review_verdict.epoch", dict(key="epoch", on="verdict")),
+        ("review_verdict.artifact_hash", dict(key="artifact_hash", on="verdict")),
+        ("review_brief_issued.epoch", dict(key="epoch", on="brief")),
+        ("review_brief_issued.brief_hash", dict(key="brief_hash", on="brief")),
+        ("review_brief_issued.phase", dict(key="phase", on="brief")),
+        ("review_brief_issued.artifact_hash", dict(key="artifact_hash", on="brief")),
+        ("review_brief_issued.context_bundle_hash", dict(key="context_bundle_hash", on="brief")),
+        ("review_brief_issued.base_sha", dict(key="base_sha", on="brief")),
+        ("review_brief_issued.brief_template", dict(key="brief_template", on="brief")),
+        ("review_brief_issued.spec_hash", dict(key="spec_hash", on="brief")),
+    ]:
+        key, build = review_case(**args)
+        cases.append((label, key, build))
+
+    def policy_case(run_id, issue_no):
+        Front(s, run_id, issue={**ISSUE, "number": issue_no}, shape=False)
+        _forged(s, run_id, EventKind.REVIEW_BRIEF_ISSUED, brief_tmpl)
+        _forged(s, run_id, EventKind.REVIEW_VERDICT, verdict_tmpl)
+        _forged(s, run_id, EventKind.POLICY_FROZEN, policy_tmpl, drop="policy")
+        return prove.assert_journal(s, run_id, mode="zero")
+    cases.append(("policy_frozen.policy", "policy", policy_case))
+
+    def prompt_item_case(run_id, issue_no):
+        Front(s, run_id, issue={**ISSUE, "number": issue_no}, shape=False)
+        s.append_fact(run_id=run_id, kind=EventKind.PROMPT_ITEM, actor="coordinator", causal_command_id=None,
+                      payload={"session_id": "sess-1", "sha256": "deadbeef"})   # no "item_id"
+        return prove.assert_sessions(s, run_id, fetch=_no_fetch)
+    cases.append(("prompt_item.item_id", "item_id", prompt_item_case))
+
+    def brief_sessions_case(key):
+        def build(run_id, issue_no):
+            Front(s, run_id, issue={**ISSUE, "number": issue_no}, shape=False)
+            _forged(s, run_id, EventKind.REVIEW_BRIEF_ISSUED, brief_tmpl, drop=key)
+            return prove.assert_sessions(s, run_id, fetch=_no_fetch)
+        return build
+    cases.append(("review_brief_issued.generation (assert_sessions)", "generation", brief_sessions_case("generation")))
+    cases.append(("review_brief_issued.brief_hash (assert_sessions)", "brief_hash", brief_sessions_case("brief_hash")))
+
+    def slice_filed_case(run_id, issue_no):
+        Front(s, run_id, issue={**ISSUE, "number": issue_no}, shape=False)
+        s.append_fact(run_id=run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                      payload={"epoch": 0, "slice": 1, "issue_id": 1040, "title": "t",
+                               "parent": issue_no, "plan_hash": "deadbeef"})   # no "issue"
+        return prove.assert_slices(s, run_id, repo=REPO, gh_json=_no_gh)
+    cases.append(("slice_filed.issue (assert_slices)", "issue", slice_filed_case))
+
+    for i, (label, key, build) in enumerate(cases):
+        fails = build(f"case-{i}", 1000 + i)
+        assert isinstance(fails, list), label
+        assert any(repr(key) in x for x in fails), f"{label}: no failure line named {key!r}; got {fails}"
+
+
+def test_main_does_not_crash_on_a_slice_filed_missing_its_issue(tmp_path, monkeypatch):
+    """The same key (`slice_filed.issue`), the other call site: `main`'s own
+    `--children` loop reads it three times over before `assert_slices` ever
+    gets a look in. Both are `prove._need` now; this is the second site's
+    own regression guard, not a re-test of the first. A slice number
+    outside the plan (99), so it does not collide with `_parent`'s own real
+    filings -- `main`'s loop does not care whether a number is in the plan,
+    only whether it can find a child run for it."""
+    _no_network(monkeypatch)
+    s, f = _parent(tmp_path)
+    s.append_fact(run_id=f.run_id, kind=EventKind.SLICE_FILED, actor="claude", causal_command_id=None,
+                  payload={"epoch": 0, "slice": 99, "issue_id": 9999, "title": "t",
+                           "parent": 12, "plan_hash": "deadbeef"})   # no "issue"
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x",
+                      "--repo", REPO, "--children"])
+    assert rc == 1   # a real defect: a slice_filed the tool cannot even name
+
+
+def test_main_does_not_crash_on_a_run_enqueued_missing_its_bundle_hash(tmp_path, monkeypatch):
+    """`run_enqueued`'s own `bundle_hash`, read only by `main`'s `--issues`
+    block -- a second, forged `run_enqueued` (facts are append-only; a real
+    run never gets a second one, but `store.newest_fact` does not know
+    that, so the forged one shadows the real one for this read exactly as a
+    live corruption would)."""
+    _no_network(monkeypatch)
+    s, f = _parent(tmp_path)
+    s.append_fact(run_id=f.run_id, kind=EventKind.RUN_ENQUEUED, actor="human", causal_command_id=None,
+                  payload={"packet_hash": None})   # no "bundle_hash"
+    issues = tmp_path / "issues.txt"
+    issues.write_text("12\n")
+    rc = prove.main(["--db", str(tmp_path / "k.db"), "--run-id", f.run_id, "--server", "http://x",
+                      "--issues", str(issues)])
+    assert rc == 1
+
+
+def test_assert_slices_does_not_crash_on_a_bundle_revised_missing_its_hash(tmp_path):
+    """`front.bundle_hash`'s other source fact -- `bundle_revised`, read
+    through `front.issue_number`'s caller (`assert_slices`), which used to
+    let a bad hash crash the WHOLE function before assertion 4 (unrelated to
+    any parent number) ever ran."""
+    s = _store_with_confirmed_stops(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", shape=False, issue=ISSUE)
+    s.append_fact(run_id=f.run_id, kind=EventKind.BUNDLE_REVISED, actor="runner", causal_command_id=None,
+                  payload={})   # no "bundle_hash" at all
+    fails = prove.assert_slices(s, f.run_id, repo=REPO, gh_json=_no_gh)
+    assert isinstance(fails, list)
+    assert any("issue number" in x for x in fails)

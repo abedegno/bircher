@@ -91,7 +91,10 @@ def epoch_of(store, run_id: str, seq: int) -> int:
 def bundle_hash(store, run_id: str) -> str | None:
     revised = store.newest_fact(run_id, EventKind.BUNDLE_REVISED)
     if revised is not None:
-        return revised.payload["bundle_hash"]
+        # Round 4 (the proof's crash class): `.get`, not `[...]` -- a
+        # bundle_revised fact forged without its own bundle_hash is a proof
+        # finding (issue_number's caller reports it), not a crash here.
+        return revised.payload.get("bundle_hash")
     enq = store.newest_fact(run_id, EventKind.RUN_ENQUEUED)
     return None if enq is None else enq.payload.get("bundle_hash")
 
@@ -534,7 +537,31 @@ def accepted_plan(store, run_id: str, epoch_n: int | None = None):
 
 
 def slices_filed(store, run_id: str, epoch_n: int) -> dict:
-    return {f.payload["slice"]: f for f in epoch_facts(store, run_id, EventKind.SLICE_FILED, epoch_n)}
+    """The epoch's newest `slice_filed` per slice number -- `commands.py`'s
+    own single-fact-per-slice read (`record_filing_complete`,
+    `record_slice_closed/reopened`: a real run's kernel never writes more
+    than one legitimate filing per slice, so "the" filing is always well
+    defined for it). `.get`, not `[...]` (round 4, crash class): a forged
+    fact missing "slice" groups under `None` instead of crashing the reader.
+
+    NOT the proof's own read for "exactly one filing per slice" -- that
+    collapses a phantom filing sandwiched between a real one and its
+    restatement out of sight, which is exactly what `slice_filings` below
+    exists to keep visible (round 4, D1)."""
+    return {f.payload.get("slice"): f for f in epoch_facts(store, run_id, EventKind.SLICE_FILED, epoch_n)}
+
+
+def slice_filings(store, run_id: str, epoch_n: int) -> dict:
+    """Every `slice_filed` naming each slice number in the epoch, ALL of
+    them, in journal order -- `slices_filed`'s facts, uncollapsed. A phantom
+    filing sandwiched between a real one and its own restatement is
+    invisible to a reader that already reduced the set to one fact per
+    slice; the proof's "exactly one filing per slice" check needs the whole
+    list to see it (round 4, D1)."""
+    out: dict = {}
+    for f in epoch_facts(store, run_id, EventKind.SLICE_FILED, epoch_n):
+        out.setdefault(f.payload.get("slice"), []).append(f)
+    return out
 
 
 def filing_complete(store, run_id: str, epoch_n: int):

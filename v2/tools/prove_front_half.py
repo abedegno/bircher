@@ -143,6 +143,41 @@ HUMAN_RULING_KEYS = {
 }
 
 
+class _BadPayload(Exception):
+    """Round 4: the crash class. Twenty payload keys deep and three rounds
+    running, the same shape kept recurring -- a `.payload[key]` subscript on
+    a fact the mutation forged without that key, or with the wrong type for
+    it, killed the whole tool before it printed a single failure line
+    (`assert_journal` runs first in `main`, uncaught). Round 3 closed a few
+    by instance (round 3, "one medium crash... do it by sweep, not by
+    instance" -- and the sweep still missed a dozen more the very next
+    review). This is the class fix: ONE exception, raised by `_need` and
+    nothing else, so a missing or wrong-typed key becomes a failure line
+    naming the fact and the key -- never an exception escaping a check."""
+
+    def __init__(self, fact, key: str, detail: str):
+        self.line = f"{fact.kind} (seq {fact.seq}): payload {detail}"
+        super().__init__(self.line)
+
+
+def _need(fact, key: str, *, type=None):
+    """The one safe read. *fact*.payload[*key*], or a raised `_BadPayload`
+    naming the fact and the key: absent, or (when *type* is given) not an
+    instance of it. Every direct payload subscript below a fact's kind is
+    established as read-worthy goes through this -- not `.get(key, default)`,
+    which would quietly substitute a value the check never asked for and
+    make a missing key look like a legitimate one (the same silent-admission
+    shape the controller amendment and the grounding checks exist to close,
+    one level down at the key itself)."""
+    p = fact.payload
+    if key not in p:
+        raise _BadPayload(fact, key, f"has no {key!r} key")
+    v = p[key]
+    if type is not None and not isinstance(v, type):
+        raise _BadPayload(fact, key, f"{key!r} is {v!r}, not {type}")
+    return v
+
+
 def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     """The journal-only half of the §8 proof. Every check reads facts and
     satisfied effects already in the store; nothing here fetches a session."""
@@ -182,7 +217,14 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # "a gate" means to a fact that carries no gate id of its own.
         approvals = [f for f in human if f.kind == EventKind.HUMAN_RULING
                      and f.payload.get("ruling") in ("approve", "approve_one_piece")]
-        by_gate = collections.Counter((f.payload.get("phase"), f.payload.get("epoch")) for f in approvals)
+        # Round 4, D2: grouped by the STAMPED epoch, a duplicate approval
+        # hides behind a second copy stamped a wrong-but-in-range epoch --
+        # exactly the defect `_gate_exists` below now refuses to admit one
+        # key over. `front.epoch_of` is the same derivation used everywhere
+        # else in this file; two approvals of the same real gate group into
+        # the same bucket regardless of what either one's stamp claims.
+        by_gate = collections.Counter((f.payload.get("phase"), front.epoch_of(store, run_id, f.seq))
+                                       for f in approvals)
         dup_gates = {k: v for k, v in by_gate.items() if v > 1}
         if dup_gates:
             fails.append(f"more than one approval at the same gate: {dup_gates}")
@@ -193,12 +235,23 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # needs a real submission at the (phase, epoch) it names; a real
         # gate can only be approved after something was actually submitted
         # to it. `approve_one_piece` and a disagreement park need a real
-        # dispute at their epoch -- `front.dispute` is the one definition,
-        # as everywhere else in this file.
+        # dispute at their epoch, WITH a disputed ruling for it to resolve
+        # -- a hand-back with no ruling after it yet is not a disagreement
+        # anyone could have approved past. A "gate" park needs the same
+        # grounding as `approve`: a real submission is what it is waiting
+        # on. `front.dispute` is the one definition, as everywhere else in
+        # this file.
+        #
+        # Round 4, D2: the epoch this checks against is `front.epoch_of`'s
+        # derivation, not the stamp bounded to a range -- the same fix
+        # `assert_slices` and `assert_dispute` already apply to every other
+        # epoch-bearing fact in this file (round 3, C1/C2). A stamp that
+        # disagrees with the journal's own count no longer names a real
+        # gate, in range or not.
         def _gate_exists(f) -> bool:
             p = f.payload
-            ep = p.get("epoch")
-            if not (isinstance(ep, int) and 0 <= ep <= n):
+            ep = front.epoch_of(store, run_id, f.seq)
+            if p.get("epoch") != ep:
                 return False
             if f.kind == EventKind.HUMAN_RULING and p.get("ruling") == "approve":
                 phase = p.get("phase")
@@ -209,8 +262,27 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
             if f.kind == EventKind.PARKED and p.get("reason") == "disagreement":
                 d = front.dispute(store, run_id, ep)
                 return d is not None
-            return True
+            if f.kind == EventKind.PARKED and p.get("reason") == "gate":
+                phase = p.get("phase")
+                return phase in front.FRONT_PHASES and bool(front.submissions(store, run_id, phase, ep))
+            # Round 4: every combination `extra` admits reaches one of the
+            # branches above (that is what "admitted" means); the four
+            # branches now cover every fact `human` can hold that is not in
+            # `extra`. Denying by default, not admitting -- the previous
+            # `return True` here was never exercised by any test in three
+            # rounds of adversarial review, because nothing in `human`
+            # could reach it without also being in `extra`. A future ruling
+            # word or park reason added to the admitted set without a
+            # branch here now fails closed instead of being trusted by
+            # default.
+            return False
 
+        # Round 4, inert assertion #4: with `_gate_exists` now denying by
+        # default, an `extra` fact (already reported by "human facts beyond
+        # the approval" above) would ALSO fail `_gate_exists` -- none of its
+        # four branches match a fact `extra` admitted -- and be reported a
+        # second time here without this filter. Kept, not deleted: it is
+        # what keeps the two checks from duplicating the same fact's report.
         ungrounded = [f for f in human if f not in extra and not _gate_exists(f)]
         if ungrounded:
             fails.append(
@@ -254,8 +326,19 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     # A ruling on a question the AUTHOR raised: the shape ruling every
     # one-piece run carries would satisfy this vacuously (shaping spec §6).
     # A sliced parent is exempt -- its decision is slice_filed.
+    #
+    # Round 4, D3: a ruling naming any non-shape `question_id` used to admit
+    # this on the ruling WORD alone -- the same admission-by-word-alone
+    # shape `_gate_exists` (round 3, C4) and the controller amendment
+    # (Task 10) both close elsewhere in this file, left open here. A
+    # `model_ruling` whose `question_id` names no `model_question` this run
+    # ever asked answers nothing; grounded against the real questions, the
+    # same way `_gate_exists` grounds a ruling word against a real gate.
+    asked = {q.payload.get("question_id") for q in store.facts_of_kind(run_id, EventKind.MODEL_QUESTION)}
     if not sliced_parent and not any(
-            f.kind == EventKind.MODEL_RULING and f.payload.get("question_id") != SHAPE_QUESTION for f in facts):
+            f.kind == EventKind.MODEL_RULING and f.payload.get("question_id") != SHAPE_QUESTION
+            and f.payload.get("question_id") in asked
+            for f in facts):
         fails.append("no model_ruling: the author did not rule on a question")
 
     # The FINAL epoch only (shaping spec §6, round 12): a run that submitted
@@ -387,28 +470,46 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
     for v in store.facts_of_kind(run_id, EventKind.REVIEW_VERDICT):
         if v.payload.get("ruling") != "review_ruling" or v.payload.get("phase") not in front.FRONT_PHASES:
             continue
-        b = front.brief_for(store, run_id, v.payload["generation"])
-        if b is None or b.payload["epoch"] != v.payload["epoch"]:
-            fails.append(f"review_ruling gen {v.payload['generation']} has no brief in its epoch")
+        # Round 4: every read below goes through `_need` and is caught here,
+        # once, per verdict -- a malformed brief or verdict fails this one
+        # verdict's checks with a named line and the loop moves on to the
+        # next, rather than the whole tool dying before `assert_sessions`
+        # and `assert_dispute` ever run (the crash class; this loop alone
+        # held eight of the payload keys the round-4 review named).
+        try:
+            gen = _need(v, "generation")
+            b = front.brief_for(store, run_id, gen)
+            if b is None or _need(b, "epoch") != _need(v, "epoch"):
+                fails.append(f"review_ruling gen {gen} has no brief in its epoch")
+                continue
+            bp = b.payload
+            brief_hash = _need(b, "brief_hash")
+            data = store.read_blob(brief_hash)
+            policy_fact = store.newest_fact(run_id, EventKind.POLICY_FROZEN)
+            if policy_fact is None:
+                fails.append(f"review_ruling gen {gen}: no policy_frozen fact to render its brief against")
+                continue
+            spec_hash = _need(b, "spec_hash")
+            artifact_hash = _need(b, "artifact_hash")
+            pol = from_payload(_need(policy_fact, "policy"))
+            rendered = brief.render(
+                phase=_need(b, "phase"), artefact=store.read_blob(artifact_hash),
+                bundle=store.read_blob(_need(b, "context_bundle_hash")),
+                spec=None if spec_hash is None else store.read_blob(spec_hash),
+                policy=pol, base_sha=_need(b, "base_sha"), template=_need(b, "brief_template"),
+                prior_findings=(None if bp.get("prior_findings_hash") is None
+                                else store.read_blob(bp["prior_findings_hash"])),
+            )
+            if data != rendered:
+                fails.append(f"brief {brief_hash[:12]} is not render() over its named objects")
+            if _need(v, "artifact_hash") != artifact_hash:
+                fails.append("review_ruling artifact_hash differs from its brief's")
+            fh = v.payload.get("findings_hash")
+            if fh and brief.hash8(artifact_hash) not in store.read_blob(fh).decode("utf-8", "replace"):
+                fails.append("the reviewer's verdict line does not name the brief's hash8")
+        except _BadPayload as exc:
+            fails.append(exc.line)
             continue
-        bp = b.payload
-        data = store.read_blob(bp["brief_hash"])
-        pol = from_payload(store.newest_fact(run_id, EventKind.POLICY_FROZEN).payload["policy"])
-        rendered = brief.render(
-            phase=bp["phase"], artefact=store.read_blob(bp["artifact_hash"]),
-            bundle=store.read_blob(bp["context_bundle_hash"]),
-            spec=None if bp["spec_hash"] is None else store.read_blob(bp["spec_hash"]),
-            policy=pol, base_sha=bp["base_sha"], template=bp["brief_template"],
-            prior_findings=(None if bp.get("prior_findings_hash") is None
-                            else store.read_blob(bp["prior_findings_hash"])),
-        )
-        if data != rendered:
-            fails.append(f"brief {bp['brief_hash'][:12]} is not render() over its named objects")
-        if v.payload["artifact_hash"] != bp["artifact_hash"]:
-            fails.append("review_ruling artifact_hash differs from its brief's")
-        fh = v.payload.get("findings_hash")
-        if fh and brief.hash8(bp["artifact_hash"]) not in store.read_blob(fh).decode("utf-8", "replace"):
-            fails.append("the reviewer's verdict line does not name the brief's hash8")
 
     return fails
 
@@ -424,15 +525,31 @@ def assert_sessions(store, run_id: str, *, server: str = "", fetch=_fetch) -> li
         fails.append(f"the {server}/v1/sessions listing could not be read: {exc}")
         listed = set()
 
-    prompt_items = {p.payload["item_id"] for p in store.facts_of_kind(run_id, EventKind.PROMPT_ITEM)}
+    # Round 4: both comprehensions below used to subscript the payload
+    # directly (`prompt_item`'s `item_id`, `review_brief_issued`'s
+    # `generation`/`brief_hash`) -- a crash before a single failure line
+    # printed. Built as loops instead, each malformed fact caught and named
+    # by `_need`/`_BadPayload` rather than dropped by a silent `.get()`
+    # default, which would have made a missing key look like a legitimate
+    # unset one.
+    prompt_items = set()
+    for p in store.facts_of_kind(run_id, EventKind.PROMPT_ITEM):
+        try:
+            prompt_items.add(_need(p, "item_id"))
+        except _BadPayload as exc:
+            fails.append(exc.line)
     cursors = {f.payload.get("cursor_item_id")
                for f in store.facts_of_kind(run_id, EventKind.HUMAN_ANSWER, EventKind.HUMAN_RULING,
                                             EventKind.HUMAN_DIRECTION, EventKind.PARKED,
                                             EventKind.HUMAN_ITEM_DISMISSED)} - {None}
     prompt_hashes = {r["intent"]["body"]["artifact"]
                      for r in front.satisfied_effects(store, run_id, "sess-prompt")}
-    briefs = {b.payload["generation"]: b.payload["brief_hash"]
-              for b in store.facts_of_kind(run_id, EventKind.REVIEW_BRIEF_ISSUED)}
+    briefs = {}
+    for b in store.facts_of_kind(run_id, EventKind.REVIEW_BRIEF_ISSUED):
+        try:
+            briefs[_need(b, "generation")] = _need(b, "brief_hash")
+        except _BadPayload as exc:
+            fails.append(exc.line)
     roles = {d["generation"]: d["role"] for d in store.dispatches_for(run_id)}
     prompts_by_session: dict[str, list[dict]] = {}
     for r in front.satisfied_effects(store, run_id, "sess-prompt"):
@@ -529,9 +646,34 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
     plan = front.accepted_plan(store, run_id, n)
     h = front.accepted_slices_hash(store, run_id, n)
     filed = front.slices_filed(store, run_id, n)
-    parent = front.issue_number(store, run_id)
-    numbers = {k: f.payload["issue"] for k, f in filed.items()}
-    if plan is not None and filed:
+    # Round 4: a bad bundle_hash (missing, or pointing nowhere real) used to
+    # crash the whole function before assertion 4 -- which needs no parent
+    # number at all -- ever got to run.
+    try:
+        parent = front.issue_number(store, run_id)
+    except Exception as exc:  # noqa: BLE001 -- a bad bundle is a finding, not a crash
+        fails.append(f"the run's own issue number could not be read: {exc}")
+        parent = None
+    # Round 4: built as a loop, not a comprehension over `f.payload["issue"]`
+    # -- a slice_filed fact missing it names itself and is left out, rather
+    # than crashing before assertions 1-3 (or clause (a) below) ever run.
+    numbers = {}
+    for k, f in filed.items():
+        try:
+            numbers[k] = _need(f, "issue")
+        except _BadPayload as exc:
+            fails.append(exc.line)
+    if plan is not None and filed and parent is not None:
+        # Round 4, D1: `front.slices_filed` collapses every filing of a
+        # slice to its LAST one -- a dict comprehension keyed on the slice
+        # number. A phantom filing sandwiched between a real one and its own
+        # restatement is invisible to that collapse, and so to every check
+        # below that reads `filed`. `front.slice_filings` is the same facts,
+        # uncollapsed; this is the one place §6's "exactly one" gets to see
+        # all of them, not just the newest.
+        dup_filed = {k: len(fs) for k, fs in front.slice_filings(store, run_id, n).items() if len(fs) > 1}
+        if dup_filed:
+            fails.append(f"slice_filed: more than one filing for slice(s) {dup_filed} (one filing per slice)")
         # 1. The children are the plan, body and all -- and exactly one delivered create per slice.
         if sorted(filed) != [s.number for s in plan.slices]:
             fails.append(f"slice_filed {sorted(filed)} does not match the plan's slices, by number")
@@ -544,7 +686,11 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             if k not in filed:
                 fails.append(f"a delivered create for slice {k} has no slice_filed")
         for s in plan.slices:
-            if s.number not in filed:
+            # Round 4: also skip a slice (or a dependency of one) whose
+            # slice_filed fact was missing "issue" -- already named above by
+            # `_need`, and a `numbers[...]` subscript below would otherwise
+            # crash on exactly the fact that just failed to build it.
+            if s.number not in filed or s.number not in numbers or any(d not in numbers for d in s.depends_on):
                 continue
             try:
                 live = gh_json(["gh", "issue", "view", str(numbers[s.number]), "--repo", repo, "--json", "title,body"])
@@ -556,7 +702,7 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
                 fails.append(f"child #{numbers[s.number]}: title or body is not render_child over slice {s.number}")
         # 2. The dependencies are the links.
         for s in plan.slices:
-            if s.number not in filed:
+            if s.number not in filed or s.number not in numbers or any(d not in numbers for d in s.depends_on):
                 continue
             try:
                 links = gh_json(["gh", "api", f"repos/{repo}/issues/{numbers[s.number]}/dependencies/blocked_by"])
@@ -577,6 +723,11 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
             ums = [c for c in comments if (c.get("body") or "").startswith(f"bircher: sliced {h[:8]}")]
             if len(ums) != 1:
                 fails.append(f"{len(ums)} umbrella comments for plan {h[:8]}, want exactly one")
+            elif any(s.number not in numbers for s in plan.slices):
+                # Round 4: `umbrella_body` subscripts every plan slice's
+                # filed number unconditionally; a slice already named above
+                # (missing "issue") would otherwise crash it here too.
+                fails.append("the umbrella comment could not be checked: a filed slice has no issue number")
             elif ums[0]["body"].rstrip("\n") != slices.umbrella_body(h[:8], plan, numbers).rstrip("\n"):
                 fails.append("the umbrella comment does not list exactly the filed children")
     # 4. One decision per VISIT, and every filing in the last epoch
@@ -587,8 +738,6 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         if f.payload.get("epoch") != n:
             fails.append(f"slice_filed in epoch {f.payload.get('epoch')}, outside the final epoch {n}")
 
-    accepted_h = front.accepted_slices_hash(store, run_id, n)
-
     def _decision_at(e: int, v: int):
         """The visit's own decision, per clause (b): EVERY shape ruling
         attributed to it (round 3, C3 -- not `front.shape_ruling`'s newest
@@ -597,14 +746,23 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         already collapsed them to one), and the submission the acceptance
         actually followed (empty if none). Shared by clauses (b) and (c) so
         "the last visit's decision" means exactly the same thing in both
-        places (round 1, M1)."""
+        places (round 1, M1).
+
+        Round 4, D4: the accepted hash is EPOCH e's own
+        (`front.accepted_slices_hash(store, run_id, e)`), not the final
+        epoch's read once outside this function and reused for every `e`.
+        The old `e == n` conjunct collapsed "within EACH epoch" (spec §6(b))
+        to just the final one -- clause (b)'s "ruling beside the accepted
+        plan" check was dead in every superseded epoch, the very epochs a
+        hand-back and a re-shape make routine."""
         rulings = [f for f in front.epoch_facts(store, run_id, EventKind.MODEL_RULING, e)
                    if f.payload.get("question_id") == slices.SHAPE_QUESTION
                    and front.visit_stamp_of(store, run_id, f) == v]
         subs_v = front.submissions(store, run_id, "slices", e, visit=v)
         acc_v = front.newest_review_verdict(store, run_id, "slices", e, visit=v)
+        accepted_h_e = front.accepted_slices_hash(store, run_id, e)
         accepted = [x for x in subs_v
-                    if e == n and x.payload.get("hash") == accepted_h
+                    if x.payload.get("hash") == accepted_h_e
                     and acc_v is not None and acc_v.payload.get("verdict") == "accept"]
         return rulings, subs_v, accepted
 
@@ -642,9 +800,20 @@ def assert_slices(store, run_id: str, *, repo: str, gh_json) -> list[str]:
         # its own right, compared by `!=` so a stamp of the wrong TYPE
         # (a string) fails the comparison instead of crashing a `<=` the
         # way the round-1 range check did.
+        # Round 4: `reshape_requested` and `human_ruling {approve_one_piece}`
+        # both carry a `visit` stamp too (the hand-back opens the next
+        # visit; the resolution names the disputed ruling's own, per
+        # commands.py's `approve_one_piece` comment) and neither was ever
+        # compared against the walk -- no exploit was found for either, but
+        # leaving a written, unread stamp unchecked is the same gap this
+        # very loop exists to close for the other two kinds. Cheap to add,
+        # so added rather than deleted.
         stamped = ([f for f in front.epoch_facts(store, run_id, EventKind.MODEL_RULING, e)
                     if f.payload.get("question_id") == slices.SHAPE_QUESTION]
-                   + front.submissions(store, run_id, "slices", e))
+                   + front.submissions(store, run_id, "slices", e)
+                   + front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, e)
+                   + [f for f in front.epoch_facts(store, run_id, EventKind.HUMAN_RULING, e)
+                      if f.payload.get("ruling") == "approve_one_piece"])
         for f in stamped:
             if "visit" not in f.payload:
                 continue  # no stamp at all: the prefix walk is simply the answer, not a claim to check
@@ -785,9 +954,17 @@ def main(argv=None) -> int:
             return 2
         fails += assert_slices(store, a.run_id, repo=a.repo, gh_json=gh_json)
         for f in store.facts_of_kind(a.run_id, EventKind.SLICE_FILED):
-            kids = [r for r in store.all_run_ids() if r.startswith(f"i{f.payload['issue']}-")]
+            # Round 4: `f.payload["issue"]`, read three times over this
+            # fact, used to crash `main` outright on a slice_filed missing
+            # it.
+            try:
+                issue = _need(f, "issue")
+            except _BadPayload as exc:
+                fails.append(exc.line)
+                continue
+            kids = [r for r in store.all_run_ids() if r.startswith(f"i{issue}-")]
             if not kids:
-                fails.append(f"child #{f.payload['issue']} has no run yet")
+                fails.append(f"child #{issue} has no run yet")
                 continue
             # Nothing here reads gh today, but a read failure while proving a
             # child must become a failure line, not an exception escaping
@@ -796,19 +973,27 @@ def main(argv=None) -> int:
                 child_fails = (assert_journal(store, kids[-1], mode=mode) + assert_sessions(store, kids[-1], server=a.server)
                                + assert_dispute(store, kids[-1]))
             except ReadFailed as exc:
-                fails.append(f"child #{f.payload['issue']} ({kids[-1]}): could not read: {exc}")
+                fails.append(f"child #{issue} ({kids[-1]}): could not read: {exc}")
                 continue
-            fails += [f"child #{f.payload['issue']} ({kids[-1]}): {x}" for x in child_fails]
+            fails += [f"child #{issue} ({kids[-1]}): {x}" for x in child_fails]
 
     if a.issues:
         # The body-content half of this rule (no file, function or acceptance
         # test named) is the pre-registration's own discipline, applied when
         # the list is written (Task 24) -- there is no body left to read here.
         enq = store.newest_fact(a.run_id, EventKind.RUN_ENQUEUED)
-        snap = json.loads(store.read_blob(enq.payload["bundle_hash"]))
-        allowed = {int(x) for x in open(a.issues).read().split()}
-        if snap["number"] not in allowed:
-            fails.append(f"issue #{snap['number']} is not in the pre-registered list")
+        if enq is None:
+            fails.append("no run_enqueued fact: cannot check the pre-registered issue list")
+        else:
+            try:
+                # Round 4: `run_enqueued`'s `bundle_hash` -- the crash class.
+                bh = _need(enq, "bundle_hash")
+                snap = json.loads(store.read_blob(bh))
+                allowed = {int(x) for x in open(a.issues).read().split()}
+                if snap["number"] not in allowed:
+                    fails.append(f"issue #{snap['number']} is not in the pre-registered list")
+            except _BadPayload as exc:
+                fails.append(exc.line)
 
     for f in fails:
         print(f, file=sys.stderr)
