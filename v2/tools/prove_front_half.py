@@ -146,36 +146,50 @@ HUMAN_RULING_KEYS = {
 class _BadPayload(Exception):
     """Round 4: the crash class. Twenty payload keys deep and three rounds
     running, the same shape kept recurring -- a `.payload[key]` subscript on
-    a fact the mutation forged without that key, or with the wrong type for
-    it, killed the whole tool before it printed a single failure line
-    (`assert_journal` runs first in `main`, uncaught). Round 3 closed a few
-    by instance (round 3, "one medium crash... do it by sweep, not by
-    instance" -- and the sweep still missed a dozen more the very next
-    review). This is the class fix: ONE exception, raised by `_need` and
-    nothing else, so a missing or wrong-typed key becomes a failure line
-    naming the fact and the key -- never an exception escaping a check."""
+    a fact the mutation forged without that key killed the whole tool before
+    it printed a single failure line (`assert_journal` runs first in `main`,
+    uncaught). Round 3 closed a few by instance (round 3, "one medium
+    crash... do it by sweep, not by instance" -- and the sweep still missed
+    a dozen more the very next review). This is the class fix: ONE
+    exception, raised by `_need` and nothing else, so a missing key becomes
+    a failure line naming the fact and the key -- never an exception
+    escaping a check.
+
+    Round 5, RC-2: this used to also cover a wrong-TYPED key, via a `type=`
+    parameter on `_need` that no call site anywhere -- in this file or its
+    tests -- ever passed. An isinstance branch nothing calls is exactly the
+    inert-condition shape round 4 exists to close, reintroduced by the fix
+    for it; removed rather than wired up on speculation (see `_need`'s own
+    docstring for why no reader here has a genuine wrong-type risk distinct
+    from the missing-key one this class already closes)."""
 
     def __init__(self, fact, key: str, detail: str):
         self.line = f"{fact.kind} (seq {fact.seq}): payload {detail}"
         super().__init__(self.line)
 
 
-def _need(fact, key: str, *, type=None):
+def _need(fact, key: str):
     """The one safe read. *fact*.payload[*key*], or a raised `_BadPayload`
-    naming the fact and the key: absent, or (when *type* is given) not an
-    instance of it. Every direct payload subscript below a fact's kind is
-    established as read-worthy goes through this -- not `.get(key, default)`,
-    which would quietly substitute a value the check never asked for and
-    make a missing key look like a legitimate one (the same silent-admission
-    shape the controller amendment and the grounding checks exist to close,
-    one level down at the key itself)."""
+    naming the fact and the key when it is absent. Every direct payload
+    subscript below a fact's kind is established as read-worthy goes
+    through this -- not `.get(key, default)`, which would quietly
+    substitute a value the check never asked for and make a missing key
+    look like a legitimate one (the same silent-admission shape the
+    controller amendment and the grounding checks exist to close, one level
+    down at the key itself).
+
+    Missing-key only (round 5, RC-2, dropped the unused `type=` parameter):
+    every value this file reads through `_need` is either compared for
+    equality (a wrong type just fails the comparison, which IS the correct
+    outcome, not a crash) or handed to `store.read_blob`/`json.loads`/
+    `brief.render`, whose own failures are a different class this file has
+    NOT closed the same way -- a bad VALUE behind a present, right-typed
+    key, as opposed to the key itself being missing. See the review-verdict
+    loop's own comment for that judgement call."""
     p = fact.payload
     if key not in p:
         raise _BadPayload(fact, key, f"has no {key!r} key")
-    v = p[key]
-    if type is not None and not isinstance(v, type):
-        raise _BadPayload(fact, key, f"{key!r} is {v!r}, not {type}")
-    return v
+    return p[key]
 
 
 def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
@@ -268,13 +282,18 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
             # Round 4: every combination `extra` admits reaches one of the
             # branches above (that is what "admitted" means); the four
             # branches now cover every fact `human` can hold that is not in
-            # `extra`. Denying by default, not admitting -- the previous
-            # `return True` here was never exercised by any test in three
-            # rounds of adversarial review, because nothing in `human`
-            # could reach it without also being in `extra`. A future ruling
-            # word or park reason added to the admitted set without a
-            # branch here now fails closed instead of being trusted by
-            # default.
+            # `extra`. This line is consequently UNREACHABLE today -- round
+            # 5's verifier confirmed it by replacing it with a `raise` and
+            # finding the whole suite still green -- and `_gate_exists` has
+            # no other call site to reach it from some other angle later.
+            # Kept as `return False`, not deleted, as a fail-closed default
+            # for a FUTURE fifth admitted ruling word or park reason added
+            # to `extra` without a matching branch here: it would otherwise
+            # be trusted by the old `return True`'s default rather than
+            # flagged. Guarding against a defect that does not exist yet is
+            # not the same as having closed one that did -- no planted
+            # history reaches this line, so it is not counted among this
+            # round's pinned fixes.
             return False
 
         # Round 4, inert assertion #4: with `_gate_exists` now denying by
@@ -476,6 +495,21 @@ def assert_journal(store, run_id: str, *, mode: str = "zero") -> list[str]:
         # next, rather than the whole tool dying before `assert_sessions`
         # and `assert_dispute` ever run (the crash class; this loop alone
         # held eight of the payload keys the round-4 review named).
+        #
+        # Round 5 judgement call, recorded rather than closed here: `_need`
+        # only closes a KEY that is missing. A key that is present and
+        # right-typed but names a HASH NO BLOB EXISTS FOR (`brief_hash`,
+        # `artifact_hash`, `context_bundle_hash`, `spec_hash`,
+        # `prior_findings_hash`) still reaches `store.read_blob(...)` ->
+        # `None` -> `brief.render(...)`'s own use of that `None`, which is a
+        # different class of crash this `except _BadPayload` does not catch
+        # (a bad VALUE, not a missing KEY). Left open, deliberately, rather
+        # than folded into this round: closing it as a class -- the way
+        # `_need` closed the missing-key one -- would mean wrapping every
+        # `read_blob` call here the same disciplined way, with its own
+        # exhaustive test, which is a fifth round's shape of work, not a
+        # short one's. Recorded in the report's "pre-existing proof gaps"
+        # list rather than left to be rediscovered silently.
         try:
             gen = _need(v, "generation")
             b = front.brief_for(store, run_id, gen)
