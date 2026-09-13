@@ -254,12 +254,15 @@ def park_notice_body(ctx: Ctx, park) -> str:
     if reason == "disagreement":
         # NOT "the reviewer accepted": nothing was accepted. Two seats
         # disagree and the person decides (shaping spec §4 *The
-        # disagreement gate*); the generic body below says "waiting for you
-        # at the phase", which reads as an ordinary gate and says nothing
-        # about why.
+        # disagreement gate*); the generic body's "waiting for you at the
+        # phase" line on its own reads as an ordinary gate and says nothing
+        # about why -- so this body keeps that sentence (every notice names
+        # its phase, §4) but leads with why, which the generic body cannot
+        # say.
         return (f"bircher: parked disagreement\n\n"
                 f"The spec author handed this issue back as an epic; the shaper reconsidered and "
-                f"reaffirmed one piece of work.\n\n{PARK_NEEDS['disagreement']}\n\n"
+                f"reaffirmed one piece of work. This run is waiting for you at the "
+                f"**{park.payload.get('phase')}** phase.\n\n{PARK_NEEDS['disagreement']}\n\n"
                 f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the "
                 "moment you send it, so nothing appears to happen until one runs.")
     return (f"bircher: parked {reason}\n\n"

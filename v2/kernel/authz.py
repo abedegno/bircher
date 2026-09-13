@@ -120,16 +120,6 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # author's own state, back to `shaping` -- a new VISIT of the same epoch,
     # never a new epoch.
     "request_reshape": (frozenset({"queued"}), "shaping"),
-    # Revision 16: the person's resolution of the same disagreement. The
-    # allowed states are broad, as `park`'s and `dismiss_human_item`'s are
-    # below -- not `{"shaping"}` alone -- because the dispute (the journal)
-    # and the state (the run's current row) are two different things, and a
-    # resolved dispute has already moved the state to `queued`: narrowing
-    # this set would let the generic "not legal from state" check above fire
-    # first for a second approval or a never-disputed run, and that message
-    # carries no "unresolved" for a caller -- or a test's `match=` -- to
-    # read. `authorize`'s own block checks the dispute before the state, in
-    # the spec's refusal-row order (spec §2 revision 16).
     # Revision 16: the person's resolution of a shape disagreement. From
     # `shaping` alone (spec §2's third refusal row) -- the dispute IS a
     # shaping-state park, and at any later state a reply is read as it is

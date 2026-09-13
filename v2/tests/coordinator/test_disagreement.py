@@ -21,6 +21,9 @@ def test_the_notice_and_the_prompt_say_what_happened(fake):
     body = phases.park_notice_body(f.ctx, f.park)
     assert "reaffirmed one piece" in body and "handed" in body
     assert "accepted" not in body                      # no reviewer accepted anything
+    # §4: "The park notice names the phase ... as every notice does" -- the
+    # disagreement branch is the one notice that used to skip this.
+    assert "**slices** phase" in body
     # Fix round 1, X7: the sentence telling the person what to type is
     # asserted nowhere else -- §4 requires the notice to say it. A LITERAL
     # expected string, not `phases.PARK_NEEDS["disagreement"] in body`: the
