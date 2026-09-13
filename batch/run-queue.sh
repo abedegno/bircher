@@ -9238,6 +9238,14 @@ assert t.startswith('世'*10), 'expected 10 whole chars, got %r' % t[:14]
     || { echo "FAIL _unreadable_dispute_item exited non-zero"; exit 1; }
   [ -f "$sdir/queue/i16-epic.md" ] || { echo "FAIL _unreadable_dispute_item: the queue file must stay"; exit 1; }
   [ ! -f "$sdir/processed/i16-epic.md" ] || { echo "FAIL _unreadable_dispute_item: the file must NOT be retired"; exit 1; }
+  # Fix round 1, F7: like i14 above, not unlike it. The row's content was
+  # asserted nowhere for this case -- only the queue-file/processed-file
+  # effects -- so a helper that wrote i15's note, or none at all, passed
+  # unnoticed as long as it also happened to leave the files alone.
+  grep -q "could not be read after a non-zero exit at shaping" "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_dispute_item: the row must say the dispute could not be read"; exit 1; }
+  grep -q '"outcome": "escalated"' "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_dispute_item: the row must be escalated"; exit 1; }
 
   rm -rf "$sdir"
   echo "sliced branches OK"
