@@ -259,7 +259,7 @@ def park_notice_body(ctx: Ctx, park) -> str:
         # about why.
         return (f"bircher: parked disagreement\n\n"
                 f"The spec author handed this issue back as an epic; the shaper reconsidered and "
-                f"reaffirmed that it is one piece of work.\n\n{PARK_NEEDS['disagreement']}\n\n"
+                f"reaffirmed one piece of work.\n\n{PARK_NEEDS['disagreement']}\n\n"
                 f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the "
                 "moment you send it, so nothing appears to happen until one runs.")
     return (f"bircher: parked {reason}\n\n"
