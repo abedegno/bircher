@@ -1093,6 +1093,37 @@ def test_the_shape_question_filter_excludes_a_grill_rulings_bad_stamp(tmp_path):
     assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None) == []
 
 
+def test_the_shape_question_filter_excludes_a_grill_rulings_bad_epoch(tmp_path):
+    """Round 2's own B4 epoch scan (`all_shape_rulings`) filters to
+    `question_id == SHAPE_QUESTION` too, independently of the stamp-vs-walk
+    scan above -- without it, a grill ruling stamped a bad EPOCH would be
+    swept into the epoch-validity check assertion 4 runs over shape
+    rulings, and it must not be: a grill ruling's epoch is checked by
+    `assert_journal`'s own model_ruling machinery, not by §6."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)
+    f.ask_round([("q1", "?")], rulings={"q1": "yes"})
+    grill_ruling = s.facts_of_kind(f.run_id, EventKind.MODEL_RULING)[-1]
+    assert grill_ruling.payload["question_id"] != "shape"
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={**grill_ruling.payload, "epoch": 99})
+    assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None) == []
+
+
+def test_the_slices_phase_filter_excludes_a_spec_submissions_bad_epoch(tmp_path):
+    """The mirror of the two tests above, on the submission side:
+    `all_slices_subs` filters to `phase == "slices"` -- without it, a `spec`
+    submission stamped a bad epoch would be swept into assertion 4's own
+    epoch-validity scan, and it must not be: a spec submission's epoch is
+    `assert_journal`'s phase-set check's concern, not §6's."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "r-1", issue=ISSUE)
+    h = put_artifact(s, SPEC_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "spec", "epoch": 99, "hash": h, "author": "claude", "round": 1})
+    assert prove.assert_slices(s, f.run_id, repo=REPO, gh_json=None) == []
+
+
 def test_the_duplicate_approval_key_distinguishes_epochs_not_just_phases(tmp_path):
     """Round 2, inert #4: the gate key is `(phase, epoch)` -- without the
     epoch half, two LEGITIMATE approvals of the SAME phase in two DIFFERENT

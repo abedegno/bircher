@@ -819,3 +819,34 @@ def test_the_review_brief_carries_the_visits_own_prior_findings(tmp_path):
     brief = f.issue_review_brief("slices")
     assert b"visit one findings" not in brief
     assert front.newest_review_verdict(s, f.run_id, "slices", 0, visit=2) is None
+
+
+def test_submissions_and_shape_ruling_agree_on_a_visit_none_stamp(tmp_path):
+    """Round 2, B5: `front.submissions`'s per-visit filter used to read
+    `payload.get("visit", visit_of(...))` -- a default that fires only when
+    the KEY is absent, so an explicit `visit: None` never reached the
+    fallback and matched no visit at all. `front.shape_ruling` spelled the
+    same fallback with `or`, which treats a `None` VALUE the same as an
+    absent key and silently falls back to the walk regardless. Two readers
+    of the same stamp, two answers -- `front.visit_stamp_of` is the one
+    definition now, and both agree: a stamp of `None` matches nothing,
+    consistently, for the submission AND the ruling side alike."""
+    from kernel.artifacts import put_artifact
+    s, f = _new(tmp_path)      # nothing decided yet: no OTHER real visit-1 ruling to confound the read
+    n = front.epoch(s, f.run_id)
+    h = put_artifact(s, SLICES_BYTES)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "slices", "epoch": n, "hash": h, "author": "claude", "round": 1, "visit": None})
+    s.append_fact(run_id=f.run_id, kind=EventKind.MODEL_RULING, actor="claude", causal_command_id=None,
+                  payload={"epoch": n, "question_id": "shape", "ruling": "one piece",
+                           "reasoning": "forged with a None stamp", "cost_if_wrong": "n/a", "visit": None})
+    # Neither reader matches the None-stamped fact to visit 1, the epoch's
+    # only real visit -- both now spell "the stamp is absent" the same way
+    # (it isn't), rather than one falling back to the walk and the other not.
+    assert front.submissions(s, f.run_id, "slices", n, visit=1) == []
+    assert front.shape_ruling(s, f.run_id, n, visit=1) is None
+    # An UNFILTERED read still finds the submission -- the fact exists, it
+    # simply belongs to no visit a caller can ask for by number.
+    unfiltered = front.submissions(s, f.run_id, "slices", n)
+    assert len(unfiltered) == 1
+    assert front.visit_stamp_of(s, f.run_id, unfiltered[0]) is None
