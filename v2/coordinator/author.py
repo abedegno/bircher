@@ -322,14 +322,43 @@ def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
                      % (cause.payload["detail"], HAND_BACK_GRAMMAR))
     if phase == "spec":
         n = ctx.epoch()
+        d = front.dispute(store, run_id, n)
         # The availability instruction: every composed spec turn of an epoch
         # that holds a shape ruling and no hand-back yet, so a revision turn
         # briefed with a reviewer's "several pieces" finding can act on it.
         if (front.shape_ruling(store, run_id, n) is not None
-                and not front.epoch_facts(store, run_id, EventKind.RESHAPE_REQUESTED, n)
+                and d is None
                 and question is None):
             parts.append("\n## Handing back\n\nIf this issue is more than one piece of work, do not write the\n"
                          "spec. Hand it back instead and end the turn.\n\n%s\n" % HAND_BACK_GRAMMAR)
+        elif d is not None and d.resolution is not None:
+            # Final review, finding 3 (a judgement call, not a correctness
+            # bug): the spec-author SKILL.md's own "## Handing back" section
+            # is unconditional and embedded in every spec brief -- it has no
+            # way to know the epoch already spent its one hand-back
+            # (`request_reshape`: one per bundle, shaping spec §2). Left
+            # alone, a seat that still believes the issue is an epic hands
+            # back again, is refused, and the refusal becomes the next
+            # round's findings -- the one reachable way to spend two extra
+            # seats and earn a second park in the same epoch (attack 9). This
+            # is cheaper than that: say plainly, on exactly the turns this
+            # can happen, that the lever above is already spent.
+            #
+            # `d.resolution is not None`, not merely `d is not None`: a spec
+            # phase turn only exists once the dispute is resolved (an
+            # unresolved one keeps the run at `shaping`), so requiring the
+            # resolution keeps this section off the one synthetic case a
+            # unit test builds on purpose -- a hand-back with nothing
+            # resolved yet -- while still covering both real turns: the
+            # resolution's own (`question` is the resolution section) and
+            # any later round in the resolved epoch.
+            parts.append(
+                "\n## Handing back is no longer available\n\n"
+                "The skill above describes handing this issue back as an epic. That "
+                "already happened once in this epoch (one hand-back per bundle) and a "
+                "person has since decided this is one piece of work -- `request_reshape` "
+                "would refuse a second one, so writing `%s` again would only cost a "
+                "round. Write the spec.\n" % seat.RESHAPE_OUT)
         answers = front.epoch_facts(store, run_id, EventKind.HUMAN_ANSWER, n)
         if answers:
             # Standing, because a hand-back from the `grill: human` resume

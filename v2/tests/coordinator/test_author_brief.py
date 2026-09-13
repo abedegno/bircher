@@ -168,6 +168,33 @@ def test_the_resolution_is_not_repeated_on_a_later_round(fake):
     assert "the shape was disputed and resolved" not in brief.casefold()
 
 
+def test_the_brief_says_the_hand_back_is_spent_once_the_dispute_is_resolved(fake):
+    """Final review, finding 3. `skills/spec-author/SKILL.md`'s own "##
+    Handing back" section is unconditional and embedded in every spec
+    brief, so a seat reading only the skill would believe the lever is
+    always live. Once the epoch's one hand-back is spent
+    (`request_reshape`: one per bundle), the composed brief says so
+    explicitly, on both turns the review found reachable: the resolution's
+    own turn (`approved_one_piece`, "after approve_one_piece" in the
+    review's table) and a later round in the same resolved epoch
+    (`after_approve_one_piece`, "a later round after the resolution")."""
+    for f in (fake.approved_one_piece(), fake.after_approve_one_piece()):
+        brief = author.author_brief(f.ctx, phase="spec").decode()
+        assert "## Handing back is no longer available" in brief
+        assert "one hand-back per bundle" in brief.casefold()
+
+
+def test_the_brief_does_not_say_the_hand_back_is_spent_before_it_is(fake):
+    """The negative case: an epoch with a shape ruling and no hand-back yet
+    gets only the ordinary availability instruction, never the "already
+    spent" correction -- `revision_turn` is exactly the composed
+    availability instruction's own positive case."""
+    f = fake.revision_turn()
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "## Handing back is no longer available" not in brief
+    assert "## Handing back\n" in brief
+
+
 def test_the_resolution_renders_on_the_direction_path_with_the_ruling_that_followed(fake):
     """Fix round 1, B1/B3: the spec names TWO facts the spec round's cause
     can be -- "the person's `approve_one_piece`, or the `shape` ruling
