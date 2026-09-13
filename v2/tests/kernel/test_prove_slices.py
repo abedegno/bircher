@@ -1461,6 +1461,37 @@ def test_no_model_ruling_check_reds_on_a_ruling_naming_no_real_question(tmp_path
     assert any("no model_ruling" in x for x in fails), fails
 
 
+def test_gate_exists_reds_on_an_approve_naming_a_phase_outside_front_phases(tmp_path):
+    """Round 4, inert #2: `_gate_exists`'s `approve` branch checks
+    `phase in front.FRONT_PHASES` alongside `bool(front.submissions(...))`
+    -- without it, an approve naming a phase no real command could ever
+    submit to is grounded anyway, as long as a matching (forged)
+    artifact_submitted of that same bogus phase also exists."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    s.append_fact(run_id=f.run_id, kind=EventKind.ARTIFACT_SUBMITTED, actor="claude", causal_command_id=None,
+                  payload={"phase": "bogus", "epoch": 0, "hash": "deadbeef", "author": "claude", "round": 1})
+    s.append_fact(run_id=f.run_id, kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={"ruling": "approve", "phase": "bogus", "epoch": 0,
+                           "artifact_hash": "deadbeef", "cursor_item_id": None})
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert any("admitted by ruling word alone" in x for x in fails), fails
+
+
+def test_gate_exists_reds_on_an_approve_one_piece_with_a_hand_back_but_no_ruling(tmp_path):
+    """Round 4, inert #3: the `approve_one_piece` branch checks
+    `d.disputed is not None` -- a hand-back exists but nothing has ruled on
+    it yet, so there is no disagreement anyone could have approved past."""
+    s = Store.open(tmp_path / "a.db")
+    f = Front(s, "i12-epic-1", issue=ISSUE)
+    f.request_reshape("three parts")   # the hand-back; nothing rules on it
+    s.append_fact(run_id=f.run_id, kind=EventKind.HUMAN_RULING, actor="human", causal_command_id=None,
+                  payload={"ruling": "approve_one_piece", "phase": "slices", "epoch": 0,
+                           "visit": 2, "cursor_item_id": None})
+    fails = prove.assert_journal(s, f.run_id, mode="approval")
+    assert any("admitted by ruling word alone" in x for x in fails), fails
+
+
 def test_clause_b_reds_on_a_ruling_beside_an_accepted_plan_in_a_superseded_epoch(tmp_path):
     """Round 4, D4: `_decision_at`'s old `e == n` conjunct collapsed clause
     (b)'s "within EACH epoch" (spec §6(b)) to just the final epoch -- a
