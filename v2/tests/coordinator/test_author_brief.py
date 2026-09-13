@@ -190,6 +190,24 @@ def test_the_resolution_renders_on_the_direction_path_with_the_ruling_that_follo
     assert "is this one piece of work?" not in brief.casefold()
 
 
+def test_the_resolution_names_the_hand_backs_actor_not_the_reader(fake):
+    """Final review, finding 4. The section used to open "You handed this
+    run back as an epic," addressing whichever seat is dispatched to write
+    the spec as though IT wrote the hand-back. On the approval path the
+    spec seat happens to be the hand-back's own vendor
+    (`_other_than(disputed.actor)` lands there), so "You" read true by
+    coincidence; on the direction path the spec seat is
+    `_other_than(newest shape ruling)`, which need not be the hand-back's
+    vendor. `direction_resolved_one_piece` hands back as `codex` and rules
+    both shape rounds as `claude` (`Front`'s default author): "You" would
+    be false for whichever vendor actually reads this brief. Naming the
+    actor is true regardless of who reads it."""
+    f = fake.direction_resolved_one_piece()
+    brief = author.author_brief(f.ctx, phase="spec").decode()
+    assert "**codex** handed this run back as an epic" in brief
+    assert "you handed this run back" not in brief.casefold()
+
+
 def test_the_resolution_re_renders_findings_on_the_direction_path_too(fake):
     """Fix round 1, B2: "on both paths" -- a spec reviewed before the
     hand-back must have its findings and its draft re-rendered beneath the

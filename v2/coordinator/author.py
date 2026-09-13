@@ -218,7 +218,17 @@ def _resolution_section(ctx) -> str | None:
     rendered. `front.ruling_after_direction` is the fifth fact `Dispute`
     does not carry, and quoting IT rather than `d.disputed` is what fixes
     B3 too: `d.disputed` is the ruling the direction OVERRULED, not the one
-    that followed it."""
+    that followed it.
+
+    Final review, finding 4: this section used to open "You handed this
+    run back as an epic," addressing the reader as though they wrote the
+    hand-back. On the approval path the spec seat IS the hand-back's vendor
+    (`_other_than(disputed.actor)` lands there), so it read true by
+    coincidence; on the direction path the spec seat is
+    `_other_than(newest shape ruling)`, which can be -- and in a real run
+    was -- a different vendor than the one who wrote `reshape.md`. Naming
+    the hand-back's actor (`d.hand_back.actor`) instead of addressing the
+    reader is true on both paths."""
     d = front.dispute(ctx.store, ctx.run_id)
     if d is None or d.resolution is None:
         return None
@@ -234,8 +244,8 @@ def _resolution_section(ctx) -> str | None:
         what = ("A person directed the shaper:\n\n> %s\n\nand the shaper then ruled:\n\n> %s"
                 % (d.resolution.payload["text"], ruling.payload["reasoning"]))
     return ("\n## The shape was disputed and resolved\n\n"
-            "You handed this run back as an epic. The shaper reconsidered and reaffirmed\n"
-            "one piece. %s\n\nWrite the spec.\n" % what)
+            "**%s** handed this run back as an epic. The shaper reconsidered and reaffirmed\n"
+            "one piece. %s\n\nWrite the spec.\n" % (d.hand_back.actor, what))
 
 
 def author_brief(ctx, *, phase: str, resume_answer=None) -> bytes:
