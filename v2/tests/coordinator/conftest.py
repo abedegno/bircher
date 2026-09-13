@@ -199,12 +199,16 @@ class Scenario:
         self.front.review_round("request_revision", findings=findings)
         self._sync_sessions()
 
-    def review_spec(self, *, verdict: str, reviewer: str, findings: bytes = b"needs work") -> None:
-        """A spec submitted (by whatever vendor the fixture's own `author`
-        is) and reviewed with *verdict* by *reviewer* -- for a test that
-        wants a spec `review_verdict` on the record without caring who
-        wrote the draft, only who judged it (Task 8's spec-clause tests: it
-        is the REVIEWER's identity the same-phase rotation reads)."""
+    def review_spec(self, *, verdict: str, reviewer: str, author: str | None = None,
+                    findings: bytes = b"needs work") -> None:
+        """A spec submitted (by *author*, defaulting to the fixture's own
+        `Front.author`) and reviewed with *verdict* by *reviewer* -- for a
+        test that wants a spec `review_verdict` on the record without
+        driving the seat through `choose_author_vendor` itself, only
+        caring who judged it (Task 8's spec-clause tests: it is the
+        REVIEWER's identity the same-phase rotation reads)."""
+        if author is not None:
+            self.front.author = author
         self.front.author_round(SPEC_BYTES)
         self.front.reviewer = reviewer
         self.front.review_round(verdict, findings=findings)

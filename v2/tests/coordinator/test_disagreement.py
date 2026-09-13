@@ -81,3 +81,15 @@ def test_the_shape_rounds_counter_is_per_visit(fake):
     f.submit_plan()
     assert (pathlib.Path(f.bundle_dir) / f.run_id / "slices-v2-r1.md").exists()
     assert (pathlib.Path(f.bundle_dir) / f.run_id / "slices-v1-r1.md").exists()
+
+
+def test_the_round_number_itself_is_per_visit_not_per_epoch(fake):
+    """The test above pins the NAME's visit but, with nothing ever
+    submitted in visit 1, it cannot tell a per-visit round counter from a
+    per-epoch one -- rnd is 1 either way. `handed_back_after_a_rejected_visit_one_plan`
+    already gives visit 1 a real submission, so visit 2's first plan is
+    round 1 of ITS OWN count and round 2 of the epoch's: an epoch-wide
+    counter would name this file "slices-v2-r2.md" instead."""
+    f = fake.handed_back_after_a_rejected_visit_one_plan()
+    f.submit_plan()
+    assert (pathlib.Path(f.bundle_dir) / f.run_id / "slices-v2-r1.md").exists()

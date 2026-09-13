@@ -49,3 +49,17 @@ def test_the_spec_seat_is_never_the_shape_rulings_vendor(fake):
     assert author.choose_author_vendor(f.spec_ctx) == "codex"
     f.review_spec(verdict="request_revision", reviewer="codex")
     assert author.choose_author_vendor(f.spec_ctx) == "codex"   # the rotation now
+
+
+def test_the_spec_clause_yields_to_the_rotation_once_a_verdict_exists(fake):
+    """With only two vendors configured, `_other_than(ruling.actor)` and
+    "whoever reviewed the fresh-perspective spec" usually coincide, which
+    is why the assertion above stays "codex" whether or not the spec
+    clause's `not same_phase` guard fires at all. Reviewed by the SHAPER
+    itself -- legal, since the shaper ("claude") did not submit this
+    artefact -- makes the two diverge: with the guard, the verdict's own
+    reviewer ("claude") wins; without it, `_other_than("claude")` ("codex")
+    would win instead and this reds."""
+    f = fake.ruled_one_piece(ruling_vendor="claude")
+    f.review_spec(verdict="request_revision", reviewer="claude", author="codex")
+    assert author.choose_author_vendor(f.spec_ctx) == "claude"
