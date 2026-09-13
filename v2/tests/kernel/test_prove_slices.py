@@ -711,6 +711,16 @@ def test_the_fifth_line_skips_a_superseded_hand_back(planted):
     assert prove.assert_dispute(s, run) == []
 
 
+def test_the_fifth_line_passes_a_disputed_ruling_resolved_by_approval(planted):
+    """The other resolution path assert_dispute's docstring names -- "a
+    disputed ruling followed by its resolution" -- checked on its own:
+    `disagreed_then_approved_then_merged` (built for the approval-mode
+    tests above) also answers its hand-back this way, and nothing here has
+    asserted that of it directly yet."""
+    s, run = planted.disagreed_then_approved_then_merged()
+    assert prove.assert_dispute(s, run) == []
+
+
 def test_the_fifth_line_reds_on_a_hand_back_with_neither_a_ruling_nor_a_filing(planted):
     """The plain unanswered case: a hand-back the CURRENT epoch still holds,
     with nothing after it at all -- not superseded, so the fifth line does
