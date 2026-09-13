@@ -578,6 +578,16 @@ class _Planted:
         f.revise(dict(ISSUE, body="changed"), reshape=False)
         return s, f.run_id
 
+    def hand_back_then_nothing(self):
+        """A hand-back the CURRENT epoch still holds, standing over neither
+        a ruling nor a filing -- unlike `hand_back_then_revise_bundle`,
+        nothing supersedes it, so the fifth line does not skip it: this is
+        the plain "still waiting" case, not the superseded one."""
+        s = self._db()
+        f = Front(s, "i12-epic-1", issue=ISSUE)
+        f.request_reshape("three parts")
+        return s, f.run_id
+
     def two_hand_backs_in_one_epoch(self):
         """One hand-back per bundle is the kernel's own guard
         (`request_reshape`'s "already holds a hand-back" refusal,
@@ -699,6 +709,14 @@ def test_the_fifth_line_passes_an_answered_hand_back(planted):
 def test_the_fifth_line_skips_a_superseded_hand_back(planted):
     s, run = planted.hand_back_then_revise_bundle()
     assert prove.assert_dispute(s, run) == []
+
+
+def test_the_fifth_line_reds_on_a_hand_back_with_neither_a_ruling_nor_a_filing(planted):
+    """The plain unanswered case: a hand-back the CURRENT epoch still holds,
+    with nothing after it at all -- not superseded, so the fifth line does
+    not skip it."""
+    s, run = planted.hand_back_then_nothing()
+    assert any("no disputed ruling and no filing after it" in x for x in prove.assert_dispute(s, run))
 
 
 def test_the_fifth_line_reds_on_a_second_hand_back_in_one_epoch(planted):
