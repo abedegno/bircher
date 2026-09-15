@@ -422,11 +422,17 @@ and it is the next decision.
 
 ## E10 — muesli #1, the spec author's hand-back, live
 
-*Pre-registered 2026-09-15 21:52 UTC, before the run. Revision 16 merged as
-bircher PR #99 (`5e1a4d0`) and deployed to `/workspaces/bircher-v2` on
-`omnigent-runner-bircher` at 21:35 UTC; the 21:50 wave was the first on the new
-code and had nothing to work. Muesli #1, "Recipes -- pre/during/after/
-cross-meeting prompts", labelled `bircher:queued` at 21:52 for the 22:20 wave.*
+*Pre-registered 2026-09-15, before the run. Revision 16 merged as bircher
+PR #99 (`5e1a4d0`) and deployed to `/workspaces/bircher-v2` on
+`omnigent-runner-bircher` at about 21:30 UTC by a fast-forward pull of `main`
+(`eacb42e` to `5e1a4d0`); the wave loop was not touched by the branch and
+spawns the scripts fresh each cycle. Muesli #1, "Recipes -- pre/during/after/
+cross-meeting prompts", labelled `bircher:queued` at 21:31 UTC. The loop fires at
+about :03 and :33 UTC (not the :20/:50 recorded when it was recreated on
+09-09; the phase has drifted), so the ~21:33 wave is both the first on the new
+code and the one that picks #1 up. The 21:03 wave, the last on the old code,
+found nothing queued. A first draft of this entry carried wrong times; this is
+the correction, made before any outcome was known.*
 
 **Why #1.** It is on the pre-registered list and its body names no file, no
 function and no acceptance test. It has E9's shape exactly: one noun over three
