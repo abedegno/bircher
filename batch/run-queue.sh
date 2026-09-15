@@ -4028,6 +4028,34 @@ _unreadable_state_item() {
   json_row "$item" "" "escalated" "false" "" "" 0 "the kernel state of run '$run_id' could not be read after $where, so this pass cannot tell whether it is sliced; nothing is recorded and the queue file stays for the next pass" "n/a" >> "$SCORECARD"
 }
 
+# _disputed_shaping_item <item> <rc> <run_id>: a non-zero exit AT shaping with
+# the dispute unresolved (shaping spec §5, revision 16). The pass died between
+# the disputed ruling and its park; the queue file stays, no outcome is
+# recorded, and the next wave's loop records the park and dispatches no seat.
+_disputed_shaping_item() {
+  local item="$1" rc="$2" run_id="$3"
+  echo "[batch] $item: phases exited $rc at shaping with the shape disputed; the dispute awaits the person" >&2
+  mkdir -p "$(dirname "$SCORECARD")"
+  json_row "$item" "" "escalated" "false" "" "" 0 "phases rc=$rc at shaping: the shape is disputed and awaits the person; run '$run_id' stays open and the next pass parks it" "n/a" >> "$SCORECARD"
+}
+
+# _unreadable_dispute_item <item> <run_id>: the state is `shaping` and the
+# kernel will not say whether the dispute is unresolved.
+#
+# CANNOT TELL IS NOT "NO" -- the same rule `_unreadable_state_item` above
+# exists for, one state later. `_kernel_unresolved_disagreement` prints the
+# empty string on every failure it has, and a caller that reads that as "no"
+# falls through to the ordinary `failed` path: it records a terminal outcome
+# and retires the queue file on a run whose two seats disagree, which is
+# exactly the outcome revision 16 exists to prevent. So: no outcome, no
+# effect, the queue file untouched, and a row that says a human has to look.
+_unreadable_dispute_item() {
+  local item="$1" run_id="$2"
+  echo "[batch] $item: cannot read run $run_id's dispute; recording nothing and leaving the queue file" >&2
+  mkdir -p "$(dirname "$SCORECARD")"
+  json_row "$item" "" "escalated" "false" "" "" 0 "the dispute of run '$run_id' could not be read after a non-zero exit at shaping, so this pass cannot tell whether it awaits the person; nothing is recorded and the queue file stays" "n/a" >> "$SCORECARD"
+}
+
 # _refused_mint_row <item> <mint_out>: the scorecard row for a refused
 # `create_run`, whose note is THE REFUSAL and not the wrapper around it.
 #
@@ -4541,6 +4569,25 @@ run_item() {
       if [ "$_st_end" = sliced ]; then
         _interrupted_sliced_item "$item" "$_prc" "$BIRCHER_RUN_ID"
         return 0
+      fi
+      # THREE-VALUED, not two (shaping spec §5, revision 16). The pass may
+      # have died between the disputed ruling and its park; the run is at
+      # `shaping`, and `_kernel_unresolved_disagreement` answers yes, no, or
+      # -- on every failure it has -- the empty string. Reading empty as "no"
+      # here is the same defect the sliced check above exists to prevent one
+      # state earlier: it would fall straight through to `failed` below and
+      # retire the queue file on a run whose two seats still disagree. Only a
+      # LITERAL `no` is allowed to fall through.
+      if [ "$_st_end" = shaping ]; then
+        local _dis; _dis=$(_kernel_unresolved_disagreement "$BIRCHER_RUN_ID")
+        if [ "$_dis" = yes ]; then
+          _disputed_shaping_item "$item" "$_prc" "$BIRCHER_RUN_ID"
+          return 0
+        fi
+        if [ -z "$_dis" ]; then
+          _unreadable_dispute_item "$item" "$BIRCHER_RUN_ID"
+          return 0
+        fi
       fi
       echo "[batch] $item: phases exited $_prc; recording failed" >&2
       _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
@@ -9167,6 +9214,39 @@ assert t.startswith('世'*10), 'expected 10 whole chars, got %r' % t[:14]
     || { echo "FAIL _unreadable_state_item: the row must say the state could not be read"; exit 1; }
   grep -q '"outcome": "escalated"' "$sdir/scorecard.jsonl" \
     || { echo "FAIL _unreadable_state_item: the row must be escalated"; exit 1; }
+
+  # Revision 16: a non-zero exit at `shaping` with the dispute unresolved
+  # keeps the queue file and records no outcome (shaping spec §5) -- the
+  # same "cannot tell is not no" shape as the sliced branch above, one state
+  # later. The THREE-VALUED read (`_kernel_unresolved_disagreement`) is
+  # exercised for real in `test_kernel_client.py`; these two pin the two
+  # helpers' own effect on the scorecard and the queue file in isolation.
+  printf 'item\n' > "$sdir/queue/i15-epic.md"
+  ( export SCORECARD="$sdir/scorecard.jsonl" PROCESSED="$sdir/processed" QUEUE="$sdir/queue"
+    _disputed_shaping_item "i15-epic" 1 "i15-epic-1" ) \
+    || { echo "FAIL _disputed_shaping_item exited non-zero"; exit 1; }
+  [ -f "$sdir/queue/i15-epic.md" ] || { echo "FAIL _disputed_shaping_item: the queue file must stay"; exit 1; }
+  grep -q 'awaits the person' "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _disputed_shaping_item: the row must say the dispute awaits the person"; exit 1; }
+  # And the unreadable query takes the same path with a different note: the
+  # empty string `_kernel_unresolved_disagreement` prints on every failure
+  # it has is "could not tell", never "no" (the comment above
+  # `_unreadable_dispute_item` says what guessing costs).
+  printf 'item\n' > "$sdir/queue/i16-epic.md"
+  ( export SCORECARD="$sdir/scorecard.jsonl" PROCESSED="$sdir/processed" QUEUE="$sdir/queue"
+    _unreadable_dispute_item "i16-epic" "i16-epic-1" ) \
+    || { echo "FAIL _unreadable_dispute_item exited non-zero"; exit 1; }
+  [ -f "$sdir/queue/i16-epic.md" ] || { echo "FAIL _unreadable_dispute_item: the queue file must stay"; exit 1; }
+  [ ! -f "$sdir/processed/i16-epic.md" ] || { echo "FAIL _unreadable_dispute_item: the file must NOT be retired"; exit 1; }
+  # Fix round 1, F7: like i14 above, not unlike it. The row's content was
+  # asserted nowhere for this case -- only the queue-file/processed-file
+  # effects -- so a helper that wrote i15's note, or none at all, passed
+  # unnoticed as long as it also happened to leave the files alone.
+  grep -q "could not be read after a non-zero exit at shaping" "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_dispute_item: the row must say the dispute could not be read"; exit 1; }
+  grep -q '"outcome": "escalated"' "$sdir/scorecard.jsonl" \
+    || { echo "FAIL _unreadable_dispute_item: the row must be escalated"; exit 1; }
+
   rm -rf "$sdir"
   echo "sliced branches OK"
 
@@ -9284,6 +9364,51 @@ print(json.loads(open(sys.argv[1]).read().splitlines()[-1])["note"])' "$gdir/min
   case "$mnote" in *"[batch:kernel]"*) echo "FAIL the refused-mint note must not carry the warn prefix: $mnote"; exit 1 ;; esac
   rm -rf "$gdir"
   echo "generator and refused mint OK"
+
+  # Revision 16: the journal sweep's failure is VISIBLE, not swallowed. Before
+  # this the sweep's `2>/dev/null` meant a raise inside the snippet yielded an
+  # empty result and no line -- and the runs it drops are exactly the ones
+  # labels cannot find, so the wave silently worked a shorter backlog with
+  # nothing in the log to say why. BIRCHER_KERNEL_DB here names a file that
+  # EXISTS but is not a database, so `Store.open` inside the sweep raises --
+  # NOT an empty file: `Store.open` runs `executescript(_SCHEMA)` on every
+  # open, and sqlite3 accepts a zero-byte file as a brand new, valid,
+  # freshly-schema'd database. Only garbage bytes make it actually fail.
+  local jdir; jdir=$(mktemp -d)
+  cat > "$jdir/gh" <<'SH'
+#!/usr/bin/env bash
+# "issue list" answers with ONE labelled issue (34) -- not empty text and not
+# the literal "[]" (which `for n in $queued_nums` would word-split into a
+# single bogus issue number and mask the sweep's own failure line behind
+# is_unblocked's "blockers unreadable" noise). One real number is what lets
+# this case prove BOTH halves of the failure message: the sweep fails, AND
+# the queue is still generated from labels alone (fix round 1, F6).
+case "$*" in
+  *"issue list"*) printf '34\n' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "T" ;;
+  *"--json body"*) echo "B" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$jdir/gh"
+  printf 'not a database\n' > "$jdir/not-a.db"
+  local jout; jout=$( cd "$jdir" && PATH="$jdir:$PATH" QUEUE="$jdir/queue" \
+      BIRCHER_KERNEL_DB="$jdir/not-a.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" 2>&1 >/dev/null )
+  case "$jout" in
+    *"journal sweep failed"*) ;;
+    *) echo "FAIL issues-to-queue: the sweep's failure must print a line, got: $jout"; exit 1 ;;
+  esac
+  # THE OTHER HALF of the same message (fix round 1, F6): a failed sweep only
+  # empties parked_nums (the `|| parked_nums=""` fallback), so the label path
+  # must still run to completion. Without this line the case proved the
+  # sentence prints and said nothing about whether it is TRUE.
+  ls "$jdir/queue"/i34-*.md >/dev/null 2>&1 \
+    || { echo "FAIL issues-to-queue: a labelled issue must still be queued when the journal sweep fails"; exit 1; }
+  rm -rf "$jdir"
+  echo "issues-to-queue journal sweep failure is visible OK"
 
   rm -rf "$_st_kdb"
   echo "self-test OK"

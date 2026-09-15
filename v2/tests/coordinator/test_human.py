@@ -110,7 +110,10 @@ def test_take_listing_records_by_state_with_the_listings_cursor(world):
     from coordinator.session import list_items
     assert human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch)) == "direction"
     d = s.newest_fact("r-1", EventKind.HUMAN_DIRECTION)
-    assert d.payload == {"phase": "spec", "epoch": 0, "text": "use sqlite", "cursor_item_id": last}
+    # Revision 16: `state` is the run's state when the direction landed --
+    # `queued` here, since record_human_direction never transitions.
+    assert d.payload == {"phase": "spec", "epoch": 0, "text": "use sqlite",
+                         "state": "queued", "cursor_item_id": last}
     # The same listing again: nothing unread, nothing recorded.
     assert human.take_listing(ctx, sid, list_items("http://srv", sid, fetch=fake.fetch)) is None
     assert len(s.facts_of_kind("r-1", EventKind.HUMAN_DIRECTION)) == 1

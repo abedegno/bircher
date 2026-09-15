@@ -62,6 +62,11 @@ def phase_of(state: str) -> str | None:
 PARK_REASONS = frozenset({
     "grill", "no_verdict", "bound_exhausted", "gate", "budget_exhausted",
     "identical_resubmission",
+    # Revision 16: the two seats disagree on the shape and a person decides.
+    # Bounded in `_check_park` to a run whose dispute is unresolved, so the
+    # notice and the prompt can key on it and no ordinary gate park carries
+    # its text.
+    "disagreement",
 })
 
 #: spec §3 *The turn's end is a fact*: the four ways a turn ends.
@@ -75,6 +80,9 @@ TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
 OUTPUT_COMMANDS = frozenset({
     "submit_spec", "submit_plan", "submit_slices", "record_one_piece",
     "record_author_empty", "record_model_question", "record_model_ruling",
+    # Revision 16: the hand-back ends an author turn too, so it carries the
+    # observed-turn-and-stop check every other output command carries.
+    "request_reshape",
 })
 
 #: Every non-terminal state. `record_run_outcome` and `cancel_run` are legal
@@ -100,8 +108,27 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # leave `shaping` by different doors; the ungated advance is the
     # coordinator's own fact, separate from the reviewer's accept, because
     # the transition that authorises filing must be its own fact.
-    "record_one_piece": (frozenset({"shaping"}), "queued"),
+    # Revision 16: the destination is COMPUTED, so the table declares none,
+    # exactly as `record_review` does. A ruling proceeds to `queued` unless it
+    # is the one that lands a visit's dispute, in which case it stays at
+    # `shaping` for the person (`_one_piece_destination`). Leaving `"queued"`
+    # here would state a destination that is wrong half the time to every
+    # reader of the table.
+    "record_one_piece": (frozenset({"shaping"}), None),
     "submit_slices": (frozenset({"shaping"}), "slices_submitted"),
+    # Revision 16: the spec author's hand-back. From `queued`, the spec
+    # author's own state, back to `shaping` -- a new VISIT of the same epoch,
+    # never a new epoch.
+    "request_reshape": (frozenset({"queued"}), "shaping"),
+    # Revision 16: the person's resolution of a shape disagreement. From
+    # `shaping` alone (spec §2's third refusal row) -- the dispute IS a
+    # shaping-state park, and at any later state a reply is read as it is
+    # today, so a stale dispute can never brick a spec or plan gate. The
+    # generic state check is what refuses it elsewhere; declaring a wider
+    # set here so the branch below could phrase its own message would make
+    # the table state a legality that does not exist, and the table is what
+    # a reader asks.
+    "approve_one_piece": (frozenset({"shaping"}), "queued"),
     "advance_ungated": (frozenset({"slices_accepted"}), "sliced"),
     # The filing and closing facts (shaping spec §2): no transition; legal
     # only from `sliced`, under the coordinator's or the sweep's operator
@@ -135,7 +162,12 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_merge_outcome": (frozenset({"merge_requested"}), None),
     # The human's commands (spec §2 Commands), reachable only through
     # execute_as_human -- checked in authorize() below.
-    "record_human_answer": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    # Revision 16: FRONT_HALF_STATES only. No shaping seat asks a question,
+    # the grill is epoch-scoped and can stand open while a hand-back's visit
+    # runs, and an answer recorded at `shaping` would be dropped from the
+    # shaper's brief and delivered later to the spec author as the reply to
+    # its question -- refused from every shaping state, dispute or none.
+    "record_human_answer": (FRONT_HALF_STATES, None),
     # The three author-round states.
     "record_human_direction": (frozenset({"queued", "specified", "shaping"}), None),
     # Destination by phase: computed in authorize().
@@ -259,6 +291,20 @@ def _review_destination(store, run_id: str, state: str, verdict: str, ruling: st
     if phase == "spec":
         return "spec_accepted" if "spec" in gates else "specified"
     return "plan_accepted" if "plan" in gates else "planned"
+
+
+def _one_piece_destination(store, run_id: str) -> str:
+    """Where a one-piece ruling lands, computed from the journal as
+    `_review_destination` computes the reviewer's (revision 16).
+
+    `shaping` when the epoch holds a hand-back and no shape ruling after it
+    yet -- this ruling is the disputed one, and the loop parks it for the
+    person. `queued` otherwise: the first ruling of an epoch, and a ruling
+    recorded after the person's resolution, both proceed. Read `front.dispute`
+    for the one definition; this function adds no derivation of its own."""
+    from kernel import front
+    d = front.dispute(store, run_id)
+    return "shaping" if (d is not None and d.disputed is None) else "queued"
 
 
 #: Outcomes `record_merge_outcome` may report, and where each leaves the run.
@@ -649,10 +695,17 @@ def _check_submit(store, cmd, state: str) -> None:
     h = cmd.payload.get("artifact_hash")
     if not isinstance(h, str) or not store.has_artifact(h):
         raise NotAuthorized(f"{cmd.name} names an artefact the kernel does not hold: {h!r}")
-    if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n)):
+    # Revision 16: for `slices` the dedupe is per VISIT. A plan an earlier
+    # visit rejected may be resubmitted after a hand-back -- the shaper
+    # reconsidered and stands by it, which is a decision, not the loop
+    # spinning. Every other phase dedupes per epoch as before.
+    visit = front.shaping_visit(store, cmd.run_id, epoch_n) if phase == "slices" else None
+    if any(f.payload["hash"] == h for f in front.submissions(store, cmd.run_id, phase, epoch_n, visit=visit)):
         raise NotAuthorized(
             f"identical to the prior artefact: {h[:12]}... was already submitted "
-            f"for {phase} in epoch {epoch_n}; a resubmission that did not change is not a revision"
+            f"for {phase} in epoch {epoch_n}"
+            + (f" visit {visit}" if visit is not None else "")
+            + "; a resubmission that did not change is not a revision"
         )
     if cmd.name == "submit_plan":
         if h == store.phase_artifact(cmd.run_id, "spec"):
@@ -728,9 +781,23 @@ def _check_cursor(cmd) -> None:
 
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
-    of the six the loop has, not free text the coordinator invents."""
+    of the seven the loop has, not free text the coordinator invents."""
     if cmd.payload.get("reason") not in PARK_REASONS:
         raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
+    if cmd.payload.get("reason") == "disagreement":
+        from kernel import front
+        # `disagreement` is the first park reason whose legality depends on
+        # journal state beyond its own from-set: a person's approval can
+        # land between the coordinator's listing and this park, resolving
+        # the dispute in the gap the two calls leave open. Refusing here --
+        # not merely noting it -- is what lets `run_loop` (a later task)
+        # catch the refusal, re-read the dispute and continue the pass
+        # instead of parking a person on a decision already made.
+        if not front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                "park disagreement: the run holds no unresolved disagreement; the dispute was resolved "
+                "between the listing and this park, and the pass continues without parking"
+            )
     # Three literal `.get(...)` reads, not a loop over a variable key: the
     # provenance extractor matches `cmd.payload.get("literal")` syntactically,
     # and a dynamic key defeats it -- these three rows would then be unbound
@@ -831,6 +898,18 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         _require_turn_recorded(store, cmd, Role.AUTHOR)
     if cmd.name == "record_review" and ruling == "review_ruling" and current in FRONT_HALF_STATES | SHAPING_STATES:
         _require_turn_recorded(store, cmd, Role.REVIEWER)
+
+    # Revision 16: while the dispute is unresolved, at `shaping` only -- a
+    # grill answer at `queued` is untouched by this. A third seat's slice
+    # plan cannot slice the disagreement away, and a retry's grant cannot
+    # consume the park in place of the person's decision (spec §2).
+    if cmd.name in ("submit_slices", "grant_round") and current == "shaping":
+        from kernel import front
+        if front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                f"{cmd.name}: the shape is disputed and waits for the person; a third seat cannot "
+                "slice it away and a retry cannot consume the park (shaping spec §2)"
+            )
 
     if cmd.name in ("record_model_question", "record_model_ruling"):
         from kernel import front
@@ -978,8 +1057,41 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         _check_author_seat(store, cmd, current)
         _check_no_newer_direction(store, cmd)
         n = front.epoch(store, cmd.run_id)
-        if front.shape_ruling(store, cmd.run_id, n) is not None:
-            raise NotAuthorized(f"a shape ruling already exists in epoch {n}: one decision per epoch (shaping spec §2)")
+        # Revision 16: one decision per VISIT, not per epoch -- a hand-back
+        # opens a visit precisely so a reconsidered ruling can be recorded in
+        # it. Before any hand-back the epoch holds one visit, so this reads
+        # exactly as the old epoch-wide guard did.
+        v = front.shaping_visit(store, cmd.run_id, n)
+        if front.shape_ruling(store, cmd.run_id, n, visit=v) is not None:
+            raise NotAuthorized(
+                f"a shape ruling already exists in epoch {n} visit {v}: one decision per visit (shaping spec §2)"
+            )
+        # Revision 16: the destination is no longer the static `queued` the
+        # table declares -- a ruling that lands the visit's dispute stays at
+        # `shaping` for the person, exactly as a review's destination is
+        # computed rather than looked up (`_review_destination`, above).
+        return _one_piece_destination(store, cmd.run_id)
+
+    if cmd.name == "request_reshape":
+        from kernel import front
+        # A literal read: the provenance extractor matches this syntactically,
+        # and the row it adds to the asserted set is stated in the spec's
+        # site table (revision 16).
+        if not _non_empty_str(cmd.payload.get("reasoning")):
+            raise NotAuthorized("request_reshape carries a non-empty reasoning")
+        _check_author_seat(store, cmd, current)
+        _check_no_newer_direction(store, cmd)
+        n = front.epoch(store, cmd.run_id)
+        if front.shape_ruling(store, cmd.run_id, n) is None:
+            raise NotAuthorized(
+                f"request_reshape: epoch {n} holds no shape ruling; there is nothing to hand back to "
+                "(a v1 run born in `queued` was never shaped)"
+            )
+        if front.epoch_facts(store, cmd.run_id, EventKind.RESHAPE_REQUESTED, n):
+            raise NotAuthorized(
+                f"request_reshape: epoch {n} already holds a hand-back; one per bundle, and a second "
+                "disagreement over the same input is the person's (shaping spec §2)"
+            )
         return next_state
 
     if cmd.name == "advance_ungated":
@@ -1090,6 +1202,12 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         from kernel import front
         if role_for(store, cmd.run_id, cmd.generation) != Role.AUTHOR:
             raise NotAuthorized("record_author_empty must come from an attempt dispatched in the author role")
+        # `detail` (revision 16) is the coordinator's own prose, asserted
+        # like `park`'s `reason` and `cursor_item_id` -- shape-checked here,
+        # not verified, because there is no kernel object to verify it
+        # against.
+        if cmd.payload.get("detail") is not None and not isinstance(cmd.payload.get("detail"), str):
+            raise NotAuthorized("record_author_empty detail must be a string or absent")
         sid = cmd.payload.get("session")
         seat = front.newest_seat(store, cmd.run_id, Role.AUTHOR, phase_of(current), front.epoch(store, cmd.run_id))
         if seat is None or seat["session"]["id"] != sid:
@@ -1145,6 +1263,32 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             )
         _check_cursor(cmd)
         return None
+
+    if cmd.name == "approve_one_piece":
+        from kernel import front
+        # The actor check needed here nowhere: `approve_one_piece` is in
+        # HUMAN_COMMANDS, and the generic check at the top of this function
+        # already refuses any ruling other than `human_ruling` before a
+        # dispatched attempt ever reaches this block or the state check
+        # below -- the same gate `approve_artifact` and `grant_round` above
+        # rely on with no actor check of their own.
+        #
+        # The state is the table's, not this block's: `_TRANSITIONS` admits
+        # `shaping` alone, so the generic check above has already refused
+        # every later state by the time this runs, and a second check here
+        # could never fire. What this block owes is the reason the table
+        # cannot express -- that the epoch holds no unresolved disagreement.
+        if not front.unresolved_disagreement(store, cmd.run_id):
+            raise NotAuthorized(
+                "approve_one_piece: this epoch holds no unresolved disagreement -- no hand-back, no disputed "
+                "ruling yet, or a resolution already recorded (a second approval is this refusal)"
+            )
+        if not isinstance(cmd.payload.get("cursor_item_id"), str):
+            raise NotAuthorized(
+                "approve_one_piece carries the reply's cursor_item_id: it is the one check the kernel can "
+                "make, and stricter than the other human commands, which tolerate its absence"
+            )
+        return next_state
 
     if cmd.name == "record_implementation_output":
         if role_for(store, cmd.run_id, cmd.generation) != Role.IMPLEMENTER:

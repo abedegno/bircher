@@ -193,6 +193,28 @@ _kernel_state() {  # <run_id>
   printf '%s' "$out"
 }
 
+# _kernel_unresolved_disagreement <run_id> -> `yes`, `no`, or the empty
+# string when the kernel would not answer (shaping spec §5). THREE VALUES.
+#
+# Empty is not "no": the caller that reads it as "no" records `failed` on a
+# run whose two seats disagree and retires its queue file, which is the
+# outcome the branch exists to prevent. Modelled on `_kernel_state` above --
+# same capture, same timeout, same "advisory, never guess" shape -- with one
+# extra filter: `coordinator.cli disagreement` prints only `yes` or `no` on a
+# clean exit, so anything else that reached stdout (a stray line ahead of a
+# late crash, a truncated read) is refused rather than trusted, exactly like
+# a non-zero exit is.
+_kernel_unresolved_disagreement() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli disagreement \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  case "$out" in
+    yes|no) printf '%s' "$out" ;;
+    *) printf '' ;;
+  esac
+}
+
 # _kernel_sliced_children <run_id> -> the issue numbers of the children the
 # run filed (its slice_filed facts), space-separated; empty if none.
 _kernel_sliced_children() {  # <run_id>

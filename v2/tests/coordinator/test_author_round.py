@@ -1,9 +1,11 @@
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from coordinator import author, phases, seat
+from coordinator.author import SKILLS
 from coordinator.effects import KERNEL
 from kernel import front
 from kernel.dispatch import Role
@@ -11,6 +13,10 @@ from kernel.events import EventKind
 from kernel.store import Store
 from tests.coordinator.fake_omnigent import FakeOmnigent
 from tests.kernel.front import SPEC_BYTES, Front
+
+#: A well-formed hand-back (shaping spec §3, revision 16), for the tests
+#: below that write one.
+RESHAPE_BYTES = b"Ruling: epic\nReasoning: the issue names a store, an API and a page.\n"
 
 
 @pytest.fixture
@@ -44,6 +50,64 @@ def _writes(fake, name, data):
     fake.on_prompt = on_prompt
 
 
+class _Fake:
+    """The `world` fixture, plus the conveniences the hand-back tests need:
+    accumulate the files a session's turn writes (`write`, additive --
+    several calls build up one turn's worth), drive one spec round
+    (`spec_round`), and read back what `run_turn` was actually asked to
+    watch and to read -- `last_turn` -- since the two are not the same set
+    and a test that only reads `Turn.files` cannot tell them apart."""
+
+    def __init__(self, store, ctx, run_id, omni, monkeypatch):
+        self.store, self.ctx, self.run_id, self._omni = store, ctx, run_id, omni
+        self._files: dict[str, bytes] = {}
+        self.last_turn = None
+        omni.on_prompt = self._on_prompt
+        original = seat.run_turn
+
+        def wrapped(ctx, *, watched, read=None, **kw):
+            turn = original(ctx, watched=watched, read=read, **kw)
+            self.last_turn = SimpleNamespace(
+                watched=list(watched), read=list(watched) if read is None else list(read),
+                ended=turn.ended, files=turn.files)
+            return turn
+        monkeypatch.setattr(seat, "run_turn", wrapped)
+
+    def _on_prompt(self, sid, text):
+        ws = self._omni.sessions[sid]["workspace"]
+        os.makedirs(os.path.join(ws, "bircher"), exist_ok=True)
+        for name, data in self._files.items():
+            open(os.path.join(ws, name), "wb").write(data)
+
+    def write(self, path, data):
+        self._files[path] = data
+
+    def spec_round(self):
+        return author.author_round(self.ctx)
+
+    @property
+    def turn_ran_to_its_cap(self) -> bool:
+        return self.last_turn is not None and self.last_turn.ended == "cap"
+
+
+@pytest.fixture
+def fake_factory(world, monkeypatch):
+    """`fake`, parameterised: `fake_factory(labels=(...))` builds an
+    independent `_Fake` over its own `world()` call, for the tests that need
+    a policy other than the default (`grill: human`, below) -- `fake` itself
+    stays the single no-argument instance the rest of this file already
+    uses."""
+    def make(**kwargs):
+        s, f, omni, ctx = world(**kwargs)
+        return _Fake(s, ctx, "r-1", omni, monkeypatch)
+    return make
+
+
+@pytest.fixture
+def fake(fake_factory):
+    return fake_factory()
+
+
 def test_parse_questions():
     text = "### Q1: sqlite or postgres?\nRecommended: sqlite\n\n### Q2: port?\nRecommended: 8080\nRuling: 8080 — default — low\n"
     qs = author.parse_questions(text)
@@ -58,7 +122,11 @@ def test_an_artefact_turn_submits_and_writes_the_copy(world, tmp_path):
     assert author.author_round(ctx) == "submitted"
     assert s.run_state("r-1") == "spec_submitted"
     sub = s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED)
-    assert sub.payload["author"] == "claude" and sub.payload["round"] == 1
+    # Revision 16: the epoch's first spec seat is the vendor that is NOT the
+    # shape ruling's actor (shaping spec §2 *The vendors*) -- `world`'s run
+    # is shaped by "claude" (Front's default author), so codex, not the
+    # fixture's `default_author`, authors the fresh-perspective spec.
+    assert sub.payload["author"] == "codex" and sub.payload["round"] == 1
     copy = tmp_path / "bundle" / "r-1" / "spec-r1.md"
     assert copy.read_bytes() == SPEC_BYTES
     sid = list(fake.sessions)[0]
@@ -71,14 +139,20 @@ def test_the_brief_carries_findings_on_a_revision_and_the_spec_for_a_plan(world)
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    # Revision 16: the epoch's first spec seat is the vendor that is not the
+    # shape ruling's actor (shaping spec §2 *The vendors*) -- "claude" shaped
+    # this run (Front's default author), so "codex" authors the
+    # fresh-perspective spec, and "claude" is left to review it.
+    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "codex"
+    f.reviewer = "claude"
     f.review_round("request_revision", findings=b"needs a threat model")
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES + b"\n## Threats\n")
     assert author.author_round(ctx) == "submitted"
     sid = list(fake.sessions)[-1]
     text = fake.sessions[sid]["items"][0]["content"][0]["text"]
     assert "needs a threat model" in text and SPEC_BYTES.decode() in text
-    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "codex"   # rotation
-    f.reviewer = "claude"                                                # the other vendor reviews
+    assert s.newest_fact("r-1", EventKind.ARTIFACT_SUBMITTED).payload["author"] == "claude"   # rotation
+    f.reviewer = "codex"                                                # the other vendor reviews
     f.review_round("accept")
     _writes(fake, seat.ARTIFACT_OUT, b"# Plan\n\n### Task 1: x\n")
     assert author.author_round(ctx) == "submitted"
@@ -164,6 +238,7 @@ def test_identical_resubmission_reauthors_once_then_stalls(world):
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
     f.review_round("request_revision")
     assert author.author_round(ctx) == "reauthor"
     rej = s.newest_fact("r-1", EventKind.COMMAND_REJECTED)
@@ -259,6 +334,7 @@ def test_the_revision_author_rotates_by_default(world):
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     assert author.author_round(ctx) == "submitted"
     first = front.submissions(s, "r-1", "spec", 0)[0].payload["author"]
+    f.reviewer = "claude" if first == "codex" else "codex"   # independence (revision 16 rotates the author)
     f.review_round("request_revision")
     assert author.choose_author_vendor(ctx) != first, "the reviewer authors the revision"
 
@@ -271,6 +347,7 @@ def test_a_revision_brief_requires_dispositions(world):
     s, f, fake, ctx = world()
     _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
     author.author_round(ctx)
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
     f.review_round("request_revision")
     brief = author.author_brief(ctx, phase="spec").decode()
     assert "## Findings to address" in brief
@@ -285,3 +362,152 @@ def test_a_first_draft_asks_for_no_dispositions(world):
     the word."""
     s, f, fake, ctx = world()
     assert "## Dispositions are required" not in author.author_brief(ctx, phase="spec").decode()
+
+
+# -- the hand-back (shaping spec §3, revision 16) ----------------------------
+
+def test_the_spec_round_watches_reshape_and_artifact_under_grill_model(fake):
+    fake.spec_round()
+    assert set(fake.last_turn.watched) == {seat.RESHAPE_OUT, seat.ARTIFACT_OUT}
+    assert seat.QUESTIONS_OUT in fake.last_turn.read
+
+
+def test_a_written_questions_file_does_not_end_the_turn(fake):
+    """Fix round 1, finding 3: the brief's first assertion here compared
+    against a string `author_round` can never return -- a tautology no
+    implementation could fail. Replaced with a well-formed question, so the
+    outcome is a real, reachable one (`"questions"`) that a broken
+    implementation (say, one that watches `QUESTIONS_OUT` again) would
+    reach a different way -- by the file landing and ending the turn `file`
+    rather than `cap` -- which the second assertion still catches."""
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: what about auth?\nRecommended: use OAuth\n")
+    assert fake.spec_round() == "questions"
+    assert fake.turn_ran_to_its_cap is True
+    q = fake.store.newest_fact(fake.run_id, EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
+
+
+def test_the_spec_rounds_read_set_includes_questions_under_grill_model(fake):
+    """Fix round 1, finding 4: the read SET (as opposed to the watched set)
+    had exactly one assertion in the whole suite, and it lived inside the
+    test above (`seat.QUESTIONS_OUT in fake.last_turn.read`) -- one mutation
+    (`read=None` for the spec phase) took out coverage for both at once.
+    Independent of that test: a well-formed `questions.md` sitting beside a
+    complete `artifact.md` must still be recorded, because `read` -- not
+    `watched` -- is what makes the coordinator look at it at all."""
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: which store?\nRecommended: sqlite\n")
+    fake.write(seat.ARTIFACT_OUT, SPEC_BYTES)
+    assert fake.spec_round() == "submitted"
+    q = fake.store.newest_fact(fake.run_id, EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
+
+
+def test_the_human_grills_spec_round_watches_all_three_paths(fake_factory):
+    """Fix round 1, finding 2: under `grill: human`, `RESHAPE_OUT` is
+    appended outside the conditional in `author_round`, so it should be in
+    the watched set alongside both files the `grill: human` branch already
+    watches -- nothing pinned that before this."""
+    fake = fake_factory(labels=("bircher:grill", "bircher:autonomous"))
+    fake.spec_round()
+    assert set(fake.last_turn.watched) == {seat.RESHAPE_OUT, seat.QUESTIONS_OUT, seat.ARTIFACT_OUT}
+
+
+def test_a_hand_back_ends_the_grill_humans_asking_turn(fake_factory):
+    """Fix round 1, finding 2: spec §3 says the hand-back is a legal ending
+    of the `grill: human` asking turn -- an author that decides the issue is
+    an epic before it has anything to ask about should not have to write and
+    answer a question first. `turn_ran_to_its_cap is False` is the part that
+    is actually about WATCHING: `reshape.md` is also in `read`, so an
+    unwatched hand-back would still be picked up once the turn reached its
+    timeout on its own -- the outcome alone does not tell the two apart, and
+    only ending the turn promptly, on the file landing, does."""
+    fake = fake_factory(labels=("bircher:grill", "bircher:autonomous"))
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.run_state(fake.run_id) == "shaping"
+    assert fake.turn_ran_to_its_cap is False
+
+
+def test_the_plan_round_still_reads_questions_under_grill_model(world):
+    """Fix round 1, finding 1 -- a REGRESSION, not a coverage gap: revision
+    16 changes the SPEC round's `read` only (spec §3's paragraph is explicit
+    that the plan phase is untouched). Before this task `author_round`
+    passed `read=[ARTIFACT_OUT, QUESTIONS_OUT]` unconditionally, for every
+    phase; the `else` branch's `read=None` fell back to `watched`, which
+    under `grill: model` is `[ARTIFACT_OUT]` alone -- a plan author's
+    questions file would never be read again, and the round would return
+    `empty_retry` where it should return `questions`."""
+    s, f, fake, ctx = world()
+    _writes(fake, seat.ARTIFACT_OUT, SPEC_BYTES)
+    assert author.author_round(ctx) == "submitted"
+    f.reviewer = "claude"          # codex authored the fresh-perspective spec (revision 16)
+    f.review_round("accept")
+    assert ctx.phase() == "plan"
+    _writes(fake, seat.QUESTIONS_OUT, b"### Q1: which orm?\nRecommended: none\n")
+    assert author.author_round(ctx) == "questions"
+    q = s.newest_fact("r-1", EventKind.MODEL_QUESTION)
+    assert q is not None and q.payload["question_id"] == "Q1"
+
+
+def test_reshape_is_read_before_questions_and_before_the_artifact(fake):
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    fake.write(seat.QUESTIONS_OUT, b"1. what about auth?\n")
+    fake.write(seat.ARTIFACT_OUT, b"# A spec\n")
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.run_state(fake.run_id) == "shaping"
+    # No grill park: covered by `test_a_hand_back_beside_real_questions_records_none_of_them`
+    # below, not here. `park` is issued from exactly one site in the
+    # coordinator (`phases.stall`, inside `run_loop`), never from
+    # `author_round` itself, so a "no PARKED fact" assertion here would hold
+    # whether or not the hand-back was handled correctly (fix round 1,
+    # finding 4a) -- this test used to carry one, and it could never fail.
+    # Removed rather than kept as documentation once nothing else read it.
+    assert front.submissions(fake.store, fake.run_id, "spec", 0) == []
+
+
+def test_a_hand_back_beside_real_questions_records_none_of_them(fake):
+    """The `questions.md` above never matches `### Q<n>:`, so a version of
+    the coordinator that fell through to processing it anyway would still
+    record nothing and this file's other assertions would not catch it --
+    the shape deciding before the questions are worth asking has to hold
+    even when there is a real question sitting there to record."""
+    fake.write(seat.RESHAPE_OUT, RESHAPE_BYTES)
+    fake.write(seat.QUESTIONS_OUT, b"### Q1: sqlite or postgres?\nRecommended: sqlite\n")
+    assert fake.spec_round() == "reshaped"
+    assert fake.store.facts_of_kind(fake.run_id, EventKind.MODEL_QUESTION) == []
+
+
+def test_a_malformed_reshape_is_the_empty_turn_with_its_detail(fake):
+    fake.write(seat.RESHAPE_OUT, b"Ruling: epic\n")
+    assert fake.spec_round() == "empty_retry"
+    e = fake.store.facts_of_kind(fake.run_id, EventKind.AUTHOR_EMPTY)[-1]
+    assert "reshape.md did not parse" in e.payload["detail"]
+
+
+def test_the_skill_carries_the_block_and_the_prohibition():
+    text = (SKILLS / "spec-author" / "SKILL.md").read_text()
+    assert "Ruling: epic" in text and "Reasoning:" in text
+    assert "the first non-blank line must be exactly `Ruling: epic`" in text
+    for forbidden in ("the run's journal", "session history", "`.run/`"):
+        assert forbidden in text
+
+
+def test_the_skills_example_block_parses_for_real():
+    """The substring checks above would still pass if the example under
+    `## Handing back` were reworded into something the real grammar rejects
+    -- a missing colon, the labels swapped, a stray line before `Ruling:`.
+    Parsing the block back out through `slices.parse_reshape` is what
+    actually ties the skill's prose to what the kernel accepts, rather than
+    to words that merely look like it."""
+    text = (SKILLS / "spec-author" / "SKILL.md").read_text()
+    section = text.split("## Handing back", 1)[1]
+    block, started = [], False
+    for line in section.splitlines():
+        if line.startswith("    "):
+            started = True
+            block.append(line[4:])
+        elif started:
+            break
+    from kernel import slices
+    r = slices.parse_reshape("\n".join(block).encode())
+    assert r is not None and r.reasoning, f"the skill's own example does not parse: {block!r}"

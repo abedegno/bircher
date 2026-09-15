@@ -44,45 +44,13 @@ queued_nums=$(gh issue list --repo "$REPO" --state open --limit 200 \
                --jq '[.[] | select(any(.labels[].name; .=="bircher:queued"))]
                      | sort_by((.labels|map(.name)|map(select(startswith("priority:")))|.[0] // "priority:p9"), .number)
                      | .[].number') || { echo "issues-to-queue: gh issue list failed" >&2; exit 1; }
-# Journal-driven resumption (spec section 5). A run that parked for a person
-# has already lost its bircher:queued label -- the runner swapped it for
-# running when it took the item -- and its queue file may be gone too, so the
-# labels alone cannot find it and neither can the queue directory. The kernel
-# can: an open run holding a current `parked` fact is exactly the work the
-# next wave must pick up, and it is queued here whatever the issue's labels
-# say. Its item renders from the live issue like any other; run_item adopts
-# the open run rather than minting a second one. Off when there is no kernel
-# database to ask.
-parked_nums=""
-if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
-  parked_nums=$(PYTHONPATH="$HERE/../v2" "${BIRCHER_PY:-python3}" -c '
-import os, re, sys
-from kernel import front
-from kernel.store import Store
-s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
-closed = {"ended", "cancelled"}
-out = []
-for rid in s.all_run_ids():
-    m = re.match(r"^i(\d+)-", rid)
-    if not m or s.run_state(rid) in closed:
-        continue
-    # A parked run, whatever its labels (finding 12); and a sliced run whose
-    # filing is not complete (shaping spec §5) -- the crash-anywhere-during-
-    # filing case -- so the next pass reaches file_owed. Whether a queue
-    # file exists is never the test; the kernel fact is.
-    if front.current_park(s, rid) is not None or (
-            s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None):
-        out.append(m.group(1))
-print(" ".join(dict.fromkeys(out)))' 2>/dev/null) || parked_nums=""
-  [ -z "$parked_nums" ] || echo "parked runs to resume: $parked_nums" >&2
-fi
-# Union, label-queued first, then parked runs not already listed.
-for n in $parked_nums; do
-  case " $queued_nums " in *" $n "*) ;; *) queued_nums="$queued_nums $n" ;; esac
-done
-[ "$DRY" = 1 ] || : > "$QUEUE/.manifest"
-for n in $queued_nums; do
-  is_unblocked "$n" || { echo "skip #$n (blocked)"; continue; }
+# _emit_item <n>: the queue file, the manifest line and the count -- ONE
+# body, called from both loops below. Two copies of this (a label-queued
+# version and a journal-resumed version) is two places for the manifest to
+# drift from what actually landed in QUEUE, which is how #46 happened once
+# already for a single write site.
+_emit_item() {
+  local n="$1" title body comments_json comments out
   title=$(gh issue view "$n" --repo "$REPO" --json title --jq .title)
   body=$(gh issue view "$n" --repo "$REPO" --json body --jq .body)
   # #46: comments carry the human's corrections. A failure here must not lose the
@@ -98,5 +66,82 @@ for n in $queued_nums; do
     echo "wrote $out"
   fi
   count=$((count+1))
+}
+
+# Journal-driven resumption (spec section 5). A run that parked for a person
+# has already lost its bircher:queued label -- the runner swapped it for
+# running when it took the item -- and its queue file may be gone too, so the
+# labels alone cannot find it and neither can the queue directory. The kernel
+# can: an open run holding a current `parked` fact, a `sliced` run still
+# owing a filing, or (revision 16) an open run whose journal holds an
+# unresolved shape disagreement and no current park -- the pass died between
+# the disputed ruling and its park -- is exactly the work the next wave must
+# pick up, and it is queued here whatever the issue's labels say. Its item
+# renders from the live issue like any other; run_item adopts the open run
+# rather than minting a second one. Off when there is no kernel database to
+# ask.
+parked_nums=""
+if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
+  # VISIBLE, not swallowed. `2>/dev/null` used to sit on the python call
+  # itself, so a raise inside the snippet (an import error, a corrupt
+  # database, anything short of the process dying outright) yielded an empty
+  # result and no line -- and the runs it drops are exactly the ones labels
+  # cannot find. Captured to a file rather than piped, because the snippet's
+  # own stdout is the answer this shell reads back.
+  TMP_SWEEP_ERR=$(mktemp) || TMP_SWEEP_ERR=""
+  trap '[ -z "${TMP_SWEEP_ERR:-}" ] || rm -f "$TMP_SWEEP_ERR"' EXIT
+  parked_nums=$(PYTHONPATH="$HERE/../v2" "${BIRCHER_PY:-python3}" -c '
+import os, re, sys
+from kernel import front
+from kernel.store import Store
+s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
+closed = {"ended", "cancelled"}
+out = []
+for rid in s.all_run_ids():
+    m = re.match(r"^i(\d+)-", rid)
+    if not m or s.run_state(rid) in closed:
+        continue
+    # A parked run, whatever its labels (finding 12); a sliced run whose
+    # filing is not complete (shaping spec §5) -- the crash-anywhere-during-
+    # filing case -- so the next pass reaches file_owed; or (revision 16) an
+    # open run whose dispute is unresolved, read without a state test
+    # because the dispute exists only at `shaping` by construction. Whether
+    # a queue file exists is never the test; the kernel fact is.
+    if front.current_park(s, rid) is not None or (
+            s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None) or (
+            front.unresolved_disagreement(s, rid)):
+        out.append(m.group(1))
+print(" ".join(dict.fromkeys(out)))' 2>"${TMP_SWEEP_ERR:-/dev/null}") || parked_nums=""
+  if [ -n "${TMP_SWEEP_ERR:-}" ] && [ -s "$TMP_SWEEP_ERR" ]; then
+    echo "issues-to-queue: journal sweep failed ($(tr '\n' ' ' < "$TMP_SWEEP_ERR")); the queue was generated from labels alone" >&2
+  fi
+  [ -z "$parked_nums" ] || echo "parked runs to resume: $parked_nums" >&2
+fi
+[ "$DRY" = 1 ] || : > "$QUEUE/.manifest"
+# EMITTED, not queued_nums membership (fix round 1, finding F1). An issue
+# is_unblocked SKIPPED is still a member of queued_nums -- the label swap to
+# `running` can fail (`_effect … || true`), or a person can re-add the label
+# -- so testing membership there read a blocked label-derived item as
+# "already handled" and the journal loop below dropped it too. That is the
+# one reachable case in which a sibling blocker withholds a resumption that
+# is past its own sequencing, which is exactly the outcome this union order
+# exists to prevent. emitted_nums is what actually reached _emit_item.
+emitted_nums=""
+for n in $queued_nums; do
+  is_unblocked "$n" || { echo "skip #$n (blocked)"; continue; }
+  _emit_item "$n"
+  emitted_nums="$emitted_nums $n"
+done
+# Journal-derived resumptions are unioned in AFTER is_unblocked, not before
+# (shaping spec §5): the blocked check applies to label-derived items only.
+# An open run is past its sequencing -- a sibling blocker reopened while it
+# sat parked or disputed would otherwise withhold it every wave, with
+# nothing on the issue itself to say why. A label-derived issue above is
+# still checked, as today. The dedupe below reads emitted_nums, not
+# queued_nums, for the same reason: an issue is_unblocked skipped never
+# reached _emit_item, and the journal path is its only way in this wave.
+for n in $parked_nums; do
+  case " $emitted_nums " in *" $n "*) continue ;; esac
+  _emit_item "$n"
 done
 echo "queued $count issue(s)"

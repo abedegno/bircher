@@ -80,6 +80,10 @@ _NEEDED_REAL_FUNCTIONS = [
     # an undefined one writes no row, and a test reading an empty scorecard
     # cannot tell "took the other branch" from "the helper does not exist".
     "_finish_sliced_item", "_interrupted_sliced_item",
+    # Revision 16's two dispute exits, one state later. Same reason again:
+    # REAL, so a row that never got written cannot be misread as "the other
+    # branch fired".
+    "_disputed_shaping_item", "_unreadable_dispute_item",
 ]
 
 
@@ -142,6 +146,11 @@ _log_call() {{
 
 _kernel_find_run() {{ _log_call _kernel_find_run "$@"; printf '%s' "${{T_FIND_RUN:-}}"; }}
 _kernel_pending()  {{ _log_call _kernel_pending "$@"; printf '%s' "${{T_PENDING:-}}"; }}
+# T_DISAGREEMENT: `yes`, `no`, or unset/empty for "the kernel would not say"
+# (revision 16, shaping spec §5) -- `${{T_DISAGREEMENT-}}` so the empty string
+# is a value this knob can carry, exactly like `_kernel_state`'s own
+# `${{T_STATE_AFTER-implementing}}` above.
+_kernel_unresolved_disagreement() {{ _log_call _kernel_unresolved_disagreement "$@"; printf '%s' "${{T_DISAGREEMENT-}}"; }}
 _kernel_state() {{
   _log_call _kernel_state "$@"
   local n; n=$(cat "{statecount}"); n=$((n+1)); printf '%s' "$n" > "{statecount}"
@@ -605,6 +614,83 @@ def test_a_failed_loop_at_sliced_escalates_and_keeps_the_queue_file(tmp_path):
     assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
     note = d.args_of("json_row")[7]
     assert "filing interrupted" in note, note
+
+
+# --- the dispute branch, at the run_item level (revision 16) -----------------
+#
+# `_disputed_shaping_item` and `_unreadable_dispute_item` have their own
+# fixtures in the runner's self-test, and neither says the SEAMS reach them:
+# `if [ "$_dis" = yes ]` could be flipped to `= no`, or the `-z "$_dis"` guard
+# dropped, and every helper-level self-test case would stay green, because
+# neither calls `_kernel_unresolved_disagreement` at all. These three drives
+# are what those comparisons answer to -- the third is the discriminator: a
+# LITERAL `no` must still reach today's `failed` path, so a mutation that
+# takes the dispute branch on every answer (not only `yes`) is caught here
+# too, not only the empty-vs-no confusion the other two guard.
+
+def test_a_failed_loop_at_shaping_with_the_dispute_unresolved_keeps_the_queue_file(tmp_path):
+    """rc != 0 at `shaping` with the dispute unresolved: the pass died between
+    the disputed ruling and its park. No outcome, the queue file stays, and
+    the next wave's loop records the park and dispatches no seat."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1", "T_STATE_AFTER": "shaping",
+        "T_DISAGREEMENT": "yes",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "awaits the person" in note, note
+    # Fix round 1, F5: the call site's argument order (`item rc run_id`)
+    # binds nothing without a POSITIONAL check. Swapping `$_prc` and
+    # `$BIRCHER_RUN_ID` at the call site left the note reading "phases
+    # rc=<run id> at shaping … run '1' stays open" -- a bare
+    # `run_id in note` substring check is satisfied either way, since the
+    # swapped run id still appears somewhere in the string; only checking
+    # WHERE each value landed catches the swap.
+    run_id = d.args_of("_kernel_run_start")[0]
+    assert "phases rc=1 at shaping" in note, note
+    assert f"run '{run_id}' stays open" in note, note
+
+
+def test_an_unreadable_dispute_at_shaping_keeps_the_queue_file(tmp_path):
+    """The same read, empty rather than `no`: `_kernel_unresolved_disagreement`
+    prints nothing on every failure it has, and reading that as `no` would
+    fall through to `failed` and retire the queue file on a run whose two
+    seats may still disagree -- the outcome this branch exists to prevent."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1", "T_STATE_AFTER": "shaping",
+        "T_DISAGREEMENT": "",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    note = d.args_of("json_row")[7]
+    assert "could not be read" in note, note
+
+
+def test_a_resolved_dispute_at_shaping_falls_through_to_the_ordinary_failed_path(tmp_path):
+    """THE DISCRIMINATOR. A literal `no` -- the dispute resolved before the
+    crash -- is the one answer that still takes today's path: `failed`,
+    recorded, and the queue file retired. Without this, a mutation that always
+    takes the dispute branch (e.g. `[ -n "$_dis" ]` in place of `= yes`) reads
+    every answer as a live dispute and never lets an ordinary crash fail."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1", "T_STATE_AFTER": "shaping",
+        "T_DISAGREEMENT": "no",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["failed"], d.calls
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not (d.queue_dir / f"{ITEM}.md").exists()
 
 
 # --- 3. the state read back after start_implementation -----------------------

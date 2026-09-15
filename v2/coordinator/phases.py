@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from coordinator import sessions
 from coordinator.effects import perform_effect
 from kernel import front
-from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, phase_of
+from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, NotAuthorized, phase_of
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
 
@@ -62,13 +62,22 @@ ROUND_CAUSE_KINDS = frozenset({
     EventKind.RUN_STARTED, EventKind.BUNDLE_REVISED, EventKind.REVIEW_VERDICT,
     EventKind.HUMAN_RULING, EventKind.HUMAN_DIRECTION, EventKind.AUTHOR_EMPTY,
     EventKind.PARKED, EventKind.COMMAND_REJECTED,
+    # Revision 16: the hand-back calls for the next shaping round.
+    EventKind.RESHAPE_REQUESTED,
 })
 
 
 def _is_round_cause(f) -> bool:
     if f.kind == EventKind.COMMAND_REJECTED:
         return f.payload.get("command_name") in ("submit_spec", "submit_plan", "submit_slices",
-                                                  "record_one_piece") and f.actor != "human"
+                                                  "record_one_piece", "request_reshape") and f.actor != "human"
+    if f.kind == EventKind.MODEL_RULING:
+        # Revision 16: a SHAPE ruling calls for the spec round that asks the
+        # fresh-perspective question. A grill ruling stays what it is -- the
+        # author answering its own question inside a turn -- and admitting it
+        # here would make every grill ruling start a round.
+        from kernel.slices import SHAPE_QUESTION
+        return f.payload.get("question_id") == SHAPE_QUESTION
     return f.kind in ROUND_CAUSE_KINDS
 
 
@@ -216,6 +225,12 @@ PARK_NEEDS = {
     "budget_exhausted": "Reply with the single word `retry` in the session below, or give corrections.",
     "no_verdict": "Reply with the single word `retry` in the session below, or give corrections.",
     "identical_resubmission": "Reply with the single word `retry` in the session below, or give corrections.",
+    # Revision 16 (shaping spec §4 *The disagreement gate*): the person's
+    # decision, not a reviewer's -- so the wording says so, and says what a
+    # bare "disagreement" does not.
+    "disagreement": ("The shaper and the spec author disagree on whether this is one piece "
+                     "of work. Reply with the single word `approve` to accept one piece, or "
+                     "say how to slice it. This is your decision, not a reviewer's."),
 }
 
 
@@ -236,6 +251,20 @@ def park_notice_body(ctx: Ctx, park) -> str:
     sid = park.payload.get("session_id")
     ui = os.environ.get("BIRCHER_OMNIGENT_UI", "").rstrip("/")
     where = f"{ui}/c/{sid}" if (ui and sid) else (f"session `{sid}`" if sid else "the run's newest session")
+    if reason == "disagreement":
+        # NOT "the reviewer accepted": nothing was accepted. Two seats
+        # disagree and the person decides (shaping spec §4 *The
+        # disagreement gate*); the generic body's "waiting for you at the
+        # phase" line on its own reads as an ordinary gate and says nothing
+        # about why -- so this body keeps that sentence (every notice names
+        # its phase, §4) but leads with why, which the generic body cannot
+        # say.
+        return (f"bircher: parked disagreement\n\n"
+                f"The spec author handed this issue back as an epic; the shaper reconsidered and "
+                f"reaffirmed one piece of work. This run is waiting for you at the "
+                f"**{park.payload.get('phase')}** phase.\n\n{PARK_NEEDS['disagreement']}\n\n"
+                f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the "
+                "moment you send it, so nothing appears to happen until one runs.")
     return (f"bircher: parked {reason}\n\n"
             f"This run is waiting for you at the **{park.payload.get('phase')}** phase.\n\n"
             f"{PARK_NEEDS.get(reason, 'Open the session below and reply.')}\n\n"
@@ -390,6 +419,52 @@ def run_loop(ctx: Ctx) -> int:
                 if human.human_pass(ctx, park) == "parked":
                     return Exit.PARKED
                 continue
+            # Revision 16: the park is the disagreement's NOTICE, not its
+            # definition (shaping spec §2 *The park is the disagreement's
+            # notice, not its definition*). A pass that died between the
+            # disputed ruling and its park left the journal saying
+            # "unresolved" and no park recorded; recording it here costs one
+            # wave and never a third seat. After the operator fence above and
+            # before any seat below is dispatched.
+            #
+            # Fix round 1, X6: `state == "shaping"` cannot be independently
+            # driven false here either -- dropping it left the full suite
+            # green. The reason is the same invariant `choose_author_vendor`'s
+            # own `.kind == HUMAN_DIRECTION` comment names: `unresolved_disagreement`
+            # only ever becomes true from a `disputed` ruling recorded AT
+            # `shaping` (a ruling never transitions state), and only ever
+            # becomes false again from `approve_one_piece` or a resolving
+            # direction, neither of which leaves it true afterward. There is
+            # no history in which it reads true while the state is anything
+            # else. Left in as the documentation of that assumption a reader
+            # would otherwise have to re-derive.
+            if state == "shaping" and park is None and front.unresolved_disagreement(store, run_id):
+                try:
+                    if stall(ctx, "disagreement", session_id=_newest_author_session(ctx),
+                             findings_hash=None, verdict=None, reviewer=None) == "parked":
+                        return Exit.PARKED
+                except NotAuthorized as exc:
+                    # The dispute was resolved between `stall`'s listing and
+                    # its park -- a person's command landing in the gap the
+                    # two calls leave open (`_check_park`'s own guard). Not a
+                    # crash: re-read the dispute and carry on with the pass.
+                    ctx.log(f"disagreement park refused, the dispute resolved in the gap: {exc}")
+                    # Fix round 1, L2: `continue`ing unconditionally back
+                    # into a branch guarded by this SAME refusal's own
+                    # precondition is an infinite-loop shape -- it
+                    # terminates today only because the resolved-in-the-gap
+                    # refusal is the one case that clears
+                    # `unresolved_disagreement`, making the branch's own
+                    # condition false on the next pass. A refusal of any
+                    # OTHER shape (a park payload some future change makes
+                    # invalid, say) would leave the dispute unresolved and
+                    # spin the wave forever. Re-read the journal rather than
+                    # assume: only the gap this branch exists for continues.
+                    if front.unresolved_disagreement(store, run_id):
+                        ctx.log("disagreement park refused for a reason that left the dispute "
+                                "unresolved; failing rather than repeating the same refusal")
+                        return Exit.FAILED
+                continue
             if state == "shaping":
                 from coordinator import shape
                 out = shape.shape_round(ctx)
@@ -420,6 +495,12 @@ def run_loop(ctx: Ctx) -> int:
                         return Exit.PARKED
                 elif out == "failed":
                     return Exit.FAILED
+                elif out == "reshaped":
+                    # The spec author handed the run back; the next
+                    # iteration reads `shaping` and runs the shaping round
+                    # (named here so an unexpected outcome still falls to
+                    # the `failed` arm above rather than to this one).
+                    continue
                 continue
             if state in ("slices_submitted", "spec_submitted", "plan_submitted"):
                 out = review.review_round(ctx)

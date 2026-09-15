@@ -414,6 +414,35 @@ def test_kernel_state_reads_the_run_back_from_a_REAL_store(tmp_path):
     assert _run('_kernel_state NOPE-1-a', env=env).stdout.strip() == ""
 
 
+def test_kernel_unresolved_disagreement_reads_the_run_back_from_a_REAL_store(tmp_path):
+    """Modelled on `test_kernel_state_reads_the_run_back_from_a_REAL_store`
+    above, one state later: `run_item`'s non-zero-exit branch at `shaping`
+    (shaping spec §5, revision 16) creates no park and records no outcome on
+    an EMPTY answer either, so this has to be a real read against a real
+    dispute -- `yes` while a shape ruling followed the hand-back with
+    nothing resolving it, `no` once the person resolves it, and EMPTY --
+    never a guessed `no` -- for a run the kernel does not hold at all.
+
+    THIS is the test the empty-vs-no mutation actually reds: the bare helper
+    self-tests in `run-queue.sh --self-test` (`_disputed_shaping_item`,
+    `_unreadable_dispute_item`) call the two scorecard helpers directly and
+    never invoke `_kernel_unresolved_disagreement`, so a case that only
+    exercises those would pass unchanged if the shell query itself started
+    lying about a failure.
+    """
+    from tests.kernel.test_reshape import _disagreed
+
+    db = tmp_path / "kernel.db"
+    s, f = _disagreed(tmp_path, name="kernel.db")
+    env = {"BIRCHER_KERNEL_DB": str(db)}
+    assert _run(f'_kernel_unresolved_disagreement {f.run_id}', env=env).stdout.strip() == "yes"
+    f.approve_one_piece()
+    assert s.run_state(f.run_id) == "queued"
+    assert _run(f'_kernel_unresolved_disagreement {f.run_id}', env=env).stdout.strip() == "no"
+    # A run the kernel does not hold answers EMPTY, never a plausible value.
+    assert _run('_kernel_unresolved_disagreement NOPE-1-a', env=env).stdout.strip() == ""
+
+
 def test_find_run_open_skips_ended_and_cancelled_runs(tmp_path):
     """`open` is what stops `run_item` minting a second run over a live one.
 

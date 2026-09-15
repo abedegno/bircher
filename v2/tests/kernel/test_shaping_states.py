@@ -37,8 +37,25 @@ def test_the_sets_and_the_phase_map():
 def test_membership_per_command():
     both = authz.FRONT_HALF_STATES | authz.SHAPING_STATES
     legal = authz.legal_states_for
-    for name in ("park", "record_human_answer", "record_prompt_item", "dismiss_human_item"):
+    for name in ("park", "record_prompt_item", "dismiss_human_item"):
         assert legal(name) == both, name
+    # Revision 16: the two commands that resolve a shape disagreement, each
+    # legal from exactly one state and no more. `request_reshape` is the
+    # author's, from `queued`, opening a new visit of `shaping`;
+    # `approve_one_piece` is the person's, from `shaping` alone, landing at
+    # `queued`. The narrow sets are the point: the dispute IS a shaping-state
+    # park, and a table that admitted the later states -- so the command's own
+    # block could phrase a friendlier refusal -- would tell every reader of
+    # the state machine that a stale dispute can be approved at a spec gate.
+    assert legal("request_reshape") == frozenset({"queued"})
+    assert authz.next_state_for("request_reshape") == "shaping"
+    assert legal("approve_one_piece") == frozenset({"shaping"})
+    assert authz.next_state_for("approve_one_piece") == "queued"
+    # Revision 16: record_human_answer is the one exception -- refused from
+    # every shaping state, dispute or none, because no shaping seat asks a
+    # question and the grill is epoch-scoped (shaping spec §2
+    # *request_reshape, approve_one_piece, and the disagreement*).
+    assert legal("record_human_answer") == authz.FRONT_HALF_STATES
     assert legal("record_human_direction") == frozenset({"queued", "specified", "shaping"})
     assert legal("record_model_question") == authz.FRONT_HALF_STATES
     assert legal("record_model_ruling") == authz.FRONT_HALF_STATES

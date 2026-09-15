@@ -248,7 +248,7 @@ def main(argv=None) -> int:
         sp = subs.add_parser(name)
         sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
         sp.add_argument("--server", required=True)
-    for name in ("approve", "grant-round", "revise", "direct", "parked", "state"):
+    for name in ("approve", "grant-round", "revise", "direct", "parked", "state", "disagreement"):
         sp = subs.add_parser(name)
         sp.add_argument("--db", required=True); sp.add_argument("--run-id", required=True)
         if name in ("approve", "revise", "direct"):
@@ -354,6 +354,27 @@ def main(argv=None) -> int:
     if a.mode == "state":
         from kernel.store import Store
         print(Store.open(a.db).run_state(a.run_id))
+        return RC_OK
+
+    # Revision 16 (shaping spec §5). `yes`/`no` on stdout; any failure here is
+    # a non-zero exit with the traceback on stderr, exactly like every other
+    # mode -- the shell caller has to be able to tell "no" from "could not
+    # read", and a printed empty string cannot carry that distinction. The
+    # THIRD value lives in the exit code, not on stdout: `kernel-client.sh`'s
+    # `_kernel_unresolved_disagreement` is what turns "this crashed" into the
+    # empty string the runner treats as unreadable.
+    if a.mode == "disagreement":
+        from kernel import front
+        from kernel.store import Store
+        store = Store.open(a.db)
+        # A run the kernel does not hold must raise, exactly like `state`
+        # above -- `front.dispute` reads facts_for a run id that simply
+        # returns no rows for one the kernel never created, which computes
+        # to "no dispute" and would otherwise print `no` for "no such run".
+        # That is the same conflation this whole mode exists to refuse, one
+        # layer out: a caller cannot tell "resolved" from "never existed".
+        store.run_state(a.run_id)
+        print("yes" if front.unresolved_disagreement(store, a.run_id) else "no")
         return RC_OK
 
     if a.mode == "parked":

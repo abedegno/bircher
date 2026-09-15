@@ -55,6 +55,10 @@ class EventKind:
     SLICE_REOPENED = "slice_reopened"
     CHILDREN_OBSERVED_CLOSED = "children_observed_closed"
 
+    # Revision 16: the spec author hands a wrongly one-piece run back to
+    # shaping. Its `visit` is the one it opens.
+    RESHAPE_REQUESTED = "reshape_requested"
+
 
 SCHEMA_VERSIONS = {
     EventKind.RUN_STARTED: 1,
@@ -96,6 +100,7 @@ SCHEMA_VERSIONS = {
     EventKind.SLICE_CLOSED: 1,
     EventKind.SLICE_REOPENED: 1,
     EventKind.CHILDREN_OBSERVED_CLOSED: 1,
+    EventKind.RESHAPE_REQUESTED: 1,
 }
 
 MECHANISM_VERSION = 1

@@ -122,6 +122,14 @@ def test_the_command_interface_is_closed_and_explicit():
         # sweep's readings, and the `sliced` outcome is guarded on them.
         "record_slice_filed", "record_filing_complete", "record_slice_closed",
         "record_slice_reopened", "record_children_observed_closed",
+        # Revision 16: the spec author's hand-back (shaping spec §2). A
+        # wrongly one-piece ruling moved the run past shaping with no way
+        # back; this is the fresh perspective's correction, an author's
+        # command from `queued` to a new visit of `shaping`. The person's
+        # side of the same disagreement, `approve_one_piece`, is declared
+        # with its transition and not before it.
+        "request_reshape",
+        "approve_one_piece",
     ])
 
 

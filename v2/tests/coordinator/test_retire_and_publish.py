@@ -99,7 +99,12 @@ def test_the_pass_does_not_retire_the_session_it_derives(world):
 
 def test_round_cause_follows_the_journal(world):
     s, f, fake, ctx = world
-    assert phases.round_cause(ctx).kind == "run_started"
+    # Not "run_started": `world`'s `Front` rules the run one piece at birth
+    # (its default `shape=True`), and revision 16 admits that shape
+    # `model_ruling` as a round cause -- the fact the spec round's question
+    # is rendered from (`author._question_section`) -- so it is now newer
+    # than `run_started` and `round_cause` reads it instead.
+    assert phases.round_cause(ctx).kind == "model_ruling"
     f.author_round(SPEC_BYTES)
     assert phases.seat_cause(ctx).kind == "artifact_submitted"
     g = f._dispatch(Role.REVIEWER, "codex")
@@ -118,7 +123,10 @@ def test_round_cause_follows_the_journal(world):
     f.review_round("accept")
     assert phases.round_cause(ctx).kind == "review_verdict"          # the accept opened the plan phase
     f.revise({"number": 1, "title": "T", "body": "B2", "labels": ["bircher:autonomous"], "comments": []})
-    assert phases.round_cause(ctx).kind == "bundle_revised"
+    # Not "bundle_revised": `revise`'s default `reshape=True` rules the NEW
+    # epoch one piece too, and that ruling -- newer than the bundle_revised
+    # it follows -- is what the next spec round's question renders from.
+    assert phases.round_cause(ctx).kind == "model_ruling"
 
 
 def test_publish_owed_posts_once_per_approved_phase_and_is_idempotent(world):

@@ -38,7 +38,8 @@ def test_new_kinds_declared_with_schema_version():
     for attr, value in {"ARTIFACT_ADVANCED": "artifact_advanced", "SLICE_FILED": "slice_filed",
                         "FILING_COMPLETE": "filing_complete", "SLICE_CLOSED": "slice_closed",
                         "SLICE_REOPENED": "slice_reopened",
-                        "CHILDREN_OBSERVED_CLOSED": "children_observed_closed"}.items():
+                        "CHILDREN_OBSERVED_CLOSED": "children_observed_closed",
+                        "RESHAPE_REQUESTED": "reshape_requested"}.items():
         assert getattr(EventKind, attr) == value
         assert SCHEMA_VERSIONS[value] == 1
 
@@ -118,6 +119,18 @@ def test_ruling_grammar():
     assert slices.parse_ruling(b"Ruling: two pieces\nReasoning: r\nCost if wrong: c\n") is None
     assert slices.parse_ruling(b"Ruling: one piece\nReasoning: r\nReasoning: again\nCost if wrong: c\n") is None
     assert slices.parse_ruling(b"") is None
+
+
+def test_parse_reshape_accepts_the_grammar():
+    r = slices.parse_reshape(b"Ruling: epic\nReasoning: the issue names a store, an API and a page.\n")
+    assert r.reasoning.startswith("the issue names")
+
+
+def test_parse_reshape_refuses_four_ways():
+    assert slices.parse_reshape(b"Ruling: one piece\nReasoning: x\n") is None   # the other ruling
+    assert slices.parse_reshape(b"Ruling: epic\n") is None                      # no reasoning
+    assert slices.parse_reshape(b"Ruling: epic\nReasoning:   \n") is None       # empty reasoning
+    assert slices.parse_reshape(b"Some preamble\nRuling: epic\nReasoning: x\n") is None
 
 
 def test_render_child_is_exact_and_strict():

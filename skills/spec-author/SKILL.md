@@ -9,6 +9,9 @@ You are writing the design spec for one GitHub issue. You have the frozen
 issue snapshot, the run's policy, and — on a revision — the previous draft
 and the reviewer's findings. Nothing else is in scope.
 
+Do not read the run's journal, its session history or `.run/`. Your value
+here is that you are seeing the issue for the first time.
+
 ## What to produce
 
 A design document a plan can be written from: purpose, constraints, the
@@ -58,3 +61,21 @@ for what the issue rules out; say why. Do not accept a finding you cannot
 address in this revision. The reviewer reads this section first and will not
 re-raise a finding you resolved or refused with reasons, so it is how the
 document stops growing.
+
+## Handing back
+
+If the issue is not one piece of work — if the spec you are about to write
+would specify more than one capability a reviewer could see working end to
+end — do not write the spec. Write `bircher/reshape.md` and end the turn.
+
+Write exactly this, and nothing else in the file: the first non-blank line must be exactly `Ruling: epic`, and a non-empty `Reasoning:` block must follow it.
+
+    Ruling: epic
+    Reasoning: <why this is more than one piece; name the pieces you see>
+
+Write the file whole somewhere else in the worktree and rename it into
+place. A watched file counts as landed the moment it is non-empty, so a
+file written a line at a time can end your turn half-finished.
+
+Do not write `bircher/artifact.md` or `bircher/questions.md` in the same
+turn. The hand-back is read first and they are discarded.
