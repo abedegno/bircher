@@ -465,3 +465,32 @@ journal whatever the outcome.
 
 **Not staged.** Nothing about the issue was edited to provoke a hand-back, and
 no seat was told this is a test.
+
+### E10, first attempt: outcome 2 — the shaper sliced
+
+*Run `i1-recipes-pre-during-after-cross-meeting-p-1789508081`, minted by the
+21:33 UTC wave on 2026-09-15, parked at the slice gate by 21:37.*
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| mint, resume fence, label swap | 21:34 | `bircher:queued` → `bircher:running`; shaping seat dispatched to **claude**, session `b785e26b` |
+| shaping turn | 21:34 to 21:36 | a three-slice plan, `artifact_submitted {phase: slices, visit: 1}` — the visit stamp is revision-16 code, live for the first time |
+| review | 21:36 to 21:37 | **codex: PASS, no findings**; `slices_accepted` |
+| gate | 21:37 | `parked {reason: gate}` on the shaping session; the run waits for a person |
+
+The shaper read muesli's code rather than the issue alone: its plan names
+`handleSummarizeTemplate` requiring a completed `GetTranscript`, and argues
+that the three unexecuted phases (`pre`, `during`, `cross`) are three
+triggers, three data sources and three surfaces sharing one authoring model.
+Slice 1 generalises the execution path and ships pre-meeting briefs; slices 2
+and 3 depend on it and add live prompts and cross-meeting analysis, the last
+routed through the existing chat surface as the issue suggests.
+
+**What this is and is not evidence for.** The shaping phase worked on a real
+muesli epic with zero human touches before the gate, under the merged
+revision-16 code, which is E8b (the optional zero-touch re-proof) as a side
+effect. It is not evidence for revision 16's mechanism: the fresh-perspective
+question was never asked, because the spec round was never reached. The
+pre-registration's outcome 2. The body's own "Big" and its three named surfaces
+were enough for the shaper; the E9 shape needs an issue whose body undersells
+it.
