@@ -419,3 +419,43 @@ that admits it. Both took a mechanism the spec did not have, the disposition
 step, which is still behind a flag. Two samples on two shapes of work,
 against three failures without it: that is the case for making it the default,
 and it is the next decision.
+
+## E10 — muesli #1, the spec author's hand-back, live
+
+*Pre-registered 2026-09-15 21:52 UTC, before the run. Revision 16 merged as
+bircher PR #99 (`5e1a4d0`) and deployed to `/workspaces/bircher-v2` on
+`omnigent-runner-bircher` at 21:35 UTC; the 21:50 wave was the first on the new
+code and had nothing to work. Muesli #1, "Recipes -- pre/during/after/
+cross-meeting prompts", labelled `bircher:queued` at 21:52 for the 22:20 wave.*
+
+**Why #1.** It is on the pre-registered list and its body names no file, no
+function and no acceptance test. It has E9's shape exactly: one noun over three
+named surfaces (pre-meeting briefs, live prompts, cross-meeting analysis), with
+the body's own "Big; overlaps templates + chat" as the kind of hint a fresh
+perspective acts on and an anchored shaper rationalises past. #7 was not chosen
+because its body says it "gates several design calls" and a shaper will slice
+it unprompted, which proves E8 again rather than revision 16.
+
+**What the mechanism must do, stated before it runs.** Three outcomes, and
+what each shows:
+
+1. *The shaper rules one piece and the spec author hands back.* Revision 16's
+   claim, live: the question-turn brief withholds the ruling and a real seat
+   disagrees on the raw issue. Then either the shaper concedes and slices, or
+   reaffirms and the run parks `disagreement` for a person. Both are E10.
+2. *The shaper slices without a hand-back.* Revision 16 never fires; E8 is
+   re-proven on muesli. Not a failure of the mechanism, but not evidence for it.
+3. *The shaper rules one piece and the spec author agrees.* The fresh
+   perspective ran live and did not disagree. Evidence for open question 3
+   (is the withheld ruling enough independence?), and E9's shape repeats
+   unless the reviewer's finding on the spec carries the hand-back later.
+
+**What is measured.** For outcome 1: whether the spec author's reasoning names
+something the shaper's did not (open question 3), which vendor held each seat
+and whether the reaffirmation crosses vendors (open question 4), and whether a
+person reading the issue notice and the session prompt can act without reading
+the journal. The proof (`prove_front_half --children`) is run over the finished
+journal whatever the outcome.
+
+**Not staged.** Nothing about the issue was edited to provoke a hand-back, and
+no seat was told this is a test.
