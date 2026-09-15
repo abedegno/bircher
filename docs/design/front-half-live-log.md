@@ -494,3 +494,22 @@ question was never asked, because the spec round was never reached. The
 pre-registration's outcome 2. The body's own "Big" and its three named surfaces
 were enough for the shaper; the E9 shape needs an issue whose body undersells
 it.
+
+The gate was approved on the person's instruction at 22:00:49 UTC: `approve`
+posted into the carrier session as a `message` event with a `user`-role
+`input_text` part (item `e6e75aec`), the same body the kernel composes for its
+own prompts. The 22:03 wave read it.
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| resume | 22:04 | the runner re-froze the bundle; `revise_bundle` refused, "no relevant change" — the designed answer, no new epoch |
+| approval | 22:04 | `human_ruling {approve, slices}` (seq 3506) → `sliced` |
+| filing | 22:04 | children **#763** Pre-meeting briefs, **#764** Live in-meeting prompts, **#765** Cross-meeting analysis; #764 and #765 blocked by #763; all three `bircher:queued` + `bircher:slice`; umbrella comment `bircher: sliced 0c4a8fcd` on #1; `filing_complete`; #1 now `bircher:sliced` |
+| runner | 22:04:55 | scorecard row `sliced`, "children filed: 763 764 765"; queue file retired to `processed` |
+| proof | 22:06 | `prove_front_half --expect-approval`: **PASS** over the parent. With `--children` the tool reports "child #763/#764/#765 has no run yet" — correct, since no wave has picked them up |
+
+Zero human touches before the gate, one word at it, and the proof passes:
+E8b, the optional zero-touch re-proof on a real muesli epic, delivered as a
+side effect of an E10 attempt that did not reach revision 16's mechanism.
+The consequence is live: #763 is unblocked and queued, so the next wave
+starts a real run on it unless the label is removed first.
