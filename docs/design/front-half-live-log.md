@@ -653,3 +653,33 @@ false; the runner reads the repository at one instant and the session does
 not stop when it does. And the implementer's in-session review reached a
 green head without a second vendor, which is the thing the pipeline's
 cross-review exists to add — its verdict is the one still owed.
+
+### #763 recovered for cross-review: codex FAIL, one blocking finding
+
+*2026-09-16 22:29 to 22:32 UTC, on the person's instruction.* Launched as
+the wave launches, with the recovery arguments passed through:
+`BIRCHER_KERNEL_DB=…/kernel-muesli.db bash batch/launch.sh --log … --recover-pr i763 766 codex`.
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| adopt | 22:29 | run `i763-…-1789511682` adopted, generation 89, role implementer |
+| derive | 22:29 | PR #766 CI green at `e1a86e6` → codex review out of band |
+| review | 22:31 | **codex: FAIL**, one blocking finding, none non-blocking; posted on the PR |
+| record | 22:31 | "no review verdict at all" — the kernel records no verdict on an `ended` run; "past the lifecycle stages; not re-driving them"; PR left open with a marker for a person |
+
+The finding, quoted: `internal/worker/prebriefs.go:49-65` "only examines
+events currently inside `(now, now+7d]`. If an event with an existing brief
+is rescheduled outside that window — or has already started — it is excluded
+before cleanup, leaving its stale brief attached and retrievable through the
+calendar API." Codex ran `go build`, `go vet`, `gofmt -l` and the
+determinism check itself, all clean, and could not run the Node gates
+locally.
+
+So the second vendor found what the implementer's in-session review did not:
+a cleanup scoped to the eligibility window rather than to the source's
+existing briefs. `review-gate` stays pending. The pipeline will not repair an
+ended run, so the next step is a person's — fix the finding on the branch
+and recover again for a fresh verdict, or decide otherwise. One cosmetic
+defect of the recovery path is recorded here: the posted comment begins with
+the harness's own "omnigent: Connecting…" lines, which the out-of-band review
+does not strip.
