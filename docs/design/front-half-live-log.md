@@ -562,7 +562,8 @@ UTC; its log stamps are container-local BST, which is where the earlier
 | shaping, turn 1 | 08:36 | claude (gen 3, session `c21fde1a`) wrote a plan; `submit_slices` **refused**: "slice 4: Scope has 2 sentence(s); 3 to 6 by full stops" — the grammar's sentence bound, live |
 | shaping, turn 2 | 08:37 to 08:38 | the refusal became the round's findings; claude again (gen 5 — a refused submit is a reauthor, not a rotation) submitted a conforming plan, `visit: 1` |
 | review | 08:38 to 08:40 | **codex: request_revision**, one high finding: slice 1 (the API surface) "is explicitly a prerequisite layer with no user-visible mobile capability, so it is a bare step of the later viewing/authentication work rather than a coarse capability" — §1's definition, applied by the reviewer; back to `shaping` |
-| shaping, turn 3 | from 08:40 | by the rotation the reviewer authors the next round: **codex** holds the pen, with its own finding as the round's findings. A revised plan, or a one-piece ruling — legal after a rejected plan, the visit's one decision — are both open; a codex ruling would send the spec seat to claude with the question |
+| shaping, turn 3 | from 08:40 | by the rotation the reviewer authors the next round: **codex** holds the pen, with its own finding as the round's findings. It chose a revised plan, at 08:41: **two slices**, view notes on iOS and view notes on Android, the API work folded into the first, capture dropped as "undecided rather than committed scope", all three findings dispositioned accepted. `visit: 1`, as it must be — no hand-back has opened another |
+| review, round 2 | from 08:41 | claude reviews codex's plan; verdict pending at the time of writing |
 
 Four slices: a mobile-friendly API surface; the app shell and
 authentication; viewing notes; audio capture. The rationale reads the body's
