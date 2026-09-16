@@ -537,3 +537,14 @@ spec, which was accepted. That is outcome 3 on a true positive: no false
 hand-back. What it says about open question 3 is limited to "the question
 did not provoke a spurious disagreement", which is the cheaper half of the
 question. The verification of what that seat was shown follows below.
+
+**#763's spec seat, verified from the journal.** Shaper: claude, one-piece
+ruling at visit 1 ("already a pre-scoped slice"). Spec seat: **codex**, the
+vendor that is not the ruling's actor — the §2 vendor rule, live. Its first
+prompt (5,159 bytes) carries the question section, the `Ruling: epic` grammar
+block and the availability section; it carries none of the ruling's reasoning
+or cost, no findings, no previous draft and no resolution section. No
+`reshape_requested`; no dispute. The spec then took three rounds with
+authors codex, claude, codex and reviewers claude, codex, claude, so the
+rotation continued to cross vendors under the new rule. The run parks at the
+spec gate from 05:35, re-parking every wave since.
