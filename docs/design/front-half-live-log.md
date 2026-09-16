@@ -513,3 +513,27 @@ E8b, the optional zero-touch re-proof on a real muesli epic, delivered as a
 side effect of an E10 attempt that did not reach revision 16's mechanism.
 The consequence is live: #763 is unblocked and queued, so the next wave
 starts a real run on it unless the label is removed first.
+
+### E10, second attempt: muesli #5, pre-registered
+
+*Written 2026-09-16 08:35 UTC, before the run. Muesli #5, "Mobile client
+(iOS/Android)", labelled `bircher:queued` at 08:32 for the ~09:03 wave.*
+
+**Why #5.** Its whole body is "At least viewing, maybe capture. Keep the API
+mobile-friendly." — one noun that reads small and is not. That is E9's shape
+and the opposite of #1's, whose body announced itself as big and named its
+three surfaces. A shaper anchored on the body's minimising language rules one
+piece; a fresh perspective reading the title sees two platforms and at least
+two capabilities. The same three outcomes as the first attempt apply, and the
+same measurements.
+
+**A datum from overnight, recorded here because it arrived first.** #763, the
+first child filed from #1, ran to its spec gate between 22:33 and 05:35 UTC.
+A child carries `bircher:slice` and cannot be sliced, so its shaper ruled one
+piece, and its spec author was therefore briefed with the question and not
+the ruling — revision 16's mechanism live for the first time, on an issue
+that genuinely is one piece. The spec author did not hand back; it wrote a
+spec, which was accepted. That is outcome 3 on a true positive: no false
+hand-back. What it says about open question 3 is limited to "the question
+did not provoke a spurious disagreement", which is the cheaper half of the
+question. The verification of what that seat was shown follows below.
