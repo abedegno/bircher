@@ -610,3 +610,13 @@ options are to wait for such an issue to arrive naturally, or to accept
 that the mechanism's live proof is the #763 true negative plus the
 constructed histories of the branch review until one does. Staging one is
 excluded by this log's own rule.
+
+### Approvals, both gates
+
+*2026-09-16 12:37 UTC, on the person's instruction.* `approve` posted into
+#5's slice-gate session `2ca05ac1` (item `d012c56c`) and into #763's
+spec-gate session `911827ff` (item `d2a23700`), each as a `message` event
+with a `user`-role `input_text` part, each read back as its session's newest
+user item. The 13:04 wave reads both. #763 had waited at its spec gate for
+seven hours, re-parking every wave without spending a seat, which is the
+park doing what it is for.
