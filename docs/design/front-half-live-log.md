@@ -620,3 +620,36 @@ with a `user`-role `input_text` part, each read back as its session's newest
 user item. The 13:04 wave reads both. #763 had waited at its spec gate for
 seven hours, re-parking every wave without spending a seat, which is the
 park doing what it is for.
+
+### Both approvals taken; #5 sliced; #763's back half
+
+*Read at 21:46 UTC on 2026-09-16, eight hours after the approvals.*
+
+**#5.** The 14:35 UTC wave took the approval at 15:01: `human_ruling
+{approve, slices}` → `sliced`; children **#767** View notes on iOS and
+**#768** View notes on Android, #768 blocked by #767; umbrella `bircher:
+sliced ec3f5915` on #5; `filing_complete`; scorecard row `sliced`.
+`prove_front_half --expect-approval` over the parent: **PASS**. By 21:46
+#767 had run its own shaping (one piece, by construction), three spec
+rounds with the vendors alternating, and parked at its spec gate.
+
+**#763, the first child's back half.** The 13:05 UTC wave's implementer
+(claude, gen 88) opened muesli **PR #766** at 14:15, +6285/−199 over 63
+files, then pushed a test-determinism fix at 14:49 while CI was red. At
+15:00 the same wave derived the outcome from the repository — "PR up, CI
+red, coordinator died before fix" — and recorded `failed`; the run is
+`ended`. The implementer's session was not: its worktree kept receiving
+commits at 15:03, 17:32, 19:19 ("fix cross-review blocking findings"),
+19:51 and 20:12, and the head `e1a86e68` has every CI check green. The
+"cross-review" in those messages is the implementer's own in-session review
+tool, not the pipeline's: no `bircher/cross-review` was posted, and
+`review-gate` is **pending**. The v1 runner did not touch it. So the PR is
+green, unreviewed by the pipeline, and orphaned from its run — E9's
+position exactly, and `--recover-pr i763 766 codex` is the same remedy.
+
+Two things to note rather than fix here. The runner's derivation gave up
+on a session that was still working, and the outcome it recorded is now
+false; the runner reads the repository at one instant and the session does
+not stop when it does. And the implementer's in-session review reached a
+green head without a second vendor, which is the thing the pipeline's
+cross-review exists to add — its verdict is the one still owed.
