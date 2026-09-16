@@ -563,7 +563,8 @@ UTC; its log stamps are container-local BST, which is where the earlier
 | shaping, turn 2 | 08:37 to 08:38 | the refusal became the round's findings; claude again (gen 5 — a refused submit is a reauthor, not a rotation) submitted a conforming plan, `visit: 1` |
 | review | 08:38 to 08:40 | **codex: request_revision**, one high finding: slice 1 (the API surface) "is explicitly a prerequisite layer with no user-visible mobile capability, so it is a bare step of the later viewing/authentication work rather than a coarse capability" — §1's definition, applied by the reviewer; back to `shaping` |
 | shaping, turn 3 | from 08:40 | by the rotation the reviewer authors the next round: **codex** holds the pen, with its own finding as the round's findings. It chose a revised plan, at 08:41: **two slices**, view notes on iOS and view notes on Android, the API work folded into the first, capture dropped as "undecided rather than committed scope", all three findings dispositioned accepted. `visit: 1`, as it must be — no hand-back has opened another |
-| review, round 2 | from 08:41 | claude reviews codex's plan; verdict pending at the time of writing |
+| review, round 2 | 08:41 | **claude: accept**; `slices_accepted` |
+| gate | 08:41 | `parked {reason: gate}`; the run waits for a person |
 
 Four slices: a mobile-friendly API surface; the app shell and
 authentication; viewing notes; audio capture. The rationale reads the body's
@@ -578,3 +579,34 @@ the grammar refuses; the refusal is the next round's findings" ran live and
 recovered in one round, which is a datum for the shaping phase rather than
 for revision 16. Revision 16's only live evidence remains #763's true
 negative above.
+
+
+### E10 so far, assessed
+
+Two epic-shaped issues, two slice plans, no one-piece ruling: the hand-back
+path has not been exercised on an epic. #1 announced itself as big and
+claude sliced it in one turn; #5 undersold itself and claude sliced it too,
+after the grammar refused its first plan and codex rewrote the second. The
+pre-registered hypothesis — an undersold body anchors the shaper into one
+piece — did not hold, at least for claude as shaper.
+
+What revision 16 has shown live is the half that does not need an epic. On
+#763, a genuine one-piece, the spec seat went to the other vendor, was
+briefed with the question and without the ruling, and did not hand back.
+That is a true negative, and it is the cheaper half of open question 3.
+
+What the shaping phase showed as a by-product is worth more than expected:
+the sentence bound refused a live plan and the seat recovered in one round;
+a reviewer applied §1's definition to reject a prerequisite-layer slice as a
+bare step; and the rotation moved the pen to the other vendor, whose
+rewrite the first vendor then accepted. Every one of those is a §7 row
+running on a real issue.
+
+**What would reach the hand-back path.** A one-piece ruling on an epic.
+E9's #12 drew one, and its distinguishing feature was the "Design:" framing
+— a single deliverable named in the title. None of the remaining
+pre-registered issues (#4, #8, #9, #10) is framed that way. The honest
+options are to wait for such an issue to arrive naturally, or to accept
+that the mechanism's live proof is the #763 true negative plus the
+constructed histories of the branch review until one does. Staging one is
+excluded by this log's own rule.
