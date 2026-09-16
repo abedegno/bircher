@@ -517,7 +517,7 @@ starts a real run on it unless the label is removed first.
 ### E10, second attempt: muesli #5, pre-registered
 
 *Written 2026-09-16 08:35 UTC, before the run. Muesli #5, "Mobile client
-(iOS/Android)", labelled `bircher:queued` at 08:32 for the ~09:03 wave.*
+(iOS/Android)", labelled `bircher:queued` at 08:32 UTC.*
 
 **Why #5.** Its whole body is "At least viewing, maybe capture. Keep the API
 mobile-friendly." — one noun that reads small and is not. That is E9's shape
@@ -548,3 +548,31 @@ or cost, no findings, no previous draft and no resolution section. No
 authors codex, claude, codex and reviewers claude, codex, claude, so the
 rotation continued to cross vendors under the new rule. The run parks at the
 spec gate from 05:35, re-parking every wave since.
+
+
+### E10, second attempt: outcome 2 again — the shaper sliced, after one refusal
+
+*Run `i5-mobile-client-ios-android-1789547767`, minted by the 08:34 UTC wave
+on 2026-09-16 — two minutes after the label. The loop fires at :04 and :34
+UTC; its log stamps are container-local BST, which is where the earlier
+":03/:33" and "~09:03" came from. Corrected here before any later outcome.*
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| shaping, turn 1 | 08:36 | claude (gen 3, session `c21fde1a`) wrote a plan; `submit_slices` **refused**: "slice 4: Scope has 2 sentence(s); 3 to 6 by full stops" — the grammar's sentence bound, live |
+| shaping, turn 2 | 08:37 to 08:38 | the refusal became the round's findings; claude again (gen 5 — a refused submit is a reauthor, not a rotation) submitted a conforming plan, `visit: 1` |
+| review | from 08:38 | codex dispatched; verdict pending at the time of writing |
+
+Four slices: a mobile-friendly API surface; the app shell and
+authentication; viewing notes; audio capture. The rationale reads the body's
+"at least viewing, maybe capture" as two feature surfaces over a shared shell
+and a prerequisite API pass, "each large enough to be its own review".
+
+**What this says.** Two epic-shaped issues, two slice plans, no one-piece
+ruling — the pre-registered hypothesis that an undersold body would anchor
+the shaper into one piece did not hold for claude on #5. The hand-back path
+has still not been exercised on an epic. The §7 row "shaper writes a plan
+the grammar refuses; the refusal is the next round's findings" ran live and
+recovered in one round, which is a datum for the shaping phase rather than
+for revision 16. Revision 16's only live evidence remains #763's true
+negative above.
