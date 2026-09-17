@@ -736,3 +736,20 @@ the same vendor passed the fix. Two cosmetic defects for later: the
 recovery's posted comment begins with the harness's own "omnigent:
 Connecting…" lines, and the run's recorded outcome is `failed` for a PR
 that is now green and reviewed.
+
+### #766 merged; #767 approved at its spec gate
+
+*2026-09-17 07:53 UTC, on the person's instruction.* PR #766 squash-merged
+to muesli `main` as `551d148` "Pre-meeting briefs (issue #763) (#766)" —
+the pipeline's own convention, `--squash --delete-branch` — and #763 closed
+by the PR's "Closes #763". The first child of the first live epic is
+merged: shaped by the parent's slicing, specified and planned under
+revision 16's vendor rule, implemented, self-reviewed, caught by the
+cross-vendor review, fixed test-first, passed, merged. `approve` posted into
+#767's spec-gate session `872409a0` (item `76751fd0`) for the 08:04 wave.
+
+**What the next wave does on its own.** #764 and #765 were blocked by #763
+and carry `bircher:queued`; with #763 closed the generator's blocked check
+clears and both are queued, so two more runs start without anyone typing
+anything. The sweep records #763's closure toward #1's umbrella, which
+closes when all three children have. #767 moves to its plan phase.
