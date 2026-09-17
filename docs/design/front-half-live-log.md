@@ -753,3 +753,34 @@ and carry `bircher:queued`; with #763 closed the generator's blocked check
 clears and both are queued, so two more runs start without anyone typing
 anything. The sweep records #763's closure toward #1's umbrella, which
 closes when all three children have. #767 moves to its plan phase.
+
+### #767 halted on a transient GitHub error at the wave that would have read its approval; reconciled
+
+*Found 2026-09-17 20:17 UTC, twelve hours after the approval was posted.*
+#767's state and fact count had not moved since 07:53, and every wave since
+10:18 had escalated it: "halted or holds unresolved effects". The cause was
+the 08:04 wave's own resume: the runner's per-resume label swap
+(`running:767:44`, class `issue_or_label`) got "GraphQL: Something went
+wrong while executing your query" back from GitHub, the kernel recorded the
+effect as **uncertain**, and the run halted for a person — before `phases`
+ran, so the approval in the session was never read. The label was in fact
+present on the issue; the mutation had landed (or already stood from the
+earlier resumes, each confirmed with the issue's URL) and only the reply was
+lost. Twelve hours of waves each skipped the run correctly and spent no seat.
+
+Reconciled at 20:20 UTC with the runner's own client, in the legacy
+observed-resolution form: the typed delivered/not-delivered form refuses a
+bare label effect because it "carries no obligation", which is right — only
+an obligation-bearing effect has a delivered VALUE to bind later commands to.
+Resolution recorded: "bircher:running is present on #767 and bircher:queued
+is absent — the label edit landed despite GitHub returning a GraphQL error
+to the client". `effect_reconciled` by the human actor, version 54 → 55,
+halt cleared, the park and the unread `approve` untouched. Two things
+learned about the tooling: `_kernel_reconcile` sourced on its own needs the
+runner script's `_net_run` wrapper, and the kernel's refusal message named
+the right form without a docs lookup.
+
+Meanwhile, on their own: #764 and #765 were minted by the 08:04 wave once
+#763 closed, each ruled one piece as a slice, each through four spec rounds
+with the vendors alternating, and each parked at its spec gate by 10:18.
+The sweep recorded #763 closed toward #1's umbrella.
