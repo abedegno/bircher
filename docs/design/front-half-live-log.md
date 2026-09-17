@@ -709,3 +709,30 @@ cleanup is exactly the batch predicate negated and the two cannot drift.
 That is the same rule this branch learned about the dispute: one
 definition, every reader reads it. Build, vet, gofmt clean; the determinism
 rule checked by hand (no `time.Now`/`time.Sleep` in the new test).
+
+### #763: CI green, recovered again, codex PASS, gate green
+
+*2026-09-17 07:22 to 07:37 UTC.* The first push's CI failed on one of the
+three new tests — the source-scoping fixture seeded two sources' events at
+the same start, and the seeding helper lists the owner's events within a
+minute and requires exactly one. Fixed by starting them an hour apart
+(`6f1a365`); the two behavioural tests had passed. CI fully green at 07:34,
+`server (go)` included, so the database-backed red-then-green happened
+where it had to.
+
+Recovered again the same way, launched after waiting for the :34 wave to
+release the lock: generation 90, PR CI green at `6f1a365` → codex out of
+band → **PASS** at 07:37 → `bircher/cross-review=success` posted and
+verified → `review-gate: pass` → PR #766 mergeable, clean. The recovery
+did not merge: "run is at 'ended' — past the lifecycle stages; not
+re-driving them", which is the same stop as E9's, and the merge is a
+person's. The kernel recorded the two status effects under generation 90
+and nothing else; the run stays `ended`.
+
+**The first child's back half, in one line.** The pipeline's second vendor
+found a real defect the implementer's own review had missed, the finding
+was fixed test-first with the window defined once for both readers, and
+the same vendor passed the fix. Two cosmetic defects for later: the
+recovery's posted comment begins with the harness's own "omnigent:
+Connecting…" lines, and the run's recorded outcome is `failed` for a PR
+that is now green and reviewed.
