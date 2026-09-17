@@ -784,3 +784,25 @@ Meanwhile, on their own: #764 and #765 were minted by the 08:04 wave once
 #763 closed, each ruled one piece as a slice, each through four spec rounds
 with the vendors alternating, and each parked at its spec gate by 10:18.
 The sweep recorded #763 closed toward #1's umbrella.
+
+### Approvals posted for #764 and #765; every wave refused since 20:08 — Codex out of quota
+
+*2026-09-17 21:07 UTC, on the person's instruction.* `approve` posted into
+#764's spec-gate session `8d673fc4` (item `892b19ca`) and #765's `91b47114`
+(item `47c9464a`), each read back as its session's newest user item.
+
+None of the three posted approvals — #767's from 07:53, these two — has
+been read, and the reason is upstream of every run: from the 20:08 UTC wave
+onward, preflight fails on Codex ("You've hit your usage limit … try again
+at Sep 21st, 2026 8:22 PM") and the runner refuses to start the queue at
+all. That refusal is correct. A wave with one vendor would put claude in
+review of claude, which is the one thing the rotation exists to prevent, and
+the runner would rather do nothing than do that. Claude's own probe passes
+and GitHub auth is fine. The quota was spent honestly: #766's two
+cross-reviews, and the spec rounds of #764, #765 and #767, in which codex
+authored or reviewed every other round.
+
+Nothing is lost. The three runs are parked at their gates at zero cost, the
+approvals are durable in their sessions, and the first wave that passes
+preflight reads all three. The options are to wait for the reset, or to buy
+credits; there is no honest third.
