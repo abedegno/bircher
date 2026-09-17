@@ -683,3 +683,29 @@ and recover again for a fresh verdict, or decide otherwise. One cosmetic
 defect of the recovery path is recorded here: the posted comment begins with
 the harness's own "omnigent: Connecting…" lines, which the out-of-band review
 does not strip.
+
+### #763: the finding fixed on the branch
+
+*2026-09-17, on the person's instruction, in a worktree of `abedegno/muesli`
+on `i763-pre-meeting-briefs`; commit `b2c4df9`.*
+
+Test-first. Three DB-backed tests in a new
+`internal/worker/prebriefs_window_test.go`: an event with a brief is
+rescheduled to eight days out and the brief and its queued job are gone on
+the next pass; an event with a completed brief is moved into the past and
+the brief is gone; and the cleanup is source-scoped, leaving another
+source's out-of-window brief for that source's own pass. The red was shown
+at the compile level only — the store method did not exist — because the
+DB-backed tests skip without `TEST_DATABASE_URL` and Docker's daemon was
+not running here; the behavioural red-then-green is CI's to show.
+
+The fix: `DeleteEventBriefsOutsideWindow(owner, source, now)`, a
+source-scoped delete of every brief whose event is outside the window,
+joined through `calendar_events` and reusing the existing helpers for the
+returning-ids delete and the queued-job cleanup; called once per source
+before the batch loop. The window is now defined once — `preBriefWindow`,
+`(now, now+7d]` — and read by both the batch query and the cleanup, so the
+cleanup is exactly the batch predicate negated and the two cannot drift.
+That is the same rule this branch learned about the dispute: one
+definition, every reader reads it. Build, vet, gofmt clean; the determinism
+rule checked by hand (no `time.Now`/`time.Sleep` in the new test).
