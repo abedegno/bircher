@@ -806,3 +806,16 @@ Nothing is lost. The three runs are parked at their gates at zero cost, the
 approvals are durable in their sessions, and the first wave that passes
 preflight reads all three. The options are to wait for the reset, or to buy
 credits; there is no honest third.
+
+### Codex back; a hand-fired wave reads #767's approval
+
+*2026-09-17 22:59 to 23:08 UTC.* The person restored Codex (the direct probe
+answered READY at 22:59; the 22:38 wave had still failed). A wave fired by
+hand at 23:00 (`BIRCHER_WAVE_ONCE=1`, E8's precedent) passed preflight —
+"both providers healthy" — and the generator listed the three parked runs.
+#767 went first: its approval, posted at 07:53 the previous day and held
+through a halt, a reconcile and a quota stop, was read at last:
+`human_ruling {approve, spec}` → `specified`, park cleared, plan author
+dispatched. #764 and #765 follow in the same wave, since `run_item` is
+sequential and the implementer runs inside it, so their approvals are read
+when #767's block completes.
