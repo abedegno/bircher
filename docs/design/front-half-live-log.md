@@ -854,3 +854,74 @@ a person decides whether to grant a sixth round, correct, or stop.
 
 The parks cost nothing while they wait. The park notice on each issue names
 the phase and says what to type.
+
+### #769 (#764) repaired on its branch: two production defects behind the hang
+
+**2026-09-18 07:14 UTC.** The user's instruction was "Try to fix 764". The
+work was done in a worktree on the PR's own branch
+`764-live-in-meeting-prompts`, in two commits, `e8bc7ba` and `084bd03`. CI is
+fully green at `084bd03`; only `review-gate` is pending, and that is the
+cross-review's to post. No recover run was launched and nothing was merged;
+both are the user's call.
+
+**What the goroutine dumps said.** The ten-minute hangs in `internal/api` and
+`internal/store` were one mechanism twice. `pgxpool.Close`, called by the
+per-test pool's cleanup, blocks until every connection is returned, and in
+each package one test had left a connection checked out.
+
+- In `internal/api` the connection belonged to the live-prompts LISTEN
+  listener, parked in `WaitForNotification`. The handler starts it lazily on
+  the first stream and nothing ever stops it; the listener object was not
+  even kept. That is a production defect, not a test one: graceful shutdown
+  would block on `pool.Close()` the same way. The server now owns the
+  listener, `Server.Close()` stops it (mutex-guarded, so a late first stream
+  cannot start one after Close), `Run` defers Close, and the API test server
+  registers Close as a cleanup after the pool's, so it runs first.
+- In `internal/store`, `TestScheduleLiveJob_EnforcesCadence` "simulated the
+  first job having started" by clearing `active_job_id` while leaving that job
+  `pending`. The second schedule then violated `jobs_live_active_uniq` (one
+  pending or running `live_generate` job per output row), the test called
+  `t.Fatalf` with its transaction still open, and the cleanup blocked.
+  Postgres's own line in the CI output, `duplicate key value violates unique
+  constraint "jobs_live_active_uniq"`, was the tell. The test now settles the
+  first job as `done` and defers a rollback. The hang had masked every later
+  test in the package.
+
+**The three red tests.**
+
+- `TestRunLiveGenerate_TerminalFailure_NoGrowthCreatesNoSuccessor`
+  (`status = "pending", want failed`) was the second production defect.
+  `handleLiveGenerateTerminalFailure` read `target_revision` from the job
+  struct the pipeline holds, which the queue claim populated before the live
+  claim captured the target. It was therefore always nil, the failure path
+  compared `desired_revision` against 0, every terminal failure looked like
+  growth, and the row was rescheduled instead of marked failed. The
+  completion fence now returns the job row's own target and the failure
+  transaction uses that; a job with no captured target gets no follow-up.
+- `TestRunLiveGenerate_GrowthDuringExecutionCreatesOneFollowUp`
+  (`rendered_revision = 2, want 1`) was the test's premise: it appended
+  growth after the queue claim but before the live claim that captures the
+  target, so the target was 2. It now captures the target through
+  `ClaimLiveGenerateJobTx` first, as the worker does, then grows.
+- `TestNoteScopedRouteRegistrationCompleteness`: the new
+  `GET /api/notes/{id}/live-prompts` route is classified shared-readable,
+  matching its `GetReadableNote` gate and the API doc's
+  "ownership/readability" wording.
+
+**One more, unmasked by the fix.** With the store package running to
+completion, `TestReconcileOwnerEligibility_RunningRow_HiddenAndCancellationRequested`
+failed with `no rows in result set`. It deleted the template to make it
+ineligible, but `live_template_outputs.template_id` cascades on template
+delete, so the running row and its job vanish before the reconciliation that
+would hide them ever runs. The rule the test proves (hidden and
+cancellation-requested, not deleted) can only apply to a template that
+becomes ineligible while it still exists; the test now switches `auto_run`
+off instead. Whether deletion should cascade at all is a question for the
+cross-review, not something to change in a repair.
+
+**What this says about the run.** The session stopped at 00:53, twelve
+minutes before CI finished red, so the implementer never saw the result of
+its own branch. The two defects that mattered are both of the
+"identifier that names the wrong thing" kind: a job struct standing in for
+the job row, and a listener with no owner. Neither is visible in a diff;
+both were visible in the first goroutine dump.
