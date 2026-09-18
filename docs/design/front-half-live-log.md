@@ -1020,3 +1020,53 @@ about what it read; it read the wrong thing, and said so in a line nobody
 was required to check. Next, on the user's word: fix the finding on the
 branch (a test that forces a post-admission failure and asserts the lease
 is released), push, recover again.
+
+### #769, third recovery: the lease finding closed, a race in the template cap opened
+
+**2026-09-18 20:15 UTC.** The user said "fix the finding on the PR branch
+with a release-on-error test, push, and recover again". The fix is
+`d7e5cd0` on the PR branch: the SSE handler now reaches the store through a
+five-method `liveStore` boundary (production still passes the real store)
+and its three timers are variables, so an internal test can wrap the real
+store, force one failure after admission, and shorten the tickers rather
+than sleep. Four tests, one per class codex named: the initial snapshot
+query fails, the SSE write fails, the heartbeat reread fails, the renewal
+fails. Each asserts the lease was released exactly once and that no lease
+row remains for the note; the injected failures leave the row in place
+themselves, so only the handler's deferred release can satisfy the
+assertion. CI green at `d7e5cd0`, all DB-backed suites `ok`.
+
+**The re-run.** Launched 20:11:12 UTC, generation 49. Codex read the whole
+PR again ("schema, scheduling/worker, SSE API, Electron relay, renderer"),
+ran every non-DB gate locally, reconciled the DB-backed suites against the
+CI log, and reported the lease fix without comment, which is how a closed
+finding reads. Then, four minutes in: **VERDICT: FAIL**, one new blocking
+finding, nothing non-blocking:
+
+> The eight-template cap is vulnerable to concurrent creates or updates.
+> Two transactions can each observe seven eligible templates, both pass the
+> unlocked `count(*)`, then enable distinct eighth templates and commit,
+> leaving nine enabled. `UpdateTemplate` locks only the individual template
+> row, not a shared owner-scoped row. Serialize cap validation per owner or
+> enforce the invariant at the database level, and add a concurrent
+> regression test.
+
+The cited code is `validateLiveTemplateCap` and its count in
+`live_templates.go`, and the create and update transactions in
+`templates.go`. It is a plain check-then-act: the count is read without a
+lock that the competing writer would have to wait on. The observed-versus-
+asserted question again, one layer down: the cap is asserted by a count
+and observed by nobody.
+
+**The gate.** The head moved, so `d7e5cd0` carries no cross-review status
+and `review-gate` is pending, which is the truth. The stale green on
+`084bd03` is now behind the head and harmless.
+
+**Where this leaves the round.** Three recoveries, three different
+readings: PASS on one commit, FAIL on the lease, FAIL on the cap. The
+second and third are what the seat is for. Each new blocking finding is in
+a different subsystem, which is the shape #765's plan rounds showed and
+the pipeline trial priced as expensive. Next, on the user's word: serialize
+cap validation per owner (an owner-scoped row lock or an advisory
+transaction lock at the top of the create and update transactions) with a
+concurrent regression test, push, recover again.
