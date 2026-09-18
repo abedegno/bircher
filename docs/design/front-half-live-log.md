@@ -962,3 +962,61 @@ range ("the PR's changes are `git diff origin/main...<sha>`; review all of
 them, not only the head commit"), followed by a redeploy and a re-run of
 the recovery so that codex reads the 38 files. That is the user's call;
 the recommendation is recorded here and in memory.
+
+### #769 recovered again with the range named: codex FAIL, one blocking finding
+
+**2026-09-18 19:41 UTC.** The user said "Do all three". The prompt fix is
+bircher PR #101 (`5cf5386`, branch `fix/recovery-review-range`, open): one
+sentence after "You are reviewing EXACTLY commit", stating that the change
+under review is every file in `git diff origin/main...<sha>` and that a head
+commit touching one file does not narrow the review to one file, plus a
+self-test assertion that the range reaches the prompt text. The assertion
+was proved binding on the runner: the old prompt fails it, the new one
+passes. The bundle was deployed from the branch with `update-bundle.sh`, so
+the runner is on `fix/recovery-review-range` until #101 merges and `main`
+is redeployed.
+
+**A pre-existing failure in the bundle self-test.** `update-bundle.sh` runs
+the self-test and it fails on the runner, at `5e1a4d0` exactly as at
+`5cf5386`, on the rollback test that makes a findings file "unremovable"
+with `chmod 500`: the runner is uid 0, and root removes it anyway. The
+self-test exits at that first failure, before the recovery-prompt
+assertions, so on the runner they have never run; the wave timer does not
+run the self-test at all. Not caused here, not fixed here, recorded for an
+issue.
+
+**The re-run.** Launched 19:37:32 UTC, generation 48, same head `084bd03`.
+Codex's narrative this time opens "This is a broad feature PR (38 files,
+roughly 4.2k added lines), so I'm tracing the server lease/listener
+lifecycle, worker revision logic, and Electron reconnect/cleanup paths".
+Four minutes later: **VERDICT: FAIL**, one blocking finding, no
+non-blocking ones:
+
+> The new SSE endpoint acquires a database-backed subscriber lease
+> (`live_prompts.go:194`), which must be released by the defer
+> (`live_prompts.go:203`). Tests cover successful streaming and manually
+> releasing a seeded lease, but no post-acquisition failure path (initial
+> snapshot query failure, SSE write failure, heartbeat reread failure, or
+> renewal failure) asserts that the handler releases its lease.
+
+The suggestion: an injectable store boundary or a focused handler fixture
+that forces a failure after admission and verifies the lease count returns
+to zero, with renewal failure and initial-snapshot failure as the
+highest-value cases. This is the prompt's own release-on-error rule, applied
+to the file the first review never opened.
+
+**The gate is still green.** The recover path posts a cross-review status
+only when the outcome is ready; on FAIL it leaves the PR "with marker for
+human" and posts nothing. So `084bd03` still carries the 18:16 success from
+the one-commit review, and GitHub's `review-gate` is green on a PR whose
+real review is FAIL. The next push moves the head and clears it; until
+then the green is a scope artefact, and the recover path should post
+failure on FAIL. Both are for #101's follow-up, not for this repair.
+
+**What this says.** Same PR, same head, same vendor, same tooling: PASS
+with no findings at 18:16, FAIL with a blocking finding at 19:41. The only
+difference is a sentence naming the range. The first verdict was not wrong
+about what it read; it read the wrong thing, and said so in a line nobody
+was required to check. Next, on the user's word: fix the finding on the
+branch (a test that forces a post-admission failure and asserts the lease
+is released), push, recover again.
