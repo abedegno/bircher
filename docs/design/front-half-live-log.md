@@ -819,3 +819,38 @@ through a halt, a reconcile and a quota stop, was read at last:
 dispatched. #764 and #765 follow in the same wave, since `run_item` is
 sequential and the implementer runs inside it, so their approvals are read
 when #767's block completes.
+
+### Overnight: #764 to a red PR, #767 and #765 out of plan rounds
+
+*Read at 06:26 UTC on 2026-09-18.* The hand-fired wave and the timer waves
+after it (preflight OK from 05:09) took all three approvals in turn.
+
+**#764 → PR #769, red.** Approval read; the plan accepted after three rounds
+(claude, codex, claude); the implementer opened muesli PR #769 at 00:45,
++4106/−22 over 36 files, six commits to 00:53. At 01:05 the runner derived
+`failed` ("PR up, CI red, coordinator died before fix") and ended the run.
+Unlike #763, the session did not carry on: nothing after 00:53, and the head
+is genuinely red — two worker tests (`RunLiveGenerate`: a rendered revision
+of 2 where 1 was fixed; a terminal failure left `pending`), one API test
+(the new `/api/notes/{id}/live-prompts` route is missing from #12's
+authorization classification table), and the `internal/api` and
+`internal/store` packages **hung to the ten-minute timeout**. The run is
+`ended`, so the pipeline's repair loop cannot reach it; the PR waits for a
+person, and the hang is the first thing to understand.
+
+**#767 and #765: `bound_exhausted` at the plan phase.** Five rounds each,
+vendors alternating, every verdict `request_revision`. They are not the same
+case. #767's fifth review (claude) marks the prior high finding **resolved**
+and adds one **medium** — the scale-proof fixture must give the target owner
+20,000 of the 100,000 rows and mix in deleted rows — so the plan is
+converging and one more round would likely pass. #765's fifth review (codex)
+carries two **highs**, both about the aggregate token budget: a lookup error
+falling back to the static proxy the same way a genuine absence does, and
+`ceil(bytes/3)` not being a safe upper bound on tokenizer output outside
+English prose. Each round of #765 has found a new high in a different place
+— persistence contract, lifecycle, budget — which is the shape the pipeline
+trial called too expensive to run per issue, and the reason the park exists:
+a person decides whether to grant a sixth round, correct, or stop.
+
+The parks cost nothing while they wait. The park notice on each issue names
+the phase and says what to type.
