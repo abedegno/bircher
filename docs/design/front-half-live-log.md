@@ -925,3 +925,40 @@ its own branch. The two defects that mattered are both of the
 "identifier that names the wrong thing" kind: a job struct standing in for
 the job row, and a listener with no owner. Neither is visible in a diff;
 both were visible in the first goroutine dump.
+
+### #769 recovered: codex PASS on eight lines of a four-thousand-line PR
+
+**2026-09-18 18:14 UTC.** The user said "recover 769 for cross review. You
+can do this." The recover run was launched like #763's, from
+`launch.sh --recover-pr i764 769 codex`. It adopted PR #769, found CI green
+at `084bd03`, dispatched the out-of-band codex review, and two minutes later
+posted and verified `bircher/cross-review=success`; GitHub's `review-gate`
+went green on the same head. Codex's verdict was PASS with no findings of
+any severity.
+
+**What the review actually covered.** Codex's own Verification section says
+"Exact commit `084bd03…` reviewed", and its narrative opens "The commit only
+corrects a DB-backed regression test". It reviewed the head commit: one
+file, eight insertions, the test-only change from the repair above. The PR
+against `main` is 38 files and 4,171 insertions. Neither the implementer's
+36-file change nor the repair commit `e8bc7ba`, which fixed two production
+defects, has been read by a second vendor. The pipeline's own review stage
+never ran either: the session stopped at 00:53, before it.
+
+**Why.** The recovery prompt (`_recovery_review_prompt` in
+`batch/run-queue.sh`) says "You are reviewing EXACTLY commit <sha>" and
+"READ the changed files AND enough surrounding code", and never names the
+other side of the diff. That wording exists to pin the reviewer to a fixed
+sha (#66); it says nothing about the range. On #766 the same prompt
+produced a whole-PR review ("Reviewed the cleanup implementation and
+surrounding reconciliation, schema, job-lifecycle, API, and test code"). On
+#769 it produced a one-commit review. Same prompt, two readings; the gate
+cannot tell them apart, and this is the first live case where the narrow
+reading met a PR whose head commit was trivial.
+
+**Consequence.** The gate is green and attests to nothing about the PR's
+substance. Not merging. The fix is one sentence in the prompt, stating the
+range ("the PR's changes are `git diff origin/main...<sha>`; review all of
+them, not only the head commit"), followed by a redeploy and a re-run of
+the recovery so that codex reads the 38 files. That is the user's call;
+the recommendation is recorded here and in memory.
