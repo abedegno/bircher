@@ -419,3 +419,722 @@ that admits it. Both took a mechanism the spec did not have, the disposition
 step, which is still behind a flag. Two samples on two shapes of work,
 against three failures without it: that is the case for making it the default,
 and it is the next decision.
+
+## E10 — muesli #1, the spec author's hand-back, live
+
+*Pre-registered 2026-09-15, before the run. Revision 16 merged as bircher
+PR #99 (`5e1a4d0`) and deployed to `/workspaces/bircher-v2` on
+`omnigent-runner-bircher` at about 21:30 UTC by a fast-forward pull of `main`
+(`eacb42e` to `5e1a4d0`); the wave loop was not touched by the branch and
+spawns the scripts fresh each cycle. Muesli #1, "Recipes -- pre/during/after/
+cross-meeting prompts", labelled `bircher:queued` at 21:31 UTC. The loop fires at
+about :03 and :33 UTC (not the :20/:50 recorded when it was recreated on
+09-09; the phase has drifted), so the ~21:33 wave is both the first on the new
+code and the one that picks #1 up. The 21:03 wave, the last on the old code,
+found nothing queued. A first draft of this entry carried wrong times; this is
+the correction, made before any outcome was known.*
+
+**Why #1.** It is on the pre-registered list and its body names no file, no
+function and no acceptance test. It has E9's shape exactly: one noun over three
+named surfaces (pre-meeting briefs, live prompts, cross-meeting analysis), with
+the body's own "Big; overlaps templates + chat" as the kind of hint a fresh
+perspective acts on and an anchored shaper rationalises past. #7 was not chosen
+because its body says it "gates several design calls" and a shaper will slice
+it unprompted, which proves E8 again rather than revision 16.
+
+**What the mechanism must do, stated before it runs.** Three outcomes, and
+what each shows:
+
+1. *The shaper rules one piece and the spec author hands back.* Revision 16's
+   claim, live: the question-turn brief withholds the ruling and a real seat
+   disagrees on the raw issue. Then either the shaper concedes and slices, or
+   reaffirms and the run parks `disagreement` for a person. Both are E10.
+2. *The shaper slices without a hand-back.* Revision 16 never fires; E8 is
+   re-proven on muesli. Not a failure of the mechanism, but not evidence for it.
+3. *The shaper rules one piece and the spec author agrees.* The fresh
+   perspective ran live and did not disagree. Evidence for open question 3
+   (is the withheld ruling enough independence?), and E9's shape repeats
+   unless the reviewer's finding on the spec carries the hand-back later.
+
+**What is measured.** For outcome 1: whether the spec author's reasoning names
+something the shaper's did not (open question 3), which vendor held each seat
+and whether the reaffirmation crosses vendors (open question 4), and whether a
+person reading the issue notice and the session prompt can act without reading
+the journal. The proof (`prove_front_half --children`) is run over the finished
+journal whatever the outcome.
+
+**Not staged.** Nothing about the issue was edited to provoke a hand-back, and
+no seat was told this is a test.
+
+### E10, first attempt: outcome 2 — the shaper sliced
+
+*Run `i1-recipes-pre-during-after-cross-meeting-p-1789508081`, minted by the
+21:33 UTC wave on 2026-09-15, parked at the slice gate by 21:37.*
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| mint, resume fence, label swap | 21:34 | `bircher:queued` → `bircher:running`; shaping seat dispatched to **claude**, session `b785e26b` |
+| shaping turn | 21:34 to 21:36 | a three-slice plan, `artifact_submitted {phase: slices, visit: 1}` — the visit stamp is revision-16 code, live for the first time |
+| review | 21:36 to 21:37 | **codex: PASS, no findings**; `slices_accepted` |
+| gate | 21:37 | `parked {reason: gate}` on the shaping session; the run waits for a person |
+
+The shaper read muesli's code rather than the issue alone: its plan names
+`handleSummarizeTemplate` requiring a completed `GetTranscript`, and argues
+that the three unexecuted phases (`pre`, `during`, `cross`) are three
+triggers, three data sources and three surfaces sharing one authoring model.
+Slice 1 generalises the execution path and ships pre-meeting briefs; slices 2
+and 3 depend on it and add live prompts and cross-meeting analysis, the last
+routed through the existing chat surface as the issue suggests.
+
+**What this is and is not evidence for.** The shaping phase worked on a real
+muesli epic with zero human touches before the gate, under the merged
+revision-16 code, which is E8b (the optional zero-touch re-proof) as a side
+effect. It is not evidence for revision 16's mechanism: the fresh-perspective
+question was never asked, because the spec round was never reached. The
+pre-registration's outcome 2. The body's own "Big" and its three named surfaces
+were enough for the shaper; the E9 shape needs an issue whose body undersells
+it.
+
+The gate was approved on the person's instruction at 22:00:49 UTC: `approve`
+posted into the carrier session as a `message` event with a `user`-role
+`input_text` part (item `e6e75aec`), the same body the kernel composes for its
+own prompts. The 22:03 wave read it.
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| resume | 22:04 | the runner re-froze the bundle; `revise_bundle` refused, "no relevant change" — the designed answer, no new epoch |
+| approval | 22:04 | `human_ruling {approve, slices}` (seq 3506) → `sliced` |
+| filing | 22:04 | children **#763** Pre-meeting briefs, **#764** Live in-meeting prompts, **#765** Cross-meeting analysis; #764 and #765 blocked by #763; all three `bircher:queued` + `bircher:slice`; umbrella comment `bircher: sliced 0c4a8fcd` on #1; `filing_complete`; #1 now `bircher:sliced` |
+| runner | 22:04:55 | scorecard row `sliced`, "children filed: 763 764 765"; queue file retired to `processed` |
+| proof | 22:06 | `prove_front_half --expect-approval`: **PASS** over the parent. With `--children` the tool reports "child #763/#764/#765 has no run yet" — correct, since no wave has picked them up |
+
+Zero human touches before the gate, one word at it, and the proof passes:
+E8b, the optional zero-touch re-proof on a real muesli epic, delivered as a
+side effect of an E10 attempt that did not reach revision 16's mechanism.
+The consequence is live: #763 is unblocked and queued, so the next wave
+starts a real run on it unless the label is removed first.
+
+### E10, second attempt: muesli #5, pre-registered
+
+*Written 2026-09-16 08:35 UTC, before the run. Muesli #5, "Mobile client
+(iOS/Android)", labelled `bircher:queued` at 08:32 UTC.*
+
+**Why #5.** Its whole body is "At least viewing, maybe capture. Keep the API
+mobile-friendly." — one noun that reads small and is not. That is E9's shape
+and the opposite of #1's, whose body announced itself as big and named its
+three surfaces. A shaper anchored on the body's minimising language rules one
+piece; a fresh perspective reading the title sees two platforms and at least
+two capabilities. The same three outcomes as the first attempt apply, and the
+same measurements.
+
+**A datum from overnight, recorded here because it arrived first.** #763, the
+first child filed from #1, ran to its spec gate between 22:33 and 05:35 UTC.
+A child carries `bircher:slice` and cannot be sliced, so its shaper ruled one
+piece, and its spec author was therefore briefed with the question and not
+the ruling — revision 16's mechanism live for the first time, on an issue
+that genuinely is one piece. The spec author did not hand back; it wrote a
+spec, which was accepted. That is outcome 3 on a true positive: no false
+hand-back. What it says about open question 3 is limited to "the question
+did not provoke a spurious disagreement", which is the cheaper half of the
+question. The verification of what that seat was shown follows below.
+
+**#763's spec seat, verified from the journal.** Shaper: claude, one-piece
+ruling at visit 1 ("already a pre-scoped slice"). Spec seat: **codex**, the
+vendor that is not the ruling's actor — the §2 vendor rule, live. Its first
+prompt (5,159 bytes) carries the question section, the `Ruling: epic` grammar
+block and the availability section; it carries none of the ruling's reasoning
+or cost, no findings, no previous draft and no resolution section. No
+`reshape_requested`; no dispute. The spec then took three rounds with
+authors codex, claude, codex and reviewers claude, codex, claude, so the
+rotation continued to cross vendors under the new rule. The run parks at the
+spec gate from 05:35, re-parking every wave since.
+
+
+### E10, second attempt: outcome 2 again — the shaper sliced, after one refusal
+
+*Run `i5-mobile-client-ios-android-1789547767`, minted by the 08:34 UTC wave
+on 2026-09-16 — two minutes after the label. The loop fires at :04 and :34
+UTC; its log stamps are container-local BST, which is where the earlier
+":03/:33" and "~09:03" came from. Corrected here before any later outcome.*
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| shaping, turn 1 | 08:36 | claude (gen 3, session `c21fde1a`) wrote a plan; `submit_slices` **refused**: "slice 4: Scope has 2 sentence(s); 3 to 6 by full stops" — the grammar's sentence bound, live |
+| shaping, turn 2 | 08:37 to 08:38 | the refusal became the round's findings; claude again (gen 5 — a refused submit is a reauthor, not a rotation) submitted a conforming plan, `visit: 1` |
+| review | 08:38 to 08:40 | **codex: request_revision**, one high finding: slice 1 (the API surface) "is explicitly a prerequisite layer with no user-visible mobile capability, so it is a bare step of the later viewing/authentication work rather than a coarse capability" — §1's definition, applied by the reviewer; back to `shaping` |
+| shaping, turn 3 | from 08:40 | by the rotation the reviewer authors the next round: **codex** holds the pen, with its own finding as the round's findings. It chose a revised plan, at 08:41: **two slices**, view notes on iOS and view notes on Android, the API work folded into the first, capture dropped as "undecided rather than committed scope", all three findings dispositioned accepted. `visit: 1`, as it must be — no hand-back has opened another |
+| review, round 2 | 08:41 | **claude: accept**; `slices_accepted` |
+| gate | 08:41 | `parked {reason: gate}`; the run waits for a person |
+
+Four slices: a mobile-friendly API surface; the app shell and
+authentication; viewing notes; audio capture. The rationale reads the body's
+"at least viewing, maybe capture" as two feature surfaces over a shared shell
+and a prerequisite API pass, "each large enough to be its own review".
+
+**What this says.** Two epic-shaped issues, two slice plans, no one-piece
+ruling — the pre-registered hypothesis that an undersold body would anchor
+the shaper into one piece did not hold for claude on #5. The hand-back path
+has still not been exercised on an epic. The §7 row "shaper writes a plan
+the grammar refuses; the refusal is the next round's findings" ran live and
+recovered in one round, which is a datum for the shaping phase rather than
+for revision 16. Revision 16's only live evidence remains #763's true
+negative above.
+
+
+### E10 so far, assessed
+
+Two epic-shaped issues, two slice plans, no one-piece ruling: the hand-back
+path has not been exercised on an epic. #1 announced itself as big and
+claude sliced it in one turn; #5 undersold itself and claude sliced it too,
+after the grammar refused its first plan and codex rewrote the second. The
+pre-registered hypothesis — an undersold body anchors the shaper into one
+piece — did not hold, at least for claude as shaper.
+
+What revision 16 has shown live is the half that does not need an epic. On
+#763, a genuine one-piece, the spec seat went to the other vendor, was
+briefed with the question and without the ruling, and did not hand back.
+That is a true negative, and it is the cheaper half of open question 3.
+
+What the shaping phase showed as a by-product is worth more than expected:
+the sentence bound refused a live plan and the seat recovered in one round;
+a reviewer applied §1's definition to reject a prerequisite-layer slice as a
+bare step; and the rotation moved the pen to the other vendor, whose
+rewrite the first vendor then accepted. Every one of those is a §7 row
+running on a real issue.
+
+**What would reach the hand-back path.** A one-piece ruling on an epic.
+E9's #12 drew one, and its distinguishing feature was the "Design:" framing
+— a single deliverable named in the title. None of the remaining
+pre-registered issues (#4, #8, #9, #10) is framed that way. The honest
+options are to wait for such an issue to arrive naturally, or to accept
+that the mechanism's live proof is the #763 true negative plus the
+constructed histories of the branch review until one does. Staging one is
+excluded by this log's own rule.
+
+### Approvals, both gates
+
+*2026-09-16 12:37 UTC, on the person's instruction.* `approve` posted into
+#5's slice-gate session `2ca05ac1` (item `d012c56c`) and into #763's
+spec-gate session `911827ff` (item `d2a23700`), each as a `message` event
+with a `user`-role `input_text` part, each read back as its session's newest
+user item. The 13:04 wave reads both. #763 had waited at its spec gate for
+seven hours, re-parking every wave without spending a seat, which is the
+park doing what it is for.
+
+### Both approvals taken; #5 sliced; #763's back half
+
+*Read at 21:46 UTC on 2026-09-16, eight hours after the approvals.*
+
+**#5.** The 14:35 UTC wave took the approval at 15:01: `human_ruling
+{approve, slices}` → `sliced`; children **#767** View notes on iOS and
+**#768** View notes on Android, #768 blocked by #767; umbrella `bircher:
+sliced ec3f5915` on #5; `filing_complete`; scorecard row `sliced`.
+`prove_front_half --expect-approval` over the parent: **PASS**. By 21:46
+#767 had run its own shaping (one piece, by construction), three spec
+rounds with the vendors alternating, and parked at its spec gate.
+
+**#763, the first child's back half.** The 13:05 UTC wave's implementer
+(claude, gen 88) opened muesli **PR #766** at 14:15, +6285/−199 over 63
+files, then pushed a test-determinism fix at 14:49 while CI was red. At
+15:00 the same wave derived the outcome from the repository — "PR up, CI
+red, coordinator died before fix" — and recorded `failed`; the run is
+`ended`. The implementer's session was not: its worktree kept receiving
+commits at 15:03, 17:32, 19:19 ("fix cross-review blocking findings"),
+19:51 and 20:12, and the head `e1a86e68` has every CI check green. The
+"cross-review" in those messages is the implementer's own in-session review
+tool, not the pipeline's: no `bircher/cross-review` was posted, and
+`review-gate` is **pending**. The v1 runner did not touch it. So the PR is
+green, unreviewed by the pipeline, and orphaned from its run — E9's
+position exactly, and `--recover-pr i763 766 codex` is the same remedy.
+
+Two things to note rather than fix here. The runner's derivation gave up
+on a session that was still working, and the outcome it recorded is now
+false; the runner reads the repository at one instant and the session does
+not stop when it does. And the implementer's in-session review reached a
+green head without a second vendor, which is the thing the pipeline's
+cross-review exists to add — its verdict is the one still owed.
+
+### #763 recovered for cross-review: codex FAIL, one blocking finding
+
+*2026-09-16 22:29 to 22:32 UTC, on the person's instruction.* Launched as
+the wave launches, with the recovery arguments passed through:
+`BIRCHER_KERNEL_DB=…/kernel-muesli.db bash batch/launch.sh --log … --recover-pr i763 766 codex`.
+
+| Step | When (UTC) | Outcome |
+|---|---|---|
+| adopt | 22:29 | run `i763-…-1789511682` adopted, generation 89, role implementer |
+| derive | 22:29 | PR #766 CI green at `e1a86e6` → codex review out of band |
+| review | 22:31 | **codex: FAIL**, one blocking finding, none non-blocking; posted on the PR |
+| record | 22:31 | "no review verdict at all" — the kernel records no verdict on an `ended` run; "past the lifecycle stages; not re-driving them"; PR left open with a marker for a person |
+
+The finding, quoted: `internal/worker/prebriefs.go:49-65` "only examines
+events currently inside `(now, now+7d]`. If an event with an existing brief
+is rescheduled outside that window — or has already started — it is excluded
+before cleanup, leaving its stale brief attached and retrievable through the
+calendar API." Codex ran `go build`, `go vet`, `gofmt -l` and the
+determinism check itself, all clean, and could not run the Node gates
+locally.
+
+So the second vendor found what the implementer's in-session review did not:
+a cleanup scoped to the eligibility window rather than to the source's
+existing briefs. `review-gate` stays pending. The pipeline will not repair an
+ended run, so the next step is a person's — fix the finding on the branch
+and recover again for a fresh verdict, or decide otherwise. One cosmetic
+defect of the recovery path is recorded here: the posted comment begins with
+the harness's own "omnigent: Connecting…" lines, which the out-of-band review
+does not strip.
+
+### #763: the finding fixed on the branch
+
+*2026-09-17, on the person's instruction, in a worktree of `abedegno/muesli`
+on `i763-pre-meeting-briefs`; commit `b2c4df9`.*
+
+Test-first. Three DB-backed tests in a new
+`internal/worker/prebriefs_window_test.go`: an event with a brief is
+rescheduled to eight days out and the brief and its queued job are gone on
+the next pass; an event with a completed brief is moved into the past and
+the brief is gone; and the cleanup is source-scoped, leaving another
+source's out-of-window brief for that source's own pass. The red was shown
+at the compile level only — the store method did not exist — because the
+DB-backed tests skip without `TEST_DATABASE_URL` and Docker's daemon was
+not running here; the behavioural red-then-green is CI's to show.
+
+The fix: `DeleteEventBriefsOutsideWindow(owner, source, now)`, a
+source-scoped delete of every brief whose event is outside the window,
+joined through `calendar_events` and reusing the existing helpers for the
+returning-ids delete and the queued-job cleanup; called once per source
+before the batch loop. The window is now defined once — `preBriefWindow`,
+`(now, now+7d]` — and read by both the batch query and the cleanup, so the
+cleanup is exactly the batch predicate negated and the two cannot drift.
+That is the same rule this branch learned about the dispute: one
+definition, every reader reads it. Build, vet, gofmt clean; the determinism
+rule checked by hand (no `time.Now`/`time.Sleep` in the new test).
+
+### #763: CI green, recovered again, codex PASS, gate green
+
+*2026-09-17 07:22 to 07:37 UTC.* The first push's CI failed on one of the
+three new tests — the source-scoping fixture seeded two sources' events at
+the same start, and the seeding helper lists the owner's events within a
+minute and requires exactly one. Fixed by starting them an hour apart
+(`6f1a365`); the two behavioural tests had passed. CI fully green at 07:34,
+`server (go)` included, so the database-backed red-then-green happened
+where it had to.
+
+Recovered again the same way, launched after waiting for the :34 wave to
+release the lock: generation 90, PR CI green at `6f1a365` → codex out of
+band → **PASS** at 07:37 → `bircher/cross-review=success` posted and
+verified → `review-gate: pass` → PR #766 mergeable, clean. The recovery
+did not merge: "run is at 'ended' — past the lifecycle stages; not
+re-driving them", which is the same stop as E9's, and the merge is a
+person's. The kernel recorded the two status effects under generation 90
+and nothing else; the run stays `ended`.
+
+**The first child's back half, in one line.** The pipeline's second vendor
+found a real defect the implementer's own review had missed, the finding
+was fixed test-first with the window defined once for both readers, and
+the same vendor passed the fix. Two cosmetic defects for later: the
+recovery's posted comment begins with the harness's own "omnigent:
+Connecting…" lines, and the run's recorded outcome is `failed` for a PR
+that is now green and reviewed.
+
+### #766 merged; #767 approved at its spec gate
+
+*2026-09-17 07:53 UTC, on the person's instruction.* PR #766 squash-merged
+to muesli `main` as `551d148` "Pre-meeting briefs (issue #763) (#766)" —
+the pipeline's own convention, `--squash --delete-branch` — and #763 closed
+by the PR's "Closes #763". The first child of the first live epic is
+merged: shaped by the parent's slicing, specified and planned under
+revision 16's vendor rule, implemented, self-reviewed, caught by the
+cross-vendor review, fixed test-first, passed, merged. `approve` posted into
+#767's spec-gate session `872409a0` (item `76751fd0`) for the 08:04 wave.
+
+**What the next wave does on its own.** #764 and #765 were blocked by #763
+and carry `bircher:queued`; with #763 closed the generator's blocked check
+clears and both are queued, so two more runs start without anyone typing
+anything. The sweep records #763's closure toward #1's umbrella, which
+closes when all three children have. #767 moves to its plan phase.
+
+### #767 halted on a transient GitHub error at the wave that would have read its approval; reconciled
+
+*Found 2026-09-17 20:17 UTC, twelve hours after the approval was posted.*
+#767's state and fact count had not moved since 07:53, and every wave since
+10:18 had escalated it: "halted or holds unresolved effects". The cause was
+the 08:04 wave's own resume: the runner's per-resume label swap
+(`running:767:44`, class `issue_or_label`) got "GraphQL: Something went
+wrong while executing your query" back from GitHub, the kernel recorded the
+effect as **uncertain**, and the run halted for a person — before `phases`
+ran, so the approval in the session was never read. The label was in fact
+present on the issue; the mutation had landed (or already stood from the
+earlier resumes, each confirmed with the issue's URL) and only the reply was
+lost. Twelve hours of waves each skipped the run correctly and spent no seat.
+
+Reconciled at 20:20 UTC with the runner's own client, in the legacy
+observed-resolution form: the typed delivered/not-delivered form refuses a
+bare label effect because it "carries no obligation", which is right — only
+an obligation-bearing effect has a delivered VALUE to bind later commands to.
+Resolution recorded: "bircher:running is present on #767 and bircher:queued
+is absent — the label edit landed despite GitHub returning a GraphQL error
+to the client". `effect_reconciled` by the human actor, version 54 → 55,
+halt cleared, the park and the unread `approve` untouched. Two things
+learned about the tooling: `_kernel_reconcile` sourced on its own needs the
+runner script's `_net_run` wrapper, and the kernel's refusal message named
+the right form without a docs lookup.
+
+Meanwhile, on their own: #764 and #765 were minted by the 08:04 wave once
+#763 closed, each ruled one piece as a slice, each through four spec rounds
+with the vendors alternating, and each parked at its spec gate by 10:18.
+The sweep recorded #763 closed toward #1's umbrella.
+
+### Approvals posted for #764 and #765; every wave refused since 20:08 — Codex out of quota
+
+*2026-09-17 21:07 UTC, on the person's instruction.* `approve` posted into
+#764's spec-gate session `8d673fc4` (item `892b19ca`) and #765's `91b47114`
+(item `47c9464a`), each read back as its session's newest user item.
+
+None of the three posted approvals — #767's from 07:53, these two — has
+been read, and the reason is upstream of every run: from the 20:08 UTC wave
+onward, preflight fails on Codex ("You've hit your usage limit … try again
+at Sep 21st, 2026 8:22 PM") and the runner refuses to start the queue at
+all. That refusal is correct. A wave with one vendor would put claude in
+review of claude, which is the one thing the rotation exists to prevent, and
+the runner would rather do nothing than do that. Claude's own probe passes
+and GitHub auth is fine. The quota was spent honestly: #766's two
+cross-reviews, and the spec rounds of #764, #765 and #767, in which codex
+authored or reviewed every other round.
+
+Nothing is lost. The three runs are parked at their gates at zero cost, the
+approvals are durable in their sessions, and the first wave that passes
+preflight reads all three. The options are to wait for the reset, or to buy
+credits; there is no honest third.
+
+### Codex back; a hand-fired wave reads #767's approval
+
+*2026-09-17 22:59 to 23:08 UTC.* The person restored Codex (the direct probe
+answered READY at 22:59; the 22:38 wave had still failed). A wave fired by
+hand at 23:00 (`BIRCHER_WAVE_ONCE=1`, E8's precedent) passed preflight —
+"both providers healthy" — and the generator listed the three parked runs.
+#767 went first: its approval, posted at 07:53 the previous day and held
+through a halt, a reconcile and a quota stop, was read at last:
+`human_ruling {approve, spec}` → `specified`, park cleared, plan author
+dispatched. #764 and #765 follow in the same wave, since `run_item` is
+sequential and the implementer runs inside it, so their approvals are read
+when #767's block completes.
+
+### Overnight: #764 to a red PR, #767 and #765 out of plan rounds
+
+*Read at 06:26 UTC on 2026-09-18.* The hand-fired wave and the timer waves
+after it (preflight OK from 05:09) took all three approvals in turn.
+
+**#764 → PR #769, red.** Approval read; the plan accepted after three rounds
+(claude, codex, claude); the implementer opened muesli PR #769 at 00:45,
++4106/−22 over 36 files, six commits to 00:53. At 01:05 the runner derived
+`failed` ("PR up, CI red, coordinator died before fix") and ended the run.
+Unlike #763, the session did not carry on: nothing after 00:53, and the head
+is genuinely red — two worker tests (`RunLiveGenerate`: a rendered revision
+of 2 where 1 was fixed; a terminal failure left `pending`), one API test
+(the new `/api/notes/{id}/live-prompts` route is missing from #12's
+authorization classification table), and the `internal/api` and
+`internal/store` packages **hung to the ten-minute timeout**. The run is
+`ended`, so the pipeline's repair loop cannot reach it; the PR waits for a
+person, and the hang is the first thing to understand.
+
+**#767 and #765: `bound_exhausted` at the plan phase.** Five rounds each,
+vendors alternating, every verdict `request_revision`. They are not the same
+case. #767's fifth review (claude) marks the prior high finding **resolved**
+and adds one **medium** — the scale-proof fixture must give the target owner
+20,000 of the 100,000 rows and mix in deleted rows — so the plan is
+converging and one more round would likely pass. #765's fifth review (codex)
+carries two **highs**, both about the aggregate token budget: a lookup error
+falling back to the static proxy the same way a genuine absence does, and
+`ceil(bytes/3)` not being a safe upper bound on tokenizer output outside
+English prose. Each round of #765 has found a new high in a different place
+— persistence contract, lifecycle, budget — which is the shape the pipeline
+trial called too expensive to run per issue, and the reason the park exists:
+a person decides whether to grant a sixth round, correct, or stop.
+
+The parks cost nothing while they wait. The park notice on each issue names
+the phase and says what to type.
+
+### #769 (#764) repaired on its branch: two production defects behind the hang
+
+**2026-09-18 07:14 UTC.** The user's instruction was "Try to fix 764". The
+work was done in a worktree on the PR's own branch
+`764-live-in-meeting-prompts`, in two commits, `e8bc7ba` and `084bd03`. CI is
+fully green at `084bd03`; only `review-gate` is pending, and that is the
+cross-review's to post. No recover run was launched and nothing was merged;
+both are the user's call.
+
+**What the goroutine dumps said.** The ten-minute hangs in `internal/api` and
+`internal/store` were one mechanism twice. `pgxpool.Close`, called by the
+per-test pool's cleanup, blocks until every connection is returned, and in
+each package one test had left a connection checked out.
+
+- In `internal/api` the connection belonged to the live-prompts LISTEN
+  listener, parked in `WaitForNotification`. The handler starts it lazily on
+  the first stream and nothing ever stops it; the listener object was not
+  even kept. That is a production defect, not a test one: graceful shutdown
+  would block on `pool.Close()` the same way. The server now owns the
+  listener, `Server.Close()` stops it (mutex-guarded, so a late first stream
+  cannot start one after Close), `Run` defers Close, and the API test server
+  registers Close as a cleanup after the pool's, so it runs first.
+- In `internal/store`, `TestScheduleLiveJob_EnforcesCadence` "simulated the
+  first job having started" by clearing `active_job_id` while leaving that job
+  `pending`. The second schedule then violated `jobs_live_active_uniq` (one
+  pending or running `live_generate` job per output row), the test called
+  `t.Fatalf` with its transaction still open, and the cleanup blocked.
+  Postgres's own line in the CI output, `duplicate key value violates unique
+  constraint "jobs_live_active_uniq"`, was the tell. The test now settles the
+  first job as `done` and defers a rollback. The hang had masked every later
+  test in the package.
+
+**The three red tests.**
+
+- `TestRunLiveGenerate_TerminalFailure_NoGrowthCreatesNoSuccessor`
+  (`status = "pending", want failed`) was the second production defect.
+  `handleLiveGenerateTerminalFailure` read `target_revision` from the job
+  struct the pipeline holds, which the queue claim populated before the live
+  claim captured the target. It was therefore always nil, the failure path
+  compared `desired_revision` against 0, every terminal failure looked like
+  growth, and the row was rescheduled instead of marked failed. The
+  completion fence now returns the job row's own target and the failure
+  transaction uses that; a job with no captured target gets no follow-up.
+- `TestRunLiveGenerate_GrowthDuringExecutionCreatesOneFollowUp`
+  (`rendered_revision = 2, want 1`) was the test's premise: it appended
+  growth after the queue claim but before the live claim that captures the
+  target, so the target was 2. It now captures the target through
+  `ClaimLiveGenerateJobTx` first, as the worker does, then grows.
+- `TestNoteScopedRouteRegistrationCompleteness`: the new
+  `GET /api/notes/{id}/live-prompts` route is classified shared-readable,
+  matching its `GetReadableNote` gate and the API doc's
+  "ownership/readability" wording.
+
+**One more, unmasked by the fix.** With the store package running to
+completion, `TestReconcileOwnerEligibility_RunningRow_HiddenAndCancellationRequested`
+failed with `no rows in result set`. It deleted the template to make it
+ineligible, but `live_template_outputs.template_id` cascades on template
+delete, so the running row and its job vanish before the reconciliation that
+would hide them ever runs. The rule the test proves (hidden and
+cancellation-requested, not deleted) can only apply to a template that
+becomes ineligible while it still exists; the test now switches `auto_run`
+off instead. Whether deletion should cascade at all is a question for the
+cross-review, not something to change in a repair.
+
+**What this says about the run.** The session stopped at 00:53, twelve
+minutes before CI finished red, so the implementer never saw the result of
+its own branch. The two defects that mattered are both of the
+"identifier that names the wrong thing" kind: a job struct standing in for
+the job row, and a listener with no owner. Neither is visible in a diff;
+both were visible in the first goroutine dump.
+
+### #769 recovered: codex PASS on eight lines of a four-thousand-line PR
+
+**2026-09-18 18:14 UTC.** The user said "recover 769 for cross review. You
+can do this." The recover run was launched like #763's, from
+`launch.sh --recover-pr i764 769 codex`. It adopted PR #769, found CI green
+at `084bd03`, dispatched the out-of-band codex review, and two minutes later
+posted and verified `bircher/cross-review=success`; GitHub's `review-gate`
+went green on the same head. Codex's verdict was PASS with no findings of
+any severity.
+
+**What the review actually covered.** Codex's own Verification section says
+"Exact commit `084bd03…` reviewed", and its narrative opens "The commit only
+corrects a DB-backed regression test". It reviewed the head commit: one
+file, eight insertions, the test-only change from the repair above. The PR
+against `main` is 38 files and 4,171 insertions. Neither the implementer's
+36-file change nor the repair commit `e8bc7ba`, which fixed two production
+defects, has been read by a second vendor. The pipeline's own review stage
+never ran either: the session stopped at 00:53, before it.
+
+**Why.** The recovery prompt (`_recovery_review_prompt` in
+`batch/run-queue.sh`) says "You are reviewing EXACTLY commit <sha>" and
+"READ the changed files AND enough surrounding code", and never names the
+other side of the diff. That wording exists to pin the reviewer to a fixed
+sha (#66); it says nothing about the range. On #766 the same prompt
+produced a whole-PR review ("Reviewed the cleanup implementation and
+surrounding reconciliation, schema, job-lifecycle, API, and test code"). On
+#769 it produced a one-commit review. Same prompt, two readings; the gate
+cannot tell them apart, and this is the first live case where the narrow
+reading met a PR whose head commit was trivial.
+
+**Consequence.** The gate is green and attests to nothing about the PR's
+substance. Not merging. The fix is one sentence in the prompt, stating the
+range ("the PR's changes are `git diff origin/main...<sha>`; review all of
+them, not only the head commit"), followed by a redeploy and a re-run of
+the recovery so that codex reads the 38 files. That is the user's call;
+the recommendation is recorded here and in memory.
+
+### #769 recovered again with the range named: codex FAIL, one blocking finding
+
+**2026-09-18 19:41 UTC.** The user said "Do all three". The prompt fix is
+bircher PR #101 (`5cf5386`, branch `fix/recovery-review-range`, open): one
+sentence after "You are reviewing EXACTLY commit", stating that the change
+under review is every file in `git diff origin/main...<sha>` and that a head
+commit touching one file does not narrow the review to one file, plus a
+self-test assertion that the range reaches the prompt text. The assertion
+was proved binding on the runner: the old prompt fails it, the new one
+passes. The bundle was deployed from the branch with `update-bundle.sh`, so
+the runner is on `fix/recovery-review-range` until #101 merges and `main`
+is redeployed.
+
+**A pre-existing failure in the bundle self-test.** `update-bundle.sh` runs
+the self-test and it fails on the runner, at `5e1a4d0` exactly as at
+`5cf5386`, on the rollback test that makes a findings file "unremovable"
+with `chmod 500`: the runner is uid 0, and root removes it anyway. The
+self-test exits at that first failure, before the recovery-prompt
+assertions, so on the runner they have never run; the wave timer does not
+run the self-test at all. Not caused here, not fixed here, recorded for an
+issue.
+
+**The re-run.** Launched 19:37:32 UTC, generation 48, same head `084bd03`.
+Codex's narrative this time opens "This is a broad feature PR (38 files,
+roughly 4.2k added lines), so I'm tracing the server lease/listener
+lifecycle, worker revision logic, and Electron reconnect/cleanup paths".
+Four minutes later: **VERDICT: FAIL**, one blocking finding, no
+non-blocking ones:
+
+> The new SSE endpoint acquires a database-backed subscriber lease
+> (`live_prompts.go:194`), which must be released by the defer
+> (`live_prompts.go:203`). Tests cover successful streaming and manually
+> releasing a seeded lease, but no post-acquisition failure path (initial
+> snapshot query failure, SSE write failure, heartbeat reread failure, or
+> renewal failure) asserts that the handler releases its lease.
+
+The suggestion: an injectable store boundary or a focused handler fixture
+that forces a failure after admission and verifies the lease count returns
+to zero, with renewal failure and initial-snapshot failure as the
+highest-value cases. This is the prompt's own release-on-error rule, applied
+to the file the first review never opened.
+
+**The gate is still green.** The recover path posts a cross-review status
+only when the outcome is ready; on FAIL it leaves the PR "with marker for
+human" and posts nothing. So `084bd03` still carries the 18:16 success from
+the one-commit review, and GitHub's `review-gate` is green on a PR whose
+real review is FAIL. The next push moves the head and clears it; until
+then the green is a scope artefact, and the recover path should post
+failure on FAIL. Both are for #101's follow-up, not for this repair.
+
+**What this says.** Same PR, same head, same vendor, same tooling: PASS
+with no findings at 18:16, FAIL with a blocking finding at 19:41. The only
+difference is a sentence naming the range. The first verdict was not wrong
+about what it read; it read the wrong thing, and said so in a line nobody
+was required to check. Next, on the user's word: fix the finding on the
+branch (a test that forces a post-admission failure and asserts the lease
+is released), push, recover again.
+
+### #769, third recovery: the lease finding closed, a race in the template cap opened
+
+**2026-09-18 20:15 UTC.** The user said "fix the finding on the PR branch
+with a release-on-error test, push, and recover again". The fix is
+`d7e5cd0` on the PR branch: the SSE handler now reaches the store through a
+five-method `liveStore` boundary (production still passes the real store)
+and its three timers are variables, so an internal test can wrap the real
+store, force one failure after admission, and shorten the tickers rather
+than sleep. Four tests, one per class codex named: the initial snapshot
+query fails, the SSE write fails, the heartbeat reread fails, the renewal
+fails. Each asserts the lease was released exactly once and that no lease
+row remains for the note; the injected failures leave the row in place
+themselves, so only the handler's deferred release can satisfy the
+assertion. CI green at `d7e5cd0`, all DB-backed suites `ok`.
+
+**The re-run.** Launched 20:11:12 UTC, generation 49. Codex read the whole
+PR again ("schema, scheduling/worker, SSE API, Electron relay, renderer"),
+ran every non-DB gate locally, reconciled the DB-backed suites against the
+CI log, and reported the lease fix without comment, which is how a closed
+finding reads. Then, four minutes in: **VERDICT: FAIL**, one new blocking
+finding, nothing non-blocking:
+
+> The eight-template cap is vulnerable to concurrent creates or updates.
+> Two transactions can each observe seven eligible templates, both pass the
+> unlocked `count(*)`, then enable distinct eighth templates and commit,
+> leaving nine enabled. `UpdateTemplate` locks only the individual template
+> row, not a shared owner-scoped row. Serialize cap validation per owner or
+> enforce the invariant at the database level, and add a concurrent
+> regression test.
+
+The cited code is `validateLiveTemplateCap` and its count in
+`live_templates.go`, and the create and update transactions in
+`templates.go`. It is a plain check-then-act: the count is read without a
+lock that the competing writer would have to wait on. The observed-versus-
+asserted question again, one layer down: the cap is asserted by a count
+and observed by nobody.
+
+**The gate.** The head moved, so `d7e5cd0` carries no cross-review status
+and `review-gate` is pending, which is the truth. The stale green on
+`084bd03` is now behind the head and harmless.
+
+**Where this leaves the round.** Three recoveries, three different
+readings: PASS on one commit, FAIL on the lease, FAIL on the cap. The
+second and third are what the seat is for. Each new blocking finding is in
+a different subsystem, which is the shape #765's plan rounds showed and
+the pipeline trial priced as expensive. Next, on the user's word: serialize
+cap validation per owner (an owner-scoped row lock or an advisory
+transaction lock at the top of the create and update transactions) with a
+concurrent regression test, push, recover again.
+
+### #769 clear: six recoveries, four rounds of findings, one PASS that read the whole PR
+
+**2026-09-19 00:43 UTC.** The user said "Keep cross reviewing and fixing
+until clear". Two more rounds followed the template-cap race.
+
+**Round five (fourth recovery, FAIL, three contract-level findings).**
+Codex read the accepted spec in the issue thread and held the PR to it.
+(1) "Hosted deployments have no live-prompts transport": the renderer's
+no-bridge branch was read as a missing browser client. There is no browser
+client in this repository; `web/` holds only the admin UI and
+`docs/ARCHITECTURE.md` lists a web client as later work. "Hosted" is the
+desktop app connected to a self-hosted server, which the main-process relay
+already serves with authenticated fetch and ReadableStream. Answered in the
+transport's documentation, `docs/API.md`, the PR body, and a test pinning
+the no-bridge branch as a test-double affordance. (2) Trashing a note did
+not end its live work: `DeleteNote` only set `deleted_at`, so queued and
+running rows and their jobs carried on and admitted subscribers kept
+receiving them. `DeleteNote` now ends the current stream inside the trash
+transaction, as sealing and supersession do. A new `LiveNoteSnapshot` reads
+stream identity and visible rows in one repeatable-read transaction (also
+closing the review's consistency suggestion) and reports a trashed note as
+not found; the handler then ends every card it has sent and closes, which
+releases the lease. (3) The plan's end-to-end tests had never been written;
+the implementer's PR body said so. `internal/api/live_prompts_e2e_test.go`
+is the hosted shape: two API processes over one database, one viewer each,
+the meeting driven through the real streaming websocket by the fake
+transcriber, the real worker running the jobs against the stub agent.
+Interim text schedules nothing; the first final queues a prompt on both
+viewers; growth after the fixed target leaves rendered at two and schedules
+exactly one follow-up about fifteen seconds out; closing the stream and
+batch-replacing the transcript ends the prompts on both viewers, cancels the
+follow-up, and leaves the post-meeting summaries intact.
+`e2e/specs/live-prompts.spec.ts` is the embedded shape: the packaged
+transport delivers a snapshot as the signed-in user, goes quiet on stop, and
+admits a fresh subscription after the lease is released.
+
+Getting the Go end-to-end test green took two more pushes, both test
+assumptions: it waited for a ready control message the server only forwards
+when the plugin emits a loading one; and its three LISTEN connections (one
+hub per API process plus the note stream's own) filled the default
+three-connection test pool, so the first write blocked behind them. The
+test pool helper gained an explicit connection-cap variant.
+
+**Round six (fifth recovery, FAIL, one finding).** Two minutes in, a whole-PR
+read: the relay's `stopAll` exists for window destruction but nothing called
+it, and on macOS with background running the process outlives its window,
+so the destroyed renderer's stop IPC never arrives and the stream keeps
+renewing its lease. Wired into the window's closed handler and before-quit,
+with a main-process test that starts a stream through the real IPC handler,
+closes the window on darwin with background running on, and asserts the
+request's abort signal fired while the app stayed alive.
+
+**Sixth recovery: PASS at `e4ea3eb`.** This time the scope line reads "a
+large cross-stack feature (database/store/API/worker/Electron/renderer), so
+I'm reviewing the full implementation paths and the resource-release tests",
+and the verification lists every failure path by name: snapshot query, SSE
+write, heartbeat reread, renewal, renderer stop, window close, application
+quit. `bircher/cross-review` and `review-gate` are green on the head; the PR
+is mergeable and clean. Not merged.
+
+**The shape of it.** Six recoveries. The first PASS read eight lines. Once
+the range was named, four consecutive FAILs each found one thing in a
+different subsystem: the lease's failure paths, the cap's concurrency, the
+trash lifecycle and the missing end-to-end proof, the window lifecycle.
+None was visible in the diff of the round before; each was visible to a
+reviewer reading the whole PR against its contract. The last verdict reads
+the way the first should have.
