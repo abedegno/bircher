@@ -1070,3 +1070,71 @@ the pipeline trial priced as expensive. Next, on the user's word: serialize
 cap validation per owner (an owner-scoped row lock or an advisory
 transaction lock at the top of the create and update transactions) with a
 concurrent regression test, push, recover again.
+
+### #769 clear: six recoveries, four rounds of findings, one PASS that read the whole PR
+
+**2026-09-19 00:43 UTC.** The user said "Keep cross reviewing and fixing
+until clear". Two more rounds followed the template-cap race.
+
+**Round five (fourth recovery, FAIL, three contract-level findings).**
+Codex read the accepted spec in the issue thread and held the PR to it.
+(1) "Hosted deployments have no live-prompts transport": the renderer's
+no-bridge branch was read as a missing browser client. There is no browser
+client in this repository; `web/` holds only the admin UI and
+`docs/ARCHITECTURE.md` lists a web client as later work. "Hosted" is the
+desktop app connected to a self-hosted server, which the main-process relay
+already serves with authenticated fetch and ReadableStream. Answered in the
+transport's documentation, `docs/API.md`, the PR body, and a test pinning
+the no-bridge branch as a test-double affordance. (2) Trashing a note did
+not end its live work: `DeleteNote` only set `deleted_at`, so queued and
+running rows and their jobs carried on and admitted subscribers kept
+receiving them. `DeleteNote` now ends the current stream inside the trash
+transaction, as sealing and supersession do. A new `LiveNoteSnapshot` reads
+stream identity and visible rows in one repeatable-read transaction (also
+closing the review's consistency suggestion) and reports a trashed note as
+not found; the handler then ends every card it has sent and closes, which
+releases the lease. (3) The plan's end-to-end tests had never been written;
+the implementer's PR body said so. `internal/api/live_prompts_e2e_test.go`
+is the hosted shape: two API processes over one database, one viewer each,
+the meeting driven through the real streaming websocket by the fake
+transcriber, the real worker running the jobs against the stub agent.
+Interim text schedules nothing; the first final queues a prompt on both
+viewers; growth after the fixed target leaves rendered at two and schedules
+exactly one follow-up about fifteen seconds out; closing the stream and
+batch-replacing the transcript ends the prompts on both viewers, cancels the
+follow-up, and leaves the post-meeting summaries intact.
+`e2e/specs/live-prompts.spec.ts` is the embedded shape: the packaged
+transport delivers a snapshot as the signed-in user, goes quiet on stop, and
+admits a fresh subscription after the lease is released.
+
+Getting the Go end-to-end test green took two more pushes, both test
+assumptions: it waited for a ready control message the server only forwards
+when the plugin emits a loading one; and its three LISTEN connections (one
+hub per API process plus the note stream's own) filled the default
+three-connection test pool, so the first write blocked behind them. The
+test pool helper gained an explicit connection-cap variant.
+
+**Round six (fifth recovery, FAIL, one finding).** Two minutes in, a whole-PR
+read: the relay's `stopAll` exists for window destruction but nothing called
+it, and on macOS with background running the process outlives its window,
+so the destroyed renderer's stop IPC never arrives and the stream keeps
+renewing its lease. Wired into the window's closed handler and before-quit,
+with a main-process test that starts a stream through the real IPC handler,
+closes the window on darwin with background running on, and asserts the
+request's abort signal fired while the app stayed alive.
+
+**Sixth recovery: PASS at `e4ea3eb`.** This time the scope line reads "a
+large cross-stack feature (database/store/API/worker/Electron/renderer), so
+I'm reviewing the full implementation paths and the resource-release tests",
+and the verification lists every failure path by name: snapshot query, SSE
+write, heartbeat reread, renewal, renderer stop, window close, application
+quit. `bircher/cross-review` and `review-gate` are green on the head; the PR
+is mergeable and clean. Not merged.
+
+**The shape of it.** Six recoveries. The first PASS read eight lines. Once
+the range was named, four consecutive FAILs each found one thing in a
+different subsystem: the lease's failure paths, the cap's concurrency, the
+trash lifecycle and the missing end-to-end proof, the window lifecycle.
+None was visible in the diff of the round before; each was visible to a
+reviewer reading the whole PR against its contract. The last verdict reads
+the way the first should have.
