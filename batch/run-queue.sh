@@ -2591,6 +2591,13 @@ _recovery_review_prompt() {
   # on muesli #745 the second died on "already exists" and, with only PASS
   # and FAIL on offer, reported FAIL for a PR it had not read.
   local _nonce="${_co:0:8}"; [ -n "$_nonce" ] || _nonce=head
+  # The RANGE is named as well as the sha. Pinning "EXACTLY commit <sha>"
+  # fixes WHICH tree is read but says nothing about HOW MUCH of it: on muesli
+  # #769 (2026-09-18) the reviewer read it as "the head commit's diff", read one
+  # test file of a 38-file PR, and returned PASS, which the run then posted as
+  # a green cross-review. On #766 the same words got a whole-PR review. The
+  # prompt now states the merge-base range so a trivial head commit cannot
+  # narrow the review; the self-test asserts the range reaches the text.
   # No `rm -rf` in the setup line: omnigent's blast_radius guardrail denies
   # the catastrophic set, and `rm -rf /tmp/review-...` reads as `rm -rf /...`.
   # On muesli #759 (2026-09-10) the reviewer's setup was rejected before it
@@ -2604,6 +2611,7 @@ _recovery_review_prompt() {
 Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
 First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree remove --force /tmp/review-$pr-$_nonce-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-$pr-$_nonce-oob ] || mv /tmp/review-$pr-$_nonce-oob /tmp/review-$pr-$_nonce-oob.stale.\$\$; git worktree add --detach /tmp/review-$pr-$_nonce-oob $_co; cd /tmp/review-$pr-$_nonce-oob.
 You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
+The change under review is the WHOLE pull request as it stands at that commit: every file in \`git diff origin/main...$_co\` (from the PR's merge-base with main up to the pinned head), NOT only the head commit's own diff. A head commit that touches one file does not narrow the review to one file.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
@@ -7892,6 +7900,12 @@ SH
   case "$_pp" in
     *"reviewing EXACTLY commit a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
     *) echo "FAIL _recovery_review_prompt: prompt does not name the reviewed commit"; exit 1 ;;
+  esac
+  # muesli #769: the pinned sha alone let the reviewer narrow itself to the head
+  # commit's diff. The prompt must also name the PR's range against main.
+  case "$_pp" in
+    *"git diff origin/main...a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
+    *) echo "FAIL _recovery_review_prompt: prompt does not name the PR's range against main"; exit 1 ;;
   esac
   # The setup line must not carry `rm -rf`: the guardrail rejects it before
   # the reviewer reads anything (muesli #759, three reviews derived as FAIL).
