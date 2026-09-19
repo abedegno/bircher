@@ -461,8 +461,12 @@ every verdict on the reviewed head: `success` for PASS, `failure` for FAIL
 with the blocking count, `error` when no verdict was produced, with `<vendor>
 round <n> ... on <merge-base7>..<head7>` as the description; the merge path
 re-posts only when no success is present, and a re-stamp after a
-content-identical update-branch keeps the reviewed description. `strict: true`
-is set, so a PR whose base has moved becomes `BEHIND` and is refused.
+content-identical update-branch keeps the reviewed description. The target
+repository's `review-gate` workflow reacts to that status event and posts its
+own `review-gate` status on the head ~7s later, requiring `success` on
+`bircher/cross-review`; it reads the state only, never the description.
+`strict: true` is set, so a PR whose base has moved becomes `BEHIND` and is
+refused.
 
 ---
 

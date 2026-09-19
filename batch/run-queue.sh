@@ -8428,12 +8428,18 @@ SH
     _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
   [ -s "$_sd/calls" ] \
     || { echo "FAIL #71: with budget remaining, the status post must still reach gh"; rm -rf "$_sd"; exit 1; }
-  # THE CHECK BEFORE THE VERIFICATION needs the deadline to expire DURING the POST --
-  # an already-expired one breaks at the first check and never reaches it. So the fake
-  # POST outlives the remaining budget, and exactly ONE call must be made.
+  # THE CHECK BEFORE THE VERIFICATION needs the deadline to expire DURING a call --
+  # an already-expired one breaks at the first check and never reaches it. The
+  # short-circuit's own `commits/<sha>/status` read is that call now: it is issued
+  # before the retry loop, `*status*` (not `*statuses*`) makes the fake sleep through
+  # it too, and `timeout` kills it at the 1s cap -- so the read alone consumes the
+  # whole deadline DETERMINISTICALLY, not on however long fork/exec happens to take.
+  # By the time the retry loop's leading `_deadline_passed` check runs, the deadline
+  # is already spent, so neither the POST nor the verification is ever issued.
+  # Exactly ONE call -- the short-circuit's read -- must be made.
   local _sd2; _sd2=$(mktemp -d); : > "$_sd2/calls"
   printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$GH_CALLS"' \
-    'case "$*" in *statuses*) sleep 2 ;; esac' 'exit 1' > "$_sd2/gh"
+    'case "$*" in *status*) sleep 2 ;; esac' 'exit 1' > "$_sd2/gh"
   printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_sd2/timeout"
   chmod +x "$_sd2/gh" "$_sd2/timeout"
   ( PATH="$_sd2:$PATH"; export PATH; GH_CALLS="$_sd2/calls"; export GH_CALLS
@@ -8441,7 +8447,7 @@ SH
     _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
     _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
   [ "$(wc -l < "$_sd2/calls" | tr -d ' ')" = 1 ] \
-    || { echo "FAIL #71: a deadline expiring during the POST must stop before the verification (got $(wc -l < "$_sd2/calls") calls)"; rm -rf "$_sd2"; exit 1; }
+    || { echo "FAIL #71: a deadline expiring during the short-circuit read must stop before the POST and the verification (got $(wc -l < "$_sd2/calls") calls)"; rm -rf "$_sd2"; exit 1; }
   rm -rf "$_sd2"; unset _sd2
   # THE BACKOFF must be capped to what remains. Unbounded, attempt 2's 8s sleep starts
   # while ~1s of budget is left and overruns by seven -- the phase exceeded by WAITING
