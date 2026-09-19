@@ -14,9 +14,14 @@ a workflow language."
 
 from __future__ import annotations
 
+import re
+
 from kernel.artifacts import VerdictBinding, binding_hash
 from kernel.dispatch import Role, actor_for, role_for
 from kernel.events import EventKind
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 class NotAuthorized(Exception):
@@ -68,6 +73,9 @@ PARK_REASONS = frozenset({
     # its text.
     "disagreement",
 })
+
+#: spec §1: why a run is sent back to `planned`.
+REPAIR_CAUSES = frozenset({"ci_red", "review_fail", "plan_conformance"})
 
 #: spec §3 *The turn's end is a fact*: the four ways a turn ends.
 TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
@@ -178,6 +186,12 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
     "record_ci_observation": (frozenset({"implementing", "reviewing"}), None),
+    # The closed loop (spec §1): the ONE door back to `planned` in the back
+    # half. A repair round is an implementation round, so the run re-enters
+    # `planned` and `start_implementation` dispatches it. Refused from
+    # `planned` itself (nothing to repair yet) and from every front-half
+    # state by this from-set.
+    "request_repair": (frozenset({"implementing", "reviewing"}), "planned"),
     "request_merge": (frozenset({"reviewing"}), "merge_requested"),
     # The terminal record every path can reach. Legal from every state except
     # `ended` itself, because a run can finish from anywhere: the coordinator
@@ -1226,6 +1240,17 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
     if cmd.name == "park":
         _check_park(store, cmd)
         return None
+
+    if cmd.name == "request_repair":
+        if cmd.payload.get("cause") not in REPAIR_CAUSES:
+            raise NotAuthorized(f"request_repair cause {cmd.payload.get('cause')!r} is not one of {sorted(REPAIR_CAUSES)}")
+        head = cmd.payload.get("head_sha")
+        if not isinstance(head, str) or not _FULL_SHA.fullmatch(head):
+            raise NotAuthorized("request_repair head_sha must be a 40-hex sha")
+        ev = cmd.payload.get("evidence")
+        if not isinstance(ev, list) or not all(isinstance(e, str) for e in ev):
+            raise NotAuthorized("request_repair evidence must be a list of strings")
+        return next_state
 
     if cmd.name == "record_human_answer":
         ids = cmd.payload.get("question_ids")

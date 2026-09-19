@@ -105,6 +105,9 @@ COMMAND_NAMES = frozenset({
     # The kernel's own rendering of the reviewer's brief (spec §2 *Brief*): a
     # front-half review_ruling is refused unless its generation carries one.
     "issue_review_brief",
+    # The closed loop (spec §1): red CI, a failed review or a plan-conformance
+    # gap returns the run to planned through this one door.
+    "request_repair",
     # The shaping phase (shaping spec §2 *States*): the ruling, the slice
     # plan, and the coordinator's own ungated advance.
     "record_one_piece", "submit_slices", "advance_ungated",
@@ -298,6 +301,16 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
                      "session_id": p.get("session_id"), "cursor_item_id": p.get("cursor_item_id"),
                      "findings_hash": p.get("findings_hash"), "verdict": p.get("verdict"),
                      "reviewer": p.get("reviewer"), "generation": cmd.generation},
+        )
+    elif cmd.name == "request_repair":
+        p = cmd.payload
+        prior = store.facts_of_kind(cmd.run_id, EventKind.REPAIR_REQUESTED)
+        store.append_fact(
+            run_id=cmd.run_id, kind=EventKind.REPAIR_REQUESTED, actor=actor,
+            causal_command_id=cmd.idempotency_key,
+            payload={"cause": p["cause"], "head_sha": p["head_sha"],
+                     "evidence": list(p.get("evidence") or []),
+                     "round": len(list(prior)) + 1, "generation": cmd.generation},
         )
     elif cmd.name == "record_human_answer":
         store.append_fact(
