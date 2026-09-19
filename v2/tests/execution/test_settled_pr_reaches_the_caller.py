@@ -96,16 +96,16 @@ def test_a_short_tuple_is_rejected_rather_than_silently_accepted():
     coordinator, or a truncated write, would silently restore the stale-PR
     behaviour this change exists to remove.
     """
-    assert _width_ok("a|b|c|d|e|f|g|h")
-    assert not _width_ok("a|b|c|d|e|f|g")
+    assert _width_ok("a|b|c|d|e|f|g|h|i|j")
     assert not _width_ok("a|b|c|d|e|f|g|h|i")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k")
     assert not _width_ok("")
 
 
 def test_an_embedded_newline_is_rejected():
     """`read` consumes only the FIRST line, so a multi-line result would be
     parsed as its first line with the rest discarded silently."""
-    assert not _width_ok("a|b|c|d|e|f|g|h\nx|y")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j\nx|y")
 
 
 def test_a_real_tuple_is_accepted():
@@ -113,8 +113,8 @@ def test_a_real_tuple_is_accepted():
     `"$(printf '\\n')"` for the newline test, which command substitution
     reduces to the EMPTY STRING, so the pattern matched everything and the
     check rejected every valid tuple."""
-    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738")
-    assert _width_ok("escalated|na|no PR||na|unknown||")
+    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738||")
+    assert _width_ok("escalated|na|no PR||na|unknown||||")
 
 
 def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
@@ -122,7 +122,10 @@ def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
     field left it able to reproduce the exact defect: review and comment a
     sibling, then authorize and merge the stale PR it was invoked with."""
     src = RUN_QUEUE.read_text()
-    assert "r_settled_pr <<EOF" in src, "recovery must parse the settled PR"
+    # The settled PR is field 8 of 10; the reviewed range (merge_base, digest)
+    # rides out after it and is discarded here -- recover_pr_cmd does not (yet)
+    # thread it into a review record, only run_item does.
+    assert "r_settled_pr _ _ <<EOF" in src, "recovery must parse the settled PR"
     i = src.index('pr="$r_settled_pr"')
     j = src.index("merge_ready_pr \"$item\" \"$pr\"", i)
     assert i < j, "recovery must adopt the settled PR before it merges"

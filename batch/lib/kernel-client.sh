@@ -852,9 +852,9 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # implementation output; the kernel refuses a review whose phase is not the
 # phase of the state it is recorded from. The front half's spec and plan
 # reviews do not come through here.
-_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal]
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal] [head_sha] [merge_base_sha] [delta_digest]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
-  local key="${7:-}" terminal="${8:-}"
+  local key="${7:-}" terminal="${8:-}" head_sha="${9:-}" merge_base="${10:-}" digest="${11:-}"
   local verdict; verdict=$(_kernel_verdict "$raw" "$terminal")
   # No early return: every input now maps to something submittable -- a mapped
   # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
@@ -865,18 +865,22 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
     _kernel_warn "incomplete verdict binding (artifact='$artifact' base='$base' context='$context') -- not recording a review"
     return 0
   fi
+  # What was reviewed (spec §4): included only when the derivation pinned a
+  # head. Values are shas and a hex digest, so they need no JSON escaping.
+  local range=""
+  [ -n "$head_sha" ] && range="\"head_sha\":\"$head_sha\",\"merge_base_sha\":\"$merge_base\",\"delta_digest\":\"$digest\","
   # An empty key must not become `--idempotency-key ""`: the CLI would take the
   # empty string as the key rather than falling back to its default, and every
   # record_review in the run would collide on it.
   if [ -n "$key" ]; then
     _kernel command --run-id "$run_id" --generation "$generation" \
       --name record_review --idempotency-key "$key" \
-      --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
+      --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",${range}\"policy_version\":$_KERNEL_POLICY_VERSION}"
     return 0
   fi
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_review \
-    --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",\"policy_version\":$_KERNEL_POLICY_VERSION}"
+    --payload-json "{\"verdict\":\"$verdict\",\"phase\":\"implementation\",\"artifact_hash\":\"$artifact\",\"base_sha\":\"$base\",\"context_bundle_hash\":\"$context\",${range}\"policy_version\":$_KERNEL_POLICY_VERSION}"
 }
 
 # _kernel_request_merge <run_id> <generation> <pr> <repo> <head_git_sha>

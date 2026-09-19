@@ -127,6 +127,13 @@ OUT_HASH = "outputhash" + "0" * 54
 #: distinct from OUT_HASH so a call site that threads the artifact where the
 #: context belongs is visible.
 CTX_HASH = "ctxbundle" + "0" * 55
+#: What the stubbed `observe_outcome`'s ninth field echoes -- the merge-base
+#: between the PR's base and the reviewed head (spec §4). A sha, distinct from
+#: HEAD_SHA/REVIEWED_SHA so a call site that threads the wrong one is visible.
+MERGE_BASE_SHA = "d" * 40
+#: The tenth field: the digest of the PR's own delta at the reviewed head.
+#: A hex digest, distinct from OUT_HASH/CTX_HASH for the same reason.
+DELTA_DIGEST = "e" * 64
 VENDOR = "claude_code"
 REVIEWER = "codex"
 PR = "777"
@@ -254,9 +261,9 @@ def _heredoc_to_herestring(run_item_src):
     pairs = [
         (
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            "resubmissions _settled_pr <<EOF\n$obs\nEOF",
+            "resubmissions _settled_pr _merge_base _delta_digest <<EOF\n$obs\nEOF",
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            'resubmissions _settled_pr <<< "$obs"',
+            'resubmissions _settled_pr _merge_base _delta_digest <<< "$obs"',
         ),
     ]
     for old, new in pairs:
@@ -303,7 +310,7 @@ _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
-  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}'
+  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}'
 }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
@@ -435,6 +442,8 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
         # PR the item already has keeps these tests about argument wiring; the
         # settle-and-adopt behaviour has its own file.
         pr=PR,
+        # The NINTH and TENTH fields: the reviewed range (spec §4).
+        merge_base=MERGE_BASE_SHA, delta_digest=DELTA_DIGEST,
     )
     if not merge_ok:
         stub = stub.replace(
@@ -691,7 +700,10 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
       context  -- exactly the bundle hash _kernel_bundle_hash read back from
                   the kernel. It used to be the artifact hash of the queue
                   prompt, PUT as a stand-in spec; the run now holds a real
-                  frozen issue snapshot, and that is what "context" means.
+                  frozen issue snapshot, and that is what "context" means;
+      head/range -- exactly the observed head and the derivation's own
+                  merge-base/delta-digest fields (spec §4), so what the
+                  verdict says was reviewed is what was actually reviewed.
     """
     calls, _, _tmp = happy_drive
     by_name = {n: a for n, a in calls}
@@ -705,6 +717,38 @@ def test_record_review_binds_the_artifact_the_kernel_ACTUALLY_HOLDS(happy_drive)
     assert args[5] == CTX_HASH, (
         "the review binds a context hash that is not the bundle the kernel "
         "froze for this run")
+    assert args[8] == HEAD_SHA, (
+        "the review does not record the observed head it was guarded on")
+    assert args[9] == MERGE_BASE_SHA, (
+        "the review does not bind the merge-base the derivation reported")
+    assert args[10] == DELTA_DIGEST, (
+        "the review does not bind the delta digest the derivation reported")
+
+
+def test_the_review_record_carries_the_range():
+    """The review record must carry WHAT WAS REVIEWED, not just the verdict.
+
+    `_kernel_record_review`'s optional ninth/tenth/eleventh arguments are the
+    observed head, the merge-base against the PR's base, and the digest of
+    the PR's own delta at that head (spec §4) -- the same three fields the
+    derivation's tuple carries out past `pr`. A verdict recorded without them
+    approves a PR number; it does not name the range a human or a later audit
+    could point to as "this is what was reviewed".
+
+    Static, not driven through `happy_drive`: the dynamic drive already binds
+    these three positionally (see `test_record_review_binds_the_artifact_
+    the_kernel_ACTUALLY_HOLDS`); this is the source-level guarantee that the
+    variables threaded into the call are the ones this file's own extraction
+    helper sees, using the same find-the-matching-close-brace mechanism
+    `_extracted_script` already relies on to isolate `run_item` from the rest
+    of `batch/run-queue.sh`.
+    """
+    src_lines = RUN_QUEUE.read_text().splitlines()
+    run_item_src = _extract_function(src_lines, "run_item")
+    call = run_item_src[run_item_src.index('_kernel_record_review "$BIRCHER_RUN_ID"'):]
+    call = call[:call.index("\n")]
+    for name in ('"$observed_head"', '"$_merge_base"', '"$_delta_digest"'):
+        assert name in call, f"{name} must reach the review record"
 
 
 def test_the_merge_redispatch_gets_the_implementer_vendor_again(happy_drive):

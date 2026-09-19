@@ -2372,7 +2372,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # added to fix: `observe_outcome` runs the same `_settle_pr`, so recovery can
   # review and comment a sibling PR and then authorize and merge the stale one
   # it was invoked with.
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr _ _ <<EOF
 $rec
 EOF
   if [ -n "${r_settled_pr:-}" ] && [ "$r_settled_pr" != "$pr" ]; then
@@ -2637,13 +2637,14 @@ _derive_budget() {
   printf '%s' "$floor"
 }
 
-# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of eight fields.
+# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of ten fields.
 #
-# FAIL CLOSED. The old reader could not tell a seven-field tuple from an
-# eight-field one: `read -r a..h` simply leaves `h` empty, so a short result --
-# version skew against an older coordinator, a truncated write, a partial
-# failure -- silently restored the very behaviour the eighth field was added to
-# remove, and the caller went on to authorize and merge a stale PR.
+# FAIL CLOSED. The old reader could not tell a short tuple from a full one:
+# `read -r a..j` simply leaves the tail empty, so a short result -- version
+# skew against an older coordinator, a truncated write, a partial failure --
+# silently restored the very behaviour the later fields were added to remove:
+# the caller went on to authorize and merge a stale PR, or record a verdict
+# with no reviewed range.
 #
 # Also rejects embedded newlines: `read` consumes only the FIRST line, so a
 # multi-line result would be parsed as its first line and the rest discarded
@@ -2655,7 +2656,7 @@ _derived_width_ok() {
   # every input -- the check rejected everything, including valid tuples.
   case $line in *$'\n'*) return 1 ;; esac
   n=$(printf '%s' "$line" | awk -F'|' '{print NF}')
-  [ "$n" = 8 ]
+  [ "$n" = 10 ]
 }
 
 # _max_revisions -> how many repair rounds this run may spend, 0-5.
@@ -4834,6 +4835,8 @@ run_item() {
   local _rev_key=""
   local _rev_round=0
   local _rev_terminal=""
+  local _merge_base=""
+  local _delta_digest=""
   if [ "${_blind:-0}" = 1 ]; then
     # Unchanged from the marker era, and still correct: the cancel was never
     # confirmed, so the coordinator may still be running. Deriving an outcome
@@ -4879,6 +4882,8 @@ run_item() {
     # for the same reason: every signal looks normal.
     _rev_key=""
     _rev_left=0
+    _merge_base=""
+    _delta_digest=""
     if [ "$(_max_revisions)" != 0 ] && [ -n "${BIRCHER_RUN_ID:-}" ]; then
       # `used|left|confirmed`. A LOOKUP FAILURE leaves _rev_left at 0, which
       # ends the loop and escalates -- deliberately, because the alternative
@@ -4902,22 +4907,24 @@ run_item() {
     # wearing a verdict's clothes.
     if [ -z "${obs//[[:space:]]/}" ]; then
       echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||"
+      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||||"
     fi
-    # EIGHT fields. The last is the PR the DERIVATION settled on, which is not
+    # TEN fields. The eighth is the PR the DERIVATION settled on, which is not
     # always the one passed in: it discards an abandoned PR, discovers one by
-    # code or issue linkage, and adopts a CI-green sibling. Reading seven
-    # absorbed the eighth into `resubmissions` silently -- `read` does not
-    # error on a short variable list, it concatenates the remainder into the
-    # last name.
+    # code or issue linkage, and adopts a CI-green sibling. The last two are
+    # the reviewed range (spec §4): the merge-base against the PR's base and
+    # the digest of the PR's own delta at the reviewed head. Reading fewer
+    # names than the tuple has absorbs the remainder into the last one
+    # silently -- `read` does not error on a short variable list, it
+    # concatenates the remainder into the last name.
     # WIDTH CHECKED BEFORE PARSING. A short tuple leaves `_settled_pr` empty,
     # which used to mean "keep the PR I started with" -- indistinguishable from
     # a derivation that legitimately settled on nothing.
     if ! _derived_width_ok "$obs"; then
-      echo "[batch] $item: derivation returned a malformed tuple (not eight fields on one line) -> escalating rather than guessing which field is which" >&2
-      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||"
+      echo "[batch] $item: derivation returned a malformed tuple (not ten fields on one line) -> escalating rather than guessing which field is which" >&2
+      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||||"
     fi
-    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr <<EOF
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr _merge_base _delta_digest <<EOF
 $obs
 EOF
     : "${outcome:=timeout}" "${ci_first:=unknown}"
@@ -4961,8 +4968,11 @@ EOF
       # escalations below set `escalated` and keep `request_revision`, because a
       # revision genuinely is owed there and nothing performed it.
       _rev_terminal=$(_terminal_review_flag "$outcome")
-      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-        "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal"
+      # The reviewed range rides out on the SAME call, not a follow-up one:
+      # `observed_head` is the head this branch is guarded on, and
+      # `_merge_base`/`_delta_digest` are the derivation's own two trailing
+      # fields (spec §4) -- what the reviewer's verdict actually covered.
+      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal" "$observed_head" "$_merge_base" "$_delta_digest"
       BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
       export BIRCHER_GENERATION
     fi
@@ -5663,7 +5673,7 @@ SH
   # for the branch lookup, so they are `unknown` and empty -- which is the
   # correct answer to "no history was visible", and is pinned here so a change
   # that starts inventing `false|0` on a failed lookup is caught.
-  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7" ] \
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7||" ] \
     || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -5682,7 +5692,7 @@ SH
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||" ] \
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||||" ] \
     || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "observe_outcome OK"
@@ -5728,7 +5738,7 @@ SH
   cat >"$rdir/omnigent" <<'SH'
 #!/usr/bin/env bash
 # A reviewer that BLOCKS, with findings shaped like the real ones: multiple
-# paragraphs, a pipe, and newlines -- all three of which the eight-field tuple
+# paragraphs, a pipe, and newlines -- all three of which the ten-field tuple
 # cannot carry, which is the whole reason the findings travel by file.
 printf 'Blocking:\n- the retry loop reads `a | b` and drops b\n- no test covers the empty case\n\nVERDICT: FAIL\n'
 exit 0
@@ -5745,7 +5755,7 @@ SH
     *) echo "FAIL repair: a FAIL with rounds left must derive 'revise', got '$rev_out'"; exit 1 ;;
   esac
   _derived_width_ok "$rev_out" \
-    || { echo "FAIL repair: the revise tuple is not eight fields on one line: '$rev_out'"; exit 1; }
+    || { echo "FAIL repair: the revise tuple is not ten fields on one line: '$rev_out'"; exit 1; }
   [ -s "$rdir/findings.txt" ] \
     || { echo "FAIL repair: no findings were written for a revise"; exit 1; }
   grep -q 'drops b' "$rdir/findings.txt" \
@@ -6161,7 +6171,7 @@ SH
   # DISCOVERS it, so the field carrying it back is exactly what this asserts.
   # Before the field existed the discovery was used internally and the caller
   # never learned of it.
-  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300" ] \
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300||" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -6226,7 +6236,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305" ] \
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305||" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
@@ -7745,6 +7755,16 @@ if [ "$1" = "api" ]; then
     [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
     [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
     exit 0; }
+  # merge_base()/delta_digest() (spec §4): a ready recovery now reads the
+  # PR's compare and tree, which this fixture never modeled. EMPTY, not the
+  # catch-all below: that fixed two-line string is neither valid JSON (so it
+  # would silently become an unprovable delta, harmless) NOR pipe/newline-free
+  # (so as `merge_base`'s raw, unparsed answer it corrupts the derive tuple --
+  # a pipe adds a field and a newline trips `_derived_width_ok`'s embedded-
+  # newline guard, which does not care whether the width required is eight or
+  # ten). Empty is what `merge_base()`'s `.strip()` and `delta_digest()`'s
+  # `json.loads(... or "null")` both already treat as "unprovable".
+  printf '%s\n' "$@" | grep -q '/compare/' && exit 0
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
