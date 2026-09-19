@@ -121,9 +121,16 @@ session has settled and exits when the tuple is printed.
 | `human.py` | human interaction: the cursor, the discriminator, the batch rules, dismissals and their replies |
 | `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption; a shaping round before the spec — a one-piece ruling or a slice plan (`coordinator/shape.py`); the slice plan's review and gate; `file_owed` (`coordinator/filing.py`), which files an accepted plan's children in four idempotent passes; and `sweep_sliced` (`coordinator/sweep.py`), run by each wave before it generates the queue |
 
-It returns an eight-field pipe-delimited tuple:
+It returns a ten-field pipe-delimited tuple:
 
-    outcome|review|note|sha|ci|ci_first|resubmissions|pr
+    outcome|review|note|sha|ci|ci_first|resubmissions|pr|merge_base|delta_digest
+
+The last two are what the reviewer actually read (gate integrity, spec §4):
+`merge_base` is the merge-base of the PR's base branch with the reviewed head,
+and `delta_digest` is the digest of the PR's own three-dot delta at that head.
+The runner records both on the `review_verdict` fact, so a verdict says what it
+covered rather than only that it happened; the digest is also what lets a
+re-stamp after an `update-branch` prove the reviewed content is unchanged.
 
 > **TARGET —** the coordinator is the orchestrator. No tuple, no subprocess
 > boundary, no pipe-delimited transport: the derivation's result is an object
@@ -690,5 +697,5 @@ programme exists to catch.
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
 state machine, effect classes, fact vocabulary and mode switches; the derived
 outcome replacing the marker as the decision input; effect routing with its
-enumerating guards; the pre-merge gate; the eight-field boundary's fail-closed
+enumerating guards; the pre-merge gate; the ten-field boundary's fail-closed
 width check.
