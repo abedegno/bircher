@@ -8,6 +8,7 @@ from kernel.commands import Command, submit
 from conftest import valid_argv
 from kernel.effects import EffectClass, pending_reconciliation, reconcile
 from kernel.dispatch import Role, dispatch
+from kernel.events import EventKind
 from kernel.ids import Clock
 from kernel.ownership import acquire
 from kernel.store import Store
@@ -168,3 +169,100 @@ def test_an_unknown_verdict_is_refused():
         _sub(s, "record_review", "rv", verdict="lgtm",
              artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
              actor="codex", policy_version=1)
+
+
+# --- gate integrity: the verdict records what it reviewed --------------------
+
+#: The store `command()` below dispatches and reads against. Set by the
+#: `store_and_run` fixture -- one store per test, the same module-global
+#: pattern test_authorization.py uses for its FRONT driver, because `command`
+#: (unlike `_sub` above) is called from inside a test body without a store to
+#: hand it: the caller wants a `Command` back to extend, not a submitted one.
+_ACTIVE_STORE = None
+
+
+@pytest.fixture
+def store_and_run():
+    """A run at `reviewing`, implementation phase, with a passing CI
+    observation -- the setup
+    `test_request_merge_with_an_accepted_review_is_authorized`
+    (test_authorization.py) builds before recording its review."""
+    global _ACTIVE_STORE
+    s, _ = _to_implementing(_store())
+    _sub(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _ACTIVE_STORE = s
+    return s, "r"
+
+
+def command(name, run_id, payload, key=None, actor=None):
+    """Build, but do not submit, a `Command` -- the same dispatch `_sub`
+    performs above, returned instead of submitted so a test can extend the
+    payload first."""
+    role = Role.REVIEWER if name == "record_review" else Role.IMPLEMENTER
+    if actor is None:
+        actor = "codex" if role == Role.REVIEWER else "claude"
+    return Command(
+        name=name, run_id=run_id, expected_version=_ACTIVE_STORE.run_version(run_id),
+        idempotency_key=key or f"{name}-cmd",
+        generation=dispatch(_ACTIVE_STORE, run_id, actor=actor, role=role).generation,
+        payload=payload,
+    )
+
+
+def _accept_payload(store, run_id):
+    """The artifact/base/context binding an `accept` verdict must carry: the
+    run's current output (what `record_implementation_output` recorded in
+    `store_and_run`), the driver's base_sha, and its context bundle -- the
+    same tuple `test_request_merge_with_an_accepted_review_is_authorized`
+    binds."""
+    return {
+        "verdict": "accept",
+        "phase": "implementation",
+        "artifact_hash": store.current_artifact(run_id),
+        "base_sha": BASE,
+        "context_bundle_hash": BUNDLE,
+        "policy_version": 1,
+    }
+
+
+def test_the_verdict_records_what_it_reviewed(store_and_run):
+    store, run_id = store_and_run
+    payload = _accept_payload(store, run_id)   # the helper's artifact/base/context binding
+    payload.update({"head_sha": "e" * 40, "merge_base_sha": "2" * 40, "delta_digest": "d" * 64})
+    submit(store, command("record_review", run_id, payload))
+    fact = [f for f in store.facts_for(run_id) if f.kind == EventKind.REVIEW_VERDICT][-1]
+    assert fact.payload["head_sha"] == "e" * 40
+    assert fact.payload["merge_base_sha"] == "2" * 40
+    assert fact.payload["delta_digest"] == "d" * 64
+    assert fact.schema_version == 2
+
+
+def test_the_round_advances_once_a_revision_is_recorded(tmp_path):
+    """`_round_number` is what the status description calls the round, and
+    nothing proved it ever returned more than 1 -- a function stubbed to
+    `return 1` passed every test it had. One recorded back-half
+    `request_revision` makes the next derivation round two.
+
+    An ON-DISK store, because `_round_number` takes a database PATH and
+    re-opens it: the `:memory:` store the rest of this module uses has none.
+    """
+    from coordinator.cli import _round_number
+
+    db = str(tmp_path / "kernel.db")
+    s = Store.open(db, clock=Clock(start_us=1))
+    Front(s, "r", base_sha=BASE)
+    s, spec = _to_implementing(s)
+    assert _round_number(db, "r") == 1, "no revision recorded yet"
+    _sub(s, "record_review", "rv", verdict="request_revision",
+         artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
+         actor="codex", policy_version=1)
+    assert _round_number(db, "r") == 2
+
+
+def test_a_verdict_without_a_range_records_none_not_garbage(store_and_run):
+    store, run_id = store_and_run
+    submit(store, command("record_review", run_id, _accept_payload(store, run_id)))
+    fact = [f for f in store.facts_for(run_id) if f.kind == EventKind.REVIEW_VERDICT][-1]
+    assert fact.payload["head_sha"] is None
+    assert fact.payload["merge_base_sha"] is None
+    assert fact.payload["delta_digest"] is None

@@ -1170,8 +1170,8 @@ _pr_merge_state() {
   fi
 }
 
-_post_cross_review_status() {
-  local item="$1" pr="$2" sha="${3:-}" attempt err
+_post_cross_review_status() {  # <item> <pr> [sha] [state] [description]
+  local item="$1" pr="$2" sha="${3:-}" state="${4:-success}" description="${5:-cross-vendor review PASS (Bircher)}" attempt err
   # Head sha: the caller may PIN it (the sweep pins the reviewed head so the status
   # is never posted on an unreviewed push); otherwise fetch the current head, with a
   # few retries (gh pr view can transiently fail too).
@@ -1184,6 +1184,18 @@ _post_cross_review_status() {
     done
   fi
   [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 1; }
+  # ALREADY THERE -> nothing to do. The derivation posts a status for every
+  # verdict (spec §4), so by the time the merge path gets here a success
+  # usually exists with a description naming the reviewed range; re-posting
+  # would overwrite that description with the legacy text.
+  if [ "$state" = success ] && ! _deadline_passed "${PREMERGE_DEADLINE_AT:-}" \
+     && [ "$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+       gh api "repos/$REPO/commits/$sha/status" \
+       -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
+       | grep -cx 'success')" != 0 ]; then
+    echo "[batch:merge] $item: bircher/cross-review=success already on ${sha:0:7} -> not re-posting" >&2
+    return 0
+  fi
   # Post, then read the status back to confirm it landed. Retry both with
   # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
   # non-transient cause is diagnosable next time.
@@ -1195,9 +1207,9 @@ _post_cross_review_status() {
     _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
     err=$(_effect status_check "status:$sha" \
             "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
-            gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+            gh api "repos/$REPO/statuses/$sha" -X POST -f "state=$state" \
             -f context=bircher/cross-review \
-            -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
+            -f description="$description" 2>&1 >/dev/null)
     # ...and before the verification too. Skipping it after a successful POST costs a
     # confirmation, so the caller merges best-effort and branch protection decides --
     # which is the existing conservative path, not a new one.
@@ -1208,8 +1220,8 @@ _post_cross_review_status() {
     if [ "$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
          gh api "repos/$REPO/commits/$sha/status" \
          -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
-         | grep -cx 'success')" != 0 ]; then
-      echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
+         | grep -cx "$state")" != 0 ]; then
+      echo "[batch:merge] $item: posted+verified bircher/cross-review=$state on ${sha:0:7} (attempt $attempt)" >&2
       return 0
     fi
     echo "[batch:merge] WARN $item: cross-review status not confirmed on ${sha:0:7} (attempt $attempt/5)${err:+: $err}" >&2
@@ -1232,67 +1244,6 @@ _sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum
   else shasum -a 256
   fi | cut -d' ' -f1
-}
-
-# _pr_delta_digest <base_ref> <head_ref> -> a stable digest of the PR's OWN delta,
-# or rc 1 when that delta cannot be established.
-#
-# GitHub's compare is three-dot, so `base...head` is the change the PR contributes
-# and never the base branch's own commits. That property is what makes the digest
-# comparable across an update-branch: that operation MERGES the base into the head
-# (it does not rebase), so the new head CONTAINS the new base, the merge-base IS
-# the new base, and the compare still yields only the PR's work.
-#
-# rc 1 is NOT "assume equal" - the caller turns it into an escalation. The
-# unprovable cases are real: GitHub caps the changed-file list at 300, omits `patch`
-# for binaries, pure renames and anything over its size limit, and truncates a large
-# tree. Digesting a partial answer would produce a confident wrong one, which here
-# means merging code no reviewer read.
-_pr_delta_digest() {
-  local base="$1" ref="$2" cmp tree count
-  cmp=$(gh api "repos/$REPO/compare/${base}...${ref}" 2>/dev/null) || return 1
-  [ -n "$cmp" ] || return 1
-  count=$(printf '%s' "$cmp" | jq -r '.files | length' 2>/dev/null) || return 1
-  case "$count" in ''|*[!0-9]*) return 1 ;; esac
-  # 0 files = nothing to compare (degenerate, and it would make two unrelated empty
-  # answers look equal); >= 300 = GitHub's documented cap for the changed-file list,
-  # so at exactly 300 it may be truncated.
-  { [ "$count" -ge 1 ] && [ "$count" -lt 300 ]; } || return 1
-  # A file whose patch GitHub withheld leaves a hole in the comparison.
-  printf '%s' "$cmp" | jq -e 'any(.files[]; has("patch") | not)' >/dev/null 2>&1 && return 1
-  # The compare payload carries NO mode and NO type - verified against the API, where
-  # files[] is filename/status/sha/patch plus counts and URLs. That gap is load-bearing
-  # here: git stores a symlink's TARGET as its blob content, so a symlink pointing at
-  # "x" and a regular file containing "x" share a blob sha AND project to an identical
-  # patch. Digesting the compare alone would let a base that changed a path's TYPE
-  # merge as though the PR's delta were untouched. The tree carries mode and type; a
-  # TRUNCATED tree cannot answer for every path, so it fails closed like the rest.
-  tree=$(gh api "repos/$REPO/git/trees/${ref}?recursive=1" 2>/dev/null) || return 1
-  [ -n "$tree" ] || return 1
-  # Require an explicit false. `== true` would PROCEED on an absent or null
-  # `truncated`, i.e. treat an answer we did not get as a reassuring one.
-  printf '%s' "$tree" | jq -e '.truncated == false' >/dev/null 2>&1 || return 1
-  # Note this escalates whenever the base touched a file the PR also touches: the
-  # resulting blob sha (and often the patch context) moves. That is CORRECT rather
-  # than merely cautious - the merged file then combines both changes, and the
-  # reviewer never saw that combination. The feature is for the common case where
-  # the base moved elsewhere in the tree.
-  # Canonical form: sorted by filename, sorted keys, and EVERY field that identifies
-  # the change - path, rename origin, status, resulting blob, patch, and the tree
-  # entry's mode|type. `--slurpfile` rather than `--argjson` keeps a large compare
-  # payload off the command line, where a big PR would hit ARG_MAX.
-  printf '%s' "$tree" \
-    | jq -cS --slurpfile c <(printf '%s' "$cmp") '
-        (.tree | map({key: .path, value: (.mode + "|" + .type)}) | from_entries) as $m
-        | [ $c[0].files
-            | sort_by(.filename)[]
-            | { filename,
-                previous_filename: (.previous_filename // null),
-                status,
-                sha,
-                patch,
-                entry: ($m[.filename] // "ABSENT") } ]' 2>/dev/null \
-    | _sha256
 }
 
 # _restamp_if_delta_unchanged <item> <pr> <reviewed_sha>
@@ -1329,10 +1280,21 @@ _restamp_if_delta_unchanged() {
     [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
   done
   [ -n "$new" ] || { echo "[batch:sweep] $item: PR #$pr head never moved after update-branch -> escalate" >&2; return 1; }
-  old_digest=$(_pr_delta_digest "$base" "$reviewed") || old_digest=""
-  new_digest=$(_pr_delta_digest "$base" "$new")      || new_digest=""
+  # STDERR IS NOT DISCARDED. A CLI that cannot start -- no interpreter, an
+  # import error, a bad PYTHONPATH -- is indistinguishable from an unprovable
+  # delta once its message is thrown away, and the escalation below then
+  # misdiagnoses it as GitHub withholding a patch. It goes to the run log, as
+  # the derive call's does.
+  old_digest=$( PYTHONPATH="$(_kernel_pythonpath)" \
+                _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+                "${BIRCHER_PY:-python3}" -m coordinator.cli delta \
+                  --repo "$REPO" --base "$base" --ref "$reviewed") || old_digest=""
+  new_digest=$( PYTHONPATH="$(_kernel_pythonpath)" \
+                _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+                "${BIRCHER_PY:-python3}" -m coordinator.cli delta \
+                  --repo "$REPO" --base "$base" --ref "$new") || new_digest=""
   if [ -z "$old_digest" ] || [ -z "$new_digest" ]; then
-    echo "[batch:sweep] $item: PR #$pr delta not provable (compare failed/truncated/patch withheld) -> escalate" >&2
+    echo "[batch:sweep] $item: PR #$pr delta not provable (compare failed/truncated/patch withheld, or the delta CLI failed -- see its stderr above) -> escalate" >&2
     return 1
   fi
   if [ "$old_digest" != "$new_digest" ]; then
@@ -1340,7 +1302,18 @@ _restamp_if_delta_unchanged() {
     return 1
   fi
   echo "[batch:sweep] $item: PR #$pr delta PROVEN identical across the update (${reviewed:0:7} -> ${new:0:7}) -> re-stamping the review" >&2
-  _post_cross_review_status "$item" "$pr" "$new" || return 1
+  local prior_desc restamp_desc
+  prior_desc=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+      gh api "repos/$REPO/commits/$reviewed/status" \
+      -q '.statuses[] | select(.context=="bircher/cross-review") | .description' 2>/dev/null | head -1)
+  # TRUNCATED TO 140, GitHub's limit for a status description, because this one
+  # is COMPOSED: the prior description (already up to 140) plus the re-stamp
+  # suffix is longer than the limit by construction, and GitHub truncates the
+  # overflow wherever it lands -- which would cut the suffix that says this is
+  # a re-stamp. The derivation's own descriptions are truncated at their
+  # producer (`attest.describe`); this is the same rule at this one.
+  restamp_desc="${prior_desc:-cross-vendor review PASS (Bircher)} (re-stamped on ${new:0:7}, delta unchanged)"
+  _post_cross_review_status "$item" "$pr" "$new" success "${restamp_desc:0:140}" || return 1
   RESTAMPED_HEAD="$new"
   return 0
 }
@@ -1550,9 +1523,19 @@ _await_mergeable_state() {
   return 1
 }
 
-# merge_ready_pr <item> <pr> -> rc 0 (merged or deferred; MERGE_NOTE set on
+# merge_ready_pr <item> <pr> [reviewed_sha] [status_description]
+#   -> rc 0 (merged or deferred; MERGE_NOTE set on
 # deferral) | rc 2 (HALT the run: main went red and the merge was reverted, or
-# main CI never resolved). B-1 in-run merge: merging each ready PR before the
+# main CI never resolved).
+#
+# `status_description` is the FALLBACK description for the cross-review status,
+# used only when the derivation's own post is missing (it normally is not: the
+# derivation posts a status for every verdict, naming the range it reviewed).
+# The caller supplies it because the caller is what holds the range; passed
+# empty -- every caller but `run_item` -- `_post_cross_review_status` keeps its
+# legacy text, which is all that can honestly be said when the range is unknown.
+#
+# B-1 in-run merge: merging each ready PR before the
 # next item launches means every later implementer branches from a main that
 # already contains its siblings - the merge-order conflict class disappears.
 # Safety: watch MAIN's CI on the merge commit; on red, revert (throwaway
@@ -1561,7 +1544,7 @@ _await_mergeable_state() {
 MERGE_NOTE=""
 MERGE_RETRY_ELIGIBLE=""
 merge_ready_pr() {
-  local item="$1" pr="$2" expected_sha="${3:-}"
+  local item="$1" pr="$2" expected_sha="${3:-}" status_desc="${4:-}"
   MERGE_NOTE=""
   MERGE_RETRY_ELIGIBLE=0
   # #71: evidence that what LANDED was not what was reviewed. Two variables, not one:
@@ -1612,7 +1595,7 @@ merge_ready_pr() {
   # protected repo self-merges without an approving review. No-op on repos that
   # don't require the check.
   local _status_confirmed=1
-  if ! _post_cross_review_status "$item" "$pr" "$expected_sha"; then
+  if ! _post_cross_review_status "$item" "$pr" "$expected_sha" success "$status_desc"; then
     _status_confirmed=0
     # Best-effort: attempt the merge anyway. On a repo that REQUIRES the check the
     # merge below is BLOCKED and defers (retry-eligible); on a repo that does NOT
@@ -2404,7 +2387,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
     echo "[batch:recover-pr] $code: no generation to bind this recovery to (the run is halted, or the kernel is unreachable) -> not deriving and not merging; needs a human" >&2
     return 1
   fi
-  local rec r_outcome r_review r_note r_sha r_ci r_settled_pr
+  local rec r_outcome r_review r_note r_sha r_ci r_settled_pr r_merge_base r_delta_digest
   # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
   # reaching that line -- and `rec=$(...)` swallows the death into an empty
@@ -2427,7 +2410,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # added to fix: `observe_outcome` runs the same `_settle_pr`, so recovery can
   # review and comment a sibling PR and then authorize and merge the stale one
   # it was invoked with.
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr r_merge_base r_delta_digest <<EOF
 $rec
 EOF
   if [ -n "${r_settled_pr:-}" ] && [ "$r_settled_pr" != "$pr" ]; then
@@ -2514,8 +2497,15 @@ EOF
     _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${r_ci:-na}" "$r_sha"
     BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
     export BIRCHER_GENERATION
+    # THE RANGE RIDES OUT HERE TOO. `observe_outcome` is the same derivation
+    # `run_item` drives, so its two trailing fields are the merge-base and the
+    # delta digest of what the reviewer read (spec §4) -- and a recovery's
+    # verdict fact was the one place they were parsed and dropped. Arguments
+    # 7-8 are the optional key and terminal flag, empty here exactly as they
+    # are on every non-revise path.
     _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
-      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
+      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx" "" "" \
+      "$r_sha" "$r_merge_base" "$r_delta_digest"
     _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$r_sha" \
       "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
   fi
@@ -2568,50 +2558,6 @@ EOF
   fi
   echo "[batch:recover-pr] $code: NOT ready (outcome=$r_outcome) -> PR left open with marker for human" >&2
   return 0
-}
-
-# _recovery_review_prompt <pr> -> the read-only reviewer sub-agent input.
-# Mirrors the cross-review skill's reviewer template: fetch the PR branch,
-# read whole files, run gates each with an inline PATH export, end with an
-# exact VERDICT line (findings above it).
-_recovery_review_prompt() {
-  local pr="$1" sha="${2:-}"
-  # #66: the worktree is created at the EXACT captured commit, not at FETCH_HEAD.
-  # `pull/N/head` is a MOVING ref: a push between capture and the reviewer's fetch
-  # would have it read one commit while the merge pinned another, and a later
-  # force-push back to the captured sha would then merge code the reviewer never
-  # read. Checking out the sha removes the ambiguity mechanically rather than by
-  # asking the reviewer to verify it. If the sha is no longer reachable from the
-  # ref, the checkout fails and so does the review -- which is the correct
-  # outcome, not a regression.
-  local _co="FETCH_HEAD"; [ -n "$sha" ] && _co="$sha"
-  # A UNIQUE worktree per REVIEWER. The `-oob` suffix does the work: both
-  # reviewers review the same commit, so a sha-derived nonce alone would still
-  # collide. Both wrote `/tmp/review-<PR>`;
-  # on muesli #745 the second died on "already exists" and, with only PASS
-  # and FAIL on offer, reported FAIL for a PR it had not read.
-  local _nonce="${_co:0:8}"; [ -n "$_nonce" ] || _nonce=head
-  # No `rm -rf` in the setup line: omnigent's blast_radius guardrail denies
-  # the catastrophic set, and `rm -rf /tmp/review-...` reads as `rm -rf /...`.
-  # On muesli #759 (2026-09-10) the reviewer's setup was rejected before it
-  # read anything, three reviews in a row derived as FAIL, and both repair
-  # rounds were spent on a review that never happened. `git worktree remove
-  # --force` deletes the directory itself; `git worktree prune` clears a stale
-  # registration; a leftover plain directory (a crashed run, a killed session:
-  # muesli #711 round 2 answered BLOCKED over one) is MOVED aside, not deleted,
-  # so the add always starts clean and nothing here can read as a delete.
-  cat <<EOF
-Review PR #$pr in $REPO as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:\$PATH; git fetch origin pull/$pr/head; git worktree remove --force /tmp/review-$pr-$_nonce-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-$pr-$_nonce-oob ] || mv /tmp/review-$pr-$_nonce-oob /tmp/review-$pr-$_nonce-oob.stale.\$\$; git worktree add --detach /tmp/review-$pr-$_nonce-oob $_co; cd /tmp/review-$pr-$_nonce-oob.
-You are reviewing EXACTLY commit $_co. If that checkout fails, STOP and report it -- do not review a different commit.
-READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
-Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:\$PATH &&' (e.g. 'export PATH=/root/bin:\$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
-A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (\`gh pr checks $pr\` to find the run, then \`gh run view <run-id> --log\`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (\`|| true\`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
-If the change acquires a resource that must be released -- a capture device, stream, handle, lock or subscription -- verify its FAILURE paths are tested, not just the happy path; a missing release-on-error test is a blocking finding. (muesli #666 left a microphone recording when a capture start failed.) Keep that scope narrow: do not treat every state change as in scope.
-Report blocking / non-blocking / suggestion findings, then a FINAL LINE that is EXACTLY 'VERDICT: PASS', 'VERDICT: FAIL', or 'VERDICT: BLOCKED'.
-Use BLOCKED, and ONLY BLOCKED, when you could not review at all -- the checkout failed, the tooling was unavailable, the commit was unreachable. BLOCKED means "I formed no opinion"; FAIL means "I reviewed this and it must not merge". They are routed differently and confusing them is expensive: a reviewer that could not check out its worktree once emitted FAIL, and the run recorded a code rejection for a PR nobody had read.
-Put findings BEFORE the verdict so the verdict is the last line even if output is long.
-EOF
 }
 
 # _reconcile_item_pr <code> <tracked_pr> -> the open PR number to act on.
@@ -2736,13 +2682,14 @@ _derive_budget() {
   printf '%s' "$floor"
 }
 
-# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of eight fields.
+# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of ten fields.
 #
-# FAIL CLOSED. The old reader could not tell a seven-field tuple from an
-# eight-field one: `read -r a..h` simply leaves `h` empty, so a short result --
-# version skew against an older coordinator, a truncated write, a partial
-# failure -- silently restored the very behaviour the eighth field was added to
-# remove, and the caller went on to authorize and merge a stale PR.
+# FAIL CLOSED. The old reader could not tell a short tuple from a full one:
+# `read -r a..j` simply leaves the tail empty, so a short result -- version
+# skew against an older coordinator, a truncated write, a partial failure --
+# silently restored the very behaviour the later fields were added to remove:
+# the caller went on to authorize and merge a stale PR, or record a verdict
+# with no reviewed range.
 #
 # Also rejects embedded newlines: `read` consumes only the FIRST line, so a
 # multi-line result would be parsed as its first line and the rest discarded
@@ -2754,7 +2701,7 @@ _derived_width_ok() {
   # every input -- the check rejected everything, including valid tuples.
   case $line in *$'\n'*) return 1 ;; esac
   n=$(printf '%s' "$line" | awk -F'|' '{print NF}')
-  [ "$n" = 8 ]
+  [ "$n" = 10 ]
 }
 
 # _max_revisions -> how many repair rounds this run may spend, 0-5.
@@ -4364,7 +4311,8 @@ run_item() {
   # The kernel's record of this run. Item codes recur across attempts, so a
   # minted id carries the epoch; a RESUMED one is whatever the kernel already
   # holds (below).
-  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"; export BIRCHER_KERNEL_DB
+  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"
+  export BIRCHER_KERNEL_DB
   mkdir -p "$(dirname "$BIRCHER_KERNEL_DB")" 2>/dev/null || true
   local _iss; _iss=$(_item_issue "$prompt")
   local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
@@ -4932,6 +4880,8 @@ run_item() {
   local _rev_key=""
   local _rev_round=0
   local _rev_terminal=""
+  local _merge_base=""
+  local _delta_digest=""
   if [ "${_blind:-0}" = 1 ]; then
     # Unchanged from the marker era, and still correct: the cancel was never
     # confirmed, so the coordinator may still be running. Deriving an outcome
@@ -4977,6 +4927,8 @@ run_item() {
     # for the same reason: every signal looks normal.
     _rev_key=""
     _rev_left=0
+    _merge_base=""
+    _delta_digest=""
     if [ "$(_max_revisions)" != 0 ] && [ -n "${BIRCHER_RUN_ID:-}" ]; then
       # `used|left|confirmed`. A LOOKUP FAILURE leaves _rev_left at 0, which
       # ends the loop and escalates -- deliberately, because the alternative
@@ -5000,22 +4952,24 @@ run_item() {
     # wearing a verdict's clothes.
     if [ -z "${obs//[[:space:]]/}" ]; then
       echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||"
+      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||||"
     fi
-    # EIGHT fields. The last is the PR the DERIVATION settled on, which is not
+    # TEN fields. The eighth is the PR the DERIVATION settled on, which is not
     # always the one passed in: it discards an abandoned PR, discovers one by
-    # code or issue linkage, and adopts a CI-green sibling. Reading seven
-    # absorbed the eighth into `resubmissions` silently -- `read` does not
-    # error on a short variable list, it concatenates the remainder into the
-    # last name.
+    # code or issue linkage, and adopts a CI-green sibling. The last two are
+    # the reviewed range (spec §4): the merge-base against the PR's base and
+    # the digest of the PR's own delta at the reviewed head. Reading fewer
+    # names than the tuple has absorbs the remainder into the last one
+    # silently -- `read` does not error on a short variable list, it
+    # concatenates the remainder into the last name.
     # WIDTH CHECKED BEFORE PARSING. A short tuple leaves `_settled_pr` empty,
     # which used to mean "keep the PR I started with" -- indistinguishable from
     # a derivation that legitimately settled on nothing.
     if ! _derived_width_ok "$obs"; then
-      echo "[batch] $item: derivation returned a malformed tuple (not eight fields on one line) -> escalating rather than guessing which field is which" >&2
-      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||"
+      echo "[batch] $item: derivation returned a malformed tuple (not ten fields on one line) -> escalating rather than guessing which field is which" >&2
+      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||||"
     fi
-    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr <<EOF
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr _merge_base _delta_digest <<EOF
 $obs
 EOF
     : "${outcome:=timeout}" "${ci_first:=unknown}"
@@ -5059,8 +5013,11 @@ EOF
       # escalations below set `escalated` and keep `request_revision`, because a
       # revision genuinely is owed there and nothing performed it.
       _rev_terminal=$(_terminal_review_flag "$outcome")
-      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" \
-        "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal"
+      # The reviewed range rides out on the SAME call, not a follow-up one:
+      # `observed_head` is the head this branch is guarded on, and
+      # `_merge_base`/`_delta_digest` are the derivation's own two trailing
+      # fields (spec §4) -- what the reviewer's verdict actually covered.
+      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal" "$observed_head" "$_merge_base" "$_delta_digest"
       BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
       export BIRCHER_GENERATION
     fi
@@ -5176,7 +5133,18 @@ EOF
       # request_merge, record_merge_outcome
       _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
         "$_out_hash" "$_base_sha" "$_ctx_hash"
-      merge_ready_pr "$item" "$pr" "$reviewed_sha"; merge_rc=$?
+      # The FALLBACK description, composed HERE because this is where the
+      # reviewed range is. `_post_cross_review_status`'s own default is the
+      # legacy "cross-vendor review PASS (Bircher)" text, and it fires in
+      # exactly the case that matters: the derivation's post did not land (or
+      # could not be read back). Overwriting the merge head's range-naming
+      # description with text that names nothing is the gate losing the one
+      # thing the status is for. Empty when the range is unknown -- then the
+      # legacy text is the honest answer.
+      local _status_desc=""
+      [ -n "${_merge_base:-}" ] && [ -n "${observed_head:-}" ] && \
+        _status_desc="cross-review PASS (Bircher fallback) on ${_merge_base:0:7}..${observed_head:0:7}"
+      merge_ready_pr "$item" "$pr" "$reviewed_sha" "$_status_desc"; merge_rc=$?
       local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
       _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
       [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
@@ -5761,7 +5729,7 @@ SH
   # for the branch lookup, so they are `unknown` and empty -- which is the
   # correct answer to "no history was visible", and is pinned here so a change
   # that starts inventing `false|0` on a failed lookup is caught.
-  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7" ] \
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7||" ] \
     || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -5780,7 +5748,7 @@ SH
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||" ] \
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||||" ] \
     || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "observe_outcome OK"
@@ -5826,7 +5794,7 @@ SH
   cat >"$rdir/omnigent" <<'SH'
 #!/usr/bin/env bash
 # A reviewer that BLOCKS, with findings shaped like the real ones: multiple
-# paragraphs, a pipe, and newlines -- all three of which the eight-field tuple
+# paragraphs, a pipe, and newlines -- all three of which the ten-field tuple
 # cannot carry, which is the whole reason the findings travel by file.
 printf 'Blocking:\n- the retry loop reads `a | b` and drops b\n- no test covers the empty case\n\nVERDICT: FAIL\n'
 exit 0
@@ -5843,7 +5811,7 @@ SH
     *) echo "FAIL repair: a FAIL with rounds left must derive 'revise', got '$rev_out'"; exit 1 ;;
   esac
   _derived_width_ok "$rev_out" \
-    || { echo "FAIL repair: the revise tuple is not eight fields on one line: '$rev_out'"; exit 1; }
+    || { echo "FAIL repair: the revise tuple is not ten fields on one line: '$rev_out'"; exit 1; }
   [ -s "$rdir/findings.txt" ] \
     || { echo "FAIL repair: no findings were written for a revise"; exit 1; }
   grep -q 'drops b' "$rdir/findings.txt" \
@@ -6259,7 +6227,7 @@ SH
   # DISCOVERS it, so the field carrying it back is exactly what this asserts.
   # Before the field existed the discovery was used internally and the caller
   # never learned of it.
-  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300" ] \
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300||" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -6324,7 +6292,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305" ] \
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305||" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
@@ -6992,7 +6960,10 @@ if [ "$1" = "api" ]; then
   # empty, so a test that set it exercised nothing and passed without ever creating the
   # condition it named.
   if printf '%s\n' "$@" | grep -q '/status'; then
-    if printf '%s\n' "$@" | grep -q -- '-q'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+    if printf '%s\n' "$@" | grep -q -- '-q'; then
+      [ "${STATUS_PRESENT:-0}" = 1 ] && { printf 'success\n'; exit 0; }
+      cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0
+    fi
     SJ="${FAKE_STATUS_JSON:-}"; [ -n "$SJ" ] || SJ='{"statuses":[]}'
     printf '[%s]' "$SJ"; exit 0
   fi
@@ -7026,6 +6997,26 @@ SH
   # happy path: mergeable -> merged -> main CI green -> rc 0, empty MERGE_NOTE
   ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s1" merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1
     rc=$?; [ $rc -eq 0 ] && [ -z "$MERGE_NOTE" ] ) || { echo "FAIL merge_ready_pr happy path"; exit 1; }
+  # THE FALLBACK STATUS CARRIES THE RANGE the caller threads through, and the
+  # legacy text only when the caller has no range to name. The fallback fires
+  # exactly when the derivation's own post is missing, so posting the legacy
+  # text there OVERWRITES the merge head's range-naming description with one
+  # that names nothing -- which is the status ceasing to attest to anything.
+  : > "$mdir/desc1.log"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s8" \
+    FAKE_GH_LOG="$mdir/desc1.log" \
+    merge_ready_pr demo 7 headsha1234567 \
+      "cross-review PASS (Bircher fallback) on 2742ae4..headsha" >/dev/null 2>&1 )
+  grep -q 'description=cross-review PASS (Bircher fallback) on 2742ae4..headsha' "$mdir/desc1.log" \
+    || { echo "FAIL merge_ready_pr did not thread the range description to the cross-review status"; cat "$mdir/desc1.log"; exit 1; }
+  # ...and with no description threaded, the legacy text is still what lands.
+  : > "$mdir/desc2.log"
+  ( PATH="$mdir:$PATH" REPO=demo/demo MAIN_CI_TIMEOUT=31 FAKE_STATUS_STORE="$mdir/s9" \
+    FAKE_GH_LOG="$mdir/desc2.log" \
+    merge_ready_pr demo 7 headsha1234567 >/dev/null 2>&1 )
+  grep -q 'description=cross-vendor review PASS (Bircher)' "$mdir/desc2.log" \
+    || { echo "FAIL merge_ready_pr lost the legacy description when no range was threaded"; cat "$mdir/desc2.log"; exit 1; }
+  echo "merge_ready_pr OK (threads the fallback status description)"
   # ELAPSED-TIME GUARD. The happy path now ENTERS the main-CI watch (the shims used to
   # return an empty merge sha to skip it, which is the unsafe shortcut #62 removed), so
   # this asserts the watch is actually bounded by MAIN_CI_POLL_INTERVAL and exits on the
@@ -7290,6 +7281,14 @@ SH
     && grep -q 'state=success' "$slog" \
     && grep -q 'context=bircher/cross-review' "$slog" \
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
+  # Gate integrity: a success already on the head is not re-posted. The
+  # derivation posts on every verdict; the merge path's own post is a fallback.
+  : > "$slog"
+  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_GH_LOG="$slog" STATUS_PRESENT=1 \
+    _post_cross_review_status demo 7 headsha >/dev/null 2>&1 )
+  grep -q 'statuses/headsha' "$slog" \
+    && { echo "FAIL _post_cross_review_status: re-posted a success that was already on the head"; exit 1; }
+  echo "_post_cross_review_status skips a present success OK"
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
   # Task 3 (codex P2-1): status-post unconfirmed -> BEST-EFFORT merge (let branch
@@ -7843,6 +7842,16 @@ if [ "$1" = "api" ]; then
     [ "${FAKE_PROT_RC:-0}" = 0 ] || { echo "HTTP 500 something broke" >&2; exit 1; }
     [ -n "${FAKE_PROT_CONTEXTS:-}" ] && { printf '%s\n' "$FAKE_PROT_CONTEXTS"; exit 0; }
     exit 0; }
+  # merge_base()/delta_digest() (spec §4): a ready recovery now reads the
+  # PR's compare and tree, which this fixture never modeled. EMPTY, not the
+  # catch-all below: that fixed two-line string is neither valid JSON (so it
+  # would silently become an unprovable delta, harmless) NOR pipe/newline-free
+  # (so as `merge_base`'s raw, unparsed answer it corrupts the derive tuple --
+  # a pipe adds a field and a newline trips `_derived_width_ok`'s embedded-
+  # newline guard, which does not care whether the width required is eight or
+  # ten). Empty is what `merge_base()`'s `.strip()` and `delta_digest()`'s
+  # `json.loads(... or "null")` both already treat as "unprovable".
+  printf '%s\n' "$@" | grep -q '/compare/' && exit 0
   printf 'completed|success\ncompleted|success\n'; exit 0
 fi
 exit 0
@@ -7876,42 +7885,6 @@ SH
       && { echo "FAIL recover_pr_cmd: stamped cross-review with an unusable head ('$_bad')"; rm -rf "$prdir"; exit 1; }
   done
   echo "recover_pr_cmd unusable-head refused OK (#66)"
-  # #66: the prompt must pin the checkout to the CAPTURED sha. The first cut
-  # passed the sha in and the function ignored it, still fetching the moving
-  # `pull/N/head` -- so the reviewer could read a different commit than the one
-  # the merge pinned. Assert the sha reaches the prompt text.
-  local _pp
-  _pp=$(REPO=demo/demo _recovery_review_prompt 9 a502a88e20f959c908d00871ee7f25572512dd6d)
-  case "$_pp" in
-    # The path now carries a per-review nonce so two reviewers cannot collide
-    # on it (muesli #745). The PROPERTY is unchanged and is what this asserts:
-    # the CAPTURED sha, not the moving pull/N/head, is what gets checked out.
-    *"worktree add --detach /tmp/review-9-a502a88e-oob a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
-    *) echo "FAIL _recovery_review_prompt: checkout not pinned to the captured sha"; exit 1 ;;
-  esac
-  case "$_pp" in
-    *"reviewing EXACTLY commit a502a88e20f959c908d00871ee7f25572512dd6d"*) : ;;
-    *) echo "FAIL _recovery_review_prompt: prompt does not name the reviewed commit"; exit 1 ;;
-  esac
-  # The setup line must not carry `rm -rf`: the guardrail rejects it before
-  # the reviewer reads anything (muesli #759, three reviews derived as FAIL).
-  case "$_pp" in
-    *"rm -rf"*) echo "FAIL _recovery_review_prompt: the setup line carries rm -rf, which the guardrail rejects"; exit 1 ;;
-  esac
-  case "$_pp" in
-    *"git worktree prune; [ ! -e /tmp/review-9-a502a88e-oob ] || mv /tmp/review-9-a502a88e-oob /tmp/review-9-a502a88e-oob.stale."*) : ;;
-    *) echo "FAIL _recovery_review_prompt: the setup line does not prune and move a leftover aside before adding the worktree"; exit 1 ;;
-  esac
-  # With no sha it must still work (pre-#66 behaviour), rather than emitting an
-  # empty checkout target.
-  _pp=$(REPO=demo/demo _recovery_review_prompt 9)
-  case "$_pp" in
-    # With no sha the nonce falls back to `head`, and the checkout target is
-    # still FETCH_HEAD -- which is what this asserts.
-    *"worktree add --detach /tmp/review-9-FETCH_HE-oob FETCH_HEAD"*) : ;;
-    *) echo "FAIL _recovery_review_prompt: no-sha fallback broken"; exit 1 ;;
-  esac
-  echo "_recovery_review_prompt pins the reviewed commit OK (#66)"
   # BEHIND PR: update-branch FIRST, then review + merge
   : > "$prdir/log"; : > "$prdir/store"
   ( PATH="$prdir:$PATH" REPO=demo/demo SERVER=http://x WORKDIR="$prdir" \
@@ -8514,12 +8487,18 @@ SH
     _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
   [ -s "$_sd/calls" ] \
     || { echo "FAIL #71: with budget remaining, the status post must still reach gh"; rm -rf "$_sd"; exit 1; }
-  # THE CHECK BEFORE THE VERIFICATION needs the deadline to expire DURING the POST --
-  # an already-expired one breaks at the first check and never reaches it. So the fake
-  # POST outlives the remaining budget, and exactly ONE call must be made.
+  # THE CHECK BEFORE THE VERIFICATION needs the deadline to expire DURING a call --
+  # an already-expired one breaks at the first check and never reaches it. The
+  # short-circuit's own `commits/<sha>/status` read is that call now: it is issued
+  # before the retry loop, `*status*` (not `*statuses*`) makes the fake sleep through
+  # it too, and `timeout` kills it at the 1s cap -- so the read alone consumes the
+  # whole deadline DETERMINISTICALLY, not on however long fork/exec happens to take.
+  # By the time the retry loop's leading `_deadline_passed` check runs, the deadline
+  # is already spent, so neither the POST nor the verification is ever issued.
+  # Exactly ONE call -- the short-circuit's read -- must be made.
   local _sd2; _sd2=$(mktemp -d); : > "$_sd2/calls"
   printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >> "$GH_CALLS"' \
-    'case "$*" in *statuses*) sleep 2 ;; esac' 'exit 1' > "$_sd2/gh"
+    'case "$*" in *status*) sleep 2 ;; esac' 'exit 1' > "$_sd2/gh"
   printf '%s\n' '#!/usr/bin/env bash' 'if [ "$1" = "-k" ]; then shift 2; fi' 'shift' 'exec "$@"' > "$_sd2/timeout"
   chmod +x "$_sd2/gh" "$_sd2/timeout"
   ( PATH="$_sd2:$PATH"; export PATH; GH_CALLS="$_sd2/calls"; export GH_CALLS
@@ -8527,7 +8506,7 @@ SH
     _TIMEOUT_BIN_LOADED= _TIMEOUT_BIN_CACHE= \
     _post_cross_review_status demo 7 headsha1234567 >/dev/null 2>&1 )
   [ "$(wc -l < "$_sd2/calls" | tr -d ' ')" = 1 ] \
-    || { echo "FAIL #71: a deadline expiring during the POST must stop before the verification (got $(wc -l < "$_sd2/calls") calls)"; rm -rf "$_sd2"; exit 1; }
+    || { echo "FAIL #71: a deadline expiring during the short-circuit read must stop before the POST and the verification (got $(wc -l < "$_sd2/calls") calls)"; rm -rf "$_sd2"; exit 1; }
   rm -rf "$_sd2"; unset _sd2
   # THE BACKOFF must be capped to what remains. Unbounded, attempt 2's 8s sleep starts
   # while ~1s of budget is left and overruns by seven -- the phase exceeded by WAITING

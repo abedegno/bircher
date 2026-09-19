@@ -77,6 +77,21 @@ def _maybe_stdin(value: str) -> str:
     return sys.stdin.read()
 
 
+def _round_number(db: str, run_id: str) -> int:
+    """Which review round the derivation is about to record: revisions used
+    so far, from the journal, plus one. No journal, no run, or an unreadable
+    database means round one -- the description must never block a status.
+    """
+    if not db or not run_id or not os.path.exists(db):
+        return 1
+    try:
+        from kernel.store import Store
+        from coordinator.observe import revisions_used
+        return revisions_used(Store.open(db).facts_for(run_id)) + 1
+    except Exception:                                  # noqa: BLE001
+        return 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="bircher-coordinator")
     subs = p.add_subparsers(dest="mode", required=True)
@@ -122,6 +137,11 @@ def main(argv=None) -> int:
     ef.add_argument("--key", required=True)
     ef.add_argument("--timeout", type=float, default=None)
     ef.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    dl = subs.add_parser("delta")
+    dl.add_argument("--repo", required=True)
+    dl.add_argument("--base", required=True)
+    dl.add_argument("--ref", required=True)
 
     dv = subs.add_parser("derive")
     dv.add_argument("--item", required=True)
@@ -472,6 +492,16 @@ def main(argv=None) -> int:
             return RC_EFFECT_DENIED
         return RC_OK
 
+    if a.mode == "delta":
+        from coordinator.delta import delta_digest
+        # `_gh` reads the repo from here rather than from an unexported global.
+        os.environ["BIRCHER_GH_REPO"] = a.repo
+        digest = delta_digest(a.repo, a.base, a.ref)
+        if not digest:
+            return RC_FAILED
+        print(digest, end="")
+        return RC_OK
+
     if a.mode == "derive":
         # Imported here so the rest of the CLI stays usable when the world is
         # not reachable -- `wiring` builds real gh and effect callables.
@@ -498,7 +528,10 @@ def main(argv=None) -> int:
                                   server=a.server, bundle_dir=a.bundle_dir,
                                   poll_interval=a.poll_interval,
                                   ci_wait=a.ci_wait, rerun_wait=a.rerun_wait,
-                                  revisions_left=a.revisions_left),
+                                  revisions_left=a.revisions_left,
+                                  round_number=_round_number(
+                                      os.environ.get("BIRCHER_KERNEL_DB", ""),
+                                      os.environ.get("BIRCHER_RUN_ID", ""))),
                    rerun_max=a.rerun_max)
         # Written BEFORE the tuple is printed, and ATOMICALLY: the caller reads
         # the tuple, sees `revise`, and then reads this file. Printing first

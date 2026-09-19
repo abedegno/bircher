@@ -25,8 +25,9 @@ RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
 
 def test_the_derived_line_carries_the_settled_pr():
     d = Derived("ready", "claude_code:pass", "n", "a" * 40, "green", "true", 0, "738")
-    assert d.as_line().split("|")[-1] == "738"
-    assert d.as_tuple()[-1] == "738"
+    # `pr` is field 8 of 10 -- the reviewed range rides out after it.
+    assert d.as_line().split("|")[7] == "738"
+    assert d.as_tuple()[7] == "738"
 
 
 def test_the_shell_reads_as_many_fields_as_the_line_emits():
@@ -48,6 +49,56 @@ def test_the_shell_reads_as_many_fields_as_the_line_emits():
         f"run_item reads {len(names)} fields but the derivation emits "
         f"{Derived.FIELDS}; the surplus is silently absorbed into "
         f"{names[-1]!r}")
+
+
+def test_the_recovery_reads_as_many_fields_as_the_line_emits():
+    """THE SAME CLASS, at the OTHER reader.
+
+    `recover_pr_cmd` parses the same ten-field tuple `run_item` does, and it
+    is a separate `read` with its own name list -- so widening one and not the
+    other leaves the recovery silently absorbing the surplus into its last
+    name. Asserted against `Derived.FIELDS`, as `run_item`'s is.
+    """
+    src = RUN_QUEUE.read_text()
+    m = re.search(r"IFS='\|' read -r (r_outcome[^<]*?)<<EOF", src, re.S)
+    assert m, "recover_pr_cmd's tuple read is not where this test expects it"
+    names = m.group(1).split()
+    assert len(names) == Derived.FIELDS, (
+        f"recover_pr_cmd reads {len(names)} fields but the derivation emits "
+        f"{Derived.FIELDS}; the surplus is silently absorbed into "
+        f"{names[-1]!r}")
+
+
+def test_the_recovery_records_the_range_on_its_verdict():
+    """`run_item` records what the reviewer read on the verdict fact (spec
+    §4). The recovery drives the same derivation and the same kernel command,
+    and parsed those two fields only to throw them away -- so a recovered
+    item's verdict fact recorded no range at all."""
+    src = RUN_QUEUE.read_text()
+    m = re.search(r'_kernel_record_review "\$BIRCHER_RUN_ID" "\$BIRCHER_GENERATION" "\$r_review"'
+                  r'(.*?)\n\n', src, re.S)
+    assert m, "the recovery's record_review call is not where this test expects it"
+    call = m.group(1)
+    for arg in ('"$r_sha"', '"$r_merge_base"', '"$r_delta_digest"'):
+        assert arg in call, f"the recovery's verdict does not carry {arg}"
+
+
+def test_run_item_threads_the_reviewed_range_into_the_fallback_status():
+    """The runner's status post is a FALLBACK, and it fires exactly when the
+    derivation's own post did not land. Its default description names no
+    range, so without a description threaded from the call site the fallback
+    replaces the merge head's range-naming description with legacy text."""
+    src = RUN_QUEUE.read_text()
+    m = re.search(r'\n\s*_status_desc="([^"\n]*)"', src)
+    assert m, "run_item composes no fallback status description"
+    desc = m.group(1)
+    assert "${_merge_base:0:7}" in desc and "${observed_head:0:7}" in desc, (
+        f"the fallback description names no range: {desc!r}")
+    call = re.search(r'merge_ready_pr "\$item" "\$pr" "\$reviewed_sha"([^\n]*)', src)
+    assert call, "run_item's merge_ready_pr call is not where this test expects it"
+    assert '"$_status_desc"' in call.group(1), (
+        "run_item composes a range description and does not pass it to "
+        "merge_ready_pr")
 
 
 def test_run_item_adopts_the_settled_pr_before_it_authorizes_a_merge():
@@ -95,16 +146,16 @@ def test_a_short_tuple_is_rejected_rather_than_silently_accepted():
     coordinator, or a truncated write, would silently restore the stale-PR
     behaviour this change exists to remove.
     """
-    assert _width_ok("a|b|c|d|e|f|g|h")
-    assert not _width_ok("a|b|c|d|e|f|g")
+    assert _width_ok("a|b|c|d|e|f|g|h|i|j")
     assert not _width_ok("a|b|c|d|e|f|g|h|i")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k")
     assert not _width_ok("")
 
 
 def test_an_embedded_newline_is_rejected():
     """`read` consumes only the FIRST line, so a multi-line result would be
     parsed as its first line with the rest discarded silently."""
-    assert not _width_ok("a|b|c|d|e|f|g|h\nx|y")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j\nx|y")
 
 
 def test_a_real_tuple_is_accepted():
@@ -112,8 +163,8 @@ def test_a_real_tuple_is_accepted():
     `"$(printf '\\n')"` for the newline test, which command substitution
     reduces to the EMPTY STRING, so the pattern matched everything and the
     check rejected every valid tuple."""
-    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738")
-    assert _width_ok("escalated|na|no PR||na|unknown||")
+    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738||")
+    assert _width_ok("escalated|na|no PR||na|unknown||||")
 
 
 def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
@@ -121,7 +172,10 @@ def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
     field left it able to reproduce the exact defect: review and comment a
     sibling, then authorize and merge the stale PR it was invoked with."""
     src = RUN_QUEUE.read_text()
-    assert "r_settled_pr <<EOF" in src, "recovery must parse the settled PR"
+    # The settled PR is field 8 of 10; the reviewed range (merge_base, digest)
+    # rides out after it, into the recovery's own review record.
+    assert "r_settled_pr r_merge_base r_delta_digest <<EOF" in src, (
+        "recovery must parse the settled PR and the range after it")
     i = src.index('pr="$r_settled_pr"')
     j = src.index("merge_ready_pr \"$item\" \"$pr\"", i)
     assert i < j, "recovery must adopt the settled PR before it merges"

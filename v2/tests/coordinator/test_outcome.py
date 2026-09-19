@@ -3,6 +3,8 @@
 Every dependency arrives in one injected object, so these exercise `derive`
 rather than a rearrangement of it.
 """
+import hashlib
+
 import pytest
 
 from coordinator.outcome import Deps, Derived, derive
@@ -22,14 +24,14 @@ def _deps(**over):
     return d
 
 
-def test_the_tuple_has_eight_fields_in_order():
-    """Eight since the settled PR joined it. The width is asserted against
+def test_the_tuple_has_ten_fields_in_order():
+    """Ten since the reviewed range joined it. The width is asserted against
     `Derived.FIELDS` as well as the literal, because the shell's reader is
     checked against that constant and two numbers that can disagree will."""
     r = derive("i1", "i1", "7", "", deps=_deps())
-    assert len(r.as_tuple()) == 8 == Derived.FIELDS
+    assert len(r.as_tuple()) == 10 == Derived.FIELDS
     assert r.outcome == "ready"
-    assert r.as_tuple()[5:] == ("true", 0, "7")
+    assert r.as_tuple()[5:] == ("true", 0, "7", "", "")
     assert len(r.as_line().split("|")) == Derived.FIELDS
 
 
@@ -104,7 +106,10 @@ def test_a_GENUINE_red_is_never_re_run():
 def test_the_comment_is_posted_through_the_effect_path():
     d = _deps()
     derive("i1", "i1", "7", "", deps=d)
-    assert [c for c, _k, _a in d.posted] == ["comment"]
+    # The status posts BEFORE the comment: it rides the same pinned head the
+    # verdict was captured against, and the comment documents the outcome
+    # that head's verdict fed into.
+    assert [c for c, _k, _a in d.posted] == ["status_check", "comment"]
 
 
 def test_the_comment_carries_no_bircher_status_line():
@@ -124,7 +129,8 @@ def test_an_abandoned_tracked_pr_is_dropped_and_rediscovered():
               discover_by_code=lambda code: ["9"])
     r = derive("i1", "i1", "7", "", deps=d)
     assert r.outcome == "ready"
-    assert d.posted and "9" in d.posted[0][2]
+    # The comment is the LAST post: the status precedes it.
+    assert d.posted and "9" in d.posted[-1][2]
 
 
 def test_no_pr_anywhere_is_a_timeout():
@@ -146,7 +152,7 @@ def test_exactly_one_issue_match_adopts_and_two_do_not():
 def test_a_reconciled_sibling_replaces_the_tracked_pr():
     d = _deps(reconcile=lambda code, pr: "6")
     derive("i1", "i1", "5", "", deps=d)
-    assert "6" in d.posted[0][2]
+    assert "6" in d.posted[-1][2]
 
 
 def test_a_TERMINAL_outcome_carries_no_sha():
@@ -241,8 +247,9 @@ def test_the_comment_key_is_stable_for_the_same_body():
     d2 = _deps()
     derive("i1", "i1", "7", "", deps=d2)
 
-    key1 = d1.posted[0][1]
-    key2 = d2.posted[0][1]
+    # The comment is the LAST post: the status precedes it.
+    key1 = d1.posted[-1][1]
+    key2 = d2.posted[-1][1]
     # NOTE: this equality DOES NOT BIND the defect. `hash()` is stable WITHIN
     # a process, so both derives agree even with the bug present -- confirmed
     # by mutation: restoring `abs(hash(body))` left this assertion passing and
@@ -252,7 +259,7 @@ def test_the_comment_key_is_stable_for_the_same_body():
 
     # THIS is the binding assertion: the key must equal a specific,
     # process-independent digest, which `hash()` cannot produce.
-    body = d1.posted[0][2][-1]
+    body = d1.posted[-1][2][-1]
     assert key1 == f"pr-comment:7:{hashlib.sha256(body.encode()).hexdigest()[:16]}"
 
 
@@ -365,7 +372,9 @@ def test_the_comment_is_addressed_to_the_repository_under_management():
     d = _deps(repo="owner/target")
     derive("i1", "i1", "7", "", deps=d)
 
-    argv = d.posted[0][2]
+    # The comment is the LAST post: the status precedes it, and names its
+    # repository in the URL rather than a `--repo` flag.
+    argv = d.posted[-1][2]
     assert "--repo" in argv, "the comment effect must name its repository"
     assert argv[argv.index("--repo") + 1] == "owner/target", (
         f"the comment was addressed to the wrong repository: {argv}")
@@ -384,7 +393,8 @@ def test_derive_returns_the_pr_it_settled_on_not_the_one_passed_in():
     assert r.pr == "738", (
         "derive discarded the abandoned #737 and discovered #738, but returned "
         f"{r.pr!r} to the caller that has to merge it")
-    assert r.as_line().split("|")[-1] == "738"
+    # `pr` is field 8 of 10 -- the range fields ride out after it.
+    assert r.as_line().split("|")[7] == "738"
 
 
 def test_derive_returns_a_reconciled_sibling():
@@ -398,3 +408,144 @@ def test_derive_returns_the_original_pr_when_nothing_changed():
     """The common case must round-trip, or the caller adopts a wrong value."""
     r = derive("i1", "i1", "7", "", deps=_deps())
     assert r.pr == "7"
+
+
+def _green_pass_deps(effects, verdict="PASS", out="VERDICT: PASS"):
+    return Deps(
+        checks=lambda pr: "ci|pass",
+        head_of=lambda pr: "e4ea3eb7" + "1" * 32,
+        review=lambda pr, sha: (verdict, out),
+        effect=lambda cls, key, argv: effects.append((cls, key, argv)) or "ok",
+        base_of=lambda pr: "develop",
+        merge_base=lambda base, head: "2742ae4f" + "0" * 32,
+        delta_digest=lambda base, head: "d" * 64,
+        round_number=3,
+        reviewer="codex",
+        repo="o/r",
+    )
+
+
+def test_the_line_has_ten_fields_and_carries_the_range():
+    effects = []
+    r = derive("i", "c", "7", "", deps=_green_pass_deps(effects))
+    assert r.FIELDS == 10
+    fields = r.as_line().split("|")
+    assert len(fields) == 10
+    assert fields[8] == "2742ae4f" + "0" * 32
+    assert fields[9] == "d" * 64
+
+
+def _status_key(head, state, desc):
+    """The key the derivation must compute: the head, then the CONTENT of the
+    post. Written out here rather than imported so the test states the format
+    independently of the code that produces it."""
+    return f"status:{head}:" + hashlib.sha256(f"{state}\n{desc}".encode()).hexdigest()[:16]
+
+
+def test_a_pass_posts_a_success_status_naming_the_range():
+    effects = []
+    derive("i", "c", "7", "", deps=_green_pass_deps(effects))
+    posts = [e for e in effects if e[0] == "status_check"]
+    assert len(posts) == 1
+    cls, key, argv = posts[0]
+    assert key == _status_key("e4ea3eb7" + "1" * 32, "success",
+                              "codex round 3 PASS on 2742ae4..e4ea3eb")
+    assert "repos/o/r/statuses/e4ea3eb7" + "1" * 32 in argv
+    assert "state=success" in argv
+    assert "context=bircher/cross-review" in argv
+    assert "description=codex round 3 PASS on 2742ae4..e4ea3eb" in argv
+
+
+def test_a_fail_posts_failure_with_its_blocking_count():
+    effects = []
+    out = "Blocking findings\n\n- one\n- two\n\nNon-blocking findings\n\n- None.\n\nVERDICT: FAIL\n"
+    derive("i", "c", "7", "", deps=_green_pass_deps(effects, verdict="FAIL", out=out))
+    argv = [e for e in effects if e[0] == "status_check"][0][2]
+    assert "state=failure" in argv
+    assert "description=codex round 3 FAIL (2 blocking) on 2742ae4..e4ea3eb" in argv
+
+
+def test_no_verdict_posts_error():
+    effects = []
+    derive("i", "c", "7", "", deps=_green_pass_deps(effects, verdict="NONE", out="rambling"))
+    argv = [e for e in effects if e[0] == "status_check"][0][2]
+    assert "state=error" in argv
+    assert "no verdict on 2742ae4..e4ea3eb" in " ".join(argv)
+
+
+def test_two_verdicts_on_one_head_do_not_share_an_effect_key():
+    """THE REPLAY. The round only advances on a recorded `review_verdict`
+    fact, and an `error` (no verdict) or a terminal FAIL records none -- so
+    `status:<head>:<round>` was the SAME key for a FAIL and for the PASS that
+    superseded it, and `kernel/effects.py` returns the prior external id on a
+    replayed key WITHOUT executing. The later verdict was never posted and the
+    gate kept showing the earlier one.
+    """
+    first, second = [], []
+    out = "Blocking findings\n\n- one\n\nVERDICT: FAIL\n"
+    derive("i", "c", "7", "", deps=_green_pass_deps(first, verdict="FAIL", out=out))
+    derive("i", "c", "7", "", deps=_green_pass_deps(second))          # a PASS, same head
+    fail_key = [e for e in first if e[0] == "status_check"][0][1]
+    pass_key = [e for e in second if e[0] == "status_check"][0][1]
+    assert fail_key != pass_key, (
+        "a FAIL and a later PASS on the same head share an effect key, so the "
+        "PASS replays the FAIL's journalled effect and never posts")
+    # ...and both still name the head they are about.
+    head = "e4ea3eb7" + "1" * 32
+    assert fail_key.startswith(f"status:{head}:") and pass_key.startswith(f"status:{head}:")
+
+
+def test_an_unparseable_merge_base_is_recorded_as_unknown():
+    """`gh` prints `null` for a merge-base it cannot compute, and that text was
+    taken raw into the tuple, the description and (through the runner) into
+    hand-built JSON. It gets the head's own 40-hex validation."""
+    effects = []
+    d = _green_pass_deps(effects)
+    d.merge_base = lambda base, head: "null\n"
+    r = derive("i", "c", "7", "", deps=d)
+    assert r.merge_base == ""
+    assert r.as_line().split("|")[8] == ""
+    argv = [e for e in effects if e[0] == "status_check"][0][2]
+    assert "description=codex round 3 PASS on ?..e4ea3eb" in argv
+
+
+def test_a_failed_status_post_does_not_change_the_outcome():
+    def effect(cls, key, argv):
+        if cls == "status_check":
+            raise RuntimeError("github is down")
+        return "ok"
+    d = _green_pass_deps([])
+    d.effect = effect
+    r = derive("i", "c", "7", "", deps=d)
+    assert r.outcome == "ready"
+
+
+def test_no_status_is_posted_without_a_pinned_head():
+    effects = []
+    d = _green_pass_deps(effects)
+    d.head_of = lambda pr: "not-a-sha"
+    derive("i", "c", "7", "", deps=d)
+    assert not [e for e in effects if e[0] == "status_check"]
+
+
+def test_red_ci_posts_nothing_and_carries_no_range():
+    effects = []
+    d = _green_pass_deps(effects)
+    d.checks = lambda pr: "ci|fail"
+    r = derive("i", "c", "7", "", deps=d)
+    assert not [e for e in effects if e[0] == "status_check"]
+    assert r.merge_base == "" and r.delta_digest == ""
+
+
+def test_the_round_is_revisions_used_plus_one(tmp_path):
+    from coordinator.cli import _round_number
+    from kernel.store import Store
+    db = tmp_path / "k.db"
+    Store.open(str(db))  # an empty journal
+    assert _round_number(str(db), "run-1") == 1
+
+
+def test_no_journal_means_round_one():
+    from coordinator.cli import _round_number
+    assert _round_number("", "") == 1
+    assert _round_number("/nonexistent/path.db", "run-1") == 1

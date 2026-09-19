@@ -121,9 +121,16 @@ session has settled and exits when the tuple is printed.
 | `human.py` | human interaction: the cursor, the discriminator, the batch rules, dismissals and their replies |
 | `phases.py` | the front-half loop itself: `retire_owed`, `publish_owed`, parking and resumption; a shaping round before the spec — a one-piece ruling or a slice plan (`coordinator/shape.py`); the slice plan's review and gate; `file_owed` (`coordinator/filing.py`), which files an accepted plan's children in four idempotent passes; and `sweep_sliced` (`coordinator/sweep.py`), run by each wave before it generates the queue |
 
-It returns an eight-field pipe-delimited tuple:
+It returns a ten-field pipe-delimited tuple:
 
-    outcome|review|note|sha|ci|ci_first|resubmissions|pr
+    outcome|review|note|sha|ci|ci_first|resubmissions|pr|merge_base|delta_digest
+
+The last two are what the reviewer actually read (gate integrity, spec §4):
+`merge_base` is the merge-base of the PR's base branch with the reviewed head,
+and `delta_digest` is the digest of the PR's own three-dot delta at that head.
+The runner records both on the `review_verdict` fact, so a verdict says what it
+covered rather than only that it happened; the digest is also what lets a
+re-stamp after an `update-branch` prove the reviewed content is unchanged.
 
 > **TARGET —** the coordinator is the orchestrator. No tuple, no subprocess
 > boundary, no pipe-delimited transport: the derivation's result is an object
@@ -456,9 +463,17 @@ Mode defaults are already `BIRCHER_EFFECT_MODE=kernel` and
 `BIRCHER_KERNEL_MODE=enforce`. `--source queue` drains `queue/*.md` instead.
 
 **The merge gate on muesli:** branch protection requires `review-gate`, NOT
-`bircher/cross-review`. They chain — bircher posts cross-review, a workflow
-reacts to that status event and posts review-gate ~7s later. `strict: true` is
-set, so a PR whose base has moved becomes `BEHIND` and is refused.
+`bircher/cross-review`. `bircher/cross-review` is posted by the derivation for
+every verdict on the reviewed head: `success` for PASS, `failure` for FAIL
+with the blocking count, `error` when no verdict was produced, with `<vendor>
+round <n> ... on <merge-base7>..<head7>` as the description; the merge path
+re-posts only when no success is present, and a re-stamp after a
+content-identical update-branch keeps the reviewed description. The target
+repository's `review-gate` workflow reacts to that status event and posts its
+own `review-gate` status on the head ~7s later, requiring `success` on
+`bircher/cross-review`; it reads the state only, never the description.
+`strict: true` is set, so a PR whose base has moved becomes `BEHIND` and is
+refused.
 
 ---
 
@@ -682,5 +697,5 @@ programme exists to catch.
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
 state machine, effect classes, fact vocabulary and mode switches; the derived
 outcome replacing the marker as the decision input; effect routing with its
-enumerating guards; the pre-merge gate; the eight-field boundary's fail-closed
+enumerating guards; the pre-merge gate; the ten-field boundary's fail-closed
 width check.

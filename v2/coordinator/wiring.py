@@ -11,7 +11,7 @@ import os
 import time
 
 from coordinator import ci as ci_mod
-from coordinator import discovery, review
+from coordinator import delta, discovery, review
 from coordinator.ci import GhError, _gh
 from coordinator.effects import perform_effect
 from coordinator.observe import ci_history
@@ -27,7 +27,8 @@ def _int(name: str, default: int) -> int:
 
 def live_deps(item: str, *, repo: str, reviewer: str, server: str,
               bundle_dir: str, poll_interval: int, ci_wait: int = 1500,
-              rerun_wait: int = 900, revisions_left: int = 0, log=None) -> Deps:
+              rerun_wait: int = 900, revisions_left: int = 0,
+              round_number: int = 1, log=None) -> Deps:
     """Wire `derive` to the real world.
 
     EVERYTHING IS PASSED IN. Nothing here reads `REPO`, `SERVER`, `BUNDLE_DIR`
@@ -102,11 +103,25 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
             # could not read would lose the only candidate the item has.
             return ("", "")
 
+    def base_of(pr):
+        try:
+            return _gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", ".base.ref"]).strip() or "main"
+        except GhError:
+            return "main"
+
+    def merge_base(base, head):
+        try:
+            return _gh(["api", f"repos/{repo}/compare/{base}...{head}",
+                        "--jq", ".merge_base_commit.sha"]).strip()
+        except GhError:
+            return ""
+
     def do_review(pr, sha):
         return review.dispatch(
             str(pr), repo, sha, reviewer=reviewer, bundle_dir=bundle_dir,
             server=server,
-            log_path=os.environ.get("BIRCHER_REVIEW_LOG") or f"/tmp/review-{item}.log")
+            log_path=os.environ.get("BIRCHER_REVIEW_LOG") or f"/tmp/review-{item}.log",
+            base=base_of(pr))
 
     def close_sibling(loser, winner):
         perform_effect(
@@ -150,6 +165,10 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         ignore=ignore,
         repo=repo,
         revisions_left=revisions_left,
+        base_of=base_of,
+        merge_base=merge_base,
+        delta_digest=lambda base, head: delta.delta_digest(repo, base, head),
+        round_number=round_number,
     )
 
 

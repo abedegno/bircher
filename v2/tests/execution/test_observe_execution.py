@@ -7,9 +7,10 @@ Every shell function this file exercised is now Python:
     run_item's marker -> deleted in C8 Phase 2
 
 Their replacements are `tests/coordinator/test_ci_and_review.py` (which also
-proves the review PROMPT renders byte-identically to the bash it came from) and
-`tests/coordinator/test_outcome.py`, which drives `derive` through eighteen
-cases -- more than this file ever had, and without a shell-extraction rig.
+covers the review PROMPT, which is the coordinator's own -- there is no bash
+copy to compare it against) and `tests/coordinator/test_outcome.py`, which
+drives `derive` through eighteen cases -- more than this file ever had, and
+without a shell-extraction rig.
 
 Kept as a stub rather than deleted so the retirement is visible in the tree
 rather than only in a commit message.

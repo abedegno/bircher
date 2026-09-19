@@ -74,16 +74,13 @@ def extract_verdict(text: str, hash8: str | None = None) -> str | None:
     return None
 
 
-#: The review prompt, ported VERBATIM from `_recovery_review_prompt`.
-#:
-#: Prose, not logic -- but prose carrying its own scars (muesli #705's CI gate
-#: that reported success while tests failed; #666's microphone left recording;
-#: #66's moving `pull/N/head` ref). A paraphrase would drop one silently, so
-#: `test_the_rendered_prompt_is_byte_identical_to_the_bash` renders both and
-#: compares.
+#: The only copy: the bash `_recovery_review_prompt` it was ported from is
+#: gone (gate integrity, spec §4), so nothing keeps two prompts in step
+#: because there is one.
 _PROMPT = r"""Review PR #{pr} in {repo} as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-{pr}-{nonce}-oob ] || mv /tmp/review-{pr}-{nonce}-oob /tmp/review-{pr}-{nonce}-oob.stale.$$; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
+First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git fetch origin {base}:refs/remotes/origin/{base}; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-{pr}-{nonce}-oob ] || mv /tmp/review-{pr}-{nonce}-oob /tmp/review-{pr}-{nonce}-oob.stale.$$; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
 You are reviewing EXACTLY commit {co}. If that checkout fails, STOP and report it -- do not review a different commit.
+The change under review is the WHOLE pull request as it stands at that commit: every file in `git diff origin/{base}...{co}` (from the PR's merge-base with {base} up to the pinned head), NOT only the head commit's own diff. A head commit that touches one file does not narrow the review to one file.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.
 Run the gates you can, EACH as ONE command prefixed with 'export PATH=/root/bin:$PATH &&' (e.g. 'export PATH=/root/bin:$PATH && go build ./...', '... && go vet ./...', client '... && npm run typecheck' / '... && npx vitest run', plugin '... && pytest'); DB-backed 'go test' needs a DB the runner lacks, so for THOSE you must not simply accept a green check.
 A green check is a CLAIM, not evidence: for any gate you could not run yourself, open the run log (`gh pr checks {pr}` to find the run, then `gh run view <run-id> --log`) and RECONCILE it with the check's conclusion -- a step can execute, report failing tests, and STILL be reported green if its exit code was swallowed (`|| true`, continue-on-error, a wrapper that always exits 0). Quote the log line showing test counts or the failure, and NAME every gate you delegated rather than ran. If you cannot reach the log, say so and treat that gate as UNVERIFIED -- do not report it as passing. (muesli #705 shipped a CI gate that reported success while tests failed; it passed review because the reviewer was told to trust the check.)
@@ -93,7 +90,7 @@ Use BLOCKED, and ONLY BLOCKED, when you could not review at all -- the checkout 
 Put findings BEFORE the verdict so the verdict is the last line even if output is long."""
 
 
-def review_prompt(pr: str, repo: str, sha: str = "", nonce: str = "") -> str:
+def review_prompt(pr: str, repo: str, sha: str = "", nonce: str = "", base: str = "main") -> str:
     """The prompt handed to the reviewer.
 
     #66: the worktree is created at the EXACT captured commit, not FETCH_HEAD.
@@ -126,11 +123,11 @@ def review_prompt(pr: str, repo: str, sha: str = "", nonce: str = "") -> str:
     # `fatal: '/tmp/review-745' already exists`. Nothing cleans these up
     # either -- the runner still holds worktrees from smoke PRs #11-#16.
     return _PROMPT.format(pr=pr, repo=repo, co=(sha or "FETCH_HEAD"),
-                          nonce=(nonce or (sha or "head")[:8]))
+                          nonce=(nonce or (sha or "head")[:8]), base=(base or "main"))
 
 
 def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
-             server: str, log_path: str, run=None) -> tuple[str | None, str]:
+             server: str, log_path: str, run=None, base: str = "main") -> tuple[str | None, str]:
     """Dispatch a reviewer and read its verdict. Returns (verdict, output).
 
     `verdict` is `PASS`, `FAIL`, or None. **None is not a soft PASS.** A
@@ -167,7 +164,7 @@ def dispatch(pr: str, repo: str, sha: str, *, reviewer: str, bundle_dir: str,
     # so the fallback degrades to "slightly less informative", not "collides".
     gen = os.environ.get("BIRCHER_GENERATION", "").strip()
     nonce = f"{(sha or 'head')[:8]}-g{gen}" if gen.isdigit() else ""
-    prompt = review_prompt(pr, repo, sha, nonce=nonce)
+    prompt = review_prompt(pr, repo, sha, nonce=nonce, base=base)
     r = runner(["omnigent", "run", f"agents/{reviewer}", "--server", server,
                 "-p", prompt], bundle_dir)
     out = r.stdout or ""

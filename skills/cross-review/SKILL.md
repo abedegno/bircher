@@ -33,8 +33,13 @@ anyone needs to read through.
    the raw vendor name. The reviewer reads the REAL code (not a diff excerpt):
    its `input` instructs it to
    `export PATH=/root/bin:$PATH`, then
-   `git fetch origin pull/<PR>/head && git worktree add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD`,
-   `cd /tmp/review-<PR>-<short-sha>`, read the changed files AND their surrounding context,
+   `git fetch origin pull/<PR>/head && git fetch origin <base>:refs/remotes/origin/<base>
+&& git worktree add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD`,
+   `cd /tmp/review-<PR>-<short-sha>`, review the WHOLE pull request as it stands
+   at that commit — every file in `git diff origin/<base>...FETCH_HEAD`, where
+   `<base>` is the PR's base branch, NOT only the head commit's own diff (a head
+   commit that touches one file does not narrow the review to one file) —
+   read the changed files AND their surrounding context,
    run the gates it can — prefixing EACH gate command with
    `export PATH=/root/bin:$PATH &&` in the same shell call, since the reviewer's
    shell may not persist env between calls (`export PATH=/root/bin:$PATH && go
@@ -58,8 +63,13 @@ build ./...`, `... && go vet ./...`, client `... && npm run typecheck` / `...
    `sys_session_send(agent="claude_code"|"codex", title="review-<task_slug>",
 args={purpose: "review", input: "Review PR #<PR> against this contract:
 <contract>. First: export PATH=/root/bin:$PATH; git fetch origin
-pull/<PR>/head; git worktree add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD; cd
-/tmp/review-<PR>-<short-sha>. READ the changed files and enough surrounding code to
+pull/<PR>/head; git fetch origin <base>:refs/remotes/origin/<base>; git worktree
+add --detach /tmp/review-<PR>-<short-sha> FETCH_HEAD; cd
+/tmp/review-<PR>-<short-sha>. The change under review is the WHOLE pull request
+as it stands at that commit: every file in `git diff origin/<base>...FETCH_HEAD`
+(from the PR's merge-base with <base> up to the checked-out head), NOT only the
+head commit's own diff. A head commit that touches one file does not narrow the
+review to one file. READ the changed files and enough surrounding code to
 verify each contract point — do NOT judge from the diff alone. Run the gates
 you can, each as ONE command prefixed with `export PATH=/root/bin:$PATH &&`
 (e.g. `export PATH=/root/bin:$PATH && go build ./...`) since your shell may not
