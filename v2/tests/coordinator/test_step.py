@@ -1,5 +1,7 @@
 """The one next action for a run with a pull request."""
 
+import pytest
+
 from kernel.artifacts import put_artifact
 from kernel.authz import NotAuthorized
 from kernel.commands import Command, submit, HUMAN_GENERATION, execute_as_human
@@ -8,8 +10,9 @@ from kernel.events import EventKind
 from kernel.ids import Clock
 from kernel.store import Store
 from tests.kernel.front import Front
-from kernel import back
+from kernel import back, front
 
+from coordinator.cli import main
 from coordinator.step import Ground, Step, next_step
 
 BASE, HEAD, BUNDLE = "c" * 40, "d" * 40, "e" * 64
@@ -171,3 +174,84 @@ def test_a_merged_or_cancelled_run_is_done():
 def test_a_closed_pr_is_done_too():
     s, _ = _to_implementing(_store())
     assert next_step(s, "r", g(pr_state="closed")).kind == "done"
+
+
+def _file_store(tmp_path):
+    db = str(tmp_path / "k.db")
+    s = Store.open(db, clock=Clock(start_us=1))
+    Front(s, "r", base_sha=BASE)
+    return s, db
+
+
+def test_the_step_cli_prints_the_step_line(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["step", "--db", db, "--run-id", "r", "--pr-state", "open", "--head", HEAD,
+                 "--ci", "red", "--failing-jobs", "server (go),client (node)"]) == 0
+    assert capsys.readouterr().out == "repair|ci_red|client (node),server (go)||no"
+
+
+def test_the_step_cli_reads_the_verdict_and_fingerprints_from_the_journal(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _, spec = _to_implementing(s)
+    _sub(s, "record_review", "v1", verdict="request_revision", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD, fingerprints=["ab" * 20])
+    assert main(["step", "--db", db, "--run-id", "r", "--pr-state", "open", "--head", HEAD, "--ci", "green"]) == 0
+    assert capsys.readouterr().out == f"repair|review_fail|{'ab' * 20}||no"
+
+
+def test_the_step_cli_says_redispatch_for_a_repair_already_requested(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    _repair(s, "r1", evidence=["server (go)"])
+    assert main(["step", "--db", db, "--run-id", "r", "--pr-state", "open", "--head", HEAD,
+                 "--ci", "red", "--failing-jobs", "server (go)"]) == 0
+    assert capsys.readouterr().out == "repair|ci_red|server (go)||yes"
+
+
+def test_the_step_cli_refuses_a_run_the_kernel_does_not_hold(tmp_path):
+    _, db = _file_store(tmp_path)
+    with pytest.raises(Exception):
+        main(["step", "--db", db, "--run-id", "nope", "--pr-state", "open", "--head", HEAD, "--ci", "green"])
+
+
+def test_back_state_prints_the_newest_observation_and_the_artifact(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _, spec = _to_implementing(s)
+    _ci(s, "c1", "failure", jobs=["x"])
+    assert main(["back-state", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == f"42|open|{HEAD}|{spec}"
+
+
+def test_back_state_before_any_observation_is_blank_but_for_the_artifact(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _, spec = _to_implementing(s)
+    assert main(["back-state", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == f"|||{spec}"
+
+
+def test_session_last_item_prints_the_last_id(monkeypatch, capsys):
+    monkeypatch.setattr("coordinator.session.list_items",
+                        lambda server, sid, **kw: [{"id": "a", "role": "user", "text": "x"},
+                                                   {"id": "b", "role": "assistant", "text": "y"}])
+    assert main(["session-last-item", "--server", "http://x", "--id", "s1"]) == 0
+    assert capsys.readouterr().out == "b"
+
+
+def test_the_no_progress_notice_names_the_cause_and_the_two_words(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    for k in ("r1", "r2"):
+        _repair(s, k, evidence=["server (go)"])
+        _sub(s, "start_implementation", "k" + k, actor="claude")
+    _park(s, "p1", cause="ci_red", evidence=["server (go)"])
+    assert main(["park-notice", "--db", db, "--run-id", "r"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("bircher: parked no_progress")
+    assert "ci_red" in out and "server (go)" in out and "`retry`" in out and "`stop`" in out
+
+
+def test_park_notice_without_a_park_is_rc_1(tmp_path):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["park-notice", "--db", db, "--run-id", "r"]) == 1

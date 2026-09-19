@@ -231,6 +231,18 @@ PARK_NEEDS = {
     "disagreement": ("The shaper and the spec author disagree on whether this is one piece "
                      "of work. Reply with the single word `approve` to accept one piece, or "
                      "say how to slice it. This is your decision, not a reviewer's."),
+    # The closed loop (spec §3): three repair rounds in a row hit the same
+    # wall. Two words, because a correction has no seat to go to in the back
+    # half -- the next round is briefed from the journal, not from a reply.
+    "no_progress": ("Reply with the single word `retry` in the session below for another "
+                    "repair round, or `stop` to close the run without merging."),
+}
+
+#: The same reasons read differently once a pull request exists: there is
+#: no author to correct, only a round to grant or a run to stop.
+_BACK_HALF_NEEDS = {
+    "no_verdict": ("The reviewer produced no verdict. Reply with the single word `retry` in "
+                   "the session below to review again, or `stop` to close the run without merging."),
 }
 
 
@@ -265,9 +277,20 @@ def park_notice_body(ctx: Ctx, park) -> str:
                 f"**{park.payload.get('phase')}** phase.\n\n{PARK_NEEDS['disagreement']}\n\n"
                 f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the "
                 "moment you send it, so nothing appears to happen until one runs.")
+    phase = park.payload.get("phase") or "implementation"
+    if reason == "no_progress":
+        ev = ", ".join(park.payload.get("evidence") or []) or "no evidence recorded"
+        return (f"bircher: parked no_progress\n\n"
+                f"Three repair rounds in a row ended the same way ({park.payload.get('cause')}: {ev}). "
+                f"This run is waiting for you at the **{phase}** phase.\n\n{PARK_NEEDS['no_progress']}\n\n"
+                f"{where}\n\nRun `{ctx.run_id}`. Your reply is read by the next wave, not the moment "
+                "you send it, so nothing appears to happen until one runs.")
+    needs = PARK_NEEDS.get(reason, 'Open the session below and reply.')
+    if phase == "implementation":
+        needs = _BACK_HALF_NEEDS.get(reason, needs)
     return (f"bircher: parked {reason}\n\n"
-            f"This run is waiting for you at the **{park.payload.get('phase')}** phase.\n\n"
-            f"{PARK_NEEDS.get(reason, 'Open the session below and reply.')}\n\n"
+            f"This run is waiting for you at the **{phase}** phase.\n\n"
+            f"{needs}\n\n"
             f"{where}\n\n"
             f"Run `{ctx.run_id}`. Your reply is read by the next wave, not the moment "
             "you send it, so nothing appears to happen until one runs.")

@@ -278,6 +278,22 @@ def main(argv=None) -> int:
         if name == "direct":
             sp.add_argument("--text", required=True)
 
+    # The closed loop (spec §2): the runner's window onto the journal. Every
+    # mode is read-only; the runner performs what `step` names and records
+    # the resulting fact itself.
+    st = subs.add_parser("step")
+    st.add_argument("--db", required=True); st.add_argument("--run-id", required=True)
+    st.add_argument("--pr-state", default="", dest="pr_state")
+    st.add_argument("--head", default="")
+    st.add_argument("--ci", default="na")
+    st.add_argument("--failing-jobs", default="", dest="failing_jobs")
+    bs = subs.add_parser("back-state")
+    bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
+    sl = subs.add_parser("session-last-item")
+    sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
+    pn = subs.add_parser("park-notice")
+    pn.add_argument("--db", required=True); pn.add_argument("--run-id", required=True)
+
     a = p.parse_args(argv)
 
     if a.mode == "phases":
@@ -404,6 +420,64 @@ def main(argv=None) -> int:
         if park is None:
             return RC_FAILED
         print(json.dumps(dict(park.payload, seq=park.seq, id=park.id)))
+        return RC_OK
+
+    if a.mode == "step":
+        from kernel import back
+        from kernel.store import Store
+
+        from coordinator.step import Ground, next_step
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)  # raises for a run the kernel does not hold
+        verdict, fps = None, ()
+        fact = back.verdict_for_head(store, a.run_id, a.head) if a.head else None
+        if fact is not None:
+            verdict = "PASS" if fact.payload.get("verdict") == "accept" else "FAIL"
+            fps = tuple(fact.payload.get("fingerprints") or ())
+        jobs = tuple(j for j in a.failing_jobs.split(",") if j)
+        s = next_step(store, a.run_id, Ground(pr_state=a.pr_state, head=a.head, ci=a.ci,
+                                              failing_jobs=jobs, verdict=verdict, fingerprints=fps))
+        print(f"{s.kind}|{s.cause}|{','.join(s.evidence)}|{s.reason}|{'yes' if s.redispatch else 'no'}", end="")
+        return RC_OK
+
+    if a.mode == "back-state":
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        ci = back.latest_ci(store, a.run_id) or {}
+        print(f"{ci.get('pr') or ''}|{ci.get('pr_state') or ''}|{ci.get('head_git_sha') or ''}|"
+              f"{store.current_artifact(a.run_id) or ''}", end="")
+        return RC_OK
+
+    if a.mode == "session-last-item":
+        from coordinator import session as _session
+        try:
+            listing = _session.list_items(a.server, a.id)
+        except _session.LookupFailed as exc:
+            print(f"session-last-item: {exc}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        print(listing[-1]["id"] if listing else "", end="")
+        return RC_OK
+
+    if a.mode == "park-notice":
+        from types import SimpleNamespace
+
+        from kernel import front
+        from kernel.store import Store
+
+        from coordinator.phases import park_notice_body
+        store = Store.open(a.db)
+        park = front.current_park(store, a.run_id)
+        if park is None:
+            return RC_FAILED
+        print(park_notice_body(SimpleNamespace(run_id=a.run_id), park), end="")
         return RC_OK
 
     if a.mode in ("approve", "grant-round", "revise", "direct"):
