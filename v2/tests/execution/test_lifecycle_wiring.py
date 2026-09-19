@@ -514,6 +514,11 @@ _EFFECT_SITE_CONTEXT = {
     # above session creation in the first place.
     "_create_session": "REACHED",
     "_stop_session": "REACHED",
+    # Added by the closed loop's Task 7 as unused code; Task 9 wires it into
+    # `_step_loop`'s park branches, which run inside `run_item` exactly as
+    # `_issue_writeback` and `_ensure_issue_closed` do -- BIRCHER_RUN_ID and
+    # BIRCHER_GENERATION are already established by dynamic scope.
+    "_park_back_half": "REACHED",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about

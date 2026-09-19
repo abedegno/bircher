@@ -973,3 +973,45 @@ _kernel_record_outcome() {  # <run_id> <generation> <outcome>
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_merge_outcome --payload-json "{\"outcome\":\"$outcome\"}"
 }
+
+# _kernel_request_repair <run_id> <generation> <cause> <head_git_sha> [evidence_csv]
+#
+# The one door back to `planned` in the back half (closed-loop spec §1).
+# *evidence_csv* is failing job names or finding fingerprints, comma-joined;
+# quotes and backslashes are stripped because the value is spliced into JSON.
+_kernel_request_repair() {  # <run_id> <generation> <cause> <head> [evidence_csv]
+  local run_id="$1" generation="$2" cause="$3" head="$4" ev="${5:-}"
+  ev=$(printf '%s' "$ev" | tr -d '"\\')
+  local arr="[]"; [ -n "$ev" ] && arr="[\"${ev//,/\",\"}\"]"
+  # request_repair
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name request_repair --payload-json "{\"cause\":\"$cause\",\"head_sha\":\"$head\",\"evidence\":$arr}"
+}
+
+# _kernel_park_back <run_id> <generation> <reason> [session_id] [cursor_item_id] [cause] [evidence_csv]
+#
+# A back-half park (closed-loop spec §3). The carrier session and its cursor
+# are what `park-reply` reads; cause and evidence are what `no_progress` is
+# checked against by the kernel.
+_kernel_park_back() {  # <run_id> <generation> <reason> [session_id] [cursor] [cause] [evidence_csv]
+  local run_id="$1" generation="$2" reason="$3" sid="${4:-}" cur="${5:-}" cause="${6:-}" ev="${7:-}"
+  ev=$(printf '%s' "$ev" | tr -d '"\\')
+  local arr="[]"; [ -n "$ev" ] && arr="[\"${ev//,/\",\"}\"]"
+  local jsid=null jcur=null jcause=null
+  [ -n "$sid" ] && jsid="\"$sid\""
+  [ -n "$cur" ] && jcur="\"$cur\""
+  [ -n "$cause" ] && jcause="\"$cause\""
+  # park
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name park --payload-json "{\"reason\":\"$reason\",\"session_id\":$jsid,\"cursor_item_id\":$jcur,\"findings_hash\":null,\"verdict\":null,\"reviewer\":null,\"cause\":$jcause,\"evidence\":$arr}"
+}
+
+# _kernel_back_state <run_id> -> `pr|pr_state|head|artifact` from the journal
+# (coordinator.cli back-state), or empty when the kernel would not answer.
+_kernel_back_state() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli back-state \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}

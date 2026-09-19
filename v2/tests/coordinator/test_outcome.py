@@ -156,23 +156,19 @@ def test_a_reconciled_sibling_replaces_the_tracked_pr():
     assert "6" in d.posted[-1][2]
 
 
-def test_a_TERMINAL_outcome_carries_no_sha():
-    """It is the merge-authorising evidence, so a failed or escalated
-    derivation must not carry one.
-
-    RENAMED from `..._only_on_a_ready_outcome`, which stopped being true when
-    the repair loop landed: `revise` carries the head too, because the runner
-    needs it to record the CI observation and bind the review that carries
-    `request_revision`. The old name asserted a property this test never
-    checked -- it only ever drove the FAIL path -- so it stayed green while its
-    name became false. See `test_a_revise_carries_the_reviewed_head`.
-    """
-    d = _deps(review=lambda pr, sha: ("FAIL", ""))
-    r = derive("i1", "i1", "7", "", deps=d)
-    assert r.outcome == "failed" and r.sha == ""
-    esc = derive("i1", "i1", "7", "",
-                 deps=_deps(review=lambda pr, sha: (None, "")))
-    assert esc.outcome == "escalated" and esc.sha == ""
+def test_the_head_rides_out_on_every_outcome_with_a_pr():
+    """The closed loop (spec §1) repairs a red head and records CI against it,
+    so the head is evidence on every outcome, not only the merge-authorising
+    one. The merge gate is `outcome == ready`, not the presence of a sha."""
+    head = "a" * 40
+    failed = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: ("FAIL", "")))
+    assert failed.outcome == "failed" and failed.sha == head
+    esc = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: (None, "")))
+    assert esc.outcome == "escalated" and esc.sha == head
+    red = derive("i1", "i1", "7", "", deps=_deps(checks=lambda pr: "build|fail"))
+    assert red.ci == "red" and red.sha == head
+    none = derive("i1", "i1", "", "", deps=_deps(pr_state=lambda pr: ("", "")))
+    assert none.pr == "" and none.sha == ""
 
 
 def test_a_reviewer_with_no_verdict_escalates():

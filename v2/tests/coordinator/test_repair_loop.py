@@ -113,9 +113,9 @@ def test_the_findings_never_enter_the_pipe_delimited_line():
     assert "blocking" not in d.as_line()
 
 
-def test_the_findings_ride_out_only_on_a_revise():
-    """On any other outcome the runner has nothing to route them to, and a
-    scorecard note is not a place for a multi-paragraph review."""
+def test_the_findings_ride_out_on_every_fail():
+    """The repair round is briefed from them, whether or not this particular
+    FAIL still has a round left to spend."""
     from coordinator.outcome import Deps, derive
 
     def _d(**over):
@@ -132,8 +132,7 @@ def test_the_findings_ride_out_only_on_a_revise():
 
     terminal = derive("i1", "i1", "7", "", deps=_d(revisions_left=0))
     assert terminal.outcome == "failed"
-    assert terminal.findings == "", (
-        "findings must not ride out when there is no round to spend them on")
+    assert "blocking: the thing" in terminal.findings
 
     passing = derive("i1", "i1", "7", "",
                      deps=_d(review=lambda pr, sha: ("PASS", "looks fine"),
@@ -316,13 +315,15 @@ def test_a_revise_carries_the_reviewed_head():
         "a revise with no head skips the runner's entire kernel lifecycle block")
 
 
-def test_a_terminal_failure_still_carries_NO_head():
-    """The original rule is unchanged: a failed or escalated derivation must
-    never carry merge-authorising evidence. `revise` is neither."""
+def test_a_terminal_failure_still_carries_the_head_but_it_authorises_nothing():
+    """RENAMED (closed-loop spec §1): the head is no longer withheld on a
+    terminal outcome -- a red head is what a `ci_red` repair names and what
+    the CI observation is recorded against. It still authorises no merge: the
+    runner's merge gate is `outcome == ready`, not the presence of a sha."""
     from coordinator.outcome import derive
     r = derive("i1", "i1", "7", "", deps=_deps("FAIL", revisions_left=0))
     assert r.outcome == "failed"
-    assert r.sha == ""
+    assert r.sha == "a" * 40
 
 
 def test_the_head_a_revise_carries_is_the_one_the_reviewer_READ():
