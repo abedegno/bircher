@@ -128,3 +128,25 @@ def test_a_ci_observation_carries_the_prs_state_jobs_and_number():
         _ci(s, "ci2", "failure", pr_state="draft")
     with pytest.raises(NotAuthorized):
         _ci(s, "ci3", "failure", pr="forty-two")
+
+
+def test_fingerprints_must_be_a_list_of_strings_or_absent():
+    s, spec = _to_implementing(_store())
+    with pytest.raises(NotAuthorized):
+        _sub(s, "record_review", "v2", verdict="request_revision", artifact_hash=spec,
+             base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1,
+             head_sha=HEAD, fingerprints="not a list")
+    with pytest.raises(NotAuthorized):
+        _sub(s, "record_review", "v3", verdict="request_revision", artifact_hash=spec,
+             base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1,
+             head_sha=HEAD, fingerprints=[1, 2])
+
+
+def test_failing_jobs_must_be_a_list_not_a_bare_string():
+    """A bare string is iterable, so a shape check that only asked "is this
+    iterable" would accept it and later split it into one job per
+    character."""
+    s, _ = _to_implementing(_store())
+    with pytest.raises(NotAuthorized):
+        _sub(s, "record_ci_observation", "ci4", actor="claude", status="failure",
+             head_git_sha=HEAD, failing_jobs="server (go)")

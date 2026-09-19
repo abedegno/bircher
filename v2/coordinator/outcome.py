@@ -238,13 +238,27 @@ def _post_status(item, pr, head, verdict, reviewer_out, merge_base, d: Deps) -> 
 
 def _failing_names(checks: str, ignore: str) -> list[str]:
     """The failing blocking checks' names from gh's `name|bucket` rows, with
-    the ignore pattern applied as `keep_blocking` applies it."""
+    the ignore pattern applied as `keep_blocking` applies it.
+
+    Each name has its own commas replaced with a space and its whitespace
+    collapsed. A GitHub matrix name carries a comma of its own (`build
+    (ubuntu-latest, node 18)`), and `as_line` joins this field's names with a
+    comma too -- so a name with a raw comma in it would read back as two
+    names. The name is never an identifier the loop looks up again: it is
+    evidence for a set comparison (`test_red_ci_names_its_failing_jobs_
+    sorted_and_ignoring_the_ignored`) and for a repair brief's text, and a
+    lossy-but-unambiguous name serves both exactly as well as the original --
+    so normalising it here keeps the comma-joined transport a single shape
+    rather than adding a second escaping convention just for names that
+    happen to contain a comma.
+    """
     from coordinator.ci import drop_ignored
     out = set()
     for line in drop_ignored(checks or "", ignore).splitlines():
         parts = line.split("|")
         if len(parts) >= 2 and parts[1].strip() in ("fail", "cancel"):
-            out.add(parts[0].strip())
+            name = " ".join(parts[0].replace(",", " ").split())
+            out.add(name)
     return sorted(out)
 
 

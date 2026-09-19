@@ -54,7 +54,7 @@ def test_the_shell_reads_as_many_fields_as_the_line_emits():
 def test_the_recovery_reads_as_many_fields_as_the_line_emits():
     """THE SAME CLASS, at the OTHER reader.
 
-    `recover_pr_cmd` parses the same ten-field tuple `run_item` does, and it
+    `recover_pr_cmd` parses the same thirteen-field tuple `run_item` does, and it
     is a separate `read` with its own name list -- so widening one and not the
     other leaves the recovery silently absorbing the surplus into its last
     name. Asserted against `Derived.FIELDS`, as `run_item`'s is.

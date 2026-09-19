@@ -473,6 +473,16 @@ def test_green_ci_names_no_failing_jobs():
     assert derive("i1", "i1", "7", "", deps=_deps()).failing_jobs == ""
 
 
+def test_a_comma_in_a_job_name_does_not_split_into_two_entries():
+    """GitHub matrix names carry a comma of their own
+    (`build (ubuntu-latest, node 18)`), and the tuple's transport joins
+    failing_jobs with a comma too -- so a raw comma in the name would read
+    back as two jobs. Fixed at the source: the comma becomes a space."""
+    d = _deps(checks=lambda pr: "build (ubuntu-latest, node 18)|fail\nlint|pass")
+    r = derive("i1", "i1", "7", "", deps=d)
+    assert r.failing_jobs == "build (ubuntu-latest node 18)"
+
+
 def _status_key(head, state, desc):
     """The key the derivation must compute: the head, then the CONTENT of the
     post. Written out here rather than imported so the test states the format

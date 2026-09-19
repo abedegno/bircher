@@ -265,7 +265,8 @@ def test_a_finding_without_a_path_fingerprints_its_sentence_alone():
 def test_fingerprints_ignore_line_numbers_whitespace_and_path_case():
     a = "Blocking findings\n\n- In   Foo/Bar.py:12 the lock is   dropped.\n"
     b = "Blocking findings\n\n- In foo/bar.py:99 the lock is dropped.\n"
-    assert fingerprints(a) == fingerprints(b)
+    got = fingerprints(a)
+    assert got and got == fingerprints(b)
 
 
 def test_fingerprints_count_agrees_with_blocking_count():
