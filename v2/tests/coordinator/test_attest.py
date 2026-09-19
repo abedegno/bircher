@@ -109,6 +109,79 @@ CODEX_BOLD = """**Blocking findings**
 **VERDICT: FAIL**
 """
 
+# --- the shapes a live reviewer writes that the first cut counted wrong -----
+# Every fixture below was MEASURED against the previous regexes and came back
+# with the wrong number; the count beside each one in the parametrize list is
+# what the text plainly says.
+
+#: A Markdown heading. `#` ahead of the phrase was not allowed, so this
+#: counted 0 -- a two-finding FAIL posted as `FAIL (0 blocking)`.
+CODEX_HASH_HEADING = """## Blocking findings
+
+- The relay never releases its socket on an early return.
+- The cap is racy under concurrent creates.
+"""
+
+#: Heading markers AND bold together, as GPT-5 writes them. Counted 0.
+CODEX_HASH_BOLD_HEADING = """### **Blocking findings**
+
+- The lease is renewed after it has already expired.
+"""
+
+#: A closing heading that itself carries `#` markers. The closer was anchored
+#: with the same lead as the opener but required a SHORT trailer, so `##
+#: Non-blocking findings` did not close and its bullets were counted as
+#: blocking -- 1 became 4.
+CODEX_HASH_CLOSERS = """## Blocking findings
+
+- The only real one.
+
+## Non-blocking findings
+
+- A naming nit.
+- Another nit.
+
+## Suggestions
+
+- Consider a helper.
+"""
+
+#: A closing heading with a prose trailer. `Non-blocking findings -- none
+#: worth naming` did not close either, so the bullet after it was blocking.
+CODEX_PROSE_TRAILER_CLOSER = """Blocking findings
+
+- The only real one.
+
+Non-blocking findings -- none worth naming
+
+- A nit that is not blocking.
+"""
+
+#: The section's own count. `(2)` was captured as the rest of the heading
+#: line and counted as a third finding.
+CODEX_PARENTHETICAL_COUNT = """Blocking findings (2)
+
+- The first.
+- The second.
+"""
+
+#: The phrase continuing as PROSE. With no boundary after it this opened a
+#: section and counted the sentence itself, so a clean PASS reported
+#: `FAIL (1 blocking)` when the verdict went the other way.
+CODEX_PHRASE_CONTINUES = """Blocking findings were all resolved.
+"""
+
+#: A bullet that happens to contain a closing heading's word after a colon.
+#: The closer must be anchored at the START of the line, or this finding
+#: closes the section it belongs to and the one below it is lost.
+CODEX_HEADING_WORD_IN_BULLET = """Blocking findings
+
+- The lease is never released: Verification of the lease is missing too.
+- A second, real finding.
+
+Non-blocking findings: None.
+"""
+
 
 @pytest.mark.parametrize("text, expected", [
     (CODEX_FAIL, 2),
@@ -119,6 +192,13 @@ CODEX_BOLD = """**Blocking findings**
     (CODEX_PHRASE_IN_PROSE, 2),
     (CODEX_NESTED, 2),
     (CODEX_BOLD, 2),
+    (CODEX_HASH_HEADING, 2),
+    (CODEX_HASH_BOLD_HEADING, 1),
+    (CODEX_HASH_CLOSERS, 1),
+    (CODEX_PROSE_TRAILER_CLOSER, 1),
+    (CODEX_PARENTHETICAL_COUNT, 2),
+    (CODEX_PHRASE_CONTINUES, 0),
+    (CODEX_HEADING_WORD_IN_BULLET, 2),
     ("", 0),
     ("no headings at all\nVERDICT: PASS", 0),
 ])

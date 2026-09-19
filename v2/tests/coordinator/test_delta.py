@@ -78,8 +78,11 @@ def test_every_unprovable_case_yields_no_digest(compare, tree):
 
 
 def test_a_failed_lookup_is_unprovable_not_a_crash():
+    """FileNotFoundError, not RuntimeError: the failure the name describes is
+    a runner with no `gh` on PATH, and that is an OSError. Raising a
+    RuntimeError proved only that the tuple already listed RuntimeError."""
     def gh(args):
-        raise RuntimeError("boom")
+        raise FileNotFoundError(2, "No such file or directory: 'gh'")
     assert delta_digest("o/r", "main", "b1", gh=gh) == ""
 
 

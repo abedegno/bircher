@@ -195,13 +195,26 @@ def _post_status(item, pr, head, verdict, reviewer_out, merge_base, d: Deps) -> 
     blocking = attest.blocking_count(reviewer_out) if verdict == "FAIL" else 0
     state = attest.state_for(verdict)
     desc = attest.describe(d.reviewer, d.round_number, verdict, blocking, merge_base, head)
-    key = f"status:{head}:{d.round_number}"
+    # CONTENT-ADDRESSED, exactly as the PR comment's key below is, and for the
+    # same reason. `status:<head>:<round>` did not change when the VERDICT
+    # changed: the round only advances on a recorded `review_verdict` fact, and
+    # an `error` (no verdict) or a terminal FAIL records none -- so a later
+    # derivation of the SAME head posting a different state replayed the same
+    # key, `kernel/effects.py` returned the prior external id WITHOUT executing,
+    # and the new state was never posted. A gate left showing a superseded
+    # verdict is the exact failure this section exists to make impossible.
+    stamp = hashlib.sha256(f"{state}\n{desc}".encode()).hexdigest()[:16]
+    key = f"status:{head}:{stamp}"
     try:
         d.effect("status_check", key,
                  ["gh", "api", f"repos/{d.repo}/statuses/{head}", "-X", "POST",
                   "-f", f"state={state}", "-f", f"context={attest.CONTEXT}",
                   "-f", f"description={desc}"])
-        d.log(f"{item}: posted {attest.CONTEXT}={state} on {head[:7]} ({desc})")
+        # "recorded", not "posted": `d.effect` is idempotent, so a replayed key
+        # returns the prior external id without a network call. Claiming a post
+        # happened on that path is a log line that cannot be read as evidence.
+        d.log(f"{item}: recorded status effect {attest.CONTEXT}={state} "
+              f"on {head[:7]} ({desc})")
     except Exception as exc:                       # noqa: BLE001
         d.log(f"{item}: failed to post {attest.CONTEXT}={state} on PR #{pr} "
               f"({type(exc).__name__}: {exc}) -> continuing; the outcome is "
@@ -244,7 +257,17 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                 # reviewer was told to check out (spec §4): the merge-base with
                 # the PR's base and the digest of the PR's own delta.
                 base = d.base_of(pr) or "main"
-                merge_base = (d.merge_base(base, reviewed_sha) or "").strip()
+                # VALIDATED LIKE THE HEAD IS. `merge_base` is whatever the
+                # lookup printed -- `null`, an error line, anything -- and it
+                # is spliced into the pipe-delimited tuple, into the status
+                # description and, through the runner, into hand-built JSON.
+                # Anything that is not a 40-hex sha is "unknown" (`""`), which
+                # the description already renders as `?`.
+                raw_base = (d.merge_base(base, reviewed_sha) or "").strip()
+                merge_base = raw_base if _FULL_SHA.match(raw_base) else ""
+                if raw_base and not merge_base:
+                    d.log(f"{item}: merge-base for PR #{pr} is not a 40-hex sha "
+                          f"({raw_base!r}) -> recording it as unknown")
                 digest = d.delta_digest(base, reviewed_sha) or ""
                 _post_status(item, pr, reviewed_sha, verdict, reviewer_out,
                              merge_base, d)

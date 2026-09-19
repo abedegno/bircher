@@ -453,6 +453,11 @@ from coordinator.review import dispatch, review_prompt
 def test_the_prompt_names_the_range_against_the_prs_base():
     p = review_prompt("7", "o/r", "abc123", base="develop")
     assert "git diff origin/develop...abc123" in p
+    # ...and the range is FETCHABLE. The setup fetched only the pull head, so
+    # on a non-default base `origin/develop` need not exist in the reviewer's
+    # clone and the diff the sentence names fails outright. The `<src>:<dst>`
+    # form is the one that updates the remote-tracking ref.
+    assert "git fetch origin develop:refs/remotes/origin/develop" in p
     assert "NOT only the head commit's own diff" in p
     # The pinned checkout is unchanged by naming the range.
     assert "You are reviewing EXACTLY commit abc123." in p

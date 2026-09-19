@@ -78,7 +78,7 @@ def extract_verdict(text: str, hash8: str | None = None) -> str | None:
 #: gone (gate integrity, spec §4), so nothing keeps two prompts in step
 #: because there is one.
 _PROMPT = r"""Review PR #{pr} in {repo} as an INDEPENDENT, READ-ONLY reviewer. Do NOT edit, commit, or open/update any PR.
-First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-{pr}-{nonce}-oob ] || mv /tmp/review-{pr}-{nonce}-oob /tmp/review-{pr}-{nonce}-oob.stale.$$; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
+First: export PATH=/root/bin:$PATH; git fetch origin pull/{pr}/head; git fetch origin {base}:refs/remotes/origin/{base}; git worktree remove --force /tmp/review-{pr}-{nonce}-oob 2>/dev/null; git worktree prune; [ ! -e /tmp/review-{pr}-{nonce}-oob ] || mv /tmp/review-{pr}-{nonce}-oob /tmp/review-{pr}-{nonce}-oob.stale.$$; git worktree add --detach /tmp/review-{pr}-{nonce}-oob {co}; cd /tmp/review-{pr}-{nonce}-oob.
 You are reviewing EXACTLY commit {co}. If that checkout fails, STOP and report it -- do not review a different commit.
 The change under review is the WHOLE pull request as it stands at that commit: every file in `git diff origin/{base}...{co}` (from the PR's merge-base with {base} up to the pinned head), NOT only the head commit's own diff. A head commit that touches one file does not narrow the review to one file.
 READ the changed files AND enough surrounding code to verify correctness -- do NOT judge from the diff alone.

@@ -75,7 +75,11 @@ def delta_digest(repo: str, base: str, ref: str, gh=_gh) -> str:
     try:
         compare = json.loads(gh(["api", f"repos/{repo}/compare/{base}...{ref}"]) or "null")
         tree = json.loads(gh(["api", f"repos/{repo}/git/trees/{ref}?recursive=1"]) or "null")
-    except (GhError, ValueError, TypeError, RuntimeError):
+    # OSError too: `_gh` execs a binary, and a runner with no `gh` on PATH
+    # raises FileNotFoundError, not GhError. An unprovable delta is the
+    # answer here in every case -- a traceback out of this function aborts
+    # a derivation that is otherwise complete and correct.
+    except (GhError, ValueError, TypeError, RuntimeError, OSError):
         return ""
     text = canonical_delta(compare, tree)
     if text is None:

@@ -3,6 +3,8 @@
 Every dependency arrives in one injected object, so these exercise `derive`
 rather than a rearrangement of it.
 """
+import hashlib
+
 import pytest
 
 from coordinator.outcome import Deps, Derived, derive
@@ -433,13 +435,21 @@ def test_the_line_has_ten_fields_and_carries_the_range():
     assert fields[9] == "d" * 64
 
 
+def _status_key(head, state, desc):
+    """The key the derivation must compute: the head, then the CONTENT of the
+    post. Written out here rather than imported so the test states the format
+    independently of the code that produces it."""
+    return f"status:{head}:" + hashlib.sha256(f"{state}\n{desc}".encode()).hexdigest()[:16]
+
+
 def test_a_pass_posts_a_success_status_naming_the_range():
     effects = []
     derive("i", "c", "7", "", deps=_green_pass_deps(effects))
     posts = [e for e in effects if e[0] == "status_check"]
     assert len(posts) == 1
     cls, key, argv = posts[0]
-    assert key == "status:" + "e4ea3eb7" + "1" * 32 + ":3"
+    assert key == _status_key("e4ea3eb7" + "1" * 32, "success",
+                              "codex round 3 PASS on 2742ae4..e4ea3eb")
     assert "repos/o/r/statuses/e4ea3eb7" + "1" * 32 in argv
     assert "state=success" in argv
     assert "context=bircher/cross-review" in argv
@@ -461,6 +471,42 @@ def test_no_verdict_posts_error():
     argv = [e for e in effects if e[0] == "status_check"][0][2]
     assert "state=error" in argv
     assert "no verdict on 2742ae4..e4ea3eb" in " ".join(argv)
+
+
+def test_two_verdicts_on_one_head_do_not_share_an_effect_key():
+    """THE REPLAY. The round only advances on a recorded `review_verdict`
+    fact, and an `error` (no verdict) or a terminal FAIL records none -- so
+    `status:<head>:<round>` was the SAME key for a FAIL and for the PASS that
+    superseded it, and `kernel/effects.py` returns the prior external id on a
+    replayed key WITHOUT executing. The later verdict was never posted and the
+    gate kept showing the earlier one.
+    """
+    first, second = [], []
+    out = "Blocking findings\n\n- one\n\nVERDICT: FAIL\n"
+    derive("i", "c", "7", "", deps=_green_pass_deps(first, verdict="FAIL", out=out))
+    derive("i", "c", "7", "", deps=_green_pass_deps(second))          # a PASS, same head
+    fail_key = [e for e in first if e[0] == "status_check"][0][1]
+    pass_key = [e for e in second if e[0] == "status_check"][0][1]
+    assert fail_key != pass_key, (
+        "a FAIL and a later PASS on the same head share an effect key, so the "
+        "PASS replays the FAIL's journalled effect and never posts")
+    # ...and both still name the head they are about.
+    head = "e4ea3eb7" + "1" * 32
+    assert fail_key.startswith(f"status:{head}:") and pass_key.startswith(f"status:{head}:")
+
+
+def test_an_unparseable_merge_base_is_recorded_as_unknown():
+    """`gh` prints `null` for a merge-base it cannot compute, and that text was
+    taken raw into the tuple, the description and (through the runner) into
+    hand-built JSON. It gets the head's own 40-hex validation."""
+    effects = []
+    d = _green_pass_deps(effects)
+    d.merge_base = lambda base, head: "null\n"
+    r = derive("i", "c", "7", "", deps=d)
+    assert r.merge_base == ""
+    assert r.as_line().split("|")[8] == ""
+    argv = [e for e in effects if e[0] == "status_check"][0][2]
+    assert "description=codex round 3 PASS on ?..e4ea3eb" in argv
 
 
 def test_a_failed_status_post_does_not_change_the_outcome():

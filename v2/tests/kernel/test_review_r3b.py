@@ -237,6 +237,28 @@ def test_the_verdict_records_what_it_reviewed(store_and_run):
     assert fact.schema_version == 2
 
 
+def test_the_round_advances_once_a_revision_is_recorded(tmp_path):
+    """`_round_number` is what the status description calls the round, and
+    nothing proved it ever returned more than 1 -- a function stubbed to
+    `return 1` passed every test it had. One recorded back-half
+    `request_revision` makes the next derivation round two.
+
+    An ON-DISK store, because `_round_number` takes a database PATH and
+    re-opens it: the `:memory:` store the rest of this module uses has none.
+    """
+    from coordinator.cli import _round_number
+
+    db = str(tmp_path / "kernel.db")
+    s = Store.open(db, clock=Clock(start_us=1))
+    Front(s, "r", base_sha=BASE)
+    s, spec = _to_implementing(s)
+    assert _round_number(db, "r") == 1, "no revision recorded yet"
+    _sub(s, "record_review", "rv", verdict="request_revision",
+         artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
+         actor="codex", policy_version=1)
+    assert _round_number(db, "r") == 2
+
+
 def test_a_verdict_without_a_range_records_none_not_garbage(store_and_run):
     store, run_id = store_and_run
     submit(store, command("record_review", run_id, _accept_payload(store, run_id)))
