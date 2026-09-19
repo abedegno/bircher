@@ -123,6 +123,11 @@ def main(argv=None) -> int:
     ef.add_argument("--timeout", type=float, default=None)
     ef.add_argument("cmd", nargs=argparse.REMAINDER)
 
+    dl = subs.add_parser("delta")
+    dl.add_argument("--repo", required=True)
+    dl.add_argument("--base", required=True)
+    dl.add_argument("--ref", required=True)
+
     dv = subs.add_parser("derive")
     dv.add_argument("--item", required=True)
     dv.add_argument("--code", default="")
@@ -470,6 +475,16 @@ def main(argv=None) -> int:
         except NotDispatched as exc:
             print(f"effect not dispatched: {exc}", file=sys.stderr)
             return RC_EFFECT_DENIED
+        return RC_OK
+
+    if a.mode == "delta":
+        from coordinator.delta import delta_digest
+        # `_gh` reads the repo from here rather than from an unexported global.
+        os.environ["BIRCHER_GH_REPO"] = a.repo
+        digest = delta_digest(a.repo, a.base, a.ref)
+        if not digest:
+            return RC_FAILED
+        print(digest, end="")
         return RC_OK
 
     if a.mode == "derive":

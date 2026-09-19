@@ -1234,67 +1234,6 @@ _sha256() {
   fi | cut -d' ' -f1
 }
 
-# _pr_delta_digest <base_ref> <head_ref> -> a stable digest of the PR's OWN delta,
-# or rc 1 when that delta cannot be established.
-#
-# GitHub's compare is three-dot, so `base...head` is the change the PR contributes
-# and never the base branch's own commits. That property is what makes the digest
-# comparable across an update-branch: that operation MERGES the base into the head
-# (it does not rebase), so the new head CONTAINS the new base, the merge-base IS
-# the new base, and the compare still yields only the PR's work.
-#
-# rc 1 is NOT "assume equal" - the caller turns it into an escalation. The
-# unprovable cases are real: GitHub caps the changed-file list at 300, omits `patch`
-# for binaries, pure renames and anything over its size limit, and truncates a large
-# tree. Digesting a partial answer would produce a confident wrong one, which here
-# means merging code no reviewer read.
-_pr_delta_digest() {
-  local base="$1" ref="$2" cmp tree count
-  cmp=$(gh api "repos/$REPO/compare/${base}...${ref}" 2>/dev/null) || return 1
-  [ -n "$cmp" ] || return 1
-  count=$(printf '%s' "$cmp" | jq -r '.files | length' 2>/dev/null) || return 1
-  case "$count" in ''|*[!0-9]*) return 1 ;; esac
-  # 0 files = nothing to compare (degenerate, and it would make two unrelated empty
-  # answers look equal); >= 300 = GitHub's documented cap for the changed-file list,
-  # so at exactly 300 it may be truncated.
-  { [ "$count" -ge 1 ] && [ "$count" -lt 300 ]; } || return 1
-  # A file whose patch GitHub withheld leaves a hole in the comparison.
-  printf '%s' "$cmp" | jq -e 'any(.files[]; has("patch") | not)' >/dev/null 2>&1 && return 1
-  # The compare payload carries NO mode and NO type - verified against the API, where
-  # files[] is filename/status/sha/patch plus counts and URLs. That gap is load-bearing
-  # here: git stores a symlink's TARGET as its blob content, so a symlink pointing at
-  # "x" and a regular file containing "x" share a blob sha AND project to an identical
-  # patch. Digesting the compare alone would let a base that changed a path's TYPE
-  # merge as though the PR's delta were untouched. The tree carries mode and type; a
-  # TRUNCATED tree cannot answer for every path, so it fails closed like the rest.
-  tree=$(gh api "repos/$REPO/git/trees/${ref}?recursive=1" 2>/dev/null) || return 1
-  [ -n "$tree" ] || return 1
-  # Require an explicit false. `== true` would PROCEED on an absent or null
-  # `truncated`, i.e. treat an answer we did not get as a reassuring one.
-  printf '%s' "$tree" | jq -e '.truncated == false' >/dev/null 2>&1 || return 1
-  # Note this escalates whenever the base touched a file the PR also touches: the
-  # resulting blob sha (and often the patch context) moves. That is CORRECT rather
-  # than merely cautious - the merged file then combines both changes, and the
-  # reviewer never saw that combination. The feature is for the common case where
-  # the base moved elsewhere in the tree.
-  # Canonical form: sorted by filename, sorted keys, and EVERY field that identifies
-  # the change - path, rename origin, status, resulting blob, patch, and the tree
-  # entry's mode|type. `--slurpfile` rather than `--argjson` keeps a large compare
-  # payload off the command line, where a big PR would hit ARG_MAX.
-  printf '%s' "$tree" \
-    | jq -cS --slurpfile c <(printf '%s' "$cmp") '
-        (.tree | map({key: .path, value: (.mode + "|" + .type)}) | from_entries) as $m
-        | [ $c[0].files
-            | sort_by(.filename)[]
-            | { filename,
-                previous_filename: (.previous_filename // null),
-                status,
-                sha,
-                patch,
-                entry: ($m[.filename] // "ABSENT") } ]' 2>/dev/null \
-    | _sha256
-}
-
 # _restamp_if_delta_unchanged <item> <pr> <reviewed_sha>
 #   -> rc 0 and RESTAMPED_HEAD=<new head> when the updated head provably carries the
 #      SAME change the reviewer passed; rc 1 (caller escalates) otherwise.
@@ -1329,8 +1268,14 @@ _restamp_if_delta_unchanged() {
     [ "${BIRCHER_STATUS_BACKOFF:-1}" = 0 ] || sleep $((attempt * 2))
   done
   [ -n "$new" ] || { echo "[batch:sweep] $item: PR #$pr head never moved after update-branch -> escalate" >&2; return 1; }
-  old_digest=$(_pr_delta_digest "$base" "$reviewed") || old_digest=""
-  new_digest=$(_pr_delta_digest "$base" "$new")      || new_digest=""
+  old_digest=$( PYTHONPATH="$(_kernel_pythonpath)" \
+                _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+                "${BIRCHER_PY:-python3}" -m coordinator.cli delta \
+                  --repo "$REPO" --base "$base" --ref "$reviewed" 2>/dev/null) || old_digest=""
+  new_digest=$( PYTHONPATH="$(_kernel_pythonpath)" \
+                _net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+                "${BIRCHER_PY:-python3}" -m coordinator.cli delta \
+                  --repo "$REPO" --base "$base" --ref "$new" 2>/dev/null) || new_digest=""
   if [ -z "$old_digest" ] || [ -z "$new_digest" ]; then
     echo "[batch:sweep] $item: PR #$pr delta not provable (compare failed/truncated/patch withheld) -> escalate" >&2
     return 1
