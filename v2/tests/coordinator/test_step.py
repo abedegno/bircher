@@ -130,13 +130,15 @@ def test_the_769_sequence_repairs_five_times_and_merges():
     # Six verdicts on six heads: FAIL x5 with different findings, then PASS.
     s, spec = _to_implementing(_store())
     heads = [f"{i + 1:02d}" * 20 for i in range(6)]
+    # Until Task 9 freezes _BACK_HALF_DESTINATIONS a request_revision lands at planned, so each round needs a start_implementation before its request_repair; next_step reads facts by kind, so the extra transition changes no answer.
     for i, h in enumerate(heads[:5]):
         _sub(s, "record_review", f"v{i}", verdict="request_revision", artifact_hash=spec, base_sha=BASE,
              context_bundle_hash=BUNDLE, policy_version=1, head_sha=h, fingerprints=[f"{i:02x}" * 20])
         st = next_step(s, "r", g(head=h, verdict="FAIL", fingerprints=(f"{i:02x}" * 20,)))
         assert st.kind == "repair", (i, st)
+        _sub(s, "start_implementation", f"si{i}a", actor="claude")
         _sub(s, f"request_repair", f"rr{i}", actor="claude", cause="review_fail", head_sha=h, evidence=list(st.evidence))
-        _sub(s, "start_implementation", f"si{i}", actor="claude")
+        _sub(s, "start_implementation", f"si{i}b", actor="claude")
     _sub(s, "record_review", "v5", verdict="accept", artifact_hash=spec, base_sha=BASE,
          context_bundle_hash=BUNDLE, policy_version=1, head_sha=heads[5])
     assert next_step(s, "r", g(head=heads[5], verdict="PASS")).kind == "merge"
@@ -145,12 +147,14 @@ def test_the_769_sequence_repairs_five_times_and_merges():
 def test_three_identical_fails_park_for_no_progress():
     s, spec = _to_implementing(_store())
     fp = "ab" * 20
+    # Until Task 9 freezes _BACK_HALF_DESTINATIONS a request_revision lands at planned, so each round needs a start_implementation before its request_repair; next_step reads facts by kind, so the extra transition changes no answer.
     for i in range(2):
         h = f"{i + 1:02d}" * 20
         _sub(s, "record_review", f"v{i}", verdict="request_revision", artifact_hash=spec, base_sha=BASE,
              context_bundle_hash=BUNDLE, policy_version=1, head_sha=h, fingerprints=[fp])
+        _sub(s, "start_implementation", f"si{i}a", actor="claude")
         _sub(s, "request_repair", f"rr{i}", actor="claude", cause="review_fail", head_sha=h, evidence=[fp])
-        _sub(s, "start_implementation", f"si{i}", actor="claude")
+        _sub(s, "start_implementation", f"si{i}b", actor="claude")
     h = "9" * 40
     _sub(s, "record_review", "v2", verdict="request_revision", artifact_hash=spec, base_sha=BASE,
          context_bundle_hash=BUNDLE, policy_version=1, head_sha=h, fingerprints=[fp])
