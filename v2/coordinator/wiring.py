@@ -102,11 +102,18 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
             # could not read would lose the only candidate the item has.
             return ("", "")
 
+    def base_of(pr):
+        try:
+            return _gh(["api", f"repos/{repo}/pulls/{pr}", "--jq", ".base.ref"]).strip() or "main"
+        except GhError:
+            return "main"
+
     def do_review(pr, sha):
         return review.dispatch(
             str(pr), repo, sha, reviewer=reviewer, bundle_dir=bundle_dir,
             server=server,
-            log_path=os.environ.get("BIRCHER_REVIEW_LOG") or f"/tmp/review-{item}.log")
+            log_path=os.environ.get("BIRCHER_REVIEW_LOG") or f"/tmp/review-{item}.log",
+            base=base_of(pr))
 
     def close_sibling(loser, winner):
         perform_effect(

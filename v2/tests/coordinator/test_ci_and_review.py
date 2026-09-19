@@ -15,9 +15,6 @@ from coordinator.ci import (GhError, classify_failure, drop_ignored,
                             keep_blocking, normalize)
 from coordinator.review import extract_verdict
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
-
 
 #: The bash these replaced, CAPTURED AS IT SHIPPED.
 #:
@@ -453,20 +450,28 @@ def test_a_pr_with_no_workflow_runs_is_genuine():
 from coordinator.review import dispatch, review_prompt
 
 
-def test_the_rendered_prompt_is_byte_identical_to_the_bash():
-    """Prose carrying scars (#705, #666, #66). A paraphrase would drop one
-    silently, so both are rendered and compared rather than eyeballed."""
-    src = RUN_QUEUE.read_text().splitlines()
-    i = next(k for k, l in enumerate(src)
-             if l.startswith("_recovery_review_prompt() {"))
-    end = next(k for k in range(i + 1, len(src)) if src[k] == "}")
-    fn = "\n".join(src[i:end + 1])
-    script = (f'set -uo pipefail\nREPO="$REPO_IN"\n{fn}\n'
-              '_recovery_review_prompt "$PR_IN" "$SHA_IN"')
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                       env={"PATH": "/usr/bin:/bin", "REPO_IN": "o/r",
-                            "PR_IN": "7", "SHA_IN": "abc123"})
-    assert r.stdout.rstrip("\n") == review_prompt("7", "o/r", "abc123").rstrip("\n")
+def test_the_prompt_names_the_range_against_the_prs_base():
+    p = review_prompt("7", "o/r", "abc123", base="develop")
+    assert "git diff origin/develop...abc123" in p
+    assert "NOT only the head commit's own diff" in p
+    # The pinned checkout is unchanged by naming the range.
+    assert "You are reviewing EXACTLY commit abc123." in p
+
+
+def test_the_base_defaults_to_main():
+    assert "git diff origin/main...abc123" in review_prompt("7", "o/r", "abc123")
+
+
+def test_the_range_reaches_the_runner(tmp_path):
+    seen = {}
+
+    def run(argv, cwd):
+        seen["argv"] = argv
+        return _R(0, "VERDICT: PASS")
+
+    dispatch("7", "o/r", "dead", reviewer="claude_code", bundle_dir="/b",
+             server="http://s", log_path=str(tmp_path / "l"), run=run, base="release")
+    assert any("origin/release...dead" in a for a in seen["argv"]), "the base must reach the prompt"
 
 
 def test_an_absent_sha_falls_back_to_FETCH_HEAD():
