@@ -105,6 +105,16 @@ def test_request_repair_is_accepted_from_reviewing_and_returns_to_planned():
     assert s.run_state("r") == "planned"
 
 
+@pytest.mark.parametrize("verdict", ["accept", "request_revision", "reject"])
+def test_no_back_half_verdict_transitions_the_run(verdict):
+    s, spec = _to_implementing(_store())
+    _sub(s, "record_review", "v1", verdict=verdict, artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    assert s.run_state("r") == "reviewing"
+    with pytest.raises(NotAuthorized):
+        _sub(s, "start_implementation", "k9", actor="claude")
+
+
 def _ci(s, key, status, head=HEAD, pr_state="open", jobs=None, pr="42"):
     return _sub(s, "record_ci_observation", key, actor="claude", status=status,
                 head_git_sha=head, pr_state=pr_state, failing_jobs=list(jobs or []), pr=pr)

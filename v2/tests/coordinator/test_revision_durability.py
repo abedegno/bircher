@@ -143,6 +143,10 @@ def test_the_allowance_is_spent_and_reaches_zero(db, capsys):
         _sub(s, "record_review", f"rev-{i}", "codex", Role.REVIEWER,
              verdict="request_revision", artifact_hash=art, base_sha=BASE,
              context_bundle_hash=BUNDLE, policy_version=1)
+        # request_repair -- not the verdict -- reopens `planned` (closed-loop
+        # spec §1).
+        _sub(s, "request_repair", f"rr-{i}", "claude", Role.IMPLEMENTER,
+             cause="review_fail", head_sha=HEAD, evidence=["codex review"])
         _sub(s, "start_implementation", f"si-{i}", "claude", Role.IMPLEMENTER)
         _sub(s, "record_implementation_output", f"io-{i}", "claude",
              Role.IMPLEMENTER, artifact_hash=art)
@@ -206,6 +210,10 @@ def _round(s, n, *, artifact, head, verdict):
 
 
 def _reimplement(s, n, *, artifact, head):
+    # request_repair -- not the verdict -- reopens `planned` (closed-loop
+    # spec §1): a repair round always crosses it on the way back in.
+    _sub(s, "request_repair", f"rr-{n}", "claude", Role.IMPLEMENTER,
+         cause="review_fail", head_sha=head, evidence=["codex review"])
     _sub(s, "start_implementation", f"si-{n}", "claude", Role.IMPLEMENTER)
     _sub(s, "record_implementation_output", f"io-{n}", "claude",
          Role.IMPLEMENTER, artifact_hash=artifact)

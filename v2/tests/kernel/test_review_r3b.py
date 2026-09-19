@@ -111,16 +111,22 @@ def test_a_review_over_an_unrecorded_artifact_is_refused():
              actor="codex", policy_version=1)
 
 
-# --- 4. a revision request must allow revised implementation -----------------
+# --- 4. a revision request must be repaired before reimplementation ----------
 
-def test_request_revision_allows_reimplementation():
-    """Every record_review transitioned to `reviewing`, and
-    start_implementation is legal only from `planned` -- so asking for a
-    revision left nowhere to do it."""
+def test_request_repair_after_a_revision_allows_reimplementation():
+    """A verdict is evidence, not a transition (closed-loop spec §1): every
+    record_review leaves the run in `reviewing`, where start_implementation
+    is illegal; request_repair, not request_revision, is the door back to
+    `planned`."""
     s, spec = _to_implementing(_store())
     _sub(s, "record_review", "rv", verdict="request_revision",
          artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
          actor="codex", policy_version=1)
+    assert s.run_state("r") == "reviewing"
+    with pytest.raises(NotAuthorized):
+        _sub(s, "start_implementation", "impl1", actor="claude")
+    _sub(s, "request_repair", "rr1", actor="claude", cause="review_fail",
+         head_sha=HEAD, evidence=["codex review"])
     assert _sub(s, "start_implementation", "impl2",
                 actor="claude").accepted
 

@@ -68,10 +68,14 @@ def _review(s, key, verdict, artifact, reviewer="codex", head=HEAD):
 
 def test_a_second_implementer_cannot_review_its_own_revision():
     """_implementer_of returned the FIRST start_implementation fact, so the
-    revision loop added last round let a later implementer approve itself."""
+    revision loop added last round let a later implementer approve itself.
+    request_repair, not the verdict, is the door back to `planned` (closed-
+    loop spec §1)."""
     s = _store()
     spec = _to_reviewing(s, implementer="claude")
     _review(s, "rv1", "request_revision", spec)
+    _sub(s, "request_repair", "rr1", actor="claude", cause="review_fail",
+         head_sha=HEAD, evidence=["codex review"])
     _sub(s, "start_implementation", "a4", actor="codex")
     with pytest.raises(NotAuthorized, match="independen"):
         _review(s, "rv2", "accept", spec, reviewer="codex")

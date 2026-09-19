@@ -155,8 +155,11 @@ def test_a_revision_invalidates_an_acceptance_of_the_previous_output():
          status="success", head_git_sha=HEAD)
     _review(s, "rv", v1)                       # accepted, run is `reviewing`
 
-    # A revision lands: the implementer records new output.
+    # A revision lands: request_repair -- not the verdict itself -- reopens
+    # `planned` (closed-loop spec §1), and the implementer records new output.
     _review(s, "rv2", v1, verdict="request_revision")
+    _sub(s, "request_repair", "rr1", "claude", Role.IMPLEMENTER,
+         cause="review_fail", head_sha=HEAD, evidence=["codex review"])
     _sub(s, "start_implementation", "si2", "claude", Role.IMPLEMENTER)
     v2 = put_artifact(s, b"diff v2")
     _sub(s, "record_implementation_output", "o2", "claude", Role.IMPLEMENTER,

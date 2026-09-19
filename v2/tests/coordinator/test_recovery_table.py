@@ -112,6 +112,10 @@ def test_a_revision_with_an_implementer_already_up_settles_it(reviewing):
     _sub(s, "record_review", "rv", "codex", Role.REVIEWER,
          verdict="request_revision", artifact_hash=art, base_sha=BASE,
          context_bundle_hash=BUNDLE, policy_version=1)
+    # request_repair -- not the verdict -- reopens `planned` (closed-loop
+    # spec §1).
+    _sub(s, "request_repair", "rr", "claude", Role.IMPLEMENTER,
+         cause="review_fail", head_sha=HEAD, evidence=["codex review"])
     _sub(s, "start_implementation", "si", "claude", Role.IMPLEMENTER)
     assert _do(s).do == "settle_implementer"
 

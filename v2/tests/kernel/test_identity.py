@@ -196,14 +196,17 @@ def test_the_verdict_fact_names_the_dispatched_reviewer():
 
 
 def test_the_revision_loop_tracks_the_current_implementer():
-    """request_revision -> planned -> start_implementation puts a NEW
-    implementer in place. Independence must follow it, or the new implementer
-    reviews its own work."""
+    """request_revision -> reviewing; request_repair -> planned (closed-loop
+    spec §1); start_implementation puts a NEW implementer in place.
+    Independence must follow it, or the new implementer reviews its own
+    work."""
     s = _store()
     spec = _to_implementing(s, implementer="claude")
     _sub(s, "record_review", "rv", "codex", Role.REVIEWER,
          verdict="request_revision", artifact_hash=spec, base_sha=BASE,
          context_bundle_hash=BUNDLE, policy_version=1)
+    _sub(s, "request_repair", "rr1", "claude", Role.IMPLEMENTER,
+         cause="review_fail", head_sha=HEAD, evidence=["codex review"])
     _sub(s, "start_implementation", "si2", "gpt", Role.IMPLEMENTER)
     with pytest.raises(NotAuthorized, match="independence"):
         _sub(s, "record_review", "rv2", "gpt", Role.REVIEWER, verdict="accept",

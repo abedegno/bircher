@@ -245,9 +245,10 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
 #: run is no longer a property of the word alone -- see `_review_destination`.
 _VERDICT_WORDS = frozenset({"accept", "request_revision", "reject"})
 
-#: Back-half destinations, unchanged from v1.
+# The closed loop (spec §1): a verdict is evidence, not a transition. The one
+# door back to planned is request_repair.
 _BACK_HALF_DESTINATIONS: dict[str, str] = {
-    "accept": "reviewing", "request_revision": "planned", "reject": "reviewing",
+    "accept": "reviewing", "request_revision": "reviewing", "reject": "reviewing",
 }
 
 
