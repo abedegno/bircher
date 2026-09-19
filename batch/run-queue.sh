@@ -2496,18 +2496,25 @@ EOF
       "recovered: outcome=$r_outcome review=$r_review head=$r_sha note=$r_note")
     _rp_ctx=$(_kernel_put_artifact "recover-pr context: repo=$REPO pr=$pr code=$code")
     _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${r_ci:-na}" "$r_sha" "$r_pr_state" "$r_failing_jobs" "$pr"
-    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-    export BIRCHER_GENERATION
-    # THE RANGE RIDES OUT HERE TOO. `observe_outcome` is the same derivation
-    # `run_item` drives, so its trailing fields are the merge-base and the
-    # delta digest of what the reviewer read (spec §4), and the fingerprints
-    # of what it found (closed-loop spec §3) -- and a recovery's verdict fact
-    # was the one place they were parsed and dropped. Arguments 7-8 are the
-    # optional key and terminal flag, empty here exactly as they are on every
-    # non-revise path.
-    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
-      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx" "" "" \
-      "$r_sha" "$r_merge_base" "$r_delta_digest" "$r_fingerprints"
+    # A VERDICT IS RECORDED ONLY WHEN THERE IS ONE: the head now rides out on
+    # every colour (closed-loop spec §1), including a red or pending PR, where
+    # `r_review` is `na`/`<reviewer>:na` -- not a verdict the kernel accepts.
+    case "$r_review" in
+      *:pass|*:fail)
+        BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+        export BIRCHER_GENERATION
+        # THE RANGE RIDES OUT HERE TOO. `observe_outcome` is the same derivation
+        # `run_item` drives, so its trailing fields are the merge-base and the
+        # delta digest of what the reviewer read (spec §4), and the fingerprints
+        # of what it found (closed-loop spec §3) -- and a recovery's verdict fact
+        # was the one place they were parsed and dropped. Arguments 7-8 are the
+        # optional key and terminal flag, empty here exactly as they are on every
+        # non-revise path.
+        _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
+          "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx" "" "" \
+          "$r_sha" "$r_merge_base" "$r_delta_digest" "$r_fingerprints"
+        ;;
+    esac
     _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$r_sha" \
       "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
   fi
