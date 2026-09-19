@@ -108,7 +108,7 @@ def test_the_findings_never_enter_the_pipe_delimited_line():
     from coordinator.outcome import Derived
     d = Derived("revise", "cx:fail", "n", "a" * 40, "green", "true", 0, "7",
                 findings="blocking:\n- one | two\n- three")
-    assert len(d.as_line().split("|")) == Derived.FIELDS == 10
+    assert len(d.as_line().split("|")) == Derived.FIELDS == 13
     assert "\n" not in d.as_line()
     assert "blocking" not in d.as_line()
 

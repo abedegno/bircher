@@ -109,25 +109,40 @@ class Derived:
     #: the verdict fact (spec §4).
     merge_base: str = ""
     delta_digest: str = ""
+    #: The blocking findings' fingerprints (closed-loop spec §3), comma-joined
+    #: hex, on a FAIL; empty otherwise. The runner records them on the verdict
+    #: fact so the no-progress judgement can compare rounds.
+    fingerprints: str = ""
+    #: The PR's state as this derivation saw it -- open, closed or merged, or
+    #: "" when there was no PR to ask about. For the PR the derivation settled
+    #: on, or for the caller's own PR when the settle discarded it: a PR a
+    #: person closed still has to reach the journal, or the run cannot end
+    #: (spec §1).
+    pr_state: str = ""
+    #: The failing blocking checks' names, comma-joined and sorted, on a red;
+    #: empty otherwise. A `ci_red` repair's evidence (spec §3).
+    failing_jobs: str = ""
 
     def as_tuple(self):
         return (self.outcome, self.review, self.note, self.sha, self.ci,
                 self.ci_first, self.resubmissions, self.pr, self.merge_base,
-                self.delta_digest)
+                self.delta_digest, self.fingerprints, self.pr_state,
+                self.failing_jobs)
 
     #: Field count, so a consumer can assert it rather than assume it. The
     #: absorption hazard below is silent, and silence is what made the missing
     #: `pr` field survive a live run that looked like it worked.
-    FIELDS = 10
+    FIELDS = 13
 
     def as_line(self) -> str:
-        """The TEN-field form the shell parses. A caller reading fewer
+        """The THIRTEEN-field form the shell parses. A caller reading fewer
         absorbs the last into its neighbour, silently -- `read -r a b c` puts
         every remaining field into `c`, so a short reader does not error, it
         corrupts one value."""
         r = "" if self.resubmissions is None else self.resubmissions
         return (f"{self.outcome}|{self.review}|{self.note}|{self.sha}|"
-                f"{self.ci}|{self.ci_first}|{r}|{self.pr}|{self.merge_base}|{self.delta_digest}")
+                f"{self.ci}|{self.ci_first}|{r}|{self.pr}|{self.merge_base}|{self.delta_digest}|"
+                f"{self.fingerprints}|{self.pr_state}|{self.failing_jobs}")
 
 
 def _settle_pr(item, code, pr, issue, d: Deps) -> str:
@@ -221,10 +236,33 @@ def _post_status(item, pr, head, verdict, reviewer_out, merge_base, d: Deps) -> 
               f"derived from the repository and is unaffected")
 
 
+def _failing_names(checks: str, ignore: str) -> list[str]:
+    """The failing blocking checks' names from gh's `name|bucket` rows, with
+    the ignore pattern applied as `keep_blocking` applies it."""
+    from coordinator.ci import drop_ignored
+    out = set()
+    for line in drop_ignored(checks or "", ignore).splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[1].strip() in ("fail", "cancel"):
+            out.add(parts[0].strip())
+    return sorted(out)
+
+
+def _pr_state_word(d: Deps, pr: str) -> str:
+    """open | closed | merged | "" for *pr*."""
+    if not pr:
+        return ""
+    state, merged_at = d.pr_state(pr)
+    if merged_at and merged_at != "null":
+        return "merged"
+    return {"OPEN": "open", "CLOSED": "closed", "MERGED": "merged"}.get((state or "").upper(), "")
+
+
 def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
            rerun_max: int = 4) -> Derived:
-    """The whole derivation. Returns the ten fields."""
+    """The whole derivation. Returns the thirteen fields."""
     d = deps
+    known = pr
     pr = _settle_pr(item, code, pr, issue, d)
 
     ci_first, resubmissions = "unknown", None
@@ -235,8 +273,11 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
 
     ci, verdict, reviewed_sha, reviewer_out = "na", None, "", ""
     merge_base, digest = "", ""
+    failing = []
     if pr:
         ci = _settle_ci(item, pr, d, rerun_max)
+        if ci == "red":
+            failing = _failing_names(d.checks(pr), d.ignore)
 
         if ci == "green":
             # CAPTURED BEFORE THE REVIEW, never re-read after (#66). A push
@@ -333,6 +374,15 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
     # `[ "$outcome" = "ready" ]`, and `revise` never reaches the scorecard at
     # all. The head here binds a review that the next round supersedes.
     sha_out = reviewed_sha if o.outcome in ("ready", "revise") else ""
+    # THE VERDICT'S FINGERPRINTS (closed-loop spec §3): one per blocking
+    # finding, so a later round can tell "the same defect, unmoved" from "a
+    # different one". Only on a FAIL -- a PASS or an escalation names no
+    # findings to fingerprint.
+    fps = ",".join(attest.fingerprints(reviewer_out)) if verdict == "FAIL" else ""
+    # THE PR'S STATE, for the PR this derivation actually settled on, or for
+    # the caller's own PR when the settle discarded it (spec §1): a PR a
+    # person closed still has to reach the journal, or the run cannot end.
+    pr_state = _pr_state_word(d, pr or known)
     # The findings ride out only on `revise`: on any other outcome the runner
     # has nothing to route them to, and a scorecard note is not the place for a
     # multi-paragraph review.
@@ -340,4 +390,6 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                    ci_first, resubmissions, str(pr or ""),
                    findings=(reviewer_out if o.outcome == "revise" else ""),
                    merge_base=merge_base if reviewed_sha else "",
-                   delta_digest=digest if reviewed_sha else "")
+                   delta_digest=digest if reviewed_sha else "",
+                   fingerprints=fps, pr_state=pr_state,
+                   failing_jobs=",".join(failing))

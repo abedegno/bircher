@@ -234,7 +234,7 @@ def test_the_verdict_records_what_it_reviewed(store_and_run):
     assert fact.payload["head_sha"] == "e" * 40
     assert fact.payload["merge_base_sha"] == "2" * 40
     assert fact.payload["delta_digest"] == "d" * 64
-    assert fact.schema_version == 2
+    assert fact.schema_version == 3
 
 
 def test_the_round_advances_once_a_revision_is_recorded(tmp_path):

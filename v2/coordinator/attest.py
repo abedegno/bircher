@@ -8,6 +8,7 @@ never a pass.
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 #: The context muesli's `review-gate` workflow requires `success` on.
@@ -48,6 +49,42 @@ _OTHER_SECTION = re.compile(
 #: item elaborates the finding above it and is not another finding.
 _ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\S")
 _NONE = re.compile(r"^(none|n/a|no blocking findings)\.?\**$", re.I)
+#: A path-like token: `dir/file.ext` or `file.ext`, optionally `:line` or
+#: `:a-b`. Used by `fingerprints` to name a finding's first file and to strip
+#: line numbers out of it wherever it recurs in the finding's own sentence.
+_PATH = re.compile(r"(?:[\w.-]+/)*[\w-]+\.[A-Za-z]{1,6}(?::\d+(?:-\d+)?)?")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+#: A list item's own marker (`- `, `* `, `• `, `1. `, `1) `), stripped off a
+#: raw source line to leave the finding's text -- the same shape `_ITEM`
+#: recognises, but capturing instead of merely matching.
+_MARKER = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+
+
+def _blocking_items(text: str) -> list[str]:
+    """The blocking findings as text, one string per finding: the walk
+    `blocking_count` performs, keeping what it counts. Every rule the merged
+    counter applies (heading forms, the `None` answer, prose off the phrase,
+    closing headings) applies here unchanged, because this IS that walk."""
+    items, inside = [], False
+    for line in (text or "").splitlines():
+        m = _BLOCKING.search(line)
+        if m:
+            colon, rest = m.group(1), m.group(2).strip()
+            # Prose continuing off the phrase with no colon is a mention of
+            # the section, not the section (`Blocking findings were all
+            # resolved.`). A heading ends the line, or introduces its findings
+            # with a colon.
+            if rest and not colon:
+                continue
+            inside = True
+            if rest and not _NONE.match(rest):
+                items.append(rest)
+            continue
+        if inside and _OTHER_SECTION.search(line):
+            break
+        if inside and _ITEM.match(line):
+            items.append(_MARKER.sub("", line, count=1).strip())
+    return items
 
 
 def blocking_count(text: str) -> int:
@@ -71,26 +108,24 @@ def blocking_count(text: str) -> int:
     finding and makes every list below it blocking. Items count at column
     zero; an indented item elaborates the finding above it.
     """
-    count, inside = 0, False
-    for line in (text or "").splitlines():
-        m = _BLOCKING.search(line)
-        if m:
-            colon, rest = m.group(1), m.group(2).strip()
-            # Prose continuing off the phrase with no colon is a mention of
-            # the section, not the section (`Blocking findings were all
-            # resolved.`). A heading ends the line, or introduces its findings
-            # with a colon.
-            if rest and not colon:
-                continue
-            inside = True
-            if rest and not _NONE.match(rest):
-                count += 1
-            continue
-        if inside and _OTHER_SECTION.search(line):
-            break
-        if inside and _ITEM.match(line):
-            count += 1
-    return count
+    return len(_blocking_items(text))
+
+
+def fingerprints(text: str) -> list[str]:
+    """One fingerprint per blocking finding (closed-loop spec §3): sha1 of the
+    first file path, lower-cased and stripped of its line numbers, joined by
+    one space to the finding's first sentence with whitespace collapsed and
+    every path token in it normalised the same way -- so a finding that
+    merely moved down twelve lines after a repair fingerprints the same, and
+    one that moved to another file does not."""
+    out = []
+    for item in _blocking_items(text):
+        m = _PATH.search(item)
+        path = m.group(0).split(":")[0].lower() if m else ""
+        sentence = " ".join(_SENTENCE_END.split(item.strip(), maxsplit=1)[0].split())
+        sentence = _PATH.sub(lambda mm: mm.group(0).split(":")[0].lower(), sentence)
+        out.append(hashlib.sha1(f"{path} {sentence}".encode("utf-8")).hexdigest())
+    return out
 
 
 def state_for(verdict: str | None) -> str:

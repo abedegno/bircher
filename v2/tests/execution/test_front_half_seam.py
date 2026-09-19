@@ -104,9 +104,11 @@ def _heredoc_to_herestring(src):
     restriction it routes around. Matched exactly, so an edit to the real line
     fails loudly here rather than silently reverting."""
     old = ("IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-           "resubmissions _settled_pr _merge_base _delta_digest <<EOF\n$obs\nEOF")
+           "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+           "_pr_state _failing_jobs <<EOF\n$obs\nEOF")
     new = ("IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-           'resubmissions _settled_pr _merge_base _delta_digest <<< "$obs"')
+           "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+           '_pr_state _failing_jobs <<< "$obs"')
     assert old in src, "run_item's marker-parsing heredoc has changed shape"
     return src.replace(old, new)
 
@@ -209,7 +211,7 @@ _kernel_dispatch() {{
 }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
-  printf '%s' 'ready|codex:pass|derived from the repository|{head_sha}|green|true|1|{pr}||'
+  printf '%s' 'ready|codex:pass|derived from the repository|{head_sha}|green|true|1|{pr}|||||'
 }}
 
 _net_run()         {{ shift; "$@"; }}
@@ -1321,8 +1323,9 @@ _CLEAR = {"halted": False, "version": 5, "state": "reviewing", "pending": []}
 
 
 #: What `observe_outcome` returns on the paths that get as far as the merge:
-#: outcome|review|note|head|ci|ci_first|resubmissions|settled_pr|merge_base|delta_digest.
-READY_TUPLE = f"ready|codex:pass|derived from the repository|{HEAD_SHA}|green|true|1|9||"
+#: outcome|review|note|head|ci|ci_first|resubmissions|settled_pr|merge_base|
+#: delta_digest|fingerprints|pr_state|failing_jobs.
+READY_TUPLE = f"ready|codex:pass|derived from the repository|{HEAD_SHA}|green|true|1|9|||||"
 
 
 def _recover(tmp_path, *, pending, after=None, gen="", extra_env=None):

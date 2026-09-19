@@ -103,3 +103,28 @@ def test_request_repair_is_accepted_from_reviewing_and_returns_to_planned():
     assert s.run_state("r") == "reviewing"
     assert _repair(s, "rr1").accepted
     assert s.run_state("r") == "planned"
+
+
+def _ci(s, key, status, head=HEAD, pr_state="open", jobs=None, pr="42"):
+    return _sub(s, "record_ci_observation", key, actor="claude", status=status,
+                head_git_sha=head, pr_state=pr_state, failing_jobs=list(jobs or []), pr=pr)
+
+
+def test_the_verdict_stores_its_fingerprints():
+    s, spec = _to_implementing(_store())
+    fp = ["ab" * 20, "cd" * 20]
+    _sub(s, "record_review", "v1", verdict="request_revision", artifact_hash=spec,
+         base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1,
+         head_sha=HEAD, fingerprints=fp)
+    fact = [f for f in s.facts_for("r") if f.kind == EventKind.REVIEW_VERDICT][-1]
+    assert fact.payload["fingerprints"] == fp
+    assert fact.schema_version == 3
+
+
+def test_a_ci_observation_carries_the_prs_state_jobs_and_number():
+    s, _ = _to_implementing(_store())
+    assert _ci(s, "ci1", "failure", jobs=["server (go)", "client (node)"]).accepted
+    with pytest.raises(NotAuthorized):
+        _ci(s, "ci2", "failure", pr_state="draft")
+    with pytest.raises(NotAuthorized):
+        _ci(s, "ci3", "failure", pr="forty-two")

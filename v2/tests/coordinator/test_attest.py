@@ -232,3 +232,42 @@ def test_no_verdict_says_so_and_an_unknown_base_is_a_question_mark():
 
 def test_the_description_never_exceeds_githubs_limit():
     assert len(describe("x" * 200, 1, "PASS", 0, "a" * 40, "b" * 40)) <= 140
+
+
+# --- fingerprints (closed-loop spec §3) --------------------------------------
+
+import hashlib
+
+from coordinator.attest import fingerprints
+
+
+def _fp(path, sentence):
+    return hashlib.sha1(f"{path} {sentence}".encode("utf-8")).hexdigest()
+
+
+def test_fingerprints_name_the_first_path_and_first_sentence():
+    text = ("Blocking findings\n\n"
+            "- `src/main/livePromptRelay.ts:206-209` provides `stopAll()` but it is never called. The window path skips it.\n"
+            "- The eight-template cap is vulnerable to concurrent creates. See templates.go.\n\n"
+            "Non-blocking findings: None.\n\nVERDICT: FAIL\n")
+    assert fingerprints(text) == [
+        _fp("src/main/livepromptrelay.ts",
+            "`src/main/livepromptrelay.ts` provides `stopAll()` but it is never called."),
+        _fp("templates.go", "The eight-template cap is vulnerable to concurrent creates."),
+    ]
+
+
+def test_a_finding_without_a_path_fingerprints_its_sentence_alone():
+    text = "Blocking findings\n\n- Timer leak on unmount, seen twice.\n\nVERDICT: FAIL\n"
+    assert fingerprints(text) == [_fp("", "Timer leak on unmount, seen twice.")]
+
+
+def test_fingerprints_ignore_line_numbers_whitespace_and_path_case():
+    a = "Blocking findings\n\n- In   Foo/Bar.py:12 the lock is   dropped.\n"
+    b = "Blocking findings\n\n- In foo/bar.py:99 the lock is dropped.\n"
+    assert fingerprints(a) == fingerprints(b)
+
+
+def test_fingerprints_count_agrees_with_blocking_count():
+    text = "## Blocking findings\n\n1. One.\n2. Two.\n\n## Suggestions\n\n- x\n"
+    assert len(fingerprints(text)) == blocking_count(text) == 2

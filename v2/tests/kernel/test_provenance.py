@@ -195,6 +195,12 @@ def test_the_residuals_are_the_ones_we_know_about():
         "cmd.payload['cause']",
         "cmd.payload['head_sha']",
         "cmd.payload['evidence']",
+        # The closed loop's second task: the verdict's fingerprints and the
+        # PR's state and failing jobs, all asserted by the runner from its own
+        # reading of the reviewer's text and of GitHub.
+        "cmd.payload['fingerprints']",
+        "cmd.payload['pr_state']",
+        "cmd.payload['failing_jobs']",
         # The front half's own three (docs/design/provenance-table.md's
         # "Front half" section, spec §9): prose rows with no single
         # store.X or payload[...] the AST walk could find, added by hand
@@ -273,7 +279,11 @@ def test_the_spec_and_the_table_agree_on_the_count():
              "thirty": 30,
              # Task 1: the closed loop's three repair inputs (cause, head_sha,
              # evidence) push the count to thirty-three.
-             "thirty-one": 31, "thirty-two": 32, "thirty-three": 33}
+             "thirty-one": 31, "thirty-two": 32, "thirty-three": 33,
+             # Task 2: the closed loop's second task -- the verdict's
+             # fingerprints and the PR's state and failing jobs -- push the
+             # count to thirty-six.
+             "thirty-four": 34, "thirty-five": 35, "thirty-six": 36}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")

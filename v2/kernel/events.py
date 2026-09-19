@@ -70,7 +70,7 @@ SCHEMA_VERSIONS = {
     EventKind.COMMAND_ACCEPTED: 1,
     EventKind.COMMAND_REJECTED: 1,
     EventKind.ARTIFACT_CREATED: 1,
-    EventKind.REVIEW_VERDICT: 2,  # 2: head_sha, merge_base_sha, delta_digest (gate integrity)
+    EventKind.REVIEW_VERDICT: 3,  # 3: fingerprints (closed loop)
     EventKind.TRANSITION: 1,
     EventKind.OBSERVATION: 1,
     EventKind.HUMAN_RULING: 1,

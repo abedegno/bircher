@@ -146,16 +146,16 @@ def test_a_short_tuple_is_rejected_rather_than_silently_accepted():
     coordinator, or a truncated write, would silently restore the stale-PR
     behaviour this change exists to remove.
     """
-    assert _width_ok("a|b|c|d|e|f|g|h|i|j")
-    assert not _width_ok("a|b|c|d|e|f|g|h|i")
-    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k")
+    assert _width_ok("a|b|c|d|e|f|g|h|i|j|k|l|m")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k|l")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k|l|m|n")
     assert not _width_ok("")
 
 
 def test_an_embedded_newline_is_rejected():
     """`read` consumes only the FIRST line, so a multi-line result would be
     parsed as its first line with the rest discarded silently."""
-    assert not _width_ok("a|b|c|d|e|f|g|h|i|j\nx|y")
+    assert not _width_ok("a|b|c|d|e|f|g|h|i|j|k|l|m\nx|y")
 
 
 def test_a_real_tuple_is_accepted():
@@ -163,8 +163,8 @@ def test_a_real_tuple_is_accepted():
     `"$(printf '\\n')"` for the newline test, which command substitution
     reduces to the EMPTY STRING, so the pattern matched everything and the
     check rejected every valid tuple."""
-    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738||")
-    assert _width_ok("escalated|na|no PR||na|unknown||||")
+    assert _width_ok("ready|claude_code:pass|note|" + "a" * 40 + "|green|true|0|738|||||")
+    assert _width_ok("escalated|na|no PR||na|unknown|||||||")
 
 
 def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
@@ -172,9 +172,11 @@ def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
     field left it able to reproduce the exact defect: review and comment a
     sibling, then authorize and merge the stale PR it was invoked with."""
     src = RUN_QUEUE.read_text()
-    # The settled PR is field 8 of 10; the reviewed range (merge_base, digest)
-    # rides out after it, into the recovery's own review record.
-    assert "r_settled_pr r_merge_base r_delta_digest <<EOF" in src, (
+    # The settled PR is field 8 of 13; the reviewed range (merge_base, digest)
+    # and the closed loop's three (fingerprints, pr_state, failing_jobs) ride
+    # out after it, into the recovery's own review and CI records.
+    assert ("r_settled_pr r_merge_base r_delta_digest r_fingerprints "
+            "r_pr_state r_failing_jobs <<EOF") in src, (
         "recovery must parse the settled PR and the range after it")
     i = src.index('pr="$r_settled_pr"')
     j = src.index("merge_ready_pr \"$item\" \"$pr\"", i)

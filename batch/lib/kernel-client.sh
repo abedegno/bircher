@@ -796,6 +796,10 @@ _kernel_ci_status() {
   case "$1" in
     green|success) printf 'success' ;;
     red|failure|failed) printf 'failure' ;;
+    # Neither is green: `_ci_is_green` accepts exactly "success". Recorded as
+    # themselves so a closed PR can be observed with no head.
+    pending) printf 'pending' ;;
+    na) printf 'na' ;;
     # PREFIXED and stripped -- and the prefix is the part that matters.
     #
     # Stripping alone was FAIL-OPEN: the strip happens after the recognised
@@ -813,13 +817,20 @@ _kernel_ci_status() {
   esac
 }
 
-_kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
-  local run_id="$1" generation="$2" status="$3" head="$4"
+_kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha> [pr_state] [failing_jobs_csv] [pr]
+  local run_id="$1" generation="$2" status="$3" head="$4" pr_state="${5:-}" jobs="${6:-}" pr="${7:-}"
   status=$(_kernel_ci_status "$status")
+  # Job names come from `gh pr checks --json name`; quotes and backslashes are
+  # stripped rather than escaped, because the value is spliced into JSON.
+  jobs=$(printf '%s' "$jobs" | tr -d '"\\')
+  local extra=""
+  [ -n "$pr_state" ] && extra="$extra,\"pr_state\":\"$pr_state\""
+  [ -n "$jobs" ] && extra="$extra,\"failing_jobs\":[\"${jobs//,/\",\"}\"]"
+  [ -n "$pr" ] && extra="$extra,\"pr\":\"$pr\""
   # record_ci_observation
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_ci_observation \
-    --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"}"
+    --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"$extra}"
 }
 
 # _kernel_record_review <run_id> <generation> <verdict> <artifact_hash>
@@ -852,9 +863,9 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # implementation output; the kernel refuses a review whose phase is not the
 # phase of the state it is recorded from. The front half's spec and plan
 # reviews do not come through here.
-_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal] [head_sha] [merge_base_sha] [delta_digest]
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal] [head_sha] [merge_base_sha] [delta_digest] [fingerprints_csv]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
-  local key="${7:-}" terminal="${8:-}" head_sha="${9:-}" merge_base="${10:-}" digest="${11:-}"
+  local key="${7:-}" terminal="${8:-}" head_sha="${9:-}" merge_base="${10:-}" digest="${11:-}" fps="${12:-}"
   local verdict; verdict=$(_kernel_verdict "$raw" "$terminal")
   # No early return: every input now maps to something submittable -- a mapped
   # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
@@ -868,7 +879,11 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
   # What was reviewed (spec §4): included only when the derivation pinned a
   # head. Values are shas and a hex digest, so they need no JSON escaping.
   local range=""
-  [ -n "$head_sha" ] && range="\"head_sha\":\"$head_sha\",\"merge_base_sha\":\"$merge_base\",\"delta_digest\":\"$digest\","
+  if [ -n "$head_sha" ]; then
+    range="\"head_sha\":\"$head_sha\",\"merge_base_sha\":\"$merge_base\",\"delta_digest\":\"$digest\","
+    # Hex digests, comma-joined by the derivation; no escaping needed.
+    [ -n "$fps" ] && range="$range\"fingerprints\":[\"${fps//,/\",\"}\"],"
+  fi
   # An empty key must not become `--idempotency-key ""`: the CLI would take the
   # empty string as the key rather than falling back to its default, and every
   # record_review in the run would collide on it.

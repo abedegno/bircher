@@ -692,6 +692,9 @@ def _submit(store, cmd: Command, actor: str | None, *, fenced: bool, ruling: str
                         "head_sha": cmd.payload.get("head_sha"),
                         "merge_base_sha": cmd.payload.get("merge_base_sha"),
                         "delta_digest": cmd.payload.get("delta_digest"),
+                        # closed-loop spec §3: one per blocking finding, so
+                        # rounds can be compared.
+                        "fingerprints": cmd.payload.get("fingerprints"),
                     },
                 )
             _side_fact(store, cmd, actor)

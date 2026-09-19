@@ -1206,7 +1206,25 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         verdict = cmd.payload.get("verdict")
         if verdict not in _VERDICT_WORDS:
             raise NotAuthorized(f"verdict {verdict!r} is not one of {sorted(_VERDICT_WORDS)}")
+        fps = cmd.payload.get("fingerprints")
+        if fps is not None and (not isinstance(fps, list) or not all(isinstance(x, str) for x in fps)):
+            raise NotAuthorized("record_review fingerprints must be a list of strings or absent")
         return _review_destination(store, cmd.run_id, current, verdict, ruling)
+
+    if cmd.name == "record_ci_observation":
+        # The PR's state and its failing jobs ride beside the CI status
+        # (closed-loop spec §1, §3): an external observation, validated here
+        # so `back.py` can trust what it reads.
+        ps = cmd.payload.get("pr_state")
+        if ps not in (None, "open", "closed", "merged"):
+            raise NotAuthorized("record_ci_observation pr_state must be open, closed, merged or absent")
+        jobs = cmd.payload.get("failing_jobs")
+        if jobs is not None and (not isinstance(jobs, list) or not all(isinstance(j, str) for j in jobs)):
+            raise NotAuthorized("record_ci_observation failing_jobs must be a list of strings or absent")
+        prn = cmd.payload.get("pr")
+        if prn is not None and (not isinstance(prn, str) or not prn.isdigit()):
+            raise NotAuthorized("record_ci_observation pr must be a string of digits or absent")
+        return next_state
 
     if cmd.name == "record_turn_ended":
         _check_turn_ended(store, cmd, current)

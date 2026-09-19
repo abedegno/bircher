@@ -261,9 +261,11 @@ def _heredoc_to_herestring(run_item_src):
     pairs = [
         (
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            "resubmissions _settled_pr _merge_base _delta_digest <<EOF\n$obs\nEOF",
+            "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+            "_pr_state _failing_jobs <<EOF\n$obs\nEOF",
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            'resubmissions _settled_pr _merge_base _delta_digest <<< "$obs"',
+            "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+            '_pr_state _failing_jobs <<< "$obs"',
         ),
     ]
     for old, new in pairs:
@@ -310,7 +312,7 @@ _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
-  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}'
+  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}|||'
 }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
@@ -661,12 +663,17 @@ def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
     """The reviewer's finding, reproduced as a positive assertion: the THIRD
     argument to record_ci is $_obs_ci ("green"), never $outcome ("ready") --
     two in-scope variables from the same derived tuple with different
-    vocabularies (see module docstring for the mutation this must catch)."""
+    vocabularies (see module docstring for the mutation this must catch).
+
+    The fifth/sixth/seventh arguments are the PR's state, its failing jobs
+    and its number (closed-loop spec §1, §3) -- empty/empty/PR here, since
+    this fixture's derived tuple carries no pr_state or failing_jobs and the
+    settled PR is unchanged from the one the item started with."""
     calls, _, _tmp = happy_drive
     name, args = calls[I_CI]
     assert name == "_kernel_record_ci"
     run_id = calls[I_RUN_START][1][0]
-    assert args == [run_id, "2", "green", HEAD_SHA], args
+    assert args == [run_id, "2", "green", HEAD_SHA, "", "", PR], args
 
 
 def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
