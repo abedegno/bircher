@@ -64,6 +64,14 @@ CONTRACT = {
     # before creating it, so an absent generation degrades to a less
     # informative name and not to a collision.
     "BIRCHER_GENERATION": "runner",
+    # RUNNER-SET: run-queue.sh exports both before the main loop / at run
+    # start and they stay exported for the process's remaining lifetime, so
+    # `derive`'s subprocess inherits them same as BIRCHER_GENERATION above.
+    # `_round_number` reads them to compute the review round from the kernel
+    # journal -- absent, empty, or an unreadable database all degrade to
+    # round 1 rather than blocking a status post.
+    "BIRCHER_KERNEL_DB": "runner",
+    "BIRCHER_RUN_ID": "runner",
 }
 
 _READ = re.compile(

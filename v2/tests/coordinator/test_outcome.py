@@ -489,3 +489,17 @@ def test_red_ci_posts_nothing_and_carries_no_range():
     r = derive("i", "c", "7", "", deps=d)
     assert not [e for e in effects if e[0] == "status_check"]
     assert r.merge_base == "" and r.delta_digest == ""
+
+
+def test_the_round_is_revisions_used_plus_one(tmp_path):
+    from coordinator.cli import _round_number
+    from kernel.store import Store
+    db = tmp_path / "k.db"
+    Store.open(str(db))  # an empty journal
+    assert _round_number(str(db), "run-1") == 1
+
+
+def test_no_journal_means_round_one():
+    from coordinator.cli import _round_number
+    assert _round_number("", "") == 1
+    assert _round_number("/nonexistent/path.db", "run-1") == 1

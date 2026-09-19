@@ -4265,7 +4265,8 @@ run_item() {
   # The kernel's record of this run. Item codes recur across attempts, so a
   # minted id carries the epoch; a RESUMED one is whatever the kernel already
   # holds (below).
-  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"; export BIRCHER_KERNEL_DB
+  BIRCHER_KERNEL_DB="${BIRCHER_KERNEL_DB:-$BUNDLE_DIR/.run/kernel.db}"
+  export BIRCHER_KERNEL_DB
   mkdir -p "$(dirname "$BIRCHER_KERNEL_DB")" 2>/dev/null || true
   local _iss; _iss=$(_item_issue "$prompt")
   local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
