@@ -255,3 +255,61 @@ def test_park_notice_without_a_park_is_rc_1(tmp_path):
     s, db = _file_store(tmp_path)
     _to_implementing(s)
     assert main(["park-notice", "--db", db, "--run-id", "r"]) == 1
+
+
+def _parked_with_carrier(tmp_path):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    for k in ("r1", "r2"):
+        _repair(s, k, evidence=["x"])
+        _sub(s, "start_implementation", "k" + k, actor="claude")
+    _sub(s, "park", "p1", actor="claude", reason="no_progress", cause="ci_red", evidence=["x"],
+         session_id="sess-1", cursor_item_id="it-1")
+    return s, db
+
+
+def _listing(*replies):
+    items = [{"id": "it-1", "role": "user", "text": "notice"}, {"id": "it-2", "role": "assistant", "text": "ok"}]
+    for i, text in enumerate(replies, start=3):
+        items.append({"id": f"it-{i}", "role": "user", "text": text})
+    return items
+
+
+def test_park_reply_grants_a_round_on_retry(tmp_path, capsys, monkeypatch):
+    s, db = _parked_with_carrier(tmp_path)
+    monkeypatch.setattr("coordinator.session.list_items", lambda server, sid, **kw: _listing("Retry"))
+    assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
+    assert capsys.readouterr().out == "retry"
+    assert front.current_park(s, "r") is None
+    assert not back.would_be_third_identical(s, "r", "ci_red", ["x"])
+
+
+def test_park_reply_cancels_the_run_on_stop(tmp_path, capsys, monkeypatch):
+    s, db = _parked_with_carrier(tmp_path)
+    monkeypatch.setattr("coordinator.session.list_items", lambda server, sid, **kw: _listing("stop"))
+    assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
+    assert capsys.readouterr().out == "stop"
+    assert s.run_state("r") == "cancelled"
+
+
+def test_park_reply_reads_only_after_the_cursor(tmp_path, capsys, monkeypatch):
+    s, db = _parked_with_carrier(tmp_path)
+    monkeypatch.setattr("coordinator.session.list_items", lambda server, sid, **kw: _listing())
+    assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
+    assert capsys.readouterr().out == "none"
+    assert front.current_park(s, "r") is not None
+
+
+def test_park_reply_leaves_other_text_alone(tmp_path, capsys, monkeypatch):
+    s, db = _parked_with_carrier(tmp_path)
+    monkeypatch.setattr("coordinator.session.list_items", lambda server, sid, **kw: _listing("try harder"))
+    assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
+    assert capsys.readouterr().out == "other"
+    assert front.current_park(s, "r") is not None
+
+
+def test_park_reply_without_a_park_says_so(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
+    assert capsys.readouterr().out == "nopark"

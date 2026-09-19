@@ -293,6 +293,9 @@ def main(argv=None) -> int:
     sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
     pn = subs.add_parser("park-notice")
     pn.add_argument("--db", required=True); pn.add_argument("--run-id", required=True)
+    pr_ = subs.add_parser("park-reply")
+    pr_.add_argument("--db", required=True); pr_.add_argument("--run-id", required=True)
+    pr_.add_argument("--server", required=True)
 
     a = p.parse_args(argv)
 
@@ -478,6 +481,61 @@ def main(argv=None) -> int:
         if park is None:
             return RC_FAILED
         print(park_notice_body(SimpleNamespace(run_id=a.run_id), park), end="")
+        return RC_OK
+
+    if a.mode == "park-reply":
+        # The back half's reply reader (closed-loop spec §1): the carrier
+        # session's user items after the park's cursor, discriminated by
+        # `classify_batch`, and the one ruling they make recorded as the
+        # human. No dismissal: a refused or unrecognised reply is reported
+        # and read again next wave, which costs nothing.
+        from kernel import front
+        from kernel.authz import NotAuthorized
+        from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
+        from kernel.store import Store
+
+        from coordinator import session as _session
+        from coordinator.human import classify_batch
+        store = Store.open(a.db)
+        state = store.run_state(a.run_id)
+        park = front.current_park(store, a.run_id)
+        if park is None:
+            print("nopark", end="")
+            return RC_OK
+        sid, cur = park.payload.get("session_id"), park.payload.get("cursor_item_id")
+        if not sid:
+            print("none", end="")
+            return RC_OK
+        try:
+            listing = _session.list_items(a.server, sid)
+        except _session.LookupFailed as exc:
+            print(f"park-reply: cannot read session {sid}: {exc}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        seen = cur is None or all(it["id"] != cur for it in listing)
+        after = []
+        for it in listing:
+            if seen and it["role"] == "user":
+                after.append(it)
+            if it["id"] == cur:
+                seen = True
+        if not after:
+            print("none", end="")
+            return RC_OK
+        kind, _ = classify_batch(after, state=state, grill_open=False)
+        name = {"retry": "grant_round", "stop": "cancel_run"}.get(kind)
+        if name is None:
+            print("other", end="")
+            return RC_OK
+        try:
+            execute_as_human(store, Command(
+                name=name, run_id=a.run_id, expected_version=store.run_version(a.run_id),
+                idempotency_key=f"human:{a.run_id}:{after[-1]['id']}", generation=HUMAN_GENERATION,
+                payload={"cursor_item_id": listing[-1]["id"]}))
+        except NotAuthorized as exc:
+            print(f"park-reply: {name} refused: {exc}", file=sys.stderr)
+            print("refused", end="")
+            return RC_OK
+        print(kind, end="")
         return RC_OK
 
     if a.mode in ("approve", "grant-round", "revise", "direct"):
