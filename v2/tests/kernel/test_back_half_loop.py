@@ -94,3 +94,12 @@ def test_a_malformed_repair_request_is_refused(bad):
     s, _ = _to_implementing(_store())
     with pytest.raises(NotAuthorized):
         _repair(s, "rr1", **bad)
+
+
+def test_request_repair_is_accepted_from_reviewing_and_returns_to_planned():
+    s, spec = _to_implementing(_store())
+    _sub(s, "record_review", "v1", verdict="accept", artifact_hash=spec,
+         base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    assert s.run_state("r") == "reviewing"
+    assert _repair(s, "rr1").accepted
+    assert s.run_state("r") == "planned"

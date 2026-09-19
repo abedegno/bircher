@@ -188,6 +188,13 @@ def test_the_residuals_are_the_ones_we_know_about():
         # Task 6 (revision 16): the malformed hand-back's own reason,
         # shape-checked and rendered to the next seat, verified by nobody.
         "cmd.payload['detail']",
+        # The closed loop (spec §1, Task 1): why a repair is requested, which
+        # head the runner is requesting repair for, and observations
+        # supporting the request. All asserted by the runner; binding the head
+        # to the newest CI observation is a declared follow-up.
+        "cmd.payload['cause']",
+        "cmd.payload['head_sha']",
+        "cmd.payload['evidence']",
         # The front half's own three (docs/design/provenance-table.md's
         # "Front half" section, spec §9): prose rows with no single
         # store.X or payload[...] the AST walk could find, added by hand
@@ -263,7 +270,10 @@ def test_the_spec_and_the_table_agree_on_the_count():
              "twenty-six": 26, "twenty-seven": 27, "twenty-eight": 28,
              "twenty-nine": 29,
              # Task 6: the malformed hand-back's own reason.
-             "thirty": 30}
+             "thirty": 30,
+             # Task 1: the closed loop's three repair inputs (cause, head_sha,
+             # evidence) push the count to thirty-three.
+             "thirty-one": 31, "thirty-two": 32, "thirty-three": 33}
     claimed = words.get(m.group(1).lower())
     assert claimed is not None, f"unrecognised count word: {m.group(1)!r}"
     actual = sum(1 for r in table_rows() if r["provenance"] == "asserted")
