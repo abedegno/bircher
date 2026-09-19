@@ -244,3 +244,43 @@ def test_no_progress_park_is_refused_from_the_front_half():
     s = _store()
     with pytest.raises(NotAuthorized):
         _park(s, "p1", cause="ci_red", evidence=["x"])
+
+
+def test_a_run_with_an_open_pr_cannot_end():
+    s, _ = _to_implementing(_store())
+    _ci(s, "c1", "failure", pr_state="open")
+    with pytest.raises(NotAuthorized):
+        _sub(s, "record_run_outcome", "o1", actor="claude", outcome="failed")
+
+
+def test_an_unobserved_pr_counts_as_open():
+    s, _ = _to_implementing(_store())
+    with pytest.raises(NotAuthorized):
+        _sub(s, "record_run_outcome", "o1", actor="claude", outcome="failed")
+
+
+def test_a_closed_pr_lets_the_run_end():
+    s, _ = _to_implementing(_store())
+    _ci(s, "c1", "failure", pr_state="closed")
+    assert _sub(s, "record_run_outcome", "o1", actor="claude", outcome="failed").accepted
+    assert s.run_state("r") == "ended"
+
+
+def test_a_run_without_an_implementation_still_ends():
+    s = _store()
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
+    assert _sub(s, "record_run_outcome", "o1", actor="claude", outcome="timeout").accepted
+
+
+def test_a_cancelled_run_ends():
+    # The generation is taken BEFORE the cancel: the runner records the
+    # terminal fact under the generation it already holds, and `dispatch`
+    # may refuse a seat on a cancelled run.
+    s, _ = _to_implementing(_store())
+    _ci(s, "c1", "failure", pr_state="open")
+    gen = dispatch(s, "r", actor="claude", role=Role.IMPLEMENTER).generation
+    assert submit(s, Command(name="cancel_run", run_id="r", expected_version=s.run_version("r"),
+                             idempotency_key="x1", generation=gen, payload={})).accepted
+    assert submit(s, Command(name="record_run_outcome", run_id="r", expected_version=s.run_version("r"),
+                             idempotency_key="o1", generation=gen, payload={"outcome": "escalated"})).accepted
+    assert s.run_state("r") == "ended"

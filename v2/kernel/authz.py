@@ -800,7 +800,7 @@ def _check_cursor(cmd) -> None:
 
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
-    of the seven the loop has, not free text the coordinator invents."""
+    of the eight the loop has, not free text the coordinator invents."""
     if cmd.payload.get("reason") not in PARK_REASONS:
         raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
     if cmd.payload.get("reason") == "disagreement":
@@ -1380,6 +1380,17 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(
                 f"outcome {outcome!r} is not one of {sorted(_RUN_OUTCOMES)}"
             )
+        # The closed loop (spec §1): a run whose pull request is open does not
+        # end. Its exits are a merge (from `merged`) or a person's stop (from
+        # `cancelled`); both are outside _ALL_ACTIVE and pass this check. An
+        # unobserved PR counts as open: silence must not end a run.
+        if current in _ALL_ACTIVE:
+            from kernel import back
+            if back.implementation_output_recorded(store, cmd.run_id) and \
+                    back.latest_pr_state(store, cmd.run_id) in (None, "open"):
+                raise NotAuthorized(
+                    "a run with an open pull request cannot end: merge it, or a person stops it (spec §1)"
+                )
         # A run that entered `sliced` may have filed children; `failed` over
         # them would end the epic with its filing half done and nothing left
         # to repair it (shaping spec §2, ruling 15). cancel_run is the other exit.

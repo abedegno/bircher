@@ -340,7 +340,7 @@ def test_a_merged_outcome_WITH_a_confirmed_merge_effect_is_accepted():
     check could be pointed anywhere and stay green.
     """
     s = _advance_to_reviewing(_store())
-    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD, pr_state="merged")
     _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
             base_sha=BASE, context_bundle_hash=BUNDLE, actor="codex",
             policy_version=1)
