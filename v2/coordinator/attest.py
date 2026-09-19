@@ -16,22 +16,42 @@ CONTEXT = "bircher/cross-review"
 #: GitHub truncates longer descriptions; truncate deliberately instead.
 _MAX_DESCRIPTION = 140
 
-_BLOCKING = re.compile(r"(?<![\w-])blocking findings\b\W*(.*)$", re.I)
-_OTHER_SECTION = re.compile(r"(?<![\w-])(non-blocking findings|suggestions|verification|verdict)\b", re.I)
-#: A list item at the section's own indentation: `- `, `* `, `• `, `1. `, `1) `.
-_ITEM = re.compile(r"^ {0,2}(?:[-*•]|\d+[.)])\s+\S")
-_NONE = re.compile(r"^(none|n/a|no blocking findings)\.?$", re.I)
+
+def _heading(phrase: str) -> str:
+    """`Phrase` or `PHRASE`: a heading is capitalised, prose is not."""
+    return f"(?:{phrase}|{phrase.upper()})"
+
+
+#: A heading starts its line, or is glued to the end of the sentence before
+#: it (`...conclusions.Blocking findings`, as the live reviewers write).
+#: Case-sensitive on purpose: "found no blocking findings issues" is prose
+#: and opens no section; "the final verdict logic" is prose and closes none.
+_LEAD = r"(?:^|[.!?:]\s*)\**\s*"
+_BLOCKING = re.compile(_LEAD + _heading("Blocking findings") + r"\**\s*:?\s*\**\s*(.*)$")
+#: A closing heading ends its line, allowing only a short trailer
+#: (`Non-blocking findings: None.`, `VERDICT: FAIL`).
+_OTHER_SECTION = re.compile(
+    _LEAD + "(?:" + "|".join(_heading(p) for p in
+                              ("Non-blocking findings", "Suggestions", "Verification", "Verdict"))
+    + r")\b\**\s*:?\s*(?:None\.?|N/A|PASS|FAIL|BLOCKED)?\.?\**\s*$")
+#: A list item at column zero: `- `, `* `, `• `, `1. `, `1) `. An indented
+#: item elaborates the finding above it and is not another finding.
+_ITEM = re.compile(r"^(?:[-*•]|\d+[.)])\s+\S")
+_NONE = re.compile(r"^(none|n/a|no blocking findings)\.?\**$", re.I)
 
 
 def blocking_count(text: str) -> int:
     """How many items the reviewer listed under its blocking-findings heading.
 
     Counts list items between the heading and the next section heading, at
-    the section's own indentation (a nested sub-bullet elaborates a finding,
-    it is not another one). A heading followed on the same line by `None`
-    counts nothing; a heading followed by a finding on the same line counts
-    one. Text with no heading counts nothing, so an unstructured FAIL posts
-    `0 blocking` rather than a guess.
+    column zero (a nested sub-bullet elaborates a finding, it is not another
+    one). A heading followed on the same line by `None` counts nothing; a
+    heading followed by a finding on the same line counts one. Text with no
+    heading counts nothing, so an unstructured FAIL posts `0 blocking` rather
+    than a guess. A heading is recognised at the start of a line or glued to
+    the end of the sentence before it, in heading case only; a prose mention
+    of the phrase mid-sentence opens nothing and closes nothing. Items count
+    at column zero; an indented item elaborates the finding above it.
     """
     count, inside = 0, False
     for line in (text or "").splitlines():

@@ -59,12 +59,66 @@ Non-blocking findings
 VERDICT: FAIL
 """
 
+CODEX_WORDS_IN_BULLETS = """Blocking findings
+
+- The final verdict logic is unreachable in prod.
+- Auth check is skipped on the admin route; see the verification notes.
+- Timer leak on unmount.
+
+Non-blocking findings
+
+- None.
+
+VERDICT: FAIL
+"""
+
+CODEX_PHRASE_IN_PROSE = """We reviewed things and found no blocking findings issues really but lets see.
+
+Blocking findings
+
+- Real finding one.
+- Real finding two.
+
+Non-blocking findings
+
+- None.
+
+VERDICT: FAIL
+"""
+
+CODEX_NESTED = """Blocking findings
+
+- Real finding one.
+  - elaboration of one, not a second finding
+- Real finding two.
+
+Non-blocking findings: None.
+
+VERDICT: FAIL
+"""
+
+CODEX_BOLD = """**Blocking findings**
+
+- a
+- b
+
+**Non-blocking findings**
+
+- None.
+
+**VERDICT: FAIL**
+"""
+
 
 @pytest.mark.parametrize("text, expected", [
     (CODEX_FAIL, 2),
     (CODEX_NUMBERED, 3),
     (CODEX_PASS, 0),
     (CODEX_GLUED, 3),
+    (CODEX_WORDS_IN_BULLETS, 3),
+    (CODEX_PHRASE_IN_PROSE, 2),
+    (CODEX_NESTED, 2),
+    (CODEX_BOLD, 2),
     ("", 0),
     ("no headings at all\nVERDICT: PASS", 0),
 ])
