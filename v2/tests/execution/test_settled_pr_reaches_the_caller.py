@@ -25,8 +25,9 @@ RUN_QUEUE = REPO_ROOT / "batch" / "run-queue.sh"
 
 def test_the_derived_line_carries_the_settled_pr():
     d = Derived("ready", "claude_code:pass", "n", "a" * 40, "green", "true", 0, "738")
-    assert d.as_line().split("|")[-1] == "738"
-    assert d.as_tuple()[-1] == "738"
+    # `pr` is field 8 of 10 -- the reviewed range rides out after it.
+    assert d.as_line().split("|")[7] == "738"
+    assert d.as_tuple()[7] == "738"
 
 
 def test_the_shell_reads_as_many_fields_as_the_line_emits():

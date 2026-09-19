@@ -15,6 +15,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from coordinator import attest
 from coordinator.ci import DEFAULT_IGNORED as _DEFAULT_IGNORED
 from coordinator.observe import classify
 
@@ -68,6 +69,14 @@ class Deps:
     #: against the wrong target. Second instance of this shape; `publish_cmd`
     #: was the first.
     repo: str = ""
+    #: The PR's base branch, for the reviewer's range and the merge-base.
+    base_of: callable = lambda pr: "main"
+    #: (base, head) -> merge-base sha, or "" when unknown.
+    merge_base: callable = lambda base, head: ""
+    #: (base, head) -> the three-dot delta digest, or "" when unprovable.
+    delta_digest: callable = lambda base, head: ""
+    #: Which review round this is, from the journal (revisions used + 1).
+    round_number: int = 1
 
 
 @dataclass(frozen=True)
@@ -94,24 +103,31 @@ class Derived:
     #: LAST in the field order deliberately: `pr` is passed positionally by
     #: `derive`, and inserting anything before it silently rebinds arguments.
     findings: str = ""
+    #: What the review covered: the merge-base with the PR's base, and the
+    #: digest of the PR's own delta at the reviewed head. Both ride out on
+    #: every derivation that pinned a head, so the runner can record them on
+    #: the verdict fact (spec §4).
+    merge_base: str = ""
+    delta_digest: str = ""
 
     def as_tuple(self):
         return (self.outcome, self.review, self.note, self.sha, self.ci,
-                self.ci_first, self.resubmissions, self.pr)
+                self.ci_first, self.resubmissions, self.pr, self.merge_base,
+                self.delta_digest)
 
     #: Field count, so a consumer can assert it rather than assume it. The
     #: absorption hazard below is silent, and silence is what made the missing
     #: `pr` field survive a live run that looked like it worked.
-    FIELDS = 8
+    FIELDS = 10
 
     def as_line(self) -> str:
-        """The EIGHT-field form the shell parses. A caller reading seven
+        """The TEN-field form the shell parses. A caller reading fewer
         absorbs the last into its neighbour, silently -- `read -r a b c` puts
         every remaining field into `c`, so a short reader does not error, it
         corrupts one value."""
         r = "" if self.resubmissions is None else self.resubmissions
         return (f"{self.outcome}|{self.review}|{self.note}|{self.sha}|"
-                f"{self.ci}|{self.ci_first}|{r}|{self.pr}")
+                f"{self.ci}|{self.ci_first}|{r}|{self.pr}|{self.merge_base}|{self.delta_digest}")
 
 
 def _settle_pr(item, code, pr, issue, d: Deps) -> str:
@@ -166,9 +182,35 @@ def _settle_ci(item, pr, d: Deps, rerun_max: int) -> str:
     return ci
 
 
+def _post_status(item, pr, head, verdict, reviewer_out, merge_base, d: Deps) -> None:
+    """Every verdict posts `bircher/cross-review` on the reviewed head: success,
+    failure, or error, with the range in the description (spec §4). A FAIL
+    can no longer leave an older success standing.
+
+    BEST EFFORT, as the PR comment is: the outcome is derived from the
+    repository and is already correct; a transient GitHub failure here must
+    not turn a derivation into an escalation. The runner's own idempotent
+    post before the merge is the fallback for a missing success.
+    """
+    blocking = attest.blocking_count(reviewer_out) if verdict == "FAIL" else 0
+    state = attest.state_for(verdict)
+    desc = attest.describe(d.reviewer, d.round_number, verdict, blocking, merge_base, head)
+    key = f"status:{head}:{d.round_number}"
+    try:
+        d.effect("status_check", key,
+                 ["gh", "api", f"repos/{d.repo}/statuses/{head}", "-X", "POST",
+                  "-f", f"state={state}", "-f", f"context={attest.CONTEXT}",
+                  "-f", f"description={desc}"])
+        d.log(f"{item}: posted {attest.CONTEXT}={state} on {head[:7]} ({desc})")
+    except Exception as exc:                       # noqa: BLE001
+        d.log(f"{item}: failed to post {attest.CONTEXT}={state} on PR #{pr} "
+              f"({type(exc).__name__}: {exc}) -> continuing; the outcome is "
+              f"derived from the repository and is unaffected")
+
+
 def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
            rerun_max: int = 4) -> Derived:
-    """The whole derivation. Returns the eight fields."""
+    """The whole derivation. Returns the ten fields."""
     d = deps
     pr = _settle_pr(item, code, pr, issue, d)
 
@@ -179,6 +221,7 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
             ci_first, resubmissions = d.history(branch)
 
     ci, verdict, reviewed_sha, reviewer_out = "na", None, "", ""
+    merge_base, digest = "", ""
     if pr:
         ci = _settle_ci(item, pr, d, rerun_max)
 
@@ -196,6 +239,15 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
             verdict, reviewer_out = d.review(pr, reviewed_sha)
             if verdict == "NONE":
                 verdict = None
+            if reviewed_sha:
+                # WHAT WAS REVIEWED, captured against the same pinned head the
+                # reviewer was told to check out (spec §4): the merge-base with
+                # the PR's base and the digest of the PR's own delta.
+                base = d.base_of(pr) or "main"
+                merge_base = (d.merge_base(base, reviewed_sha) or "").strip()
+                digest = d.delta_digest(base, reviewed_sha) or ""
+                _post_status(item, pr, reviewed_sha, verdict, reviewer_out,
+                             merge_base, d)
 
     o = classify(pr or None, ci, verdict, reviewer=d.reviewer,
                  revisions_left=d.revisions_left)
@@ -263,4 +315,6 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
     # multi-paragraph review.
     return Derived(o.outcome, o.review, o.note, sha_out, o.ci,
                    ci_first, resubmissions, str(pr or ""),
-                   findings=(reviewer_out if o.outcome == "revise" else ""))
+                   findings=(reviewer_out if o.outcome == "revise" else ""),
+                   merge_base=merge_base if reviewed_sha else "",
+                   delta_digest=digest if reviewed_sha else "")
