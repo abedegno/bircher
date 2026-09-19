@@ -48,7 +48,7 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | 3783 | `gh issue edit --remove-label` | `issue_or_label` |
 | 3784 | `gh issue edit --add-label` | `issue_or_label` |
 | 3800 | `gh issue close` | `issue_or_label` |
-| 4409 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 4410 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 
 **1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
 classified it as `pull_request`. M1-3 split `merge` into its own class
@@ -68,10 +68,10 @@ suppression nobody wrote down is a suppression nobody re-reads.
 | Line | Text | Why it is not a call |
 |---|---|---|
 | 1634 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 7258 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 8164 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
-| 8165 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 8188 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 7259 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 8165 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
+| 8166 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 8189 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
