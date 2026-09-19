@@ -1170,8 +1170,8 @@ _pr_merge_state() {
   fi
 }
 
-_post_cross_review_status() {
-  local item="$1" pr="$2" sha="${3:-}" attempt err
+_post_cross_review_status() {  # <item> <pr> [sha] [state] [description]
+  local item="$1" pr="$2" sha="${3:-}" state="${4:-success}" description="${5:-cross-vendor review PASS (Bircher)}" attempt err
   # Head sha: the caller may PIN it (the sweep pins the reviewed head so the status
   # is never posted on an unreviewed push); otherwise fetch the current head, with a
   # few retries (gh pr view can transiently fail too).
@@ -1184,6 +1184,18 @@ _post_cross_review_status() {
     done
   fi
   [ -n "$sha" ] || { echo "[batch:merge] WARN $item: no head sha for PR #$pr -> cross-review status skipped" >&2; return 1; }
+  # ALREADY THERE -> nothing to do. The derivation posts a status for every
+  # verdict (spec §4), so by the time the merge path gets here a success
+  # usually exists with a description naming the reviewed range; re-posting
+  # would overwrite that description with the legacy text.
+  if [ "$state" = success ] && ! _deadline_passed "${PREMERGE_DEADLINE_AT:-}" \
+     && [ "$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+       gh api "repos/$REPO/commits/$sha/status" \
+       -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
+       | grep -cx 'success')" != 0 ]; then
+    echo "[batch:merge] $item: bircher/cross-review=success already on ${sha:0:7} -> not re-posting" >&2
+    return 0
+  fi
   # Post, then read the status back to confirm it landed. Retry both with
   # exponential backoff; log the REAL gh error (no more 2>/dev/null) so a
   # non-transient cause is diagnosable next time.
@@ -1195,9 +1207,9 @@ _post_cross_review_status() {
     _deadline_passed "${PREMERGE_DEADLINE_AT:-}" && break
     err=$(_effect status_check "status:$sha" \
             "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
-            gh api "repos/$REPO/statuses/$sha" -X POST -f state=success \
+            gh api "repos/$REPO/statuses/$sha" -X POST -f state=$state \
             -f context=bircher/cross-review \
-            -f description="cross-vendor review PASS (Bircher)" 2>&1 >/dev/null)
+            -f description="$description" 2>&1 >/dev/null)
     # ...and before the verification too. Skipping it after a successful POST costs a
     # confirmation, so the caller merges best-effort and branch protection decides --
     # which is the existing conservative path, not a new one.
@@ -1208,8 +1220,8 @@ _post_cross_review_status() {
     if [ "$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
          gh api "repos/$REPO/commits/$sha/status" \
          -q '.statuses[] | select(.context=="bircher/cross-review") | .state' 2>/dev/null \
-         | grep -cx 'success')" != 0 ]; then
-      echo "[batch:merge] $item: posted+verified bircher/cross-review=success on ${sha:0:7} (attempt $attempt)" >&2
+         | grep -cx "$state")" != 0 ]; then
+      echo "[batch:merge] $item: posted+verified bircher/cross-review=$state on ${sha:0:7} (attempt $attempt)" >&2
       return 0
     fi
     echo "[batch:merge] WARN $item: cross-review status not confirmed on ${sha:0:7} (attempt $attempt/5)${err:+: $err}" >&2
@@ -1285,7 +1297,12 @@ _restamp_if_delta_unchanged() {
     return 1
   fi
   echo "[batch:sweep] $item: PR #$pr delta PROVEN identical across the update (${reviewed:0:7} -> ${new:0:7}) -> re-stamping the review" >&2
-  _post_cross_review_status "$item" "$pr" "$new" || return 1
+  local prior_desc
+  prior_desc=$(_net_run "$(_cap_to "$BIRCHER_PREMERGE_TIMEOUT" "${PREMERGE_DEADLINE_AT:-}")" \
+      gh api "repos/$REPO/commits/$reviewed/status" \
+      -q '.statuses[] | select(.context=="bircher/cross-review") | .description' 2>/dev/null | head -1)
+  _post_cross_review_status "$item" "$pr" "$new" success \
+      "${prior_desc:-cross-vendor review PASS (Bircher)} (re-stamped on ${new:0:7}, delta unchanged)" || return 1
   RESTAMPED_HEAD="$new"
   return 0
 }
@@ -6904,7 +6921,10 @@ if [ "$1" = "api" ]; then
   # empty, so a test that set it exercised nothing and passed without ever creating the
   # condition it named.
   if printf '%s\n' "$@" | grep -q '/status'; then
-    if printf '%s\n' "$@" | grep -q -- '-q'; then cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0; fi
+    if printf '%s\n' "$@" | grep -q -- '-q'; then
+      [ "${STATUS_PRESENT:-0}" = 1 ] && { printf 'success\n'; exit 0; }
+      cat "${FAKE_STATUS_STORE:-/dev/null}" 2>/dev/null; exit 0
+    fi
     SJ="${FAKE_STATUS_JSON:-}"; [ -n "$SJ" ] || SJ='{"statuses":[]}'
     printf '[%s]' "$SJ"; exit 0
   fi
@@ -7202,6 +7222,14 @@ SH
     && grep -q 'state=success' "$slog" \
     && grep -q 'context=bircher/cross-review' "$slog" \
     || { echo "FAIL merge_ready_pr: cross-review status not posted"; exit 1; }
+  # Gate integrity: a success already on the head is not re-posted. The
+  # derivation posts on every verdict; the merge path's own post is a fallback.
+  : > "$slog"
+  ( PATH="$mdir:$PATH" REPO=demo/demo FAKE_GH_LOG="$slog" STATUS_PRESENT=1 \
+    _post_cross_review_status demo 7 headsha >/dev/null 2>&1 )
+  grep -q 'statuses/headsha' "$slog" \
+    && { echo "FAIL _post_cross_review_status: re-posted a success that was already on the head"; exit 1; }
+  echo "_post_cross_review_status skips a present success OK"
   rm -rf "$mdir"
   echo "merge_ready_pr OK (incl. #10 cross-review status)"
   # Task 3 (codex P2-1): status-post unconfirmed -> BEST-EFFORT merge (let branch

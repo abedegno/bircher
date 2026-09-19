@@ -456,9 +456,13 @@ Mode defaults are already `BIRCHER_EFFECT_MODE=kernel` and
 `BIRCHER_KERNEL_MODE=enforce`. `--source queue` drains `queue/*.md` instead.
 
 **The merge gate on muesli:** branch protection requires `review-gate`, NOT
-`bircher/cross-review`. They chain — bircher posts cross-review, a workflow
-reacts to that status event and posts review-gate ~7s later. `strict: true` is
-set, so a PR whose base has moved becomes `BEHIND` and is refused.
+`bircher/cross-review`. `bircher/cross-review` is posted by the derivation for
+every verdict on the reviewed head: `success` for PASS, `failure` for FAIL
+with the blocking count, `error` when no verdict was produced, with `<vendor>
+round <n> ... on <merge-base7>..<head7>` as the description; the merge path
+re-posts only when no success is present, and a re-stamp after a
+content-identical update-branch keeps the reviewed description. `strict: true`
+is set, so a PR whose base has moved becomes `BEHIND` and is refused.
 
 ---
 
