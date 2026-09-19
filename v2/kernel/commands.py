@@ -672,6 +672,13 @@ def _submit(store, cmd: Command, actor: str | None, *, fenced: bool, ruling: str
                         # proof can pair a ruling with its seat's brief
                         # (front.brief_for reads this).
                         "generation": cmd.generation,
+                        # What was reviewed (spec §4, gate integrity): the pinned
+                        # head, its merge-base with the PR's base, and the digest
+                        # of the PR's own delta. None when the caller had none
+                        # (a human ruling, or a derivation that pinned no head).
+                        "head_sha": cmd.payload.get("head_sha"),
+                        "merge_base_sha": cmd.payload.get("merge_base_sha"),
+                        "delta_digest": cmd.payload.get("delta_digest"),
                     },
                 )
             _side_fact(store, cmd, actor)
