@@ -150,3 +150,97 @@ def test_failing_jobs_must_be_a_list_not_a_bare_string():
     with pytest.raises(NotAuthorized):
         _sub(s, "record_ci_observation", "ci4", actor="claude", status="failure",
              head_git_sha=HEAD, failing_jobs="server (go)")
+
+
+from kernel import back
+from kernel.commands import HUMAN_GENERATION, execute_as_human
+
+
+def _park(s, key, *, cause, evidence):
+    return _sub(s, "park", key, actor="claude", reason="no_progress", cause=cause,
+                evidence=list(evidence), session_id=None, cursor_item_id=None)
+
+
+def _grant(s, key):
+    return execute_as_human(s, Command(
+        name="grant_round", run_id="r", expected_version=s.run_version("r"),
+        idempotency_key=key, generation=HUMAN_GENERATION, payload={"cursor_item_id": None}))
+
+
+def test_back_reads_implementation_output_and_the_newest_observation():
+    s = _store()
+    assert not back.implementation_output_recorded(s, "r")
+    s, _ = _to_implementing(s)
+    assert back.implementation_output_recorded(s, "r")
+    assert back.latest_ci(s, "r") is None
+    _ci(s, "c1", "failure", jobs=["server (go)"])
+    _ci(s, "c2", "success", pr_state="merged")
+    assert back.latest_ci(s, "r")["status"] == "success"
+    assert back.latest_pr_state(s, "r") == "merged"
+
+
+def test_the_verdict_for_a_head_is_the_newest_on_that_head():
+    s, spec = _to_implementing(_store())
+    other = "f" * 40
+    _sub(s, "record_review", "v1", verdict="request_revision", artifact_hash=spec,
+         base_sha=BASE, context_bundle_hash=BUNDLE, policy_version=1, head_sha=other, fingerprints=["aa" * 20])
+    assert back.verdict_for_head(s, "r", HEAD) is None
+    assert back.verdict_for_head(s, "r", other).payload["fingerprints"] == ["aa" * 20]
+
+
+def test_three_identical_repairs_in_a_row_is_no_progress():
+    s, _ = _to_implementing(_store())
+    ev = ["server (go)"]
+    assert not back.would_be_third_identical(s, "r", "ci_red", ev)
+    _repair(s, "r1", evidence=ev)
+    _sub(s, "start_implementation", "k4", actor="claude")
+    assert not back.would_be_third_identical(s, "r", "ci_red", ev)
+    _repair(s, "r2", evidence=ev)
+    _sub(s, "start_implementation", "k5", actor="claude")
+    assert back.would_be_third_identical(s, "r", "ci_red", ev)
+    assert not back.would_be_third_identical(s, "r", "ci_red", ["client (node)"])
+    assert not back.would_be_third_identical(s, "r", "review_fail", ev)
+
+
+def test_evidence_order_does_not_matter():
+    s, _ = _to_implementing(_store())
+    _repair(s, "r1", evidence=["a", "b"])
+    _sub(s, "start_implementation", "k4", actor="claude")
+    _repair(s, "r2", evidence=["b", "a"])
+    _sub(s, "start_implementation", "k5", actor="claude")
+    assert back.would_be_third_identical(s, "r", "ci_red", ["b", "a"])
+
+
+def test_a_round_grant_resets_the_window():
+    s, _ = _to_implementing(_store())
+    ev = ["server (go)"]
+    _repair(s, "r1", evidence=ev)
+    _sub(s, "start_implementation", "k4", actor="claude")
+    _repair(s, "r2", evidence=ev)
+    _sub(s, "start_implementation", "k5", actor="claude")
+    assert back.would_be_third_identical(s, "r", "ci_red", ev)
+    _park(s, "p1", cause="ci_red", evidence=ev)
+    _grant(s, "g1")
+    assert not back.would_be_third_identical(s, "r", "ci_red", ev)
+
+
+def test_no_progress_park_needs_the_journal_to_say_so():
+    s, _ = _to_implementing(_store())
+    with pytest.raises(NotAuthorized):
+        _park(s, "p0", cause="ci_red", evidence=["server (go)"])
+
+
+def test_park_and_grant_are_legal_in_the_back_half():
+    s, _ = _to_implementing(_store())
+    ev = ["x"]
+    _repair(s, "r1", evidence=ev); _sub(s, "start_implementation", "k4", actor="claude")
+    _repair(s, "r2", evidence=ev); _sub(s, "start_implementation", "k5", actor="claude")
+    assert _park(s, "p1", cause="ci_red", evidence=ev).accepted
+    assert s.run_state("r") == "implementing"
+    assert _grant(s, "g1").accepted
+
+
+def test_no_progress_park_is_refused_from_the_front_half():
+    s = _store()
+    with pytest.raises(NotAuthorized):
+        _park(s, "p1", cause="ci_red", evidence=["x"])

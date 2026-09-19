@@ -46,6 +46,9 @@ FRONT_HALF_STATES = frozenset({
 #: guards. Membership is stated per site below, never inherited (ruling 13).
 SHAPING_STATES = frozenset({"shaping", "slices_submitted", "slices_accepted"})
 
+#: spec §1 (closed loop): the states a run with a pull request moves between.
+BACK_HALF_STATES = frozenset({"planned", "implementing", "reviewing"})
+
 _PHASE_OF_STATE = {
     "shaping": "slices", "slices_submitted": "slices", "slices_accepted": "slices", "sliced": "slices",
     "queued": "spec", "spec_submitted": "spec", "spec_accepted": "spec",
@@ -72,6 +75,8 @@ PARK_REASONS = frozenset({
     # notice and the prompt can key on it and no ordinary gate park carries
     # its text.
     "disagreement",
+    # The closed loop (spec §3): the repair about to be requested would be the third identical in a row.
+    "no_progress",
 })
 
 #: spec §1: why a run is sent back to `planned`.
@@ -162,7 +167,7 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # The membership table (shaping spec §2): the carrier session's items and
     # the gate park are legal in the shaping states too; the model's two
     # channels are NOT.
-    "park": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    "park": (FRONT_HALF_STATES | SHAPING_STATES | BACK_HALF_STATES, None),
     # merge_requested must not be a dead end. Without an outbound transition a
     # merge that comes back uncertain can never be retried after
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
@@ -181,7 +186,7 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # Destination by phase: computed in authorize().
     "approve_artifact": (frozenset({"slices_accepted", "spec_accepted", "plan_accepted"}), None),
     "grant_round": (frozenset({"shaping", "slices_submitted", "queued", "specified",
-                               "spec_submitted", "plan_submitted"}), None),
+                               "spec_submitted", "plan_submitted", "planned", "implementing", "reviewing"}), None),
     # Records what the implementation produced; does not itself transition.
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
@@ -812,6 +817,13 @@ def _check_park(store, cmd) -> None:
                 "park disagreement: the run holds no unresolved disagreement; the dispute was resolved "
                 "between the listing and this park, and the pass continues without parking"
             )
+    if cmd.payload.get("reason") == "no_progress":
+        from kernel import back
+        # Like `disagreement`: legal only when the journal itself says so,
+        # so a coordinator cannot park a run that is still making progress.
+        if not back.would_be_third_identical(store, cmd.run_id, cmd.payload.get("cause"),
+                                             cmd.payload.get("evidence") or []):
+            raise NotAuthorized("park no_progress: the journal shows progress; the repair is not the third identical")
     # Three literal `.get(...)` reads, not a loop over a variable key: the
     # provenance extractor matches `cmd.payload.get("literal")` syntactically,
     # and a dynamic key defeats it -- these three rows would then be unbound

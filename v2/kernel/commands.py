@@ -300,7 +300,8 @@ def _side_fact(store, cmd: Command, actor: str) -> None:
             payload={"phase": phase, "epoch": epoch_n, "reason": p["reason"],
                      "session_id": p.get("session_id"), "cursor_item_id": p.get("cursor_item_id"),
                      "findings_hash": p.get("findings_hash"), "verdict": p.get("verdict"),
-                     "reviewer": p.get("reviewer"), "generation": cmd.generation},
+                     "reviewer": p.get("reviewer"), "generation": cmd.generation,
+                     "cause": p.get("cause"), "evidence": list(p.get("evidence") or [])},
         )
     elif cmd.name == "request_repair":
         p = cmd.payload
