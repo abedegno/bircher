@@ -790,11 +790,23 @@ def test_request_merge_presents_the_SAME_binding_the_review_did(happy_drive):
 def test_merge_ready_pr_gets_the_item_pr_and_reviewed_sha(happy_drive):
     """The other half of the same distinction: `merge_ready_pr`'s 3rd
     argument is `$reviewed_sha` -- REVIEWED_SHA, `_merge_gate`'s answer --
-    never the marker's own `$marker_head`."""
+    never the marker's own `$marker_head`.
+
+    The 4th is the FALLBACK status description, and it names the range the
+    derivation reviewed: the merge-base (ninth field) and the observed head
+    (fourth), which are deliberately different constants here so a call site
+    threading the wrong variable is visible. It is composed at this call site
+    because this is the only place both are in scope, and it exists because
+    `_post_cross_review_status`'s own default names no range at all -- and
+    that default fires exactly when the derivation's post is missing, which
+    is when the description is the only record of what was reviewed.
+    """
     calls, _, _tmp = happy_drive
     name, args = calls[I_MERGE]
     assert name == "merge_ready_pr"
-    assert args == ["t01-test-item", PR, REVIEWED_SHA], args
+    assert args == ["t01-test-item", PR, REVIEWED_SHA,
+                    f"cross-review PASS (Bircher fallback) on "
+                    f"{MERGE_BASE_SHA[:7]}..{HEAD_SHA[:7]}"], args
 
 
 def test_record_outcome_gets_merged_at_the_implementer_generation(happy_drive):

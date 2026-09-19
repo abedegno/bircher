@@ -51,6 +51,56 @@ def test_the_shell_reads_as_many_fields_as_the_line_emits():
         f"{names[-1]!r}")
 
 
+def test_the_recovery_reads_as_many_fields_as_the_line_emits():
+    """THE SAME CLASS, at the OTHER reader.
+
+    `recover_pr_cmd` parses the same ten-field tuple `run_item` does, and it
+    is a separate `read` with its own name list -- so widening one and not the
+    other leaves the recovery silently absorbing the surplus into its last
+    name. Asserted against `Derived.FIELDS`, as `run_item`'s is.
+    """
+    src = RUN_QUEUE.read_text()
+    m = re.search(r"IFS='\|' read -r (r_outcome[^<]*?)<<EOF", src, re.S)
+    assert m, "recover_pr_cmd's tuple read is not where this test expects it"
+    names = m.group(1).split()
+    assert len(names) == Derived.FIELDS, (
+        f"recover_pr_cmd reads {len(names)} fields but the derivation emits "
+        f"{Derived.FIELDS}; the surplus is silently absorbed into "
+        f"{names[-1]!r}")
+
+
+def test_the_recovery_records_the_range_on_its_verdict():
+    """`run_item` records what the reviewer read on the verdict fact (spec
+    §4). The recovery drives the same derivation and the same kernel command,
+    and parsed those two fields only to throw them away -- so a recovered
+    item's verdict fact recorded no range at all."""
+    src = RUN_QUEUE.read_text()
+    m = re.search(r'_kernel_record_review "\$BIRCHER_RUN_ID" "\$BIRCHER_GENERATION" "\$r_review"'
+                  r'(.*?)\n\n', src, re.S)
+    assert m, "the recovery's record_review call is not where this test expects it"
+    call = m.group(1)
+    for arg in ('"$r_sha"', '"$r_merge_base"', '"$r_delta_digest"'):
+        assert arg in call, f"the recovery's verdict does not carry {arg}"
+
+
+def test_run_item_threads_the_reviewed_range_into_the_fallback_status():
+    """The runner's status post is a FALLBACK, and it fires exactly when the
+    derivation's own post did not land. Its default description names no
+    range, so without a description threaded from the call site the fallback
+    replaces the merge head's range-naming description with legacy text."""
+    src = RUN_QUEUE.read_text()
+    m = re.search(r'\n\s*_status_desc="([^"\n]*)"', src)
+    assert m, "run_item composes no fallback status description"
+    desc = m.group(1)
+    assert "${_merge_base:0:7}" in desc and "${observed_head:0:7}" in desc, (
+        f"the fallback description names no range: {desc!r}")
+    call = re.search(r'merge_ready_pr "\$item" "\$pr" "\$reviewed_sha"([^\n]*)', src)
+    assert call, "run_item's merge_ready_pr call is not where this test expects it"
+    assert '"$_status_desc"' in call.group(1), (
+        "run_item composes a range description and does not pass it to "
+        "merge_ready_pr")
+
+
 def test_run_item_adopts_the_settled_pr_before_it_authorizes_a_merge():
     """Order matters, not just presence.
 
@@ -123,9 +173,9 @@ def test_recovery_uses_the_settled_pr_rather_than_discarding_it():
     sibling, then authorize and merge the stale PR it was invoked with."""
     src = RUN_QUEUE.read_text()
     # The settled PR is field 8 of 10; the reviewed range (merge_base, digest)
-    # rides out after it and is discarded here -- recover_pr_cmd does not (yet)
-    # thread it into a review record, only run_item does.
-    assert "r_settled_pr _ _ <<EOF" in src, "recovery must parse the settled PR"
+    # rides out after it, into the recovery's own review record.
+    assert "r_settled_pr r_merge_base r_delta_digest <<EOF" in src, (
+        "recovery must parse the settled PR and the range after it")
     i = src.index('pr="$r_settled_pr"')
     j = src.index("merge_ready_pr \"$item\" \"$pr\"", i)
     assert i < j, "recovery must adopt the settled PR before it merges"

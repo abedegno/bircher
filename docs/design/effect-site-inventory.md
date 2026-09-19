@@ -37,18 +37,18 @@ grep -nE "gh .*--add-label|--remove-label" batch/run-queue.sh
 | 1107 | `curl -X POST $SERVER/v1/sessions/$1/events` (stop_session) | `session_control` |
 | 1121 | `curl -X DELETE $SERVER/v1/sessions/$1` | `session_control` |
 | 1210 | `gh api repos/$REPO/statuses/$sha -X POST` | `status_check` |
-| 1624 | `gh pr merge --squash --delete-branch` | `merge` |
-| 1828 | `git push origin HEAD:main` | `ref_update` |
-| 2010 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT -f expected_head_sha=$sha` (sweep) | `ref_update` |
-| 2154 | `git push origin $oid:refs/heads/$branch` (publish) | `ref_update` |
-| 2158 | `gh pr create --head $branch --base main` (publish) | `pull_request` |
-| 2355 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` (recover-pr) | `ref_update` |
-| 2561 | `gh pr close` | `pull_request` |
-| 3800 | `gh issue comment` | `comment` |
-| 3801 | `gh issue edit --remove-label` | `issue_or_label` |
-| 3802 | `gh issue edit --add-label` | `issue_or_label` |
-| 3818 | `gh issue close` | `issue_or_label` |
-| 4428 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
+| 1645 | `gh pr merge --squash --delete-branch` | `merge` |
+| 1849 | `git push origin HEAD:main` | `ref_update` |
+| 2031 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT -f expected_head_sha=$sha` (sweep) | `ref_update` |
+| 2175 | `git push origin $oid:refs/heads/$branch` (publish) | `ref_update` |
+| 2179 | `gh pr create --head $branch --base main` (publish) | `pull_request` |
+| 2376 | `gh api repos/$REPO/pulls/$pr/update-branch -X PUT` (recover-pr) | `ref_update` |
+| 2589 | `gh pr close` | `pull_request` |
+| 3828 | `gh issue comment` | `comment` |
+| 3829 | `gh issue edit --remove-label` | `issue_or_label` |
+| 3830 | `gh issue edit --add-label` | `issue_or_label` |
+| 3846 | `gh issue close` | `issue_or_label` |
+| 4456 | `gh issue edit --add-label bircher:running` | `issue_or_label` |
 
 **1519 is `merge`, not `pull_request`.** An earlier draft of the M1-4 plan
 classified it as `pull_request`. M1-3 split `merge` into its own class
@@ -67,11 +67,11 @@ suppression nobody wrote down is a suppression nobody re-reads.
 
 | Line | Text | Why it is not a call |
 |---|---|---|
-| 1651 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
-| 7297 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
-| 8213 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
-| 8214 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
-| 8237 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
+| 1672 | `MERGE_NOTE="merge deferred: gh pr merge failed"` | assignment value |
+| 7356 | `[ "$MERGE_NOTE" = "merge deferred: gh pr merge failed" ]` | string comparison |
+| 8272 | `_contains "$_body" '_effect ref_update … git push origin'` | selftest asserting the source contains it |
+| 8273 | `echo "FAIL #62: the recovery git push must be routed AND bounded"` | failure message |
+| 8296 | `echo "FAIL #62: … a git push that ignores SIGTERM …"` | failure message |
 
 ## Reads — not journalled
 
@@ -91,14 +91,14 @@ named here.
 
 | Line | Call | Class | Why not routed |
 |---|---|---|---|
-| 3576 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
-| 3578 | `gh run rerun` | *(none)* | Same site class as the other `gh run rerun` row above — see it for the reasoning. **Named, not numbered**, because the repointing tool remaps the Line column and cannot follow a line number written in prose: this reference had been stale since the row moved to 3457. |
+| 3604 | `gh run rerun` | *(none)* | **Re-triggers a workflow. Unrouted, and UNDETECTED until 2026-08-29** — `MUTATION` enumerates verbs and `gh run` was a noun it had never been taught, so a whole command family was invisible. Second instance of that class in one day; the first hid behind a wrapper. Now detected, and enumerated by `test_every_gh_subcommand_is_classified` so a new `gh <noun> <verb>` cannot join silently. **Left unrouted deliberately:** it creates no object and changes no repository content — it re-runs an existing workflow after an INFRASTRUCTURE failure, and its only influence on a kernel decision is via CI status, which the derivation re-observes rather than trusts. Routing it needs an effect class for "trigger a workflow", which the journal does not have — a design decision, not a migration step. Its real cost is CI minutes, bounded by `BIRCHER_CI_RERUN_MAX` (default 4). |
+| 3606 | `gh run rerun` | *(none)* | Same site class as the other `gh run rerun` row above — see it for the reasoning. **Named, not numbered**, because the repointing tool remaps the Line column and cannot follow a line number written in prose: this reference had been stale since the row moved to 3457. |
 
 | 1017 | `curl -X POST $SERVER/v1/sessions` | `session_control` | **Its response body is parsed, but that is NOT what blocks routing — corrected 2026-08-29.** The recorded reason was that routing needs the intent contract to carry a response. It does not: `perform` already returns the executor's stdout as the external object id, and `_create_session` was routed on exactly that basis, capturing the response and parsing it afterwards. The ACTUAL blocker is `-w`. The upload uses `-w '\n%{http_code}'` to capture the status alongside the body, and `-w` is deliberately absent from the `session_control` contract because its value supports `%output{path}` — an arbitrary filesystem write from a class that exists to control a session. Checked directly: the contract refuses this argv, reading the `-w` value as the URL. **The route out is `--fail-with-body`** (curl 8.14.1 on the runner supports it), which yields the body AND a non-zero exit on an HTTP error, making `-w` unnecessary. Not done here because it changes what the caller receives on failure, on the coordinator's hot path where every run begins. |
 
 ## Kernel-executor sites (not shell)
 
-The shaping phase performs its effects from Python through `perform` (`v2/coordinator/filing.py`, `v2/coordinator/sweep.py`), never from `run-queue.sh`, so the routing detector above has no line to cite. They are listed here so the inventory stays the authority on what mutates:
+The shaping phase performs its effects from Python through `perform` (`v2/coordinator/filing.py`, `v2/coordinator/sweep.py`), and the derivation performs its own two through `perform_effect` (`v2/coordinator/outcome.py`), never from `run-queue.sh`, so the routing detector above has no line to cite. They are listed here so the inventory stays the authority on what mutates:
 
 | Where | Call | Effect class | Bound by |
 |---|---|---|---|
@@ -109,3 +109,5 @@ The shaping phase performs its effects from Python through `perform` (`v2/coordi
 | `coordinator/filing.py` pass 4 | `gh issue edit <parent> --add-label bircher:sliced --remove-label bircher:running` | `issue_or_label` | `umbrella_label` |
 | `coordinator/sweep.py` | `gh issue comment <parent> --body 'bircher: sliced complete…'` | `comment` | `umbrella_close`; `filing_complete` and a same-generation `children_observed_closed` |
 | `coordinator/sweep.py` | `gh issue close <parent>` | `issue_or_label` | `parent_close`; as above, and only when the parent was observed open |
+| `coordinator/outcome.py` `_post_status` | `gh api repos/<repo>/statuses/<head> -X POST -f state -f context=bircher/cross-review -f description` | `status_check` | the reviewed head, and the CONTENT of the post: the key is `status:<head>:<sha256(state\ndescription)[:16]>`, so a later verdict on the same head is a different effect rather than a replay of the earlier one. Posted for EVERY verdict (spec §4), best effort -- a failure here does not change the derived outcome |
+| `coordinator/outcome.py` `derive` | `gh pr comment <pr> --repo <repo> --body <derived summary>` | `comment` | the body's own digest: `pr-comment:<pr>:<sha256(body)[:16]>`. Best effort, for the same reason |
