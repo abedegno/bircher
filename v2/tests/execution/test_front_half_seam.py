@@ -85,9 +85,8 @@ _NEEDED_REAL_FUNCTIONS = [
     # branch fired".
     "_disputed_shaping_item", "_unreadable_dispute_item",
     # `run_item`'s tail (closed-loop spec §2) reads `_ffile` from
-    # `_findings_path`, which reads `_max_revisions`, which reads
-    # `_clamp_int` -- pure, no kernel/session/network call among them.
-    "_findings_path", "_max_revisions", "_clamp_int",
+    # `_findings_path` -- pure, no kernel/session/network call.
+    "_findings_path",
     # `_back_half_state` decides `_side` alongside `_front_half_resumable`
     # (closed-loop spec §2): REAL, not stubbed, for the same reason as
     # `_front_half_resumable` above -- an undefined one is false under bash,

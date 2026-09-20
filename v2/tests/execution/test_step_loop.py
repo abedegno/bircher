@@ -139,6 +139,24 @@ def test_at_reviewing_the_binding_names_the_artifact_on_record():
     assert f"record_review codex:pass artifact=hash0 head={HEAD} fps=" in log
 
 
+def test_done_names_ready_from_a_merged_pr():
+    """`done` can arrive with the derivation's own word `repair` or `waiting`
+    -- neither is in `_kernel_record_run_outcome`'s vocabulary
+    (merged|ready|escalated|noop|skipped|failed|timeout), and the kernel
+    refuses an unrecognised payload, leaving the run with no terminal fact. A
+    merged PR names its own terminal word instead of handing that word
+    through."""
+    out, log = _run(_tmp(), [_tuple("repair", "codex:fail", "green", head="", pr_state="merged")],
+                    ["done||||no"], [])
+    assert out.startswith("done|ready|42|0|")
+
+
+def test_done_names_escalated_from_a_closed_pr():
+    out, log = _run(_tmp(), [_tuple("waiting", "na", "pending", head="", pr_state="closed")],
+                    ["done||||no"], [])
+    assert out.startswith("done|escalated|42|0|")
+
+
 def _tmp():
     import tempfile
     return Path(tempfile.mkdtemp(prefix="steploop-"))

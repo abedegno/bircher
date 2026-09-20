@@ -165,12 +165,6 @@ def main(argv=None) -> int:
     # differently: the shell clamped `BIRCHER_CI_RERUN_MAX=abc` to 4 and
     # computed a budget from it, while a bare `int()` here raised ValueError
     # and escalated every item. One malformed operator value, two answers.
-    # The repair loop's two arguments.
-    #
-    # `--revisions-left` is the allowance, computed by the caller from the
-    # journal (`observe.revisions_used`) rather than here, because the caller
-    # owns the kernel database handle. 0 -- the default -- reproduces the
-    # behaviour before the loop existed.
     #
     # `--findings-out` is a PATH and not a tuple field on purpose: the
     # reviewer's blocking findings are multi-paragraph text containing pipes
@@ -179,34 +173,13 @@ def main(argv=None) -> int:
     #
     # The path is REMOVED before derivation and REPLACED atomically after, so
     # the file existing means this derivation wrote it. Without that, a round
-    # that leaves an old file behind pairs a fresh `revise` with a previous
+    # that leaves an old file behind pairs a fresh repair with a previous
     # round's findings -- and a repair briefed on the wrong review looks
     # exactly like a repair briefed on the right one.
-    dv.add_argument("--revisions-left", type=int, default=0, dest="revisions_left")
     dv.add_argument("--findings-out", default="", dest="findings_out")
     dv.add_argument("--ci-wait", type=int, default=1500, dest="ci_wait")
     dv.add_argument("--rerun-max", type=int, default=4, dest="rerun_max")
     dv.add_argument("--rerun-wait", type=int, default=900, dest="rerun_wait")
-
-    # `revisions` is the runner's window onto the journal, and it answers the
-    # two questions the repair loop asks of it:
-    #
-    #   how many rounds are left   -- before derivation, to set --revisions-left
-    #   did the revision land      -- after submitting record_review, before
-    #                                 any repair work is dispatched
-    #
-    # Both read the SAME journal, and neither is answerable from the runner:
-    # bash has no sqlite handle and the kernel adapter is advisory, so an exit
-    # code from it proves nothing about what was recorded.
-    rv = subs.add_parser("revisions")
-    rv.add_argument("--db", required=True)
-    rv.add_argument("--run-id", required=True)
-    rv.add_argument("--max", type=int, default=2, dest="max_revisions")
-    # The idempotency key of the record_review command whose fact we are
-    # looking for. Supplied by the caller and never derived here: deriving it
-    # would rebuild `kernel.cli`'s default-key format in a second place, and
-    # two subsystems that rebuild the same string eventually disagree about it.
-    rv.add_argument("--confirm-command", default="", dest="confirm_command")
 
     # `recover` answers "this run was interrupted -- what now?" from the
     # journal, because the STATE NAME cannot answer it: `reviewing` is reached
@@ -666,7 +639,6 @@ def main(argv=None) -> int:
                                   server=a.server, bundle_dir=a.bundle_dir,
                                   poll_interval=a.poll_interval,
                                   ci_wait=a.ci_wait, rerun_wait=a.rerun_wait,
-                                  revisions_left=a.revisions_left,
                                   round_number=_round_number(
                                       os.environ.get("BIRCHER_KERNEL_DB", ""),
                                       os.environ.get("BIRCHER_RUN_ID", ""))),
@@ -698,25 +670,6 @@ def main(argv=None) -> int:
                       file=sys.stderr)
                 return RC_FINDINGS_UNWRITABLE
         print(r.as_line(), end="")
-        return RC_OK
-
-    if a.mode == "revisions":
-        from kernel.store import Store
-
-        from coordinator.observe import revision_confirmed, revisions_used
-        try:
-            facts = Store.open(a.db).facts_for(a.run_id)
-        except Exception as exc:
-            # An unreadable journal is NOT "zero revisions used", which would
-            # hand the loop a full allowance every round and make the bound
-            # unenforceable. It is a lookup failure, and the runner escalates.
-            print(f"could not read the journal at {a.db}: {exc}",
-                  file=sys.stderr)
-            return RC_LOOKUP_FAILED
-        used = revisions_used(facts)
-        left = max(0, a.max_revisions - used)
-        ok = revision_confirmed(facts, a.confirm_command)
-        print(f"{used}|{left}|{'yes' if ok else 'no'}", end="")
         return RC_OK
 
     if a.mode == "recover":

@@ -55,11 +55,6 @@ class Deps:
     #: to ignore it. Threading it here means there is one policy rather than
     #: one per call site.
     ignore: str = _DEFAULT_IGNORED
-    #: How many revision rounds this run may still have, from the journal.
-    #: 0 -- the default -- reproduces the behaviour before the repair loop, so
-    #: BIRCHER_MAX_REVISIONS=0 is a real rollback rather than a code path that
-    #: merely usually agrees.
-    revisions_left: int = 0
     #: The target repository, `owner/name`. EVERY effect argv must name it.
     #: `gh` resolves an omitted `--repo` from the CURRENT WORKING DIRECTORY's
     #: git remote -- which for the coordinator is the bircher checkout, not the
@@ -97,9 +92,9 @@ class Derived:
     #: derivation reviewed #738 and the caller tried to merge closed #737.
     pr: str = ""
     #: The reviewer's output, carried out on every FAIL (closed-loop spec §1)
-    #: so the repair round -- whether it revises or is the terminal round --
-    #: can put the blocking findings in front of the next implementer. That
-    #: routing is what merged #740 and #750 when done by hand.
+    #: so the repair round can put the blocking findings in front of the next
+    #: implementer. That routing is what merged #740 and #750 when done by
+    #: hand.
     #:
     #: LAST in the field order deliberately: `pr` is passed positionally by
     #: `derive`, and inserting anything before it silently rebinds arguments.
@@ -329,8 +324,7 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                 _post_status(item, pr, head_sha, verdict, reviewer_out,
                              merge_base, d)
 
-    o = classify(pr or None, ci, verdict, reviewer=d.reviewer,
-                 revisions_left=d.revisions_left)
+    o = classify(pr or None, ci, verdict, reviewer=d.reviewer)
 
     if pr:
         head_field = f" head={head_sha}" if o.outcome == "ready" and head_sha else ""

@@ -243,7 +243,7 @@ def test_the_verdict_records_what_it_reviewed(store_and_run):
     assert fact.schema_version == 3
 
 
-def test_the_round_advances_once_a_revision_is_recorded(tmp_path):
+def test_the_round_advances_once_a_request_revision_verdict_is_recorded(tmp_path):
     """`_round_number` is what the status description calls the round, and
     nothing proved it ever returned more than 1 -- a function stubbed to
     `return 1` passed every test it had. One recorded back-half

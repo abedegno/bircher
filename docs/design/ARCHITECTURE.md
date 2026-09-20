@@ -272,11 +272,11 @@ path.**
    AND a PR open, held for N polls. Then it cancels the session.
 8. **Derivation.** The runner invokes the coordinator, which selects the PR,
    waits out CI, dispatches an INDEPENDENT reviewer, and returns the tuple.
-9. **Repair, if the reviewer blocked and rounds remain.** The runner records
+9. **Repair, if the reviewer blocked.** The runner records
    `request_revision`, CONFIRMS the kernel journalled it by causal id, dispatches
    a fresh implementer session briefed on the reviewer's verbatim findings,
-   settles it, and goes back to step 8. Bounded by `BIRCHER_MAX_REVISIONS`
-   (default 2); 0 disables it and restores the pre-loop behaviour exactly.
+   settles it, and goes back to step 8. Unbounded; a run parks `no_progress`
+   after three identical rounds.
 10. **Lifecycle recording.** The runner replays the derived facts into the
    kernel: output, CI observation, review verdict, then `request_merge`.
 11. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
@@ -340,7 +340,7 @@ Steps 6 and 8 each perform a cross-vendor review of the same PR.
 | | who dispatches | when | can it repair? | bound |
 |---|---|---|---|---|
 | lead session's review | the model, per `muesli-loop` | during the session | yes | 3 fix rounds |
-| coordinator's review | Python, per `review.py` | after the session is cancelled | **yes, since 2026-08-31** | `BIRCHER_MAX_REVISIONS`, default 2 |
+| coordinator's review | Python, per `review.py` | after the session is cancelled | **yes, since 2026-08-31** | unbounded; parks `no_progress` after three identical rounds |
 
 **This table said `no` for the second row until 2026-08-31, and that asymmetry
 was the reason for the repair loop.** `observe.py` turned a reviewer FAIL into
@@ -586,8 +586,8 @@ of the runner/coordinator split and should NOT be patched in place.
 
 ### The repair loop, as of 2026-08-31
 
-Built and merged; `BIRCHER_MAX_REVISIONS` (default 2, range 0–5, 0 disables).
-A reviewer FAIL with rounds remaining is a `revise`, not an ending: the runner
+Built and merged; repair rounds are unbounded, and a run parks `no_progress`
+after three identical rounds. A reviewer FAIL is a `revise`, not an ending: the runner
 records `request_revision`, confirms the kernel journalled it, dispatches a
 repair session briefed on the reviewer's verbatim findings, and derives again.
 
@@ -658,8 +658,9 @@ journal for its answer.
 
 ONLY that case. The mechanism escalations -- the revision was not journalled, no
 findings were written -- keep `request_revision`, because a revision genuinely IS
-owed there and nothing performed it. `_terminal_review_flag` draws the line, and
-is a function rather than an inline test so something can drive it.
+owed there and nothing performed it. A small helper drew that line, kept
+separate from the runner's main flow so something could drive it; the
+allowance and that helper are gone now that rounds are unbounded.
 
 **The implementer is being killed before it finishes, and that may be part of
 what the loop is repairing** (gap 15, open). Four `runner_error` reaps across the

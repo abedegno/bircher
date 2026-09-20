@@ -171,11 +171,10 @@ _NEEDED_REAL_FUNCTIONS = [
     # empty scorecard as "it took some other branch".
     "_refused_mint_row", "_unreadable_state_item",
     # `run_item`'s tail (closed-loop spec §2) reads `_ffile` from
-    # `_findings_path`, which reads `_max_revisions`, which reads
-    # `_clamp_int` -- pure, no kernel/session/network call among them, so
-    # real rather than stubbed keeps the drive honest without adding noise
-    # to the call log.
-    "_findings_path", "_max_revisions", "_clamp_int",
+    # `_findings_path` -- pure, no kernel/session/network call, so real
+    # rather than stubbed keeps the drive honest without adding noise to the
+    # call log.
+    "_findings_path",
 ]
 
 

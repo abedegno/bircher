@@ -43,7 +43,7 @@ def test_a_red_pr_never_reaches_the_reviewer():
     d = _deps(checks=lambda pr: "build|fail",
               review=lambda pr, sha: (asked.append(pr) or "PASS", ""))
     r = derive("i1", "i1", "7", "", deps=d)
-    assert r.outcome == "failed" and asked == []
+    assert r.outcome == "repair" and asked == []
 
 
 def test_the_reviewed_sha_is_captured_BEFORE_the_review_is_dispatched():
@@ -161,8 +161,8 @@ def test_the_head_rides_out_on_every_outcome_with_a_pr():
     so the head is evidence on every outcome, not only the merge-authorising
     one. The merge gate is `outcome == ready`, not the presence of a sha."""
     head = "a" * 40
-    failed = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: ("FAIL", "")))
-    assert failed.outcome == "failed" and failed.sha == head
+    repaired = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: ("FAIL", "")))
+    assert repaired.outcome == "repair" and repaired.sha == head
     esc = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: (None, "")))
     assert esc.outcome == "escalated" and esc.sha == head
     red = derive("i1", "i1", "7", "", deps=_deps(checks=lambda pr: "build|fail"))

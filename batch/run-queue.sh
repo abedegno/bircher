@@ -2713,20 +2713,6 @@ _derived_width_ok() {
   [ "$n" = 13 ]
 }
 
-# _max_revisions -> how many repair rounds this run may spend, 0-5.
-#
-# `_clamp_int` returns its DEFAULT for anything outside the range, NOT a
-# truncation to the nearest bound -- a distinction that already cost this file
-# a silent 300s budget where 5300s was intended. Here it means
-# BIRCHER_MAX_REVISIONS=9 gets 2, not 5. That is the safe direction (an
-# operator asking for more rounds than the range allows gets the default rather
-# than the maximum) and it is stated because the alternative reading is the
-# obvious one.
-#
-# 0 disables the loop and restores the pre-loop behaviour exactly, which is
-# what makes this shippable behind a switch rather than as a rewrite.
-_max_revisions() { _clamp_int "${BIRCHER_MAX_REVISIONS:-2}" 2 0 5; }
-
 # _repair_prompt <item> <pr> <branch> <findings> -> the brief for a repair round.
 #
 # Shaped after the hand-run repairs that worked: #740 converged in one round and
@@ -2757,43 +2743,6 @@ branch, not a second implementation.
 The original task, for context:
 
 $1"
-}
-
-# _terminal_review_flag <outcome> -> `terminal` when this review failure ENDS
-# the item, empty otherwise.
-#
-# A FUNCTION so a test can reach it. The call site is inside run_item and
-# nothing can drive that, and the distinction it draws is not obvious enough to
-# leave to a grep: `failed` is reached from exactly one place -- a reviewer FAIL
-# with no repair rounds left -- so it means "the bound is spent, record a
-# rejection". Every other escalation keeps `request_revision`, because a
-# revision genuinely IS owed there and nothing performed it; telling a resume
-# to dispatch an implementer is the right answer in those cases and the wrong
-# one here.
-_terminal_review_flag() {  # <outcome>
-  [ "${1:-}" = failed ] && printf 'terminal'
-  return 0
-}
-
-# _revision_is_recorded <revisions-tuple> -> rc 0 only if the kernel journalled
-# the revision we submitted. The tuple is `used|left|confirmed` from
-# `coordinator.cli revisions --confirm-command <key>`.
-#
-# A FUNCTION, and not `[ "${state##*|}" = yes ]` at the call site, for one
-# reason: the call site is inside run_item and nothing can drive it. The branch
-# it guards is the one criterion 7 of the design exists for -- "the runner must
-# observe an accepted REVIEW_VERDICT carrying the submitted command's causal id
-# before it dispatches any repair work" -- and a guard on the most consequential
-# branch in the loop, with no test able to reach it, is the shape that let a
-# whole coordinator arm ship with zero executing coverage.
-#
-# EMPTY IS NO. An unreadable journal, a crashed lookup and a bounded call that
-# timed out all arrive here as "", and every one of them means the same thing:
-# we did not observe the fact. Reading absence as permission is how a repair
-# gets dispatched against a run the kernel never revised.
-_revision_is_recorded() {  # <used|left|confirmed>
-  case "${1:-}" in *"|yes") return 0 ;; esac
-  return 1
 }
 
 # _recovery_action <run_id> <base_sha> <context_hash> -> `do|why`, or empty.
@@ -2838,21 +2787,11 @@ _recovery_forbids_merge() {  # <action>
   return 1
 }
 
-# _findings_path <code> -> where this round's findings go, or EMPTY when the
-# repair loop is disabled.
+# _findings_path <code> -> where this round's findings go.
 #
-# EMPTY IS THE POINT. `observe_outcome` omits `--findings-out` entirely for an
-# empty value, and the CLI's unlink-then-replace only runs when that flag is
-# present -- so BIRCHER_MAX_REVISIONS=0 performs no file operation at all, which
-# is what "restores the previous behaviour exactly" has to mean.
-#
-# It did not, in the first cut: the path was passed unconditionally, so a
-# disabled loop still made derivation depend on being able to unlink a file in
-# NOOP_DIR. An unwritable or misowned directory there turned a healthy item into
-# a nonzero exit, an empty tuple and an escalation -- a live item failing for
-# repair-loop storage it was configured never to use. Found by cross-review.
+# ALWAYS a path now: the findings ride out on every FAIL (closed-loop spec
+# §1), and there is no disabled loop left to leave them unwritten.
 _findings_path() {  # <code>
-  [ "$(_max_revisions)" = 0 ] && return 0
   printf '%s' "${NOOP_DIR}/${1}.findings"
 }
 
@@ -3016,9 +2955,7 @@ _step_loop() {
   while :; do
     _merge_base=""; _delta_digest=""; _fingerprints=""; _pr_state=""; _failing_jobs=""
     echo "[batch] $item: deriving the ground truth from the repository (repair rounds so far: $_rev_round)" >&2
-    # `0` is the old allowance argument, kept until Task 10 removes it: the
-    # findings ride out on every FAIL now, so it decides nothing.
-    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" 0 "$_ffile")
+    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" "$_ffile")
     # A CRASHED OR MALFORMED DERIVATION IS NOT A VERDICT: nothing is recorded,
     # the run stays open, and the next wave derives again.
     if [ -z "${obs//[[:space:]]/}" ] || ! _derived_width_ok "$obs"; then
@@ -3083,8 +3020,22 @@ EOF
         outcome=waiting; note="${note:+$note; }waiting on PR #$pr (ci=${_obs_ci:-na}); the next wave resumes"
         return 0 ;;
       done)
-        # The PR left the loop by another hand, or the run is already over:
-        # the caller records the outcome the derivation named.
+        # The PR left the loop by another hand, or the run is already over.
+        # The derivation's own word can be `repair` or `waiting` here --
+        # neither is in `_kernel_record_run_outcome`'s vocabulary
+        # (merged|ready|escalated|noop|skipped|failed|timeout), and the
+        # kernel refuses an `unrecognised` payload -- leaving the run with no
+        # terminal fact at all. Name a terminal word from the PR's own state
+        # instead: a merge is `ready`, a close (unmerged) is `escalated`.
+        # Anything else -- open, or a state this pass could not read -- means
+        # the run ended some other way (a resumed `merged`/`cancelled` state,
+        # handled before this loop even starts) and the derivation's word was
+        # already terminal, so it stands.
+        case "$_pr_state" in
+          merged) outcome=ready ;;
+          closed) outcome=escalated ;;
+        esac
+        note="${note:+$note; }PR #$pr is ${_pr_state:-unknown}; the run ends"
         return 0 ;;
       merge)
         outcome=ready
@@ -3233,7 +3184,7 @@ _merge_step() {
   fi
 }
 
-observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out]
+observe_outcome() {  # <item> <code> <pr> [issue] [findings_out]
   # THE DERIVATION, in Python since 2026-08-29. What was 192 lines here is now
   # v2/coordinator/outcome.py with eighteen tests driving it directly, plus its
   # dependencies -- discovery, reconciliation, CI classification, the review
@@ -3247,12 +3198,11 @@ observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out
   # Emits the same SEVEN fields it always did:
   #   outcome|review|note|head|ci|ci_first|resubmissions
   #
-  # The last two arguments are the repair loop's, and both default to the
-  # pre-loop behaviour: no allowance, and nowhere to write findings. A
-  # `--revisions-left` of 0 makes `revise` unreachable, so every caller that
-  # does not pass them gets exactly what it got before.
+  # The last argument names where to write the reviewer's findings on a FAIL
+  # (closed-loop spec §1); omitted, the CLI derives exactly the same tuple and
+  # simply writes nothing to disk.
   local out="" _budget _rc=0 _pw _pr _prw
-  local _rl="${5:-0}" _fo="${6:-}"
+  local _fo="${5:-}"
   _budget=$(_derive_budget)
   # The SAME validated numbers the budget was computed from.
   read -r _pw _pr _prw <<<"$(_ci_policy)"
@@ -3264,7 +3214,7 @@ observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out
            --server "$SERVER" --bundle-dir "$BUNDLE_DIR" \
            --poll-interval "$MAIN_CI_POLL_INTERVAL" \
            --ci-wait "$_pw" --rerun-max "$_pr" --rerun-wait "$_prw" \
-           --revisions-left "$_rl" ${_fo:+--findings-out "$_fo"}
+           ${_fo:+--findings-out "$_fo"}
   ) || { _rc=$?; out=""; }
   # A TIMEOUT AND A CRASH BOTH YIELD AN EMPTY TUPLE, and the caller correctly
   # escalates either way -- but a human reading the log cannot tell them apart,
@@ -5822,28 +5772,12 @@ SH
 
   # --- The repair loop: shell -> Python -> back, over the real call path ------
   #
-  # tests/coordinator/ already drives `classify`, `revisions_used` and the
-  # findings transport directly, and none of that can see what these check:
-  # that THIS shell passes the two new arguments in a form the CLI accepts, and
-  # that the file the CLI writes is the file this shell can read. Both sides
-  # were green while disagreeing about a vocabulary before -- twice -- and
-  # neither time was it visible from either side alone.
-  [ "$(BIRCHER_MAX_REVISIONS= _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: default is not 2"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=0 _max_revisions)" = 0 ] \
-    || { echo "FAIL _max_revisions: 0 must disable the loop"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=5 _max_revisions)" = 5 ] \
-    || { echo "FAIL _max_revisions: 5 is in range"; exit 1; }
-  # OUT OF RANGE RETURNS THE DEFAULT, not the nearest bound. `_clamp_int` has
-  # always done this and the misreading of it silently turned a 5300s budget
-  # into 300s once already. Pinned so the behaviour is a decision, not a
-  # surprise a future reader has to rediscover.
-  [ "$(BIRCHER_MAX_REVISIONS=9 _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: out of range must give the DEFAULT (2), not the max"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=abc _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: a non-numeric value must give the default"; exit 1; }
-  echo "_max_revisions OK"
-
+  # tests/coordinator/ already drives `classify` and the findings transport
+  # directly, and none of that can see what this checks: that THIS shell
+  # passes findings-out in a form the CLI accepts, and that the file the CLI
+  # writes is the file this shell can read. Both sides were green while
+  # disagreeing about a vocabulary before -- twice -- and neither time was it
+  # visible from either side alone.
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/gh" <<'SH'
 #!/usr/bin/env bash
@@ -5868,54 +5802,35 @@ exit 0
 SH
   chmod +x "$rdir/gh" "$rdir/omnigent"
 
-  # WITH rounds left: the outcome is `revise` and the findings are on disk.
-  local rev_out
-  rev_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+  # A FAIL derives `repair`, and the findings land on disk (closed-loop spec §1).
+  local rep_out
+  rep_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex \
-            observe_outcome demo demo 7 "" 2 "$rdir/findings.txt")
-  case "$rev_out" in
-    revise\|codex:fail\|*) ;;
-    *) echo "FAIL repair: a FAIL with rounds left must derive 'revise', got '$rev_out'"; exit 1 ;;
+            observe_outcome demo demo 7 "" "$rdir/findings.txt")
+  case "$rep_out" in
+    repair\|codex:fail\|*) ;;
+    *) echo "FAIL repair: a FAIL must derive 'repair', got '$rep_out'"; exit 1 ;;
   esac
-  _derived_width_ok "$rev_out" \
-    || { echo "FAIL repair: the revise tuple is not thirteen fields on one line: '$rev_out'"; exit 1; }
+  _derived_width_ok "$rep_out" \
+    || { echo "FAIL repair: the repair tuple is not thirteen fields on one line: '$rep_out'"; exit 1; }
   [ -s "$rdir/findings.txt" ] \
-    || { echo "FAIL repair: no findings were written for a revise"; exit 1; }
+    || { echo "FAIL repair: no findings were written for a repair"; exit 1; }
   grep -q 'drops b' "$rdir/findings.txt" \
     || { echo "FAIL repair: the reviewer's findings did not survive the file transport"; cat "$rdir/findings.txt"; exit 1; }
   # The findings contain a pipe and newlines. If any of that had leaked into the
   # tuple the width check above would already have failed -- this pins WHY.
-  case "$rev_out" in
+  case "$rep_out" in
     *"drops b"*) echo "FAIL repair: findings leaked into the tuple"; exit 1 ;;
   esac
 
-  # WITHOUT rounds left: the TUPLE is byte-identical to the pre-loop
-  # behaviour (still `failed`, not `revise`) -- that is what makes
-  # BIRCHER_MAX_REVISIONS=0 a real rollback of the OUTCOME. The findings
-  # file is a separate channel, and the closed loop now writes it even here
-  # (spec §1): the terminal round is a repair round too, and the head that
-  # rides out with it is what a `ci_red`/`review_fail` repair is briefed
-  # from -- whether or not this particular FAIL still has a round to spend.
-  rm -f "$rdir/findings.txt"
-  local norev_out
-  norev_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
-              RECOVERY_REVIEWER=codex \
-              observe_outcome demo demo 7 "" 0 "$rdir/findings.txt")
-  case "$norev_out" in
-    failed\|codex:fail\|*) ;;
-    *) echo "FAIL repair: a FAIL with NO rounds left must stay 'failed', got '$norev_out'"; exit 1 ;;
-  esac
-  [ -s "$rdir/findings.txt" ] \
-    || { echo "FAIL repair: no findings were written for a terminal failure (closed-loop spec §1)"; exit 1; }
-  grep -q 'drops b' "$rdir/findings.txt" \
-    || { echo "FAIL repair: the reviewer's findings did not survive the file transport on a terminal failure"; cat "$rdir/findings.txt"; exit 1; }
-  # And the DEFAULT -- no arguments at all -- must be the terminal one, so every
-  # existing caller of observe_outcome is unaffected by the loop's existence.
+  # WITHOUT a findings-out path -- every non-repair caller -- the TUPLE is
+  # unaffected: the findings ride on every FAIL regardless of whether anyone
+  # asked to write them to disk.
   local dflt_out
   dflt_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex observe_outcome demo demo 7)
-  [ "$dflt_out" = "$norev_out" ] \
-    || { echo "FAIL repair: observe_outcome's default is not the pre-loop behaviour: '$dflt_out' vs '$norev_out'"; exit 1; }
+  [ "$dflt_out" = "$rep_out" ] \
+    || { echo "FAIL repair: observe_outcome's tuple changed with no findings-out path: '$dflt_out' vs '$rep_out'"; exit 1; }
   echo "observe_outcome repair arguments OK"
 
   # `_pr_branch` READS the branch. Deriving it from the code instead stalled a
@@ -5964,40 +5879,12 @@ SH
     *) echo "FAIL _repair_round: a missing vendor did not refuse by name (got: ${_rr_err:-<nothing>})"; exit 1 ;;
   esac
   # The durability gate. Criterion 7: an accepted REVIEW_VERDICT carrying the
-  # submitted command's causal id, or no repair work is dispatched.
+  # submitted command's causal id, or no repair work is dispatched. The
+  # allowance itself and its two self-test-only helper functions went with the
+  # rest of the bound; the recovery-table row below is what is left to check
+  # from this file.
   _recovery_forbids_merge "reconciled_ruling_needed|resolution is free text" \
     || { echo "FAIL _recovery_forbids_merge: a human-reconciled merge was not forbidden"; exit 1; }
-  _revision_is_recorded "1|1|yes" \
-    || { echo "FAIL _revision_is_recorded: a confirmed revision was rejected"; exit 1; }
-  ! _revision_is_recorded "1|1|no" \
-    || { echo "FAIL _revision_is_recorded: an unconfirmed revision was accepted"; exit 1; }
-  # EVERY failure shape arrives as an empty string, and every one must be "no".
-  ! _revision_is_recorded "" \
-    || { echo "FAIL _revision_is_recorded: a failed lookup read as confirmation"; exit 1; }
-  ! _revision_is_recorded \
-    || { echo "FAIL _revision_is_recorded: a missing argument read as confirmation"; exit 1; }
-  # A count is not a confirmation. `1|1|` says a revision was used at some point
-  # and says nothing about OURS -- which is precisely the previous round's
-  # revision confirming this round's missing one.
-  ! _revision_is_recorded "1|1|" \
-    || { echo "FAIL _revision_is_recorded: a truncated tuple read as confirmation"; exit 1; }
-  # And it must match the FIELD, not the substring: a run whose note or counts
-  # merely contain the word must not pass.
-  ! _revision_is_recorded "yes|1|no" \
-    || { echo "FAIL _revision_is_recorded: matched 'yes' outside the confirmed field"; exit 1; }
-  # The bound-exhausted review is the ONLY one that records a rejection.
-  [ "$(_terminal_review_flag failed)" = terminal ] \
-    || { echo "FAIL _terminal_review_flag: a spent allowance must record a rejection"; exit 1; }
-  for o in revise ready escalated timeout noop skipped ""; do
-    [ -z "$(_terminal_review_flag "$o")" ] \
-      || { echo "FAIL _terminal_review_flag: '$o' must not record a rejection"; exit 1; }
-  done
-  # `escalated` in particular: the revision-not-journalled and no-findings paths
-  # end there, and a revision IS owed on both -- `dispatch_implementer` is the
-  # right answer for a resume, so they must keep request_revision.
-  [ -z "$(_terminal_review_flag escalated)" ] \
-    || { echo "FAIL _terminal_review_flag: a mechanism escalation is not a rejection"; exit 1; }
-  echo "_terminal_review_flag OK"
 
   # --- preflight_kernel, driven for real (gap 10) -----------------------------
   #
@@ -6064,51 +5951,37 @@ SH
     *) echo "FAIL _derive_budget: an over-budget setting was accepted silently -- that is the collapse this warning exists for"; exit 1 ;;
   esac
   echo "_derive_budget defaults fit OK"
-  echo "_revision_is_recorded OK"
 
-  # THE ROLLBACK, asserted as a property of the call and not of the loop.
-  # BIRCHER_MAX_REVISIONS=0 must leave derivation with no findings-file
-  # operation whatever, so a NOOP_DIR that cannot be written to -- unwritable,
-  # misowned, holding a protected stale file -- cannot fail an item that was
-  # configured never to repair.
-  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR=/nonexistent/nope _findings_path c1)" ] \
-    || { echo "FAIL _findings_path: a disabled loop still names a findings file"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=2 NOOP_DIR=/tmp/nd _findings_path c1)" = "/tmp/nd/c1.findings" ] \
-    || { echo "FAIL _findings_path: an enabled loop must name one"; exit 1; }
-  # And an empty path must make observe_outcome behave as it did before the
-  # loop existed -- proven against a path it could not possibly write to.
+  # `_findings_path` ALWAYS names a path now: the findings ride on every FAIL
+  # (spec §1), and there is no disabled loop left to reproduce.
+  [ "$(NOOP_DIR=/tmp/nd _findings_path c1)" = "/tmp/nd/c1.findings" ] \
+    || { echo "FAIL _findings_path: must always name a path"; exit 1; }
+  # An EMPTY findings-out path (the caller declining to pass one) must
+  # reproduce the same tuple as the no-argument call above -- the file write
+  # is skipped, the derivation is not.
   local ro_out
   ro_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
            RECOVERY_REVIEWER=codex \
-           observe_outcome demo demo 7 "" 0 "")
+           observe_outcome demo demo 7 "" "")
   [ "$ro_out" = "$dflt_out" ] \
-    || { echo "FAIL rollback: an empty findings path did not reproduce the pre-loop tuple: '$ro_out' vs '$dflt_out'"; exit 1; }
-  # THE HAZARD ITSELF, reproduced. A path that merely does not exist is fine --
-  # the CLI tolerates ENOENT on the pre-derivation unlink, because "nothing to
-  # clear" is the normal case. The failure needs a stale file that CANNOT be
-  # removed, which is what an unwritable or misowned NOOP_DIR produces.
-  #
-  # An earlier version of this test used /nonexistent/... and passed while
-  # asserting the opposite of what happened -- the derivation succeeded, ENOENT
-  # having been swallowed exactly as designed. A reproduction that cannot
-  # produce the failure it names proves nothing about the fix.
+    || { echo "FAIL observe_outcome: an empty findings path did not reproduce the no-path tuple: '$ro_out' vs '$dflt_out'"; exit 1; }
+  # THE HAZARD: a stale findings file that CANNOT be removed must fail the
+  # derivation rather than silently leave a previous round's findings beside a
+  # fresh verdict. A path that merely does not exist is fine -- the CLI
+  # tolerates ENOENT on the pre-derivation unlink, because "nothing to clear"
+  # is the normal case. The failure needs a stale file that CANNOT be removed,
+  # which is what an unwritable or misowned NOOP_DIR produces.
   mkdir -p "$rdir/ro"
   : > "$rdir/ro/f.txt"
   chmod 500 "$rdir/ro"
   local rofail_out
   rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
                RECOVERY_REVIEWER=codex \
-               observe_outcome demo demo 7 "" 0 "$rdir/ro/f.txt")
-  # This is the pre-fix behaviour, pinned so the hazard stays visible: passing
-  # an unusable path fails the derivation even with NO revisions allowed.
+               observe_outcome demo demo 7 "" "$rdir/ro/f.txt")
   [ -z "$rofail_out" ] \
-    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: an unremovable stale findings file did not fail the derivation, so this test no longer reproduces the hazard: '$rofail_out'"; exit 1; }
-  # And the fix: with the loop disabled, run_item never passes the path at all,
-  # so the same unusable directory cannot reach the derivation.
-  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR="$rdir/ro" _findings_path demo)" ] \
-    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: a disabled loop still names a path in an unwritable directory"; exit 1; }
+    || { chmod 700 "$rdir/ro"; echo "FAIL observe_outcome: an unremovable stale findings file did not fail the derivation: '$rofail_out'"; exit 1; }
   chmod 700 "$rdir/ro"
-  echo "_findings_path rollback OK"
+  echo "_findings_path OK"
 
   # The three recovery rows that must never reach a merge, and the reasons they
   # are three rather than one.
