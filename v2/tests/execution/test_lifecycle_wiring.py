@@ -504,7 +504,12 @@ def test_no_effect_in_run_item_runs_before_a_generation_exists():
 #: Functions containing an `_effect` call, and the generation context they run
 #: in. REACHED = called from run_item, so the exported generation is this run's.
 _EFFECT_SITE_CONTEXT = {
-    "run_item": "REACHED",
+    # `run_item` itself is NOT here any more. Its one direct `_effect` call
+    # was the running-label swap, and F7 lifted that into `_label_running` so
+    # the back half can perform it after the park reply rather than before
+    # it. Every effect run_item causes now goes through one of the functions
+    # below; the table's second assertion is what says so, by refusing a name
+    # that no longer contains an `_effect` call.
     "_send_prompt": "REACHED",
     "_prune_session": "REACHED",
     "_post_cross_review_status": "REACHED",
@@ -541,6 +546,14 @@ _EFFECT_SITE_CONTEXT = {
     # `_issue_writeback` and `_ensure_issue_closed` do -- BIRCHER_RUN_ID and
     # BIRCHER_GENERATION are already established by dynamic scope.
     "_park_back_half": "REACHED",
+    # The running-label swap, lifted out of `run_item`'s own body into a
+    # function (F7) so the back half can perform it AFTER the park reply
+    # rather than before it. Same site, same generation-keyed idempotency
+    # key, same context: both callers -- `run_item` and `_resume_back_half`,
+    # which `run_item` calls -- are downstream of the operator fence, so
+    # BIRCHER_RUN_ID and BIRCHER_GENERATION are already established by
+    # dynamic scope exactly as they were when the line sat inline.
+    "_label_running": "REACHED",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about

@@ -92,6 +92,15 @@ _NEEDED_REAL_FUNCTIONS = [
     # `_front_half_resumable` above -- an undefined one is false under bash,
     # which would silently route every back-half state to the escalate arm.
     "_back_half_state",
+    # The running-label swap, now a function so the back half can do it after
+    # the park reply rather than before it (F7). REAL: it carries the sliced
+    # guard and the generation-keyed idempotency key these tests assert on,
+    # and an undefined one would make every "it swapped" assertion read as
+    # "it decided not to".
+    "_label_running",
+    # The journal-driven seating (F1). REAL: it decides which vendor reviews
+    # a resumed run, and a stub would answer for the decision under test.
+    "_seat_vendors",
 ]
 
 
@@ -163,6 +172,13 @@ _kernel_pending()  {{ _log_call _kernel_pending "$@"; printf '%s' "${{T_PENDING:
 _kernel_unresolved_disagreement() {{ _log_call _kernel_unresolved_disagreement "$@"; printf '%s' "${{T_DISAGREEMENT-}}"; }}
 _kernel_state() {{
   _log_call _kernel_state "$@"
+  # ONCE THE TERMINAL FACT HAS BEEN SUBMITTED the state is what the kernel
+  # made of it, and `_finish_pass` reads it back before it retires the queue
+  # file (F5: the adapter is advisory, so "I asked" is not "it was accepted").
+  # T_STATE_ENDED is that answer -- `ended` by default, anything else for a
+  # kernel that refused. Answered BEFORE the counter, so the indices every
+  # other assertion in this file uses do not move.
+  if [ -s "{ranoutcome}" ]; then printf '%s' "${{T_STATE_ENDED-ended}}"; return 0; fi
   local n; n=$(cat "{statecount}"); n=$((n+1)); printf '%s' "$n" > "{statecount}"
   # On the RESUME path the first read is the run's current state. Every later
   # read is post-loop: the sliced check the moment `phases` returns (shaping
@@ -211,7 +227,8 @@ _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
-_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; }}
+_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; printf '1' > "{ranoutcome}"; }}
+_kernel_conflicted() {{ _log_call _kernel_conflicted "$@"; printf '%s' "${{T_CONFLICTED-}}"; }}
 _kernel_dispatch() {{
   _log_call _kernel_dispatch "$@"
   local n; n=$(cat "{gencounter}"); n=$((n+1)); printf '%s' "$n" > "{gencounter}"
@@ -384,10 +401,15 @@ def _drive(tmp_path, *, env_extra=None, with_issue=True, sidecar=None,
     gencounter.write_text("0")
     statecount = tmp_path / "statecount"
     statecount.write_text("0")
+    #: Set by the `_kernel_record_run_outcome` stub; `_kernel_state` answers
+    #: T_STATE_ENDED once it exists.
+    ranoutcome = tmp_path / "ranoutcome"
+    ranoutcome.write_text("")
 
     stub_file = tmp_path / "stubs.sh"
     stub_file.write_text(_STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
+        ranoutcome=ranoutcome,
         statecount=statecount, head_sha=HEAD_SHA, reviewed_sha=REVIEWED_SHA,
         outhash=OUT_HASH, ctx_hash=CTX_HASH, pr=PR,
         issue_copy=tmp_path / "sent-issue.json",
@@ -1014,6 +1036,113 @@ def test_planned_WITHOUT_a_start_implementation_is_resumed_not_escalated(tmp_pat
     assert d.args_of("_kernel_implementation_started") == [OPEN_RUN]
     assert "escalated" not in d.outcomes, d.calls
     assert d.args_of("_kernel_start_implementation")[0] == OPEN_RUN, d.calls
+
+
+# --- F5: a refused terminal fact is not a finished run ----------------------
+
+def test_a_refused_terminal_fact_leaves_the_queue_file_where_it_is(tmp_path):
+    """`_kernel` is ADVISORY: it returns 0 whether the kernel accepted the
+    command or refused it, and in `shadow` mode logs nothing. So the pass used
+    to write the row, write back to the issue and retire the queue file on the
+    strength of HAVING ASKED -- reporting a run finished that the journal still
+    holds open, with nothing left to drive it. The state is read back; a run
+    the kernel did not end keeps its queue file for the next wave."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
+        "T_STATE_ENDED": "implementing",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert "_kernel_record_run_outcome" in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was retired on a refusal"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    # The row is still written -- a row is a record of the PASS -- and it says
+    # what happened.
+    assert d.outcomes == ["ready"], d.calls
+    note = d.args_of("json_row")[7]
+    assert "refused the terminal fact" in note, note
+
+
+def test_an_accepted_terminal_fact_retires_the_queue_file(tmp_path):
+    """The other side of the same read, so a mutation that always refuses
+    cannot pass: `ended` is `ended`, and the item is done."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
+        "T_STATE_ENDED": "ended",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not (d.queue_dir / f"{ITEM}.md").exists()
+    assert "refused the terminal fact" not in d.args_of("json_row")[7]
+
+
+# --- F7: a parked run is not relabelled `bircher:running` -------------------
+
+def _back_half_resume(tmp_path, **env):
+    e = {"BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+         "T_PENDING": json.dumps({"halted": False, "pending": []}),
+         "T_STATE_RESUME": "implementing",
+         "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}"}
+    e.update(env)
+    return _drive(tmp_path, env_extra=e)
+
+
+def _running_swaps(d):
+    return [a for n, a in d.calls
+            if n == "_effect" and any(str(x).startswith("running:") for x in a)]
+
+
+def test_a_resumed_run_holding_a_park_is_not_relabelled_running(tmp_path):
+    """The swap fired on every resumed pass, including one that then found a
+    standing park and returned immediately -- so the only signal a person sees
+    said `bircher:running`, "being worked", while the run waited on that same
+    person to reply `retry` or `stop`."""
+    d = _back_half_resume(tmp_path, T_PARK_REPLY="none")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["parked"], d.calls
+    assert _running_swaps(d) == [], _running_swaps(d)
+
+
+def test_a_resumed_run_with_no_park_is_relabelled_running(tmp_path):
+    """The other side: a pass that really does work the run still says so,
+    still through `_effect`, still under a generation-keyed idempotency key."""
+    d = _back_half_resume(tmp_path, T_PARK_REPLY="nopark")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    swaps = _running_swaps(d)
+    assert len(swaps) == 1, swaps
+    key = next(x for x in swaps[0] if str(x).startswith("running:"))
+    assert key == f"running:{ISSUE}:1", key      # the operator generation
+
+
+def test_a_person_who_replied_retry_gets_the_running_label(tmp_path):
+    """A granted round IS being worked, so the label must follow the reply
+    rather than the park's mere existence."""
+    d = _back_half_resume(tmp_path, T_PARK_REPLY="retry")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert len(_running_swaps(d)) == 1, d.calls
+
+
+def test_a_person_who_replied_stop_still_gets_the_label_swapped(tmp_path):
+    """Only the pass that RETURNS on a standing park skips the swap. A `stop`
+    ends the run and retires the item, and an issue left carrying
+    `bircher:queued` would be re-queued by `issues-to-queue.sh` -- minting a
+    second run over one a person had just stopped."""
+    d = _back_half_resume(tmp_path, T_PARK_REPLY="stop")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["escalated"], d.calls
+    assert len(_running_swaps(d)) == 1, d.calls
+
+
+def test_a_run_resumed_at_merged_still_gets_the_label_swapped(tmp_path):
+    d = _back_half_resume(tmp_path, T_STATE_RESUME="merged")
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["ready"], d.calls
+    assert len(_running_swaps(d)) == 1, d.calls
 
 
 def test_leak_guard_never_mints_over_an_open_run(tmp_path):

@@ -1025,3 +1025,19 @@ _kernel_back_state() {  # <run_id>
            --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
   printf '%s' "$out"
 }
+
+# _kernel_conflicted <run_id> -> the actors the kernel will refuse a review
+# from, comma-separated in sorted order (coordinator.cli conflicted), or empty
+# when the kernel would not answer.
+#
+# EMPTY IS NOT "nobody": it is "the journal did not say". `_seat_vendors` reads
+# it that way and leaves the wave's own pick alone, because seating a reviewer
+# on a silent answer is exactly the guess that put the implementer back in the
+# reviewer's chair. Same shape as `_kernel_back_state` above.
+_kernel_conflicted() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli conflicted \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}

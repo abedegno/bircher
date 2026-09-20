@@ -2950,10 +2950,14 @@ _park_back_half() {  # <item> <code> <reason> [cause] [evidence_csv]
 # the caller's own ending (timeout, escalated) stands. `merge` means the
 # caller performs `_merge_step`. `wait` and `park` mean the run is not over.
 _step_loop() {
-  local obs _stepline _st_now _redispatch _rbranch _findings _known_pr
+  local obs _stepline _st_now _redispatch _rbranch _findings _known_pr _recorded_verdict
   _step=""; _step_cause=""; _step_evidence=""; _step_reason=""
   while :; do
     _merge_base=""; _delta_digest=""; _fingerprints=""; _pr_state=""; _failing_jobs=""
+    # Per ITERATION, not per pass: "this round recorded a verdict" is what
+    # tells a kernel refusal apart from a silent reviewer below, and a flag
+    # left standing from the previous round would answer for this one.
+    _recorded_verdict=0
     echo "[batch] $item: deriving the ground truth from the repository (repair rounds so far: $_rev_round)" >&2
     obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" "$_ffile")
     # A CRASHED OR MALFORMED DERIVATION IS NOT A VERDICT: nothing is recorded,
@@ -2978,9 +2982,16 @@ EOF
     if [ -z "${pr:-}" ]; then
       # A PR a person closed is observed so the run can end (spec §1); the
       # caller's own ending then stands.
-      case "$_pr_state" in
-        closed|merged) _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" na "" "$_pr_state" "" "$_known_pr" ;;
-      esac
+      #
+      # WHENEVER A PR WAS KNOWN, not only on a word this pass recognised.
+      # Recording `closed|merged` alone meant a PR `gh` could not describe --
+      # deleted, an API error, a word nothing maps -- reached the journal not
+      # at all, `back.latest_pr_state` stayed frozen, and the run could never
+      # end. `_kernel_record_ci` omits an empty `pr_state` from the payload
+      # and an absent state reads as open, which is the fail-safe direction:
+      # a run that should have ended waits for the next wave, rather than one
+      # that should not have ended being ended on a word nobody read.
+      [ -n "$_known_pr" ] && _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" na "" "$_pr_state" "" "$_known_pr"
       _step=none; return 0
     fi
     _st_now=$(_kernel_state "$BIRCHER_RUN_ID")
@@ -3001,6 +3012,7 @@ EOF
           BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer); export BIRCHER_GENERATION
           _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "" "" "$observed_head" "$_merge_base" "$_delta_digest" "$_fingerprints"
           BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer); export BIRCHER_GENERATION
+          _recorded_verdict=1
           ;;
       esac
     fi
@@ -3035,13 +3047,34 @@ EOF
           merged) outcome=ready ;;
           closed) outcome=escalated ;;
         esac
+        # THE OTHER ROUTE INTO `done` is a terminal run state (step.py), and
+        # it arrives with whatever word the derivation produced -- which the
+        # two cases above do not touch when the PR's state is open or
+        # unreadable. `repair` and `waiting` are not terminal words:
+        # `_kernel_record_run_outcome` maps them to `unrecognised` and the
+        # kernel refuses, leaving the run with no terminal fact at all. Every
+        # `done` must name a word the kernel accepts.
+        case "$outcome" in
+          repair|waiting) outcome=escalated ;;
+        esac
         note="${note:+$note; }PR #$pr is ${_pr_state:-unknown}; the run ends"
         return 0 ;;
       merge)
         outcome=ready
         return 0 ;;
       review)
-        # This pass just reviewed the head and got no verdict; a person says
+        # A VERDICT THIS PASS RECORDED, and the journal still holds none for
+        # this head: the KERNEL refused the record. Almost always the seating
+        # -- the reviewer was in the run's conflicted set (`_seat_vendors`
+        # above fixes that for the next wave, and cannot when BOTH vendors
+        # are conflicted). Parking `no_verdict` here blames a reviewer that
+        # did its job and hands a person a question they cannot answer, so
+        # say what happened and let the next wave retry.
+        if [ "$_recorded_verdict" = 1 ]; then
+          echo "[batch] $item: the kernel did not record the verdict '$review' for head ${observed_head:0:7} (the reviewer is NOT at fault: a refused record, not a silent seat) -> waiting for the next wave" >&2
+          outcome=waiting; note="${note:+$note; }the kernel refused the recorded verdict ($review); the next wave re-seats and retries"; _step=wait; return 0
+        fi
+        # This pass reviewed the head and got no verdict; a person says
         # whether to review again (`retry`) or stop.
         if _park_back_half "$item" "$code" no_verdict; then
           # `review` is not in the returned vocabulary (wait|park|merge|done|
@@ -3100,13 +3133,32 @@ EOF
 # dynamic scope. A `wait` or `park` step leaves the run OPEN: no terminal
 # fact, and the queue file stays where it is for the next wave, as a
 # front-half park's does.
+#
+# AND SO DOES A TERMINAL FACT THE KERNEL REFUSED. `_kernel` is ADVISORY: it
+# returns 0 whether the kernel accepted the command or refused it, and in the
+# default `shadow` mode logs nothing. So this used to write the scorecard row,
+# write back to the issue and retire the queue file on the STRENGTH OF HAVING
+# ASKED -- reporting a run finished that the journal still holds open, with
+# nothing left to drive it. Every closed-loop defect ends here, so the state
+# is read back and a refusal takes the same path a `wait` takes.
 _finish_pass() {  # <item> <queue-file> <issue>
   local item="$1" f="$2" issue="$3"
+  local _terminal_ok=1
   mkdir -p "$(dirname "$SCORECARD")"
   case "${_step:-}" in
     wait|park) ;;
-    *) _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome" ;;
+    *)
+      # record_run_outcome
+      _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
+      if [ "$(_kernel_state "$BIRCHER_RUN_ID")" != ended ]; then
+        _terminal_ok=0
+        echo "[batch] $item: the kernel REFUSED the terminal fact outcome=$outcome for run $BIRCHER_RUN_ID -- the journal still holds this run open. NOT retiring the queue file; the next wave resumes it." >&2
+        note="${note:+$note; }the kernel refused the terminal fact (outcome=$outcome); the run is still open and the next wave resumes it"
+      fi
+      ;;
   esac
+  # The row is written either way: a row is a record of the PASS, not a claim
+  # that the run ended.
   json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" "${rounds:-}" >> "$SCORECARD"
   _issue_writeback "$issue" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}" "${rounds:-}"
   [ "$outcome" = "ready" ] && _ensure_issue_closed "$issue" "${pr:-}"
@@ -3114,6 +3166,7 @@ _finish_pass() {  # <item> <queue-file> <issue>
   case "${_step:-}" in
     wait|park) return "$merge_rc" ;;
   esac
+  [ "$_terminal_ok" = 1 ] || return "$merge_rc"
   mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
   return "$merge_rc"
 }
@@ -4183,12 +4236,78 @@ _back_half_state() {
   case "$1" in implementing|reviewing|merge_requested|merged|cancelled) return 0 ;; *) return 1 ;; esac
 }
 
+# _label_running -- swap `bircher:queued` for `bircher:running` on the run's
+# issue. Reads `_iss`, `_st`, `BIRCHER_GENERATION` and `REPO` by dynamic scope,
+# exactly as the inline call it replaces did.
+#
+# A FUNCTION so the back half can do it LATER. The swap used to fire on every
+# resumed pass, a resumed pass that then found a standing park included -- so
+# the only signal a person sees said "being worked" while the run waited on
+# that same person to reply `retry` or `stop`. `_resume_back_half` calls this
+# after it has read the park reply, which is the point at which the run really
+# is about to be worked; everything else calls it where it always did.
+#
+# The key carries the GENERATION. Keyed on the issue alone it said "this
+# run's running label" and could be attempted exactly once: a swap that
+# failed half-way (the label absent on the repo, 2026-09-08) was reconciled
+# as not delivered, the key was spent, and no later pass could try again --
+# the issue kept bircher:queued for the rest of the run. Under a generation
+# the same pass replays (a retry within it is still the same act) and the
+# next pass, a new generation, attempts it afresh.
+_label_running() {
+  [ -n "$_iss" ] && [ "${_st:-}" != sliced ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true  # a sliced run resumed mid-filing owns no running label to swap: the kernel refuses every other edit there
+}
+
+# _seat_vendors <run_id> -- seat the implementer and the reviewer from the
+# JOURNAL, and assign `vendor` and `RECOVERY_REVIEWER` in the caller's scope.
+#
+# The reviewer must be independent of THIS RUN'S OWN IMPLEMENTER, not of
+# whichever vendor this wave's usage gate happened to pick. `run_item` derives
+# `RECOVERY_REVIEWER` from `vendor`, and `vendor` defaults to `PICKED_VENDOR`,
+# which the gate re-picks every wave to balance the two providers' windows. So
+# on a resumed run whose previous implementer was claude_code, a wave that
+# picks codex seats claude_code as the reviewer; the kernel refuses that
+# verdict (`authz._conflicted_actors`), the loop finds no verdict on the head
+# and parks `no_verdict`, blaming a reviewer for a refusal the kernel made.
+#
+# THREE ANSWERS, not two. Exactly one known vendor conflicted is the ordinary
+# case and seats both roles. An empty or unreadable set is "the journal did
+# not say" -- leave the wave's pick alone rather than guess. BOTH conflicted
+# happens when a pass died between a repair's `start_implementation` and its
+# output, and then NO reviewer is acceptable: say so and leave the seats
+# where they are, so `_step_loop`'s own refusal handling keeps the run moving
+# instead of parking it on a question a person cannot answer.
+_seat_vendors() {  # <run_id>
+  local _cf _a _cc=0 _cx=0 _oifs
+  _cf=$(_kernel_conflicted "$1")
+  _oifs="$IFS"; IFS=','
+  for _a in $_cf; do
+    case "$_a" in claude_code) _cc=1 ;; codex) _cx=1 ;; esac
+  done
+  IFS="$_oifs"
+  if [ "$_cc" = 1 ] && [ "$_cx" = 1 ]; then
+    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- no reviewer the kernel will accept; leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick) and letting the loop wait rather than parking" >&2
+    return 0
+  fi
+  if [ "$_cc" = 1 ]; then
+    vendor=claude_code; RECOVERY_REVIEWER=codex
+  elif [ "$_cx" = 1 ]; then
+    vendor=codex; RECOVERY_REVIEWER=claude_code
+  else
+    echo "[batch] ${item:-?}: implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick; the journal names no conflicted actor for run $1)" >&2
+    return 0
+  fi
+  echo "[batch] ${item:-?}: implementer=$vendor reviewer=$RECOVERY_REVIEWER (from the journal's conflicted set for run $1: $_cf)" >&2
+}
+
 # _resume_back_half <item> <code> <queue-file> <issue> <state>
 #
 # One pass of the closed loop for a run another pass started (spec §2: waves
-# resume every open back-half run). Reads vendor, RECOVERY_REVIEWER,
-# BIRCHER_RUN_ID and BIRCHER_GENERATION from run_item's scope; declares every
-# name `_step_loop`, `_merge_step` and `_finish_pass` assign.
+# resume every open back-half run). Reads BIRCHER_RUN_ID and
+# BIRCHER_GENERATION from run_item's scope; declares every name `_step_loop`,
+# `_merge_step` and `_finish_pass` assign. `vendor` and `RECOVERY_REVIEWER`
+# are declared `local` here and re-seated from the journal by `_seat_vendors`,
+# so run_item's own pick survives this call unchanged.
 _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
   local item="$1" code="$2" f="$3" _iss="$4" _st="$5"
   local start; start=$(date +%s)
@@ -4197,17 +4316,26 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
   local pr="" _out_hash="" _rev_round=0
   local _merge_base="" _delta_digest="" _fingerprints="" _pr_state="" _failing_jobs="" _settled_pr=""
   local _step="" _step_cause="" _step_evidence="" _step_reason=""
+  # LOCAL, seeded from run_item's own pick and re-seated below. Without the
+  # `local` this function's seating would clobber the caller's values.
+  local vendor="${vendor:-}" RECOVERY_REVIEWER="${RECOVERY_REVIEWER:-}"
   local _base_sha; _base_sha=$(_kernel_run_base "$BIRCHER_RUN_ID")
   local _ctx_hash; _ctx_hash=$(_kernel_bundle_hash "$BIRCHER_RUN_ID")
   local _ffile; _ffile=$(_findings_path "$code")
   [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
   echo "[batch] $item: resuming run $BIRCHER_RUN_ID at $_st (closed loop)" >&2
+  # THE ENDING BRANCHES STILL SWAP. Only the pass that returns on a standing
+  # park skips it (see `_label_running`): a run that ends here is retired, and
+  # an issue left carrying `bircher:queued` would be re-queued by
+  # `issues-to-queue.sh` and mint a second run over a finished one.
   case "$_st" in
     merged)
       outcome=ready; note="run resumed at merged: recording the outcome an earlier pass lost"; _step=done
+      _label_running
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
     cancelled)
       outcome=escalated; note="stopped by a person"; _step=done
+      _label_running
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
   esac
   # A PARKED RUN READS ITS REPLY FIRST and derives nothing until a person
@@ -4220,12 +4348,18 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
     stop)
       echo "[batch] $item: stopped by a person" >&2
       outcome=escalated; note="stopped by a person"; _step=done
+      _label_running
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
     *)
       echo "[batch] $item: parked; no reply yet (${_reply:-reply unreadable})" >&2
       outcome=parked; note="parked; no reply yet (${_reply:-reply unreadable})"; _step=park
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
   esac
+  # The run really is about to be worked now, so the label can say so (see
+  # `_label_running`: the swap used to fire before the park reply was read).
+  _label_running
+  # THE SEATS, from the journal rather than from this wave's pick.
+  _seat_vendors "$BIRCHER_RUN_ID"
   local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
   _step_loop
   [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
@@ -4743,15 +4877,14 @@ run_item() {
   # that took one would spend the run's seat budget on its own bookkeeping.
   BIRCHER_GENERATION=$(_kernel_dispatch runner operator); export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || { echo "[batch] $item: operator dispatch failed" >&2; return 5; }
-  # Now that a generation exists, the label is a routed effect like any other.
-  # The key carries the GENERATION. Keyed on the issue alone it said "this
-  # run's running label" and could be attempted exactly once: a swap that
-  # failed half-way (the label absent on the repo, 2026-09-08) was reconciled
-  # as not delivered, the key was spent, and no later pass could try again --
-  # the issue kept bircher:queued for the rest of the run. Under a generation
-  # the same pass replays (a retry within it is still the same act) and the
-  # next pass, a new generation, attempts it afresh.
-  [ -n "$_iss" ] && [ "${_st:-}" != sliced ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true  # a sliced run resumed mid-filing owns no running label to swap: the kernel refuses every other edit there
+  # Now that a generation exists, the label is a routed effect like any other
+  # (`_label_running`, which carries the generation in its key).
+  #
+  # NOT ON A BACK-HALF RESUME. That pass may find a standing park and return
+  # without doing anything, and relabelling it `bircher:running` tells the
+  # person it is waiting on that it is being worked. `_resume_back_half`
+  # calls `_label_running` itself, after it has read the park reply.
+  [ "$_side" = back ] || _label_running
   if [ "$resumed" = 1 ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.

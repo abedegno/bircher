@@ -175,6 +175,11 @@ _NEEDED_REAL_FUNCTIONS = [
     # rather than stubbed keeps the drive honest without adding noise to the
     # call log.
     "_findings_path",
+    # The running-label swap, a function since F7 so the back half can do it
+    # after the park reply rather than before it. REAL: an undefined one
+    # would make `run_item`'s own call a silent no-op indistinguishable from
+    # a deliberate skip.
+    "_label_running",
 ]
 
 
@@ -322,7 +327,13 @@ _kernel_run_start() {{
 # DECIDES has its own file (test_front_half_seam.py); this one is about the
 # arguments the back half threads afterwards.
 _kernel_find_run()           {{ _log_call _kernel_find_run "$@"; printf ''; }}
-_kernel_state()              {{ _log_call _kernel_state "$@"; printf 'implementing'; }}
+# `implementing` until the terminal fact is submitted, and `ended` after it:
+# `_finish_pass` reads the state back before it retires the queue file, since
+# the adapter is advisory and "I asked" is not "the kernel accepted".
+_kernel_state() {{
+  _log_call _kernel_state "$@"
+  if [ -s "{ranoutcome}" ]; then printf 'ended'; else printf 'implementing'; fi
+}}
 _kernel_bundle_hash()        {{ _log_call _kernel_bundle_hash "$@"; printf '%s' "{ctx_hash}"; }}
 _implementer_brief()         {{ _log_call _implementer_brief "$@"; printf 'BRIEF(%s)' "$2"; }}
 _project_config()            {{ printf '{{}}'; }}
@@ -336,7 +347,7 @@ _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
-_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; }}
+_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; printf '1' > "{ranoutcome}"; }}
 _kernel_put_artifact() {{
   _log_call _kernel_put_artifact "$@"
   printf '%s' "$1" | shasum -a 256 | cut -c1-64
@@ -461,8 +472,11 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     # SINCE PHASE 2 THERE IS ONE PATH. The marker branch and the ground-truth
     # branch were the same lifecycle driven from two sources; only the derived
     # one remains, so every test here drives it.
+    ranoutcome = tmp_path / "ranoutcome"
+    ranoutcome.write_text("")
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
+        ranoutcome=ranoutcome,
         observed_review=observed_review, head_sha=HEAD_SHA,
         reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH, ctx_hash=CTX_HASH,
         issue_copy=tmp_path / "sent-issue.json",
@@ -562,11 +576,18 @@ _SEQUENCE = [
     "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
     "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
     "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
+    # `_finish_pass` READS THE STATE BACK before it retires the queue file.
+    # The adapter is advisory -- `_kernel` returns 0 whether the kernel
+    # accepted the terminal fact or refused it -- so the pass used to report
+    # a run finished on the strength of having asked. The read is a kernel
+    # call site like any other and belongs in the sequence, or an inserted
+    # one later would read as a missing call.
+    "_kernel_state",
 ]
 (I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_SLICED_CHECK, I_IMPLEMENTER,
  I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_STEP_STATE, I_OUTPUT,
  I_CI, I_REVIEWER, I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
- I_RUN_OUTCOME) = range(len(_SEQUENCE))
+ I_RUN_OUTCOME, I_ENDED_CHECK) = range(len(_SEQUENCE))
 
 
 def test_the_drive_reaches_every_kernel_call_site(happy_drive):
@@ -646,6 +667,18 @@ def test_start_implementation_gets_the_implementer_generation(happy_drive):
     # generation 2: the operator fence took 1, and the implementer is
     # dispatched AFRESH after phases rather than reusing it.
     assert args == [run_id, "2"], args
+
+
+def test_the_terminal_read_back_asks_about_this_run(happy_drive):
+    """`_finish_pass` decides whether to retire the queue file on this read,
+    so a wrong id here retires an item on another run's state -- exactly the
+    "reported finished while the journal holds it open" failure the read
+    exists to stop, with the evidence pointing at the wrong run."""
+    calls, _, _tmp = happy_drive
+    name, args = calls[I_ENDED_CHECK]
+    assert name == "_kernel_state"
+    assert args == [calls[I_RUN_START][1][0]], args
+    assert calls[I_ENDED_CHECK - 1][0] == "_kernel_record_run_outcome", calls[I_ENDED_CHECK - 1]
 
 
 def test_the_sliced_check_reads_this_run(happy_drive):
