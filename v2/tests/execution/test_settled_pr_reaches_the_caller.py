@@ -106,10 +106,12 @@ def test_run_item_adopts_the_settled_pr_before_it_authorizes_a_merge():
 
     `$pr` feeds `_kernel_request_merge`, `merge_ready_pr` and the scorecard
     line. Adopting it after the authorization would authorize one PR and merge
-    another -- a subtler version of the same defect.
+    another -- a subtler version of the same defect. The adoption is in
+    `_step_loop`; the merge authorization is in `_merge_step` (closed-loop
+    spec §2), which `_step_loop` precedes in the file.
     """
     src = RUN_QUEUE.read_text()
-    adopt = src.index('pr="$_settled_pr"')
+    adopt = src.index('pr="${_settled_pr:-}"')
     request = src.index('_kernel_request_merge "$BIRCHER_RUN_ID"', adopt - 20000)
     merge = src.index('merge_ready_pr "$item" "$pr"', adopt - 20000)
     assert adopt < request, "the settled PR must be adopted BEFORE request_merge"
@@ -119,7 +121,7 @@ def test_run_item_adopts_the_settled_pr_before_it_authorizes_a_merge():
 def test_an_unchanged_pr_is_not_announced():
     """The common case must stay quiet, or every item logs a non-event."""
     src = RUN_QUEUE.read_text()
-    i = src.index('pr="$_settled_pr"')
+    i = src.index('pr="${_settled_pr:-}"')
     guard = src[i - 400:i]
     assert '!= "${pr:-}"' in guard, (
         "adoption must be conditional on the PR actually differing")

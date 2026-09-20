@@ -170,6 +170,12 @@ _NEEDED_REAL_FUNCTIONS = [
     # one writes no row at all, and a test asserting the outcome then reads an
     # empty scorecard as "it took some other branch".
     "_refused_mint_row", "_unreadable_state_item",
+    # `run_item`'s tail (closed-loop spec §2) reads `_ffile` from
+    # `_findings_path`, which reads `_max_revisions`, which reads
+    # `_clamp_int` -- pure, no kernel/session/network call among them, so
+    # real rather than stubbed keeps the drive honest without adding noise
+    # to the call log.
+    "_findings_path", "_max_revisions", "_clamp_int",
 ]
 
 
@@ -206,6 +212,18 @@ def _extracted_script(tmp_path):
         "may have matched something else"
     )
     helpers = [_extract_function(src_lines, name) for name in _NEEDED_REAL_FUNCTIONS]
+    # `run_item`'s tail is three calls now (closed-loop spec §2): `_step_loop`
+    # (the derive/record/act cycle this file's sequence pins), `_merge_step`
+    # (the in-run merge, on a `merge` step) and `_finish_pass` (the scorecard
+    # row and the queue file's retirement). REAL, not stubbed -- they hold the
+    # exact call sites this file is checking argument wiring on, so a stub
+    # here would test nothing. `_step_loop` carries the ONE heredoc left in
+    # this drive (the derived tuple's `read`), so `_heredoc_to_herestring`
+    # applies to its extracted copy, not `run_item`'s own (which no longer
+    # contains it).
+    step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
+    merge_step_src = _extract_function(src_lines, "_merge_step")
+    finish_pass_src = _extract_function(src_lines, "_finish_pass")
 
     preamble = '''
 set -uo pipefail
@@ -227,10 +245,11 @@ IMPLEMENTER="${BIRCHER_IMPLEMENTER:-auto}"
 MERGE_NOTE=""
 MERGE_RETRY_ELIGIBLE=""
 '''
-    run_item_src = _heredoc_to_herestring(run_item_src)
 
     out = tmp_path / "run-item-extracted.sh"
-    out.write_text(preamble + "\n\n".join(helpers) + "\n\n" + run_item_src + "\n")
+    out.write_text(preamble + "\n\n".join(helpers) + "\n\n"
+                    + step_loop_src + "\n\n" + merge_step_src + "\n\n"
+                    + finish_pass_src + "\n\n" + run_item_src + "\n")
     return out
 
 
@@ -329,10 +348,19 @@ _kernel_dispatch() {{
   printf '%s' "$n"
 }}
 
-# Stubbed so no test reaches the network. Returning EMPTY means "no settle",
-# which keeps these tests on the path they were written for -- the loop running
-# to its existing exits rather than ending early on a quiet session.
-_coordinator()     {{ printf ''; return 1; }}
+# Stubbed so no test reaches the network. `session-settle` returns EMPTY,
+# which keeps the polling loop on the path it was written for -- running to
+# its existing exits rather than ending early on a quiet session. `step` is
+# `_step_loop`'s own next-action read (closed-loop spec §2): every drive
+# here records an accept, so the answer is always `merge`, unlogged like
+# every other `_coordinator` call -- this file pins the KERNEL call
+# sequence, not the journal reads between them.
+_coordinator() {{
+  case "$1" in
+    step) printf 'merge||||'; return 0 ;;
+    *) printf ''; return 1 ;;
+  esac
+}}
 _create_session()  {{ printf 'conv-test-1'; }}
 _send_prompt()     {{ return 0; }}
 _http_json()       {{ printf '{{}}'; }}
@@ -528,13 +556,17 @@ _SEQUENCE = [
     "_kernel_state",
     "_kernel_dispatch", "_kernel_start_implementation", "_kernel_state",
     "_implementer_brief", "_kernel_bundle_hash", "observe_outcome",
+    # `_step_loop`'s own state read (closed-loop spec §2): it decides whether
+    # THIS round's derivation records an implementation output at all, so it
+    # sits between the derivation and the recording -- a read, not a record.
+    "_kernel_state",
     "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
     "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
     "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
 ]
 (I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_SLICED_CHECK, I_IMPLEMENTER,
- I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_OUTPUT, I_CI, I_REVIEWER,
- I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
+ I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_STEP_STATE, I_OUTPUT,
+ I_CI, I_REVIEWER, I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
  I_RUN_OUTCOME) = range(len(_SEQUENCE))
 
 
@@ -636,15 +668,19 @@ def test_the_state_is_read_back_for_this_run_after_start_implementation(happy_dr
 
 
 def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
-    """`observe_outcome` sits at index 6, between start_implementation and
-    record_output. Everything the kernel records afterwards is derived from
-    what it returned -- so if this call ever moves after the recording, the
-    recorded facts would describe a run nobody had observed yet."""
+    """`observe_outcome` sits between start_implementation and record_output.
+    Everything the kernel records afterwards is derived from what it
+    returned -- so if this call ever moves after the recording, the recorded
+    facts would describe a run nobody had observed yet. `_step_loop`'s own
+    state read (closed-loop spec §2) is allowed directly after it -- a read,
+    not a record -- but `_kernel_record_output` must still be the first
+    RECORDING call downstream."""
     calls, _, _tmp = happy_drive
     name, _args = calls[I_OBSERVE]
     assert name == "observe_outcome", [c[0] for c in calls]
     assert calls[I_OBSERVE - 1][0] == "_kernel_bundle_hash"
-    assert calls[I_OBSERVE + 1][0] == "_kernel_record_output"
+    assert calls[I_OBSERVE + 1][0] == "_kernel_state"
+    assert calls[I_STEP_STATE + 1][0] == "_kernel_record_output"
 
 
 def test_record_output_gets_the_actual_derived_body(happy_drive):
@@ -748,10 +784,11 @@ def test_the_review_record_carries_the_range():
     variables threaded into the call are the ones this file's own extraction
     helper sees, using the same find-the-matching-close-brace mechanism
     `_extracted_script` already relies on to isolate `run_item` from the rest
-    of `batch/run-queue.sh`.
+    of `batch/run-queue.sh`. The call itself now lives in `_step_loop`
+    (closed-loop spec §2), not `run_item`.
     """
     src_lines = RUN_QUEUE.read_text().splitlines()
-    run_item_src = _extract_function(src_lines, "run_item")
+    run_item_src = _extract_function(src_lines, "_step_loop")
     call = run_item_src[run_item_src.index('_kernel_record_review "$BIRCHER_RUN_ID"'):]
     call = call[:call.index("\n")]
     for name in ('"$observed_head"', '"$_merge_base"', '"$_delta_digest"'):

@@ -84,6 +84,15 @@ _NEEDED_REAL_FUNCTIONS = [
     # REAL, so a row that never got written cannot be misread as "the other
     # branch fired".
     "_disputed_shaping_item", "_unreadable_dispute_item",
+    # `run_item`'s tail (closed-loop spec §2) reads `_ffile` from
+    # `_findings_path`, which reads `_max_revisions`, which reads
+    # `_clamp_int` -- pure, no kernel/session/network call among them.
+    "_findings_path", "_max_revisions", "_clamp_int",
+    # `_back_half_state` decides `_side` alongside `_front_half_resumable`
+    # (closed-loop spec §2): REAL, not stubbed, for the same reason as
+    # `_front_half_resumable` above -- an undefined one is false under bash,
+    # which would silently route every back-half state to the escalate arm.
+    "_back_half_state",
 ]
 
 
@@ -216,7 +225,20 @@ observe_outcome() {{
 
 _net_run()         {{ shift; "$@"; }}
 _effect()          {{ _log_call _effect "$@"; }}
-_coordinator()     {{ printf ''; return 1; }}
+# `step` is `_step_loop`'s own next-action read (closed-loop spec §2); every
+# drive here that reaches it has recorded an accept, so the answer is always
+# `merge`. `park-reply` is `_resume_back_half`'s (spec §1): T_PARK_REPLY, a
+# knob, defaults to `nopark` -- no park stands over this run. Both unlogged,
+# like every other `_coordinator` call here: this file pins run_item's OWN
+# decisions, not the journal reads between them.
+_coordinator() {{
+  case "$1" in
+    step) printf 'merge||||'; return 0 ;;
+    park-reply) printf '%s' "${{T_PARK_REPLY:-nopark}}"; return 0 ;;
+    *) printf ''; return 1 ;;
+  esac
+}}
+_kernel_back_state() {{ _log_call _kernel_back_state "$@"; printf '%s' "${{T_BACK_STATE:-|||}}"; }}
 _create_session()  {{ _log_call _create_session "$@"; printf 'conv-test-1'; }}
 _send_prompt()     {{ _log_call _send_prompt "$@"; return 0; }}
 _http_json()       {{ printf '{{}}'; }}
@@ -272,12 +294,24 @@ GH_ISSUE = {
 
 def _extracted_script(tmp_path, extra=()):
     src_lines = RUN_QUEUE.read_text().splitlines()
-    run_item_src = _heredoc_to_herestring(_extract_function(src_lines, "run_item"))
+    run_item_src = _extract_function(src_lines, "run_item")
     assert len(run_item_src.splitlines()) > 100, "run_item's body looks truncated"
     names = list(_NEEDED_REAL_FUNCTIONS) + list(extra)
     helpers = [_extract_function(src_lines, n) for n in names]
+    # `run_item`'s tail is `_step_loop`, `_merge_step` (on a `merge` step),
+    # `_finish_pass` and, on a back-half resume, `_resume_back_half` itself
+    # (closed-loop spec §2). REAL, not stubbed -- this file drives the
+    # decisions they make. `_step_loop` carries the one heredoc left in this
+    # drive (the derived tuple's `read`); `run_item` no longer contains it.
+    step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
+    merge_step_src = _extract_function(src_lines, "_merge_step")
+    finish_pass_src = _extract_function(src_lines, "_finish_pass")
+    resume_back_half_src = _extract_function(src_lines, "_resume_back_half")
     out = tmp_path / "extracted.sh"
-    out.write_text(_PREAMBLE + "\n\n".join(helpers) + "\n\n" + run_item_src + "\n")
+    out.write_text(_PREAMBLE + "\n\n".join(helpers) + "\n\n"
+                    + step_loop_src + "\n\n" + merge_step_src + "\n\n"
+                    + finish_pass_src + "\n\n" + resume_back_half_src + "\n\n"
+                    + run_item_src + "\n")
     return out
 
 
@@ -888,50 +922,57 @@ def test_resume_refused_without_the_lock(tmp_path):
 
 # --- 8/9. the leak guard -----------------------------------------------------
 
-def test_a_run_beyond_the_front_half_is_skipped_not_relaunched(tmp_path):
-    """And it ESCALATES. This is the damaging silence: a pass that dies after
-    `start_implementation` leaves the run at `implementing`, the queue file
-    stays where §5 says it stays, and every later pass logs one line to stderr
-    and moves on -- forever. The item never reaches a human at all."""
+def test_a_run_beyond_the_front_half_is_resumed_not_relaunched(tmp_path):
+    """The closed loop (spec §2): a pass that dies after `start_implementation`
+    leaves the run at `implementing`, and the OLD skip left it there forever --
+    every later pass logged one line to stderr and moved on, and the item
+    never reached a human at all. The state past the seam is now the back
+    half's, and the next pass resumes it through `_resume_back_half` instead
+    of escalating."""
     d = _drive(tmp_path, env_extra={
         "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
         "T_PENDING": json.dumps({"halted": False, "pending": []}),
         "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
     })
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
-    assert "_kernel_dispatch" not in d.names, d.names
     assert "_kernel_run_start" not in d.names, "it minted a second run"
-    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_back_state" in d.names, "the back half never resumed the run"
+    assert d.args_of("_kernel_back_state") == [OPEN_RUN]
+    assert d.outcomes, d.calls
     note = d.args_of("json_row")[7]
-    assert OPEN_RUN in note and "implementing" in note, note
-    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert "which no pass resumes" not in note, note
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists(), (
+        "the resumed pass ran the loop to a merge and should retire the queue file")
 
 
-def test_planned_with_an_accepted_start_implementation_is_skipped(tmp_path):
+def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):
     """`planned` is reachable twice: before implementation, and again after a
     request_revision. The journal is asked which one this is, because the
     aggregate row cannot say.
 
-    And it ESCALATES, for the same reason its two siblings do. The state name
-    puts this run inside the front half while the journal puts it in the back,
-    so it is the one skip where nothing about the run's own state says a human
-    is needed -- and a run whose repair loop died would be skipped on every
-    later pass, silently, with the queue file still sitting there.
+    And it is RESUMED, for the same reason its sibling above is. The state
+    name puts this run inside the front half while the journal puts it in the
+    back, so this is the one case where nothing about the run's own state
+    name says which half owns it -- and the closed loop (spec §2) resumes it
+    through `_resume_back_half` rather than skipping it forever.
     """
     d = _drive(tmp_path, env_extra={
         "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
         "T_PENDING": json.dumps({"halted": False, "pending": []}),
         "T_STATE_RESUME": "planned", "T_IMPL_STARTED": "0",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
     })
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     assert d.args_of("_kernel_implementation_started") == [OPEN_RUN]
-    assert "_kernel_dispatch" not in d.names, d.names
     assert "_kernel_run_start" not in d.names, "it minted a second run"
-    assert d.outcomes == ["escalated"], d.calls
+    assert "_kernel_back_state" in d.names, "the back half never resumed the run"
+    assert d.args_of("_kernel_back_state") == [OPEN_RUN]
+    assert d.outcomes, d.calls
     note = d.args_of("json_row")[7]
-    assert OPEN_RUN in note and "implementation has already started" in note, note
-    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
-    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert "implementation has already started" not in note, note
+    assert (d.queue_dir / "processed" / f"{ITEM}.md").exists(), (
+        "the resumed pass ran the loop to a merge and should retire the queue file")
 
 
 def test_planned_WITHOUT_a_start_implementation_is_resumed_not_escalated(tmp_path):

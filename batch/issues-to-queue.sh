@@ -92,7 +92,7 @@ if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
   trap '[ -z "${TMP_SWEEP_ERR:-}" ] || rm -f "$TMP_SWEEP_ERR"' EXIT
   parked_nums=$(PYTHONPATH="$HERE/../v2" "${BIRCHER_PY:-python3}" -c '
 import os, re, sys
-from kernel import front
+from kernel import back, front
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 closed = {"ended", "cancelled"}
@@ -107,9 +107,14 @@ for rid in s.all_run_ids():
     # open run whose dispute is unresolved, read without a state test
     # because the dispute exists only at `shaping` by construction. Whether
     # a queue file exists is never the test; the kernel fact is.
+    # ... or (closed-loop spec §2) any open run with a pull request: waves
+    # resume every one, whatever its labels, until it merges, a person stops
+    # it, or it parks.
     if front.current_park(s, rid) is not None or (
             s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None) or (
-            front.unresolved_disagreement(s, rid)):
+            front.unresolved_disagreement(s, rid)) or (
+            s.run_state(rid) in ("planned", "implementing", "reviewing", "merge_requested", "merged", "cancelled")
+            and back.implementation_output_recorded(s, rid)):
         out.append(m.group(1))
 print(" ".join(dict.fromkeys(out)))' 2>"${TMP_SWEEP_ERR:-/dev/null}") || parked_nums=""
   if [ -n "${TMP_SWEEP_ERR:-}" ] && [ -s "$TMP_SWEEP_ERR" ]; then

@@ -3167,6 +3167,72 @@ _finish_pass() {  # <item> <queue-file> <issue>
   return "$merge_rc"
 }
 
+# _merge_step -- the in-run merge (B-1), performed when the step is `merge`.
+# Reads pr observed_head _out_hash _base_sha _ctx_hash _merge_base _iss item
+# BIRCHER_RUN_ID BIRCHER_GENERATION by dynamic scope; assigns note outcome
+# merge_rc. The body is the merge block `run_item` carried until the closed
+# loop, unchanged: the reviewed head comes from the derivation, the fallback
+# status names the reviewed range, the kernel requests and records the merge,
+# and an unreviewed merge downgrades the outcome.
+_merge_step() {
+  [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ] || return 0
+  # The reviewed head comes from the REVIEWER (marker `head=`), never from a
+  # re-fetch here (issue #24). A `gh pr view` after the PASS would record whatever
+  # the head is NOW — so a push landing between the reviewer's verdict and this
+  # line would be blessed as "reviewed", defeating the --match-head-commit guard
+  # it feeds. Only the reviewer knows which commit it actually read.
+  #
+  # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
+  # sha to merge_ready_pr used to NOT fail closed — it took an unpinned branch and
+  # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
+  # also refuses an empty sha, so this is now belt and braces rather than the only
+  # guard.
+  # `_merge_gate` reads only its SECOND argument; the first was a
+  # had-a-marker flag it never consulted, and there is no marker now.
+  local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
+  local reviewed_sha=""
+  case "$_gate" in
+    pin\|*)   reviewed_sha="${_gate#pin|}" ;;
+      skip)
+      echo "[batch] $item: no reviewed head available -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
+      MERGE_NOTE="merge skipped: no reviewed head (reviewed commit unverifiable)"
+      note="${note:+$note; }$MERGE_NOTE"
+      merge_rc=0
+      ;;
+  esac
+  if [ "$_gate" != "skip" ]; then
+    # request_merge, record_merge_outcome
+    _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
+      "$_out_hash" "$_base_sha" "$_ctx_hash"
+    # The FALLBACK description, composed HERE because this is where the
+    # reviewed range is. `_post_cross_review_status`'s own default is the
+    # legacy "cross-vendor review PASS (Bircher)" text, and it fires in
+    # exactly the case that matters: the derivation's post did not land (or
+    # could not be read back). Overwriting the merge head's range-naming
+    # description with text that names nothing is the gate losing the one
+    # thing the status is for. Empty when the range is unknown -- then the
+    # legacy text is the honest answer.
+    local _status_desc=""
+    [ -n "${_merge_base:-}" ] && [ -n "${observed_head:-}" ] && \
+      _status_desc="cross-review PASS (Bircher fallback) on ${_merge_base:0:7}..${observed_head:0:7}"
+    merge_ready_pr "$item" "$pr" "$reviewed_sha" "$_status_desc"; merge_rc=$?
+    local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
+    _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
+    [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
+    # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
+    # scorecard row is written from $outcome -- captured from the item's MARKER, not
+    # from merge_rc -- and _ensure_issue_closed fires on outcome=ready. Left alone, an
+    # unreviewed merge would halt AND still close its issue as done; worse, on the
+    # red path it would close the very issue _reopen_reverted_issues had just
+    # reopened. Downgrading the outcome stops both, because the close is gated on it.
+    if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
+      note="${note:+$note; }$MERGE_UNREVIEWED_NOTE"
+      outcome=escalated
+    fi
+    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
+  fi
+}
+
 observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out]
   # THE DERIVATION, in Python since 2026-08-29. What was 192 lines here is now
   # v2/coordinator/outcome.py with eighteen tests driving it directly, plus its
@@ -4160,6 +4226,63 @@ _front_half_resumable() {
   esac
 }
 
+# _back_half_state <state> -> rc 0 for a state the closed loop resumes from
+# (closed-loop spec §2). `merged` and `cancelled` are here so a pass that
+# died between the transition and its terminal fact gets that fact written.
+_back_half_state() {
+  case "$1" in implementing|reviewing|merge_requested|merged|cancelled) return 0 ;; *) return 1 ;; esac
+}
+
+# _resume_back_half <item> <code> <queue-file> <issue> <state>
+#
+# One pass of the closed loop for a run another pass started (spec §2: waves
+# resume every open back-half run). Reads vendor, RECOVERY_REVIEWER,
+# BIRCHER_RUN_ID and BIRCHER_GENERATION from run_item's scope; declares every
+# name `_step_loop`, `_merge_step` and `_finish_pass` assign.
+_resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
+  local item="$1" code="$2" f="$3" _iss="$4" _st="$5"
+  local start; start=$(date +%s)
+  local elapsed=0 bound_outcome="ok" merge_rc=0
+  local outcome="" ci_first="unknown" review="" rounds="" note="" resubmissions="" observed_head="" _obs_ci=""
+  local pr="" _out_hash="" _rev_round=0
+  local _merge_base="" _delta_digest="" _fingerprints="" _pr_state="" _failing_jobs="" _settled_pr=""
+  local _step="" _step_cause="" _step_evidence="" _step_reason=""
+  local _base_sha; _base_sha=$(_kernel_run_base "$BIRCHER_RUN_ID")
+  local _ctx_hash; _ctx_hash=$(_kernel_bundle_hash "$BIRCHER_RUN_ID")
+  local _ffile; _ffile=$(_findings_path "$code")
+  [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
+  echo "[batch] $item: resuming run $BIRCHER_RUN_ID at $_st (closed loop)" >&2
+  case "$_st" in
+    merged)
+      outcome=ready; note="run resumed at merged: recording the outcome an earlier pass lost"; _step=done
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+    cancelled)
+      outcome=escalated; note="stopped by a person"; _step=done
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+  esac
+  # A PARKED RUN READS ITS REPLY FIRST and derives nothing until a person
+  # says `retry`: every derivation is a review, and a run waiting on a human
+  # must not spend one per wave.
+  local _reply; _reply=$(_coordinator park-reply --db "${BIRCHER_KERNEL_DB:-}" --run-id "$BIRCHER_RUN_ID" --server "${SERVER:-}") || _reply=""
+  case "$_reply" in
+    nopark) ;;
+    retry) echo "[batch] $item: a person granted another round" >&2 ;;
+    stop)
+      outcome=escalated; note="stopped by a person"; _step=done
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+    *)
+      outcome=parked; note="parked; no reply yet (${_reply:-reply unreadable})"; _step=park
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+  esac
+  local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
+  _step_loop
+  [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
+  [ "$_rev_round" != 0 ] && rounds="$_rev_round"
+  [ "$_step" = merge ] && _merge_step
+  elapsed=$(( $(date +%s) - start ))
+  _finish_pass "$item" "$f" "$_iss"
+}
+
 # _finish_sliced_item <item> <queue-file> <run_id>: the scorecard row for a
 # parent whose children are filed, and the queue file's retirement (shaping
 # spec §5). The loop is finished with this item; what remains is the sweep's,
@@ -4602,6 +4725,7 @@ run_item() {
   _project_config > "$_cfg_json"
 
   # RESUME OR MINT (spec §5). The kernel is the truth; the sidecar a hint.
+  local _side=""
   local resumed=0 _open
   _open=$(_kernel_find_run "$code" open)
   if [ -n "$_open" ]; then
@@ -4617,28 +4741,17 @@ run_item() {
       return 0
     fi
     local _st; _st=$(_kernel_state "$_open")
-    if ! _front_half_resumable "$_st"; then
-      # THE DAMAGING ONE. A pass that dies after `start_implementation`
-      # leaves the run at `implementing`, and every later pass then logs
-      # this line and moves on -- forever, with the queue file still there
-      # and nothing on the channel a human reads. The row is the handoff.
-      echo "[batch] $item: run $_open is at $_st (beyond the front half); skipping" >&2
+    if _back_half_state "$_st" || { [ "$_st" = planned ] && _kernel_implementation_started "$_open"; }; then
+      # The back half owns it (closed-loop spec §2): a state past the seam, or
+      # `planned` reached through request_repair -- which the journal, not
+      # the state name, can tell from `planned` before implementation.
+      _side=back
+    elif _front_half_resumable "$_st"; then
+      _side=front
+    else
+      echo "[batch] $item: run $_open is at '${_st:-unreadable}', which no pass resumes; skipping" >&2
       mkdir -p "$(dirname "$SCORECARD")"
-      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at '$_st', beyond the front half; this pass drives nothing and the item needs a human" "n/a" >> "$SCORECARD"
-      return 0
-    fi
-    if [ "$_st" = planned ] && _kernel_implementation_started "$_open"; then
-      # THE THIRD OF THE SAME SHAPE, and the least obvious. `planned` is
-      # reachable twice -- before implementation, and again when a review
-      # requests a revision -- so the state name alone cannot say which side of
-      # the seam this run is on; the journal can, and it says the back half
-      # already has it. From here that is the same situation as the branch
-      # above: the queue file stays, this pass drives nothing, and a run whose
-      # repair loop then died would be skipped on every later pass with nothing
-      # on the channel a human reads.
-      echo "[batch] $item: run $_open already started implementation; skipping" >&2
-      mkdir -p "$(dirname "$SCORECARD")"
-      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at 'planned' but its implementation has already started; the back half owns it and this pass drives nothing" "n/a" >> "$SCORECARD"
+      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at '${_st:-unreadable}', which no pass resumes; this pass drives nothing and the item needs a human" "n/a" >> "$SCORECARD"
       return 0
     fi
     if [ "${BIRCHER_HAVE_LOCK:-0}" != 1 ]; then
@@ -4691,6 +4804,11 @@ run_item() {
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.
     _kernel_revise_bundle "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_issue_json"
+  fi
+
+  if [ "$_side" = back ]; then
+    _resume_back_half "$item" "$code" "$f" "$_iss" "$_st"
+    return $?
   fi
 
   local host_id; host_id=$(_local_host_id 2>/dev/null) || host_id=""
@@ -5100,343 +5218,39 @@ run_item() {
   fi
 
   local outcome ci_first review rounds note resubmissions observed_head _obs_ci
-  # AT RUN_ITEM SCOPE, indent 2, not inside the branch that assigns them.
-  #
-  # `_rev_key` feeds a kernel binding and `_rev_round` is read below at the
-  # scorecard, which every path reaches -- including the `_blind` path that
-  # never enters the derivation branch. Declared inside that branch they would
-  # be unbound there, and `set -u` kills run_item AFTER the implementer has
-  # already opened its PR. That is not hypothetical: it is what `_out_hash`
-  # did, and `test_binding_variables_are_declared_at_run_item_scope` exists
-  # because of it -- it caught this one too, by indent, after I had already
-  # moved them once for the same test and satisfied only half of what it says.
-  local _rev_key=""
   local _rev_round=0
-  local _rev_terminal=""
   local _merge_base=""
   local _delta_digest=""
   local _fingerprints=""
   local _pr_state=""
   local _failing_jobs=""
+  local _settled_pr=""
+  local _step=""
+  local _step_cause=""
+  local _step_evidence=""
+  local _step_reason=""
+  local merge_rc=0
+  local _ffile; _ffile=$(_findings_path "$code")
+  [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
   if [ "${_blind:-0}" = 1 ]; then
-    # Unchanged from the marker era, and still correct: the cancel was never
-    # confirmed, so the coordinator may still be running. Deriving an outcome
-    # means READING and WRITING the PR, which races a live session.
-    outcome="escalated"; review="na"; ci_first="unknown"; resubmissions=""
-    observed_head=""
-    note="server unreachable at cap; could not confirm the session stopped, so outcome derivation was skipped to avoid racing a live coordinator - needs a human"
-    echo "[batch] $item: blind at teardown -> escalating without derivation" >&2
+    # The cancel was never confirmed, so the coordinator may still be running,
+    # and deriving would race it. The run stays open, and the next wave resumes
+    # it from the journal (closed-loop spec §2).
+    outcome="waiting"; review="na"; ci_first="unknown"; resubmissions=""; observed_head=""
+    note="server unreachable at cap; could not confirm the session stopped, so derivation was skipped to avoid racing a live coordinator; the next wave resumes"
+    _step=wait
+    echo "[batch] $item: blind at teardown -> waiting for the next wave" >&2
   else
-    # THE REPAIR LOOP. Derive; if the coordinator says the reviewer found
-    # blocking problems and rounds remain, dispatch a repair and derive again.
-    #
-    # Measured basis: 8 of 18 muesli item-runs ended `failed` on a reviewer
-    # FAIL, every one a specific actionable finding. Routing them back by hand
-    # merged #740 in one round and #750 in two.
-    #
-    # The allowance is re-read FROM THE JOURNAL every round, never carried in a
-    # variable, so a coordinator that dies and is re-driven gets no fresh
-    # rounds. `_max_revisions` of 0 makes `revise` unreachable and this loop
-    # runs exactly once -- the pre-loop behaviour, byte for byte.
-    # ONE `local` PER NAME, deliberately. `test_binding_variables_are_declared
-    # _at_run_item_scope` matches `local <var>`, so a name riding second on a
-    # shared `local` line reads to it as undeclared -- and it caught exactly
-    # that here. The check exists because `_out_hash` was once declared inside
-    # the branch that assigned it and killed run_item on `set -u` AFTER the
-    # implementer had opened its PR, so satisfying it by splitting the line is
-    # the honest fix and loosening its regex would not be.
-    local obs
-    local _rev_left=0
-    local _rev_state=""
-    local _findings=""
-    local _last_finding=""
-    local _ffile; _ffile=$(_findings_path "$code")
-    [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
-    while :; do
-    # RESET EVERY ROUND, at the top, before anything can be read.
-    #
-    # `_rev_key` is assigned inside the `observed_head` branch below, so a round
-    # that skips that branch would otherwise still be holding the PREVIOUS
-    # round's key -- and the durability check would confirm this round's
-    # revision using last round's fact, dispatching a repair for a round the
-    # kernel never opened. Same class as a stale findings file, and invisible
-    # for the same reason: every signal looks normal.
-    _rev_key=""
-    _rev_left=0
-    _merge_base=""
-    _delta_digest=""
-    _fingerprints=""
-    _pr_state=""
-    _failing_jobs=""
-    if [ "$(_max_revisions)" != 0 ] && [ -n "${BIRCHER_RUN_ID:-}" ]; then
-      # `used|left|confirmed`. A LOOKUP FAILURE leaves _rev_left at 0, which
-      # ends the loop and escalates -- deliberately, because the alternative
-      # reading of an unreadable journal is "no revisions used yet", and that
-      # hands the loop a full allowance every round and never terminates.
-      _rev_state=$(_coordinator revisions --db "${BIRCHER_KERNEL_DB:-}" \
-                     --run-id "$BIRCHER_RUN_ID" --max "$(_max_revisions)") || _rev_state=""
-      if [ -n "$_rev_state" ]; then
-        _rev_left="${_rev_state#*|}"; _rev_left="${_rev_left%%|*}"
-        _rev_left=$(_clamp_int "$_rev_left" 0 0 5)
-      else
-        echo "[batch] $item: could not read the revision allowance from the journal -> no repair rounds this derivation" >&2
-      fi
-    fi
-    echo "[batch] $item: deriving the outcome from the repository (repair rounds left: $_rev_left)" >&2
-    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" "$_rev_left" "$_ffile")
-    # An EMPTY tuple is a CRASH, not a verdict -- and since Phase 2 this is the
-    # ONLY path, so the guard that used to protect recovery alone now protects
-    # every item. `obs=$(...)` swallows a mid-function death into an empty
-    # string, which parses as outcome="" and reports "NOT ready": a crash
-    # wearing a verdict's clothes.
-    if [ -z "${obs//[[:space:]]/}" ]; then
-      echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown|||||||"
-    fi
-    # THIRTEEN fields. The eighth is the PR the DERIVATION settled on, which is
-    # not always the one passed in: it discards an abandoned PR, discovers one
-    # by code or issue linkage, and adopts a CI-green sibling. Fields nine and
-    # ten are the reviewed range (spec §4): the merge-base against the PR's
-    # base and the digest of the PR's own delta at the reviewed head. The last
-    # three are the verdict's fingerprints, the PR's state and its failing
-    # jobs (closed-loop spec §1, §3). Reading fewer names than the tuple has
-    # absorbs the remainder into the last one silently -- `read` does not
-    # error on a short variable list, it concatenates the remainder into the
-    # last name.
-    # WIDTH CHECKED BEFORE PARSING. A short tuple leaves `_settled_pr` empty,
-    # which used to mean "keep the PR I started with" -- indistinguishable from
-    # a derivation that legitimately settled on nothing.
-    if ! _derived_width_ok "$obs"; then
-      echo "[batch] $item: derivation returned a malformed tuple (not thirteen fields on one line) -> escalating rather than guessing which field is which" >&2
-      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown|||||||"
-    fi
-    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr _merge_base _delta_digest _fingerprints _pr_state _failing_jobs <<EOF
-$obs
-EOF
-    : "${outcome:=timeout}" "${ci_first:=unknown}"
-    # ADOPT IT BEFORE THE MERGE AUTHORIZATION, not after. `$pr` feeds the
-    # kernel merge command, the merge itself and the scorecard line, so a
-    # stale value authorizes one PR and reports another. On muesli #723 the
-    #
-    # (The kernel command is not named literally here on purpose:
-    # `test_the_merge_request_redispatches_as_implementer` slices this
-    # function between the FIRST occurrence of two identifiers, so naming one
-    # in a comment above the real call gives it an empty slice to search.)
-    # derivation reviewed #738, posted its cross-review there, and the caller
-    # then tried to merge #737 -- which the implementer had already closed.
-    if [ -n "${_settled_pr:-}" ] && [ "${_settled_pr}" != "${pr:-}" ]; then
-      echo "[batch] $item: derivation settled on PR #$_settled_pr (was ${pr:-none}) -> adopting" >&2
-      pr="$_settled_pr"
-    fi
-
-    # The kernel lifecycle, unchanged in order and in roles. Its INPUTS are now
-    # observations; the sequence is the one the marker branch used to drive.
-    #
-    # GUARDED ON A HEAD, and that guard does the work: the blind path above
-    # never reaches here, so a bare "na" verdict cannot arrive at
-    # _kernel_record_review from this function.
-    if [ -n "${observed_head:-}" ]; then
-      local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
-      _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
-      _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head" "$_pr_state" "$_failing_jobs" "$pr"
-      BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-      export BIRCHER_GENERATION
-      # The key is passed ONLY on a revise. Every other path keeps
-      # `kernel.cli`'s own default key, so the accept and reject branches are
-      # unchanged -- which is what makes BIRCHER_MAX_REVISIONS=0 a real
-      # rollback rather than a path that merely usually agrees.
-      _rev_key=""
-      [ "$outcome" = revise ] && \
-        _rev_key="revise:${BIRCHER_RUN_ID}:${_rev_round}:${BIRCHER_GENERATION}"
-      # TERMINAL only when the bound is spent. `failed` is reached from exactly
-      # one place -- a reviewer FAIL with no rounds left -- so it is the signal
-      # for "record a rejection, not a revision request". The mechanism
-      # escalations below set `escalated` and keep `request_revision`, because a
-      # revision genuinely is owed there and nothing performed it.
-      _rev_terminal=$(_terminal_review_flag "$outcome")
-      # The reviewed range rides out on the SAME call, not a follow-up one:
-      # `observed_head` is the head this branch is guarded on, and
-      # `_merge_base`/`_delta_digest` are the derivation's own two trailing
-      # fields (spec §4) -- what the reviewer's verdict actually covered.
-      #
-      # A VERDICT IS RECORDED ONLY WHEN THERE IS ONE. The head now rides out
-      # on every colour (closed-loop spec §1), including a red CI, so
-      # `observed_head` alone no longer guarantees `review` is `<reviewer>:
-      # pass` or `<reviewer>:fail` -- it can be `na`, and `na` is not a
-      # verdict the kernel would accept.
-      case "$review" in
-        *:pass|*:fail)
-          _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal" "$observed_head" "$_merge_base" "$_delta_digest" "$_fingerprints"
-          ;;
-      esac
-      BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-      export BIRCHER_GENERATION
-    fi
-
-    # Not a revision -> the derivation is final and the loop ends.
-    [ "$outcome" != revise ] && break
-
-    # A REVISION IS OWED. Before dispatching any repair work, confirm the
-    # kernel actually RECORDED it, by its causal id.
-    #
-    # Not the adapter's exit code and not the absence of an error: `_kernel` is
-    # advisory and always returns 0, and `commands.py` validates a review, bumps
-    # the version under CAS, then appends REVIEW_VERDICT -- in that order -- so a
-    # review can validate and then lose the CAS, producing no fact at all. Either
-    # way the run is still in `reviewing`, `start_implementation` would be
-    # refused, and the repair session would work against a run that never
-    # authorised it.
-    _rev_state=$(_coordinator revisions --db "${BIRCHER_KERNEL_DB:-}" \
-                   --run-id "$BIRCHER_RUN_ID" --max "$(_max_revisions)" \
-                   --confirm-command "$_rev_key") || _rev_state=""
-    if ! _revision_is_recorded "$_rev_state"; then
-      echo "[batch] $item: the revision was NOT recorded in the journal (${_rev_state:-lookup failed}) -> escalating instead of repairing" >&2
-      outcome="escalated"
-      note="${note:+$note; }reviewer found blocking problems but the kernel did not record the revision (causal id $_rev_key); no repair was dispatched"
-      break
-    fi
-
-    # The findings the repair is briefed on. The file exists BECAUSE this
-    # derivation wrote it -- the coordinator unlinks the path before deriving
-    # and replaces it atomically after -- so an empty or missing one here means
-    # something went wrong in this round, never that a previous round is
-    # speaking.
-    _findings=""
-    [ -s "$_ffile" ] && _findings=$(cat "$_ffile")
-    if _is_blank "$_findings"; then
-      echo "[batch] $item: a revision is owed but no findings were written -> escalating rather than dispatching a repair with an empty brief" >&2
-      outcome="escalated"
-      note="${note:+$note; }reviewer found blocking problems but wrote no findings to brief a repair with"
-      break
-    fi
-    _last_finding=$(printf '%s' "$_findings" | head -c 400)
-    _rev_round=$((_rev_round + 1))
-    echo "[batch] $item: review FAILED with $_rev_left round(s) left -> repair round $_rev_round" >&2
-    local _rbranch; _rbranch=$(_pr_branch "$pr")
-    if [ -z "${_rbranch//[[:space:]]/}" ]; then
-      # Without the branch the prompt cannot name what to push to, and an
-      # implementer left to infer it opens a second PR -- which strands the
-      # reviewed one and makes the next derivation escalate on ambiguity
-      # instead of on this.
-      echo "[batch] $item: could not read PR #$pr's head branch -> escalating rather than briefing a repair that cannot push" >&2
-      outcome="escalated"
-      note="${note:+$note; }could not read PR #$pr's head branch to brief a repair round"
-      break
-    fi
-    if ! _repair_round "$item" "$code" "$pr" "$_rbranch" "$_findings" "$_rev_round" "$vendor"; then
-      outcome="escalated"
-      note="${note:+$note; }repair round $_rev_round could not be started"
-      break
-    fi
-    done
+    _step_loop
     [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
-    # TERMINAL ESCALATION names what the last reviewer objected to, so a human
-    # sees the finding instead of having to open N review logs to find it.
-    if [ "$_rev_round" != 0 ]; then
-      note="${note:+$note; }after $_rev_round repair round(s)"
-      [ "$outcome" != ready ] && [ -n "$_last_finding" ] && \
-        note="$note; last finding: $_last_finding"
-    fi
   fi
-  # `rounds` REPORTS SOMETHING AGAIN, and it is a different measurement from the
-  # one that used to bear the name. It was the coordinator's count of its own
-  # internal fix loop and nothing observed it, so it was emptied. It is now the
-  # number of REPAIR ROUNDS this runner dispatched -- observed, because the
-  # runner performed each one, and cross-checkable against the run's
-  # request_revision facts. `resubmissions` keeps its own name and meaning
-  # (distinct commits CI ran on, minus one), which is still a third thing.
-  #
-  # Empty, not 0, when the loop is disabled: a 0 would claim the loop ran and
-  # found nothing to repair, which is not what BIRCHER_MAX_REVISIONS=0 means.
+  # `rounds` is the number of REPAIR ROUNDS this pass dispatched -- observed,
+  # because the runner performed each one, and cross-checkable against the
+  # run's repair_requested facts. Empty when none.
   rounds=""
   [ "$_rev_round" != 0 ] && rounds="$_rev_round"
-
-  # B-1 in-run merge: merge a ready PR now so the NEXT item builds on it
-  # (eliminates the merge-order conflict class). Deferral appends to the note;
-  # a red/unresolved main after merge HALTS the run (rc 2 propagates to main).
-  local merge_rc=0
-  if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
-    # The reviewed head comes from the REVIEWER (marker `head=`), never from a
-    # re-fetch here (issue #24). A `gh pr view` after the PASS would record whatever
-    # the head is NOW — so a push landing between the reviewer's verdict and this
-    # line would be blessed as "reviewed", defeating the --match-head-commit guard
-    # it feeds. Only the reviewer knows which commit it actually read.
-    #
-    # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
-    # sha to merge_ready_pr used to NOT fail closed — it took an unpinned branch and
-    # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
-    # also refuses an empty sha, so this is now belt and braces rather than the only
-    # guard.
-    # `_merge_gate` reads only its SECOND argument; the first was a
-    # had-a-marker flag it never consulted, and there is no marker now.
-    local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
-    local reviewed_sha=""
-    case "$_gate" in
-      pin\|*)   reviewed_sha="${_gate#pin|}" ;;
-        skip)
-        echo "[batch] $item: no reviewed head available -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
-        MERGE_NOTE="merge skipped: no reviewed head (reviewed commit unverifiable)"
-        note="${note:+$note; }$MERGE_NOTE"
-        merge_rc=0
-        ;;
-    esac
-    if [ "$_gate" != "skip" ]; then
-      # request_merge, record_merge_outcome
-      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
-        "$_out_hash" "$_base_sha" "$_ctx_hash"
-      # The FALLBACK description, composed HERE because this is where the
-      # reviewed range is. `_post_cross_review_status`'s own default is the
-      # legacy "cross-vendor review PASS (Bircher)" text, and it fires in
-      # exactly the case that matters: the derivation's post did not land (or
-      # could not be read back). Overwriting the merge head's range-naming
-      # description with text that names nothing is the gate losing the one
-      # thing the status is for. Empty when the range is unknown -- then the
-      # legacy text is the honest answer.
-      local _status_desc=""
-      [ -n "${_merge_base:-}" ] && [ -n "${observed_head:-}" ] && \
-        _status_desc="cross-review PASS (Bircher fallback) on ${_merge_base:0:7}..${observed_head:0:7}"
-      merge_ready_pr "$item" "$pr" "$reviewed_sha" "$_status_desc"; merge_rc=$?
-      local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
-      _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
-      [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
-      # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
-      # scorecard row is written from $outcome -- captured from the item's MARKER, not
-      # from merge_rc -- and _ensure_issue_closed fires on outcome=ready. Left alone, an
-      # unreviewed merge would halt AND still close its issue as done; worse, on the
-      # red path it would close the very issue _reopen_reverted_issues had just
-      # reopened. Downgrading the outcome stops both, because the close is gated on it.
-      if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
-        note="${note:+$note; }$MERGE_UNREVIEWED_NOTE"
-        outcome=escalated
-      fi
-      _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
-    fi
-  fi
-
-  mkdir -p "$(dirname "$SCORECARD")"
-  # The run is over: close its ledger before the scorecard row. The kernel's
-  # terminal fact is written first, but the two are NOT guaranteed to agree:
-  # `_kernel` is advisory and always returns 0, so a failed or refused command
-  # leaves no terminal fact while the scorecard row below is written anyway.
-  # An earlier version of this comment claimed they "agree by construction",
-  # which is the unearned-claim shape this change exists to remove.
-  #
-  # This site could once diverge on VALUE: $outcome came from a model-authored
-  # marker parsed with no schema validation, so a word outside the kernel's
-  # vocabulary was refused -- correctly and visibly -- while the scorecard
-  # recorded it regardless. Since Phase 2 the value comes from
-  # `classify_recovery`, which emits only the fixed vocabulary, so that
-  # particular divergence has no route left. The two records can still
-  # disagree for other reasons, which is why this note stays.
-  _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" "${rounds:-}" >> "$SCORECARD"
-  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}" "${rounds:-}"
-  # #3: guarantee the issue closes when its PR actually merged (backstops a
-  # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
-  [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
-  echo "[batch] $item -> outcome=$outcome pr=${pr:-none} review=${review:-na} rounds=${rounds:-?} bound=$bound_outcome"
-  mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
-  return "$merge_rc"
+  [ "$_step" = merge ] && _merge_step
+  _finish_pass "$item" "$f" "$(_item_issue "$prompt")"
 }
 
 self_test() {
@@ -9305,6 +9119,62 @@ f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id":
   grep -q "^i77-" "$pdir/queue/.manifest" || { echo "FAIL parked run i77 is not in the manifest"; exit 1; }
   rm -rf "$pdir"
   echo "parked runs are queued from the journal OK"
+
+  # --- an open back-half run is queued from the journal (closed-loop spec §2) --
+  # Waves resume every open back-half run that holds implementation output,
+  # whatever its labels -- until it merges, a person stops it, or it parks.
+  local qdir; qdir=$(mktemp -d)
+  cat > "$qdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;           # is_unblocked reads a COUNT, not a list
+  *"--json title"*) echo "open pr issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$qdir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -m tests.kernel.front \
+      --db "$qdir/k.db" --run-id i78-open-pr-1 --to implementing >/dev/null ) \
+    || { echo "FAIL i78 fixture could not be built"; exit 1; }
+  ( cd "$qdir" && QUEUE="$qdir/queue" PATH="$qdir:$PATH" BIRCHER_KERNEL_DB="$qdir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with an open back-half run exited non-zero"; exit 1; }
+  ls "$qdir/queue"/i78-*.md >/dev/null 2>&1 || { echo "FAIL open back-half run i78 was not queued from the journal"; exit 1; }
+  grep -q "^i78-" "$qdir/queue/.manifest" || { echo "FAIL open back-half run i78 is not in the manifest"; exit 1; }
+  rm -rf "$qdir"
+  echo "an open back-half run is queued from the journal OK"
+
+  # --- an ended run is NOT queued (closed-loop spec §2) ------------------------
+  local edir; edir=$(mktemp -d)
+  cat > "$edir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "ended issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$edir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -c '
+import sys
+from tests.kernel.front import Front
+from kernel.dispatch import Role
+from kernel.store import Store
+s = Store.open(sys.argv[1])
+f = Front(s, "i79-ended-1").to_planned()
+g = f._dispatch(Role.IMPLEMENTER, "claude")
+f._cmd(g, "record_run_outcome", {"outcome": "timeout"})
+' "$edir/k.db" ) || { echo "FAIL i79 fixture could not be built"; exit 1; }
+  ( cd "$edir" && QUEUE="$edir/queue" PATH="$edir:$PATH" BIRCHER_KERNEL_DB="$edir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with an ended run exited non-zero"; exit 1; }
+  ls "$edir/queue"/i79-*.md >/dev/null 2>&1 && { echo "FAIL an ended run was queued"; exit 1; }
+  rm -rf "$edir"
+  echo "an ended run is not queued from the journal OK"
 
   # --- wave-timer.sh: fires launch.sh with the wave's own log, skips a missing checkout --
   local tdir; tdir=$(mktemp -d)

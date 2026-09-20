@@ -497,7 +497,13 @@ def main(argv=None) -> int:
         from coordinator import session as _session
         from coordinator.human import classify_batch
         store = Store.open(a.db)
-        state = store.run_state(a.run_id)
+        # NOT `state` -- that name is the imported `coordinator.session.state`
+        # function, called elsewhere in this same `main()` (session-state,
+        # settle). Assigning it here as a local shadowed the import for the
+        # WHOLE function under Python's function-scoping rule, so the
+        # session-state mode died `UnboundLocalError` on every call, however
+        # far from a park-reply drive.
+        run_state = store.run_state(a.run_id)
         park = front.current_park(store, a.run_id)
         if park is None:
             print("nopark", end="")
@@ -521,7 +527,7 @@ def main(argv=None) -> int:
         if not after:
             print("none", end="")
             return RC_OK
-        kind, _ = classify_batch(after, state=state, grill_open=False)
+        kind, _ = classify_batch(after, state=run_state, grill_open=False)
         name = {"retry": "grant_round", "stop": "cancel_run"}.get(kind)
         if name is None:
             print("other", end="")
