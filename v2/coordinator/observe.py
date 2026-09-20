@@ -97,7 +97,8 @@ class Outcome:
 
 
 def revisions_used(facts) -> int:
-    """How many revisions this run has already had, from the JOURNAL.
+    """How many implementation-phase revision verdicts this run's journal
+    holds, counted for the round number a status description reports.
 
     Counts `REVIEW_VERDICT` facts whose verdict is `request_revision`. NOT
     `transition_performed`, which records `{"to": ..., "via": "record_review"}`
@@ -108,18 +109,14 @@ def revisions_used(facts) -> int:
     verdict explicitly; it is the same fact `authz.py` reads when deciding
     whether a binding was approved.
 
-    From the journal and not a variable, so a coordinator that dies and is
-    re-driven gets no fresh allowance.
+    A spec- or plan-phase verdict is skipped (`is_front_verdict`): a spec- or
+    plan-phase FAIL is not an implementation repair round.
 
-    A spec- or plan-phase verdict is skipped (`is_front_verdict`): the
-    allowance belongs to the implementation, and a spec-phase FAIL must not
-    spend it.
-
-    NOTE WHAT THIS DOES NOT PROVE. `commands.py` validates a review, THEN bumps
-    the version under CAS, THEN appends this fact -- so a review can validate
-    and lose the CAS, leaving no fact. This counts what was ACCEPTED, which is
-    the right basis for an allowance, but the caller must separately confirm
-    its own revision was recorded before acting on it.
+    Its only caller is `cli._round_number`, which adds one and passes the
+    result as `round_number` for the `bircher/cross-review` status description
+    (`<vendor> round <n> ...`, ARCHITECTURE.md §6b). Rounds are unbounded now
+    (closed-loop spec §3): nothing here gates or bounds a repair -- the count
+    is read for that description alone.
     """
     n = 0
     for f in facts or ():

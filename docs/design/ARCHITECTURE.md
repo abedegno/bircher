@@ -64,7 +64,7 @@ Everything below is written against this. Nothing here is finished.
 | queue loop | `main()` in bash | replaced, driving omnigent directly |
 | derivation | coordinator as a one-shot subprocess | coordinator in-process, long-lived |
 | review | twice — lead session AND coordinator | once, coordinator-owned |
-| repair loop | lead session (3 rounds) AND the coordinator (2, default) | coordinator-owned only |
+| repair loop | lead session (3 rounds) AND the coordinator (unbounded; parks `no_progress`) | kernel-owned closed loop; unbounded, parks no_progress |
 | lead session | implements, reviews, repairs, reports a marker | implements only |
 | reporting | derived only — the marker is retired in code AND in the instructions | done |
 | kernel | authorises and journals | unchanged — this part is done |
@@ -156,18 +156,24 @@ revision loops live:
 
     queued --submit_spec--> specified --submit_plan--> planned
       --start_implementation--> implementing
-      --record_review--> (by verdict)
+      --record_review--> reviewing
+        --request_repair--> planned
       --request_merge--> merge_requested
       --record_merge_outcome--> (by outcome)
       --record_run_outcome--> ended
 
-`record_review` (`_VERDICTS`):
+`record_review` (`_VERDICT_WORDS`), in the back half:
 
 | verdict | lands in |
 |---|---|
 | `accept` | `reviewing` |
 | `reject` | `reviewing` |
-| `request_revision` | **`planned`** — the revision loop: back to planning |
+| `request_revision` | `reviewing` |
+
+In the back half a verdict is evidence, not a transition (closed-loop spec
+§1). The one door back to `planned` is `request_repair` (`REPAIR_CAUSES`:
+`ci_red`, `review_fail`, `plan_conformance`), legal from `implementing` and
+`reviewing`. The front-half phases keep their own destinations.
 
 `record_merge_outcome` (`_MERGE_OUTCOMES`), legal only from `merge_requested`:
 
@@ -181,8 +187,14 @@ So the successful path is
 
 Genuinely non-transitioning: `record_implementation_output`,
 `record_ci_observation`. `cancel_run` is legal from any live state.
-`record_run_outcome` is legal from every state except `ended`. `ended` is
-terminal and unreachable-from.
+`record_run_outcome` is legal from every state except `ended`, and refused
+from an active state while the run's pull request is open or unobserved.
+`ended` is terminal and unreachable-from.
+
+`park` and `grant_round` are legal in the back half too: a run with a pull
+request can park — `no_progress` among its reasons — and a person's `retry`
+reply resumes it through `grant_round`, which resets the no-progress window
+exactly as a front-half grant resumes a stalled round.
 
 **Effect classes:** `merge`, `comment`, `status_check`, `pull_request`, `issue_create`,
 `issue_or_label`, `ref_update`, `session_control`.
@@ -193,7 +205,7 @@ terminal and unreachable-from.
 `ownership_acquired`, `effect_intended`, `effect_confirmed`,
 `effect_uncertain`, `effect_reconciled`, `attempt_dispatched`,
 `merge_authorized`, `model_question`, `enqueue_proposed`, `run_enqueued`,
-`revision_proposed`, `bundle_revised`, `shadow_rejected`.
+`revision_proposed`, `bundle_revised`, `shadow_rejected`, `repair_requested`.
 
 Also added by the shaping phase: the shaping states (`shaping`, `slices_submitted`, `slices_accepted`, `sliced`), the slice-plan grammar (`kernel/slices.py`), the `issue_create` effect class, and `kernel/filing.py` — what `perform` refuses of a filing effect: every argv shape the design adds needs its obligation kind, each kind is bound to its argv's targets, and one satisfied effect exists per obligation.
 
@@ -270,19 +282,33 @@ path.**
    summary, and stops.
 7. **Settle detection.** The runner polls: session idle AND item count stable
    AND a PR open, held for N polls. Then it cancels the session.
-8. **Derivation.** The runner invokes the coordinator, which selects the PR,
-   waits out CI, dispatches an INDEPENDENT reviewer, and returns the tuple.
-9. **Repair, if the reviewer blocked.** The runner records
-   `request_revision`, CONFIRMS the kernel journalled it by causal id, dispatches
-   a fresh implementer session briefed on the reviewer's verbatim findings,
-   settles it, and goes back to step 8. Unbounded; a run parks `no_progress`
-   after three identical rounds.
-10. **Lifecycle recording.** The runner replays the derived facts into the
-   kernel: output, CI observation, review verdict, then `request_merge`.
-11. **Merge.** `merge_ready_pr` posts `bircher/cross-review`, waits for
-   `mergeStateStatus == CLEAN`, merges pinned to the reviewed head, watches
-   main CI, and reverts on a confirmed red.
-12. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`.
+8. **The closed loop begins.** `_step_loop` derives the ground truth from the
+   repository (the coordinator's `derive`: selects the PR, waits out CI,
+   dispatches an INDEPENDENT reviewer), records what it found — the
+   implementation output on the first pass, the CI observation carrying the
+   PR's state and its failing jobs, and, when there is one, the review
+   verdict carrying its fingerprints — then asks the kernel's `next_step` for
+   the one action the journal and the ground truth together license.
+9. **Act on the step.** On `repair`: `request_repair` — the one door back to
+   `planned` (`REPAIR_CAUSES`: `ci_red`, `review_fail`, `plan_conformance`) —
+   then a repair session on the PR's own branch, briefed on the reviewer's
+   verbatim findings, and back to step 8 to derive again. Unbounded; a run
+   parks `no_progress` after three identical rounds. On `merge`: the in-run
+   merge (step 11). On `wait`: the pass ends with the run left open — no
+   terminal fact, the queue file stays. On `park`: a carrier session, the
+   park fact, and a notice on the issue, so a person can reply `retry` or
+   `stop` for the next wave to read.
+10. **Waves resume every open back-half run.** A run a pass leaves at `wait`
+   or `park` stays open. The next wave finds it still at `implementing` or
+   `reviewing` and calls `_resume_back_half`, which reads any pending human
+   reply first and otherwise re-enters `_step_loop` where the last pass left
+   off: a dead session, a crash or an outage costs one wave, not the run.
+11. **Merge.** `request_merge`, then `merge_ready_pr` posts
+   `bircher/cross-review`, waits for `mergeStateStatus == CLEAN`, merges
+   pinned to the reviewed head, watches main CI, and reverts on a confirmed
+   red.
+12. **Close-out.** Issue comment, labels, scorecard row, `record_run_outcome`
+   — refused while the run's pull request is open or unobserved (§3.3).
 
 The same thing as a picture, because the repair step turns a line into a loop
 and that is hard to see in a numbered list:
@@ -303,19 +329,30 @@ and that is hard to see in a numbered list:
        │        runs its OWN review + up to 3 fix rounds, stops
        ├─ 7. settle detection: poll until idle AND item count stable AND a PR
        │
-       ├─ 8. DERIVATION (coordinator): select the PR, wait out CI,
-       │        dispatch an INDEPENDENT reviewer, return the 8-field tuple
+       ├─ 8. THE CLOSED LOOP (`_step_loop`): derive the ground truth
+       │        (select the PR, wait out CI, dispatch an INDEPENDENT
+       │        reviewer); record the output, the CI observation (PR state +
+       │        failing jobs) and the verdict (+ fingerprints); ask
+       │        `next_step`
        │             │
-       │             └─ blocked, with rounds left? ──▶ 9. REPAIR
-       │                   record request_revision → confirm it journalled
-       │                   → dispatch a repair session with the findings
-       │                   → settle ──────────────────┐
-       │                                              │
-       │             ┌────────────────────────────────┘
-       │             ▼  (back to 8, allowance re-read FROM THE JOURNAL)
+       │             ├─ repair? ──▶ 9. REPAIR
+       │             │      request_repair (the one door back to `planned`)
+       │             │      → a repair session on the PR's own branch
+       │             │      → back to 8, derive again ────────────┐
+       │             │                                             │
+       │             │    ┌────────────────────────────────────────┘
+       │             │    ▼  (unbounded; parks no_progress after three
+       │             │        identical rounds)
+       │             ├─ wait?  the pass ends; the run stays open
+       │             ├─ park?  a carrier session, the park fact, the notice;
+       │             │          a person replies retry or stop
+       │             └─ merge? ──▶ 11. MERGE
        │
-       ├─ 10. replay the derived facts into the kernel
-       ├─ 11. merge pinned to the reviewed head, watch main CI, revert on red
+       ├─ 10. WAVES RESUME every open back-half run: the next wave
+       │        re-enters the loop at 8 for any run still `implementing` or
+       │        `reviewing` — a crash or an outage costs one wave, not the run
+       ├─ 11. request_merge, then merge pinned to the reviewed head, watch
+       │        main CI, revert on red
        └─ 12. issue comment, labels, scorecard row, record_run_outcome
 
 > **GAP — steps 6 and 8 both review.** The front half above has landed: spec
@@ -323,13 +360,17 @@ and that is hard to see in a numbered list:
 > What remains is the back half's own duplication, untouched by it — see §5.
 > Step 7 exists only because the orchestrator is a separate process from the
 > session: it has to *detect* that the model stopped rather than being told.
-> Step 10's replay-into-the-kernel exists only because the derivation happened
-> out-of-process. Step 9 dispatches a session from bash for the same reason —
+> Step 9's repair session is dispatched from bash for the same reason —
 > `v2/coordinator/session.py` is read-only and cannot create one.
 >
-> **TARGET —** steps 6–10 collapse. The coordinator dispatches the implementer,
-> observes it directly, reviews once, repairs if needed, and records as it goes
-> rather than replaying afterwards.
+> **Closed by the closed loop:** recording is no longer a separate
+> lifecycle-recording step run once the session settles. Step 8 records the
+> output, the CI observation and the verdict as each pass derives them — one
+> part of the TARGET below is already true.
+>
+> **TARGET —** steps 6–9 collapse. The coordinator dispatches the implementer,
+> observes it directly, reviews once, and repairs itself rather than through
+> bash dispatching a session.
 
 ---
 
@@ -348,11 +389,12 @@ outcome `failed`, which is terminal — so when the two reviews disagreed, the
 finding landed at the layer that could not act on it and a repairable defect
 killed the run. Observed on muesli PR #739; measured at 8 of 18 item-runs.
 
-That is now closed (gap 1). A blocked review with rounds remaining becomes a
-`revise`: the runner records `request_revision`, confirms the kernel journalled
-it, dispatches a repair session with the reviewer's verbatim findings, and
-derives again. Proven live on muesli #722, which failed review twice, was
-repaired twice, and merged.
+That is now closed (gap 1). A blocked review becomes a `repair`: the runner
+records `request_repair` — the one door back to `planned` — dispatches a
+repair session on the PR's own branch with the reviewer's verbatim findings,
+and derives again; unbounded, a run parks `no_progress` after three identical
+rounds. Proven live on muesli #722, which failed review twice, was repaired
+twice, and merged.
 
 **The duplication itself remains, and is now the sharper question.** Both layers
 can review and both can repair, so the second review no longer adds a power the
@@ -587,9 +629,9 @@ of the runner/coordinator split and should NOT be patched in place.
 ### The repair loop, as of 2026-08-31
 
 Built and merged; repair rounds are unbounded, and a run parks `no_progress`
-after three identical rounds. A reviewer FAIL is a `revise`, not an ending: the runner
-records `request_revision`, confirms the kernel journalled it, dispatches a
-repair session briefed on the reviewer's verbatim findings, and derives again.
+after three identical rounds. A reviewer FAIL is a `repair`, not an ending:
+the runner records `request_repair`, dispatches a repair session briefed on
+the reviewer's verbatim findings, and derives again.
 
 Judgement is the coordinator's; dispatch, settle and re-derive stay the
 runner's until `run_item` migrates. That split is honest rather than ideal —
@@ -694,6 +736,31 @@ a test instead — gap 9's is now `_derive_budget defaults fit` in `--self-test`
 which fails if a default is raised past the cliff. A row nobody re-measures is
 prose, and prose asserting a property nothing verifies is the defect this whole
 programme exists to catch.
+
+### The closed loop, as of 2026-09-19
+
+Built on the repair loop and replacing its bound. `run_item`'s while-loop is
+`_step_loop`: derive, record, ask `next_step`, perform the one step it names.
+`request_repair` is the only door back to `planned`; `record_run_outcome` is
+refused while the PR is open or unobserved; waves resume every open back-half
+run, so a dead session, a crash or an outage costs one wave, not the run.
+Progress is judged by evidence sets -- failing job names, finding
+fingerprints -- and three identical rounds park `no_progress`, answered by
+`retry` or `stop` in a carrier session.
+
+NOT YET PROVEN LIVE. The E11 criterion (a run that ends red is merged with no
+human touch) is the next PR's, with orphan adoption, state-derived labels and
+the round log. What is proven here is by test: the kernel refusals,
+`_step_loop` against a scripted world including the #764 and #769 shapes, the
+no-progress park after three identical rounds, and the self-test's fixtures
+for the shell-to-Python repair path and for re-queuing an open run from the
+journal.
+
+Known limits carried forward: a resumed run at `reviewing` re-reviews a head
+that already holds a verdict (one extra review per crash); a legacy run at
+`planned` through the old `request_revision` transition repairs without a
+`repair_requested` fact for that round; a merge that keeps failing is retried
+each wave until a person stops it.
 
 **What is NOT a gap.** These are done and should not be reopened: the kernel's
 state machine, effect classes, fact vocabulary and mode switches; the derived
