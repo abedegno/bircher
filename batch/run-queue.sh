@@ -6104,16 +6104,28 @@ SH
   # tolerates ENOENT on the pre-derivation unlink, because "nothing to clear"
   # is the normal case. The failure needs a stale file that CANNOT be removed,
   # which is what an unwritable or misowned NOOP_DIR produces.
-  mkdir -p "$rdir/ro"
-  : > "$rdir/ro/f.txt"
-  chmod 500 "$rdir/ro"
+  #
+  # ROOT CANNOT STAGE IT. uid 0 ignores a directory's write bit, so `chmod
+  # 500` leaves the file removable, the derivation correctly succeeds, and
+  # this assertion reads that success as a failure. The runner's container
+  # runs as root, so the `exit 1` below stopped its self-test HERE -- at
+  # check 29 of 111 -- and every later check went unrun on every deploy.
+  # Skipped rather than weakened: the hazard still binds for every non-root
+  # run, which is where this suite is developed and where CI runs it.
   local rofail_out
-  rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
-               RECOVERY_REVIEWER=codex \
-               observe_outcome demo demo 7 "" "$rdir/ro/f.txt")
-  [ -z "$rofail_out" ] \
-    || { chmod 700 "$rdir/ro"; echo "FAIL observe_outcome: an unremovable stale findings file did not fail the derivation: '$rofail_out'"; exit 1; }
-  chmod 700 "$rdir/ro"
+  if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$rdir/ro"
+    : > "$rdir/ro/f.txt"
+    chmod 500 "$rdir/ro"
+    rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+                 RECOVERY_REVIEWER=codex \
+                 observe_outcome demo demo 7 "" "$rdir/ro/f.txt")
+    [ -z "$rofail_out" ] \
+      || { chmod 700 "$rdir/ro"; echo "FAIL observe_outcome: an unremovable stale findings file did not fail the derivation: '$rofail_out'"; exit 1; }
+    chmod 700 "$rdir/ro"
+  else
+    echo "[self-test] SKIP: running as root -> a stale findings file cannot be made unremovable (uid 0 ignores the write bit); the hazard is exercised by every non-root run" >&2
+  fi
   echo "_findings_path OK"
 
   # The three recovery rows that must never reach a merge, and the reasons they
