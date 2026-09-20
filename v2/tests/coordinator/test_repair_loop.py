@@ -1,10 +1,10 @@
-"""A reviewer FAIL with rounds remaining is a revision, not an ending.
+"""A reviewer FAIL is a repair round, not an ending.
 
 Measured basis: 8 of 18 muesli item-runs ended `failed` on a reviewer FAIL,
 every one a specific actionable finding with a named fix. Routing those back by
 hand merged #740 after 1 round and #750 after 2; #722 produced a distinct
 finding at every round and is still open. So the loop converges sometimes, and
-the bound matters as much as the loop.
+convergence is the whole job now that nothing bounds the rounds.
 
 Design: docs/superpowers/specs/2026-08-31-repair-loop-design.md
 """
@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from coordinator.observe import Outcome, classify, revisions_used
+from coordinator.observe import classify, revisions_used
 
 
 class _F:
@@ -55,48 +55,15 @@ def test_counting_review_transitions_would_give_the_wrong_answer():
 
 
 def test_a_pre_crash_revision_still_counts():
-    """The allowance comes from the journal precisely so a re-driven
-    coordinator does not get a fresh one."""
+    """The count comes from the journal precisely so a re-driven coordinator
+    reads the same history: `_round_number` uses it for the status
+    description's round number."""
     assert revisions_used([_F("review_verdict", {"verdict": "request_revision"})]) == 1
 
 
 def test_an_empty_or_absent_journal_is_zero():
     assert revisions_used([]) == 0
     assert revisions_used(None) == 0
-
-
-# --- the classification ------------------------------------------------------
-
-@pytest.mark.parametrize("left,expected", [(0, "failed"), (1, "revise"), (2, "revise")])
-def test_a_fail_revises_only_while_rounds_remain(left, expected):
-    assert classify("7", "green", "FAIL", reviewer="codex",
-                    revisions_left=left).outcome == expected
-
-
-def test_the_default_reproduces_the_behaviour_before_the_loop():
-    """BIRCHER_MAX_REVISIONS=0 must be a real rollback, so the default
-    argument alone has to give today's answer exactly."""
-    before = Outcome("failed", "codex:fail", "green", "out-of-band review FAIL")
-    got = classify("7", "green", "FAIL", reviewer="codex")
-    assert (got.outcome, got.review, got.ci, got.note) == (
-        before.outcome, before.review, before.ci, before.note)
-
-
-def test_only_a_FAIL_revises():
-    """A PASS merges and a missing verdict escalates, whatever the allowance.
-    Reading silence as a repairable failure would spend rounds on a reviewer
-    that never ran -- which has happened here for other reasons."""
-    assert classify("7", "green", "PASS", reviewer="codex", revisions_left=2).outcome == "ready"
-    assert classify("7", "green", None, reviewer="codex", revisions_left=2).outcome == "escalated"
-    assert classify("7", "red", "FAIL", reviewer="codex", revisions_left=2).outcome == "failed"
-    assert classify(None, "green", "FAIL", reviewer="codex", revisions_left=2).outcome == "timeout"
-
-
-def test_a_revision_keeps_the_reviewer_verdict_as_evidence():
-    """The runner needs to know WHO failed it and why, to route the finding."""
-    o = classify("7", "green", "FAIL", reviewer="claude_code", revisions_left=1)
-    assert o.review == "claude_code:fail"
-    assert "revising" in o.note
 
 
 # --- the findings must reach the runner, and not via the tuple ---------------
@@ -106,16 +73,15 @@ def test_the_findings_never_enter_the_pipe_delimited_line():
     newlines; the tuple is ONE pipe-delimited line whose width guard rejects
     both. Putting the findings in it would corrupt every field after them."""
     from coordinator.outcome import Derived
-    d = Derived("revise", "cx:fail", "n", "a" * 40, "green", "true", 0, "7",
+    d = Derived("repair", "cx:fail", "n", "a" * 40, "green", "true", 0, "7",
                 findings="blocking:\n- one | two\n- three")
-    assert len(d.as_line().split("|")) == Derived.FIELDS == 10
+    assert len(d.as_line().split("|")) == Derived.FIELDS == 13
     assert "\n" not in d.as_line()
     assert "blocking" not in d.as_line()
 
 
-def test_the_findings_ride_out_only_on_a_revise():
-    """On any other outcome the runner has nothing to route them to, and a
-    scorecard note is not a place for a multi-paragraph review."""
+def test_the_findings_ride_out_on_every_fail():
+    """The repair round is briefed from them."""
     from coordinator.outcome import Deps, derive
 
     def _d(**over):
@@ -126,18 +92,12 @@ def test_the_findings_ride_out_only_on_a_revise():
         base.update(over)
         return Deps(**base)
 
-    revising = derive("i1", "i1", "7", "", deps=_d(revisions_left=2))
-    assert revising.outcome == "revise"
-    assert "blocking: the thing" in revising.findings
-
-    terminal = derive("i1", "i1", "7", "", deps=_d(revisions_left=0))
-    assert terminal.outcome == "failed"
-    assert terminal.findings == "", (
-        "findings must not ride out when there is no round to spend them on")
+    repairing = derive("i1", "i1", "7", "", deps=_d())
+    assert repairing.outcome == "repair"
+    assert "blocking: the thing" in repairing.findings
 
     passing = derive("i1", "i1", "7", "",
-                     deps=_d(review=lambda pr, sha: ("PASS", "looks fine"),
-                             revisions_left=2))
+                     deps=_d(review=lambda pr, sha: ("PASS", "looks fine")))
     assert passing.outcome == "ready"
     assert passing.findings == ""
 
@@ -145,13 +105,13 @@ def test_the_findings_ride_out_only_on_a_revise():
 # --- the findings file is EVIDENCE, so drive the real CLI ------------------
 #
 # These replace an earlier source-grep test. A grep for `fh.write` before
-# `print` cannot see a stale file, a partial write, or a `revise` published
+# `print` cannot see a stale file, a partial write, or a `repair` published
 # without its brief -- exactly the three failures that matter here. Drive
 # `main()` and look at the filesystem.
 
 def _derive_argv(out, item="i1"):
     return ["derive", "--item", item, "--code", item, "--pr", "7",
-            "--repo", "o/r", "--reviewer", "cx", "--findings-out", out, "--revisions-left", "2"]
+            "--repo", "o/r", "--reviewer", "cx", "--findings-out", out]
 
 
 def _fake_live_deps(verdict="FAIL", findings="blocking:\n- the thing | here"):
@@ -159,15 +119,13 @@ def _fake_live_deps(verdict="FAIL", findings="blocking:\n- the thing | here"):
     from coordinator.outcome import Deps
 
     def _f(item, *, repo, reviewer=None, server=None, bundle_dir=None,
-           poll_interval=None, ci_wait=None, rerun_wait=None,
-           revisions_left=0, **kw):
+           poll_interval=None, ci_wait=None, rerun_wait=None, **kw):
         return Deps(checks=lambda pr: "build|pass",
                     head_of=lambda pr: "a" * 40,
                     review=lambda pr, sha: (verdict, findings),
                     effect=lambda c, k, a: "ok",
                     history=lambda br: ("true", 0),
-                    branch_of=lambda pr: "feat-x",
-                    revisions_left=revisions_left)
+                    branch_of=lambda pr: "feat-x")
     return _f
 
 
@@ -179,7 +137,7 @@ def _install(monkeypatch, deps):
     monkeypatch.setitem(sys.modules, "coordinator.wiring", mod)
 
 
-def test_a_revise_writes_the_findings_and_then_prints_the_tuple(
+def test_a_repair_writes_the_findings_and_then_prints_the_tuple(
         tmp_path, capsys, monkeypatch):
     from coordinator.cli import RC_OK, main
     out = str(tmp_path / "findings.txt")
@@ -187,7 +145,7 @@ def test_a_revise_writes_the_findings_and_then_prints_the_tuple(
 
     assert main(_derive_argv(out)) == RC_OK
     line = capsys.readouterr().out
-    assert line.split("|")[0] == "revise"
+    assert line.split("|")[0] == "repair"
     assert pathlib.Path(out).read_text() == "blocking:\n- the thing | here"
     assert "|" not in line.split("|")[2]  # the note, not the findings
 
@@ -227,9 +185,9 @@ def test_a_derivation_killed_mid_flight_leaves_no_findings_behind(
     assert not out.exists()
 
 
-def test_an_unwritable_findings_path_never_publishes_a_revise(
+def test_an_unwritable_findings_path_never_publishes_a_repair(
         tmp_path, capsys, monkeypatch):
-    """A `revise` the caller cannot brief is worse than no answer: it
+    """A `repair` the caller cannot brief is worse than no answer: it
     dispatches a repair with an empty brief and no way to know."""
     from coordinator.cli import RC_FINDINGS_UNWRITABLE, main
     d = tmp_path / "ro"
@@ -243,7 +201,7 @@ def test_an_unwritable_findings_path_never_publishes_a_revise(
         d.chmod(0o700)
     cap = capsys.readouterr()
     assert rc == RC_FINDINGS_UNWRITABLE
-    assert cap.out == "", "the revise tuple must not be published"
+    assert cap.out == "", "the repair tuple must not be published"
     assert "could not write findings" in cap.err
     assert not list(d.glob("*.tmp")), "the temp file must not be left behind"
 
@@ -282,12 +240,11 @@ def test_no_findings_path_still_derives():
     r = derive("i1", "i1", "7", "", deps=Deps(
         checks=lambda pr: "build|pass", head_of=lambda pr: "a" * 40,
         review=lambda pr, sha: ("FAIL", "x"), effect=lambda c, k, a: "ok",
-        history=lambda br: ("true", 0), branch_of=lambda pr: "feat-x",
-        revisions_left=1))
-    assert r.outcome == "revise" and r.findings == "x"
+        history=lambda br: ("true", 0), branch_of=lambda pr: "feat-x"))
+    assert r.outcome == "repair" and r.findings == "x"
 
 
-# --- the head must ride out on a revise --------------------------------------
+# --- the head must ride out on a repair --------------------------------------
 #
 # Found by the FIRST LIVE RUN, not by any of the 1042 tests that were green when
 # it launched. The reviewer FAILed, `revise` was derived correctly, and the head
@@ -305,29 +262,20 @@ def _deps(verdict, **over):
     return Deps(**base)
 
 
-def test_a_revise_carries_the_reviewed_head():
+def test_a_repair_carries_the_reviewed_head():
     """Without it the runner records NO output, NO CI observation and NO
     review -- so there is no revision for the durability gate to confirm and
     the loop cannot start."""
     from coordinator.outcome import derive
-    r = derive("i1", "i1", "7", "", deps=_deps("FAIL", revisions_left=2))
-    assert r.outcome == "revise"
+    r = derive("i1", "i1", "7", "", deps=_deps("FAIL"))
+    assert r.outcome == "repair"
     assert r.sha == "a" * 40, (
-        "a revise with no head skips the runner's entire kernel lifecycle block")
+        "a repair with no head skips the runner's entire kernel lifecycle block")
 
 
-def test_a_terminal_failure_still_carries_NO_head():
-    """The original rule is unchanged: a failed or escalated derivation must
-    never carry merge-authorising evidence. `revise` is neither."""
-    from coordinator.outcome import derive
-    r = derive("i1", "i1", "7", "", deps=_deps("FAIL", revisions_left=0))
-    assert r.outcome == "failed"
-    assert r.sha == ""
-
-
-def test_the_head_a_revise_carries_is_the_one_the_reviewer_READ():
+def test_the_head_a_repair_carries_is_the_one_the_reviewer_READ():
     """Re-reading it after the verdict would bless a push that landed in
-    between -- the #66 rule, which applies to a revision exactly as it does to
+    between -- the #66 rule, which applies to a repair exactly as it does to
     an acceptance, because the review this head binds is what
     `validate_review` checks against."""
     from coordinator.outcome import derive
@@ -337,7 +285,6 @@ def test_the_head_a_revise_carries_is_the_one_the_reviewer_READ():
         seen.append(sha)
         return ("FAIL", "blocking: the thing")
 
-    r = derive("i1", "i1", "7", "",
-               deps=_deps("FAIL", review=_review, revisions_left=2))
+    r = derive("i1", "i1", "7", "", deps=_deps("FAIL", review=_review))
     assert seen == [r.sha], (
         f"the head reported ({r.sha[:7]}) is not the one reviewed ({seen})")

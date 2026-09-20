@@ -37,7 +37,10 @@ def test_the_sets_and_the_phase_map():
 def test_membership_per_command():
     both = authz.FRONT_HALF_STATES | authz.SHAPING_STATES
     legal = authz.legal_states_for
-    for name in ("park", "record_prompt_item", "dismiss_human_item"):
+    # park is now legal from back-half states too (closed-loop spec §3)
+    park_states = both | authz.BACK_HALF_STATES
+    assert legal("park") == park_states
+    for name in ("record_prompt_item", "dismiss_human_item"):
         assert legal(name) == both, name
     # Revision 16: the two commands that resolve a shape disagreement, each
     # legal from exactly one state and no more. `request_reshape` is the

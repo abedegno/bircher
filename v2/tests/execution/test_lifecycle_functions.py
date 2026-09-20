@@ -684,11 +684,18 @@ def test_a_pass_verdict_actually_advances_the_run(tmp_path):
 
 
 def test_a_fail_verdict_sends_the_run_back_rather_than_forward(tmp_path):
-    """`:fail` maps to request_revision, which returns the run to `planned` so
-    implementation can start again. `reject` would leave it in `reviewing`
-    with nowhere to go, and `accept` would let failed work merge."""
+    """`:fail` maps to request_revision, which -- like every back-half verdict
+    -- leaves the run in `reviewing` (a verdict is evidence, not a
+    transition; closed-loop spec §1), so `reviewing` no longer distinguishes
+    it from `reject`; the verdict word itself is what a resume reads to tell
+    a repair still owed from one that was refused outright, and `accept`
+    would let failed work merge."""
     s = _reviewed_run(tmp_path / "k.db", "r-fail", "codex:fail")
-    assert s.run_state("r-fail") == "planned", s.run_state("r-fail")
+    assert s.run_state("r-fail") == "reviewing", s.run_state("r-fail")
+    verdicts = [f.payload.get("verdict") for f in s.facts_for("r-fail")
+                if f.kind == EventKind.REVIEW_VERDICT
+                and f.payload.get("phase") == "implementation"]
+    assert verdicts == ["request_revision"], verdicts
 
 
 def test_a_TERMINAL_fail_records_a_rejection_not_a_revision_request(tmp_path):
@@ -726,10 +733,11 @@ def test_a_NON_terminal_fail_still_asks_for_a_revision(tmp_path):
     """The other escalation paths -- the revision was not journalled, no
     findings were written -- must keep `request_revision`. A revision genuinely
     is owed there and nothing performed it, so `dispatch_implementer` is the
-    right answer for a human or a resume."""
+    right answer for a human or a resume, even though the verdict itself left
+    the run in `reviewing`, not `planned` (closed-loop spec §1)."""
     from coordinator.recover import decide
     s = _reviewed_run(str(tmp_path / "k.db"), "r-rev", "codex:fail")
-    assert s.run_state("r-rev") == "planned"
+    assert s.run_state("r-rev") == "reviewing"
     assert decide(s.facts_for("r-rev")).do == "dispatch_implementer"
 
 

@@ -24,14 +24,15 @@ def _deps(**over):
     return d
 
 
-def test_the_tuple_has_ten_fields_in_order():
-    """Ten since the reviewed range joined it. The width is asserted against
-    `Derived.FIELDS` as well as the literal, because the shell's reader is
-    checked against that constant and two numbers that can disagree will."""
+def test_the_tuple_has_thirteen_fields_in_order():
+    """Thirteen since the fingerprints, the PR's state and its failing jobs
+    joined it. The width is asserted against `Derived.FIELDS` as well as the
+    literal, because the shell's reader is checked against that constant and
+    two numbers that can disagree will."""
     r = derive("i1", "i1", "7", "", deps=_deps())
-    assert len(r.as_tuple()) == 10 == Derived.FIELDS
+    assert len(r.as_tuple()) == 13 == Derived.FIELDS
     assert r.outcome == "ready"
-    assert r.as_tuple()[5:] == ("true", 0, "7", "", "")
+    assert r.as_tuple()[5:] == ("true", 0, "7", "", "", "", "open", "")
     assert len(r.as_line().split("|")) == Derived.FIELDS
 
 
@@ -42,7 +43,7 @@ def test_a_red_pr_never_reaches_the_reviewer():
     d = _deps(checks=lambda pr: "build|fail",
               review=lambda pr, sha: (asked.append(pr) or "PASS", ""))
     r = derive("i1", "i1", "7", "", deps=d)
-    assert r.outcome == "failed" and asked == []
+    assert r.outcome == "repair" and asked == []
 
 
 def test_the_reviewed_sha_is_captured_BEFORE_the_review_is_dispatched():
@@ -155,23 +156,19 @@ def test_a_reconciled_sibling_replaces_the_tracked_pr():
     assert "6" in d.posted[-1][2]
 
 
-def test_a_TERMINAL_outcome_carries_no_sha():
-    """It is the merge-authorising evidence, so a failed or escalated
-    derivation must not carry one.
-
-    RENAMED from `..._only_on_a_ready_outcome`, which stopped being true when
-    the repair loop landed: `revise` carries the head too, because the runner
-    needs it to record the CI observation and bind the review that carries
-    `request_revision`. The old name asserted a property this test never
-    checked -- it only ever drove the FAIL path -- so it stayed green while its
-    name became false. See `test_a_revise_carries_the_reviewed_head`.
-    """
-    d = _deps(review=lambda pr, sha: ("FAIL", ""))
-    r = derive("i1", "i1", "7", "", deps=d)
-    assert r.outcome == "failed" and r.sha == ""
-    esc = derive("i1", "i1", "7", "",
-                 deps=_deps(review=lambda pr, sha: (None, "")))
-    assert esc.outcome == "escalated" and esc.sha == ""
+def test_the_head_rides_out_on_every_outcome_with_a_pr():
+    """The closed loop (spec §1) repairs a red head and records CI against it,
+    so the head is evidence on every outcome, not only the merge-authorising
+    one. The merge gate is `outcome == ready`, not the presence of a sha."""
+    head = "a" * 40
+    repaired = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: ("FAIL", "")))
+    assert repaired.outcome == "repair" and repaired.sha == head
+    esc = derive("i1", "i1", "7", "", deps=_deps(review=lambda pr, sha: (None, "")))
+    assert esc.outcome == "escalated" and esc.sha == head
+    red = derive("i1", "i1", "7", "", deps=_deps(checks=lambda pr: "build|fail"))
+    assert red.ci == "red" and red.sha == head
+    none = derive("i1", "i1", "", "", deps=_deps(pr_state=lambda pr: ("", "")))
+    assert none.pr == "" and none.sha == ""
 
 
 def test_a_reviewer_with_no_verdict_escalates():
@@ -425,14 +422,61 @@ def _green_pass_deps(effects, verdict="PASS", out="VERDICT: PASS"):
     )
 
 
-def test_the_line_has_ten_fields_and_carries_the_range():
+def test_the_line_has_thirteen_fields_and_carries_the_range():
     effects = []
     r = derive("i", "c", "7", "", deps=_green_pass_deps(effects))
-    assert r.FIELDS == 10
+    assert r.FIELDS == 13
     fields = r.as_line().split("|")
-    assert len(fields) == 10
+    assert len(fields) == 13
     assert fields[8] == "2742ae4f" + "0" * 32
     assert fields[9] == "d" * 64
+
+
+def test_the_line_has_thirteen_fields_with_fingerprints_state_and_jobs():
+    effects = []
+    out = "Blocking findings\n\n- a.go:1 One.\n- b.go:2 Two.\n\nVERDICT: FAIL\n"
+    r = derive("i", "c", "7", "", deps=_green_pass_deps(effects, verdict="FAIL", out=out))
+    fields = r.as_line().split("|")
+    assert len(fields) == 13 == Derived.FIELDS
+    assert fields[10].count(",") == 1 and len(fields[10]) == 81
+    assert fields[11] == "open" and fields[12] == ""
+
+
+def test_a_pass_carries_no_fingerprints():
+    assert derive("i", "c", "7", "", deps=_green_pass_deps([])).fingerprints == ""
+
+
+def test_pr_state_is_lower_cased_and_merged_wins():
+    d = _green_pass_deps([])
+    d.pr_state = lambda pr: ("MERGED", "2026-09-19T00:00:00Z")
+    assert derive("i", "c", "7", "", deps=d).pr_state == "merged"
+
+
+def test_a_discarded_closed_pr_still_reports_its_state():
+    # The settle drops a CLOSED-unmerged PR and finds nothing else; the runner
+    # still has to hear "closed", or the run can never end (spec §1).
+    r = derive("i1", "i1", "7", "", deps=_deps(pr_state=lambda pr: ("CLOSED", "null")))
+    assert r.pr == "" and r.outcome == "timeout" and r.pr_state == "closed"
+
+
+def test_red_ci_names_its_failing_jobs_sorted_and_ignoring_the_ignored():
+    d = _deps(checks=lambda pr: "server (go)|fail\nclient (node)|pass\nlint|cancel")
+    r = derive("i1", "i1", "7", "", deps=d)
+    assert r.ci == "red" and r.failing_jobs == "lint,server (go)"
+
+
+def test_green_ci_names_no_failing_jobs():
+    assert derive("i1", "i1", "7", "", deps=_deps()).failing_jobs == ""
+
+
+def test_a_comma_in_a_job_name_does_not_split_into_two_entries():
+    """GitHub matrix names carry a comma of their own
+    (`build (ubuntu-latest, node 18)`), and the tuple's transport joins
+    failing_jobs with a comma too -- so a raw comma in the name would read
+    back as two jobs. Fixed at the source: the comma becomes a space."""
+    d = _deps(checks=lambda pr: "build (ubuntu-latest, node 18)|fail\nlint|pass")
+    r = derive("i1", "i1", "7", "", deps=d)
+    assert r.failing_jobs == "build (ubuntu-latest node 18)"
 
 
 def _status_key(head, state, desc):

@@ -213,9 +213,10 @@ def test_every_command_declares_its_legal_states():
 def test_request_merge_without_an_accepted_review_is_refused():
     s = _advance_to_reviewing(_store())
     _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
-    # `reject`, not `request_revision`: a revision request now returns the run
-    # to `planned`, so request_merge would be refused for being illegal in that
-    # state and the test would pass without ever reaching the approval check.
+    # `reject`: any non-accept verdict leaves the run in `reviewing` (a
+    # verdict is evidence, not a transition -- closed-loop spec §1), so
+    # `request_revision` would exercise this refusal just as well; `reject`
+    # is picked because it is never itself a request for another round.
     _submit(s, "record_review", "k4", verdict="reject",
             artifact_hash=SPEC, base_sha=BASE, context_bundle_hash=BUNDLE,
             actor="codex", policy_version=1)
@@ -340,7 +341,7 @@ def test_a_merged_outcome_WITH_a_confirmed_merge_effect_is_accepted():
     check could be pointed anywhere and stay green.
     """
     s = _advance_to_reviewing(_store())
-    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD)
+    _submit(s, "record_ci_observation", "ci", status="success", head_git_sha=HEAD, pr_state="merged")
     _submit(s, "record_review", "rv", verdict="accept", artifact_hash=SPEC,
             base_sha=BASE, context_bundle_hash=BUNDLE, actor="codex",
             policy_version=1)

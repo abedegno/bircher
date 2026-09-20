@@ -170,6 +170,16 @@ _NEEDED_REAL_FUNCTIONS = [
     # one writes no row at all, and a test asserting the outcome then reads an
     # empty scorecard as "it took some other branch".
     "_refused_mint_row", "_unreadable_state_item",
+    # `run_item`'s tail (closed-loop spec §2) reads `_ffile` from
+    # `_findings_path` -- pure, no kernel/session/network call, so real
+    # rather than stubbed keeps the drive honest without adding noise to the
+    # call log.
+    "_findings_path",
+    # The running-label swap, a function since F7 so the back half can do it
+    # after the park reply rather than before it. REAL: an undefined one
+    # would make `run_item`'s own call a silent no-op indistinguishable from
+    # a deliberate skip.
+    "_label_running",
 ]
 
 
@@ -206,6 +216,18 @@ def _extracted_script(tmp_path):
         "may have matched something else"
     )
     helpers = [_extract_function(src_lines, name) for name in _NEEDED_REAL_FUNCTIONS]
+    # `run_item`'s tail is three calls now (closed-loop spec §2): `_step_loop`
+    # (the derive/record/act cycle this file's sequence pins), `_merge_step`
+    # (the in-run merge, on a `merge` step) and `_finish_pass` (the scorecard
+    # row and the queue file's retirement). REAL, not stubbed -- they hold the
+    # exact call sites this file is checking argument wiring on, so a stub
+    # here would test nothing. `_step_loop` carries the ONE heredoc left in
+    # this drive (the derived tuple's `read`), so `_heredoc_to_herestring`
+    # applies to its extracted copy, not `run_item`'s own (which no longer
+    # contains it).
+    step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
+    merge_step_src = _extract_function(src_lines, "_merge_step")
+    finish_pass_src = _extract_function(src_lines, "_finish_pass")
 
     preamble = '''
 set -uo pipefail
@@ -227,10 +249,11 @@ IMPLEMENTER="${BIRCHER_IMPLEMENTER:-auto}"
 MERGE_NOTE=""
 MERGE_RETRY_ELIGIBLE=""
 '''
-    run_item_src = _heredoc_to_herestring(run_item_src)
 
     out = tmp_path / "run-item-extracted.sh"
-    out.write_text(preamble + "\n\n".join(helpers) + "\n\n" + run_item_src + "\n")
+    out.write_text(preamble + "\n\n".join(helpers) + "\n\n"
+                    + step_loop_src + "\n\n" + merge_step_src + "\n\n"
+                    + finish_pass_src + "\n\n" + run_item_src + "\n")
     return out
 
 
@@ -261,9 +284,11 @@ def _heredoc_to_herestring(run_item_src):
     pairs = [
         (
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            "resubmissions _settled_pr _merge_base _delta_digest <<EOF\n$obs\nEOF",
+            "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+            "_pr_state _failing_jobs <<EOF\n$obs\nEOF",
             "IFS='|' read -r outcome review note observed_head _obs_ci ci_first "
-            'resubmissions _settled_pr _merge_base _delta_digest <<< "$obs"',
+            "resubmissions _settled_pr _merge_base _delta_digest _fingerprints "
+            '_pr_state _failing_jobs <<< "$obs"',
         ),
     ]
     for old, new in pairs:
@@ -302,7 +327,13 @@ _kernel_run_start() {{
 # DECIDES has its own file (test_front_half_seam.py); this one is about the
 # arguments the back half threads afterwards.
 _kernel_find_run()           {{ _log_call _kernel_find_run "$@"; printf ''; }}
-_kernel_state()              {{ _log_call _kernel_state "$@"; printf 'implementing'; }}
+# `implementing` until the terminal fact is submitted, and `ended` after it:
+# `_finish_pass` reads the state back before it retires the queue file, since
+# the adapter is advisory and "I asked" is not "the kernel accepted".
+_kernel_state() {{
+  _log_call _kernel_state "$@"
+  if [ -s "{ranoutcome}" ]; then printf 'ended'; else printf 'implementing'; fi
+}}
 _kernel_bundle_hash()        {{ _log_call _kernel_bundle_hash "$@"; printf '%s' "{ctx_hash}"; }}
 _implementer_brief()         {{ _log_call _implementer_brief "$@"; printf 'BRIEF(%s)' "$2"; }}
 _project_config()            {{ printf '{{}}'; }}
@@ -310,13 +341,13 @@ _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
-  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}'
+  printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}|||'
 }}
 _kernel_record_ci()          {{ _log_call _kernel_record_ci "$@"; }}
 _kernel_record_review()      {{ _log_call _kernel_record_review "$@"; }}
 _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
-_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; }}
+_kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; printf '1' > "{ranoutcome}"; }}
 _kernel_put_artifact() {{
   _log_call _kernel_put_artifact "$@"
   printf '%s' "$1" | shasum -a 256 | cut -c1-64
@@ -327,10 +358,19 @@ _kernel_dispatch() {{
   printf '%s' "$n"
 }}
 
-# Stubbed so no test reaches the network. Returning EMPTY means "no settle",
-# which keeps these tests on the path they were written for -- the loop running
-# to its existing exits rather than ending early on a quiet session.
-_coordinator()     {{ printf ''; return 1; }}
+# Stubbed so no test reaches the network. `session-settle` returns EMPTY,
+# which keeps the polling loop on the path it was written for -- running to
+# its existing exits rather than ending early on a quiet session. `step` is
+# `_step_loop`'s own next-action read (closed-loop spec §2): every drive
+# here records an accept, so the answer is always `merge`, unlogged like
+# every other `_coordinator` call -- this file pins the KERNEL call
+# sequence, not the journal reads between them.
+_coordinator() {{
+  case "$1" in
+    step) printf 'merge||||'; return 0 ;;
+    *) printf ''; return 1 ;;
+  esac
+}}
 _create_session()  {{ printf 'conv-test-1'; }}
 _send_prompt()     {{ return 0; }}
 _http_json()       {{ printf '{{}}'; }}
@@ -432,8 +472,11 @@ def _run_one_item(tmp_path, *, prompt_body="Implement the thing.",
     # SINCE PHASE 2 THERE IS ONE PATH. The marker branch and the ground-truth
     # branch were the same lifecycle driven from two sources; only the derived
     # one remains, so every test here drives it.
+    ranoutcome = tmp_path / "ranoutcome"
+    ranoutcome.write_text("")
     stub = _STUB_TEMPLATE.format(
         callseq=callseq, calldir=calldir, gencounter=gencounter,
+        ranoutcome=ranoutcome,
         observed_review=observed_review, head_sha=HEAD_SHA,
         reviewed_sha=REVIEWED_SHA, outhash=OUT_HASH, ctx_hash=CTX_HASH,
         issue_copy=tmp_path / "sent-issue.json",
@@ -526,14 +569,25 @@ _SEQUENCE = [
     "_kernel_state",
     "_kernel_dispatch", "_kernel_start_implementation", "_kernel_state",
     "_implementer_brief", "_kernel_bundle_hash", "observe_outcome",
+    # `_step_loop`'s own state read (closed-loop spec §2): it decides whether
+    # THIS round's derivation records an implementation output at all, so it
+    # sits between the derivation and the recording -- a read, not a record.
+    "_kernel_state",
     "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
     "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
     "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
+    # `_finish_pass` READS THE STATE BACK before it retires the queue file.
+    # The adapter is advisory -- `_kernel` returns 0 whether the kernel
+    # accepted the terminal fact or refused it -- so the pass used to report
+    # a run finished on the strength of having asked. The read is a kernel
+    # call site like any other and belongs in the sequence, or an inserted
+    # one later would read as a missing call.
+    "_kernel_state",
 ]
 (I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_SLICED_CHECK, I_IMPLEMENTER,
- I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_OUTPUT, I_CI, I_REVIEWER,
- I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
- I_RUN_OUTCOME) = range(len(_SEQUENCE))
+ I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_STEP_STATE, I_OUTPUT,
+ I_CI, I_REVIEWER, I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
+ I_RUN_OUTCOME, I_ENDED_CHECK) = range(len(_SEQUENCE))
 
 
 def test_the_drive_reaches_every_kernel_call_site(happy_drive):
@@ -615,6 +669,18 @@ def test_start_implementation_gets_the_implementer_generation(happy_drive):
     assert args == [run_id, "2"], args
 
 
+def test_the_terminal_read_back_asks_about_this_run(happy_drive):
+    """`_finish_pass` decides whether to retire the queue file on this read,
+    so a wrong id here retires an item on another run's state -- exactly the
+    "reported finished while the journal holds it open" failure the read
+    exists to stop, with the evidence pointing at the wrong run."""
+    calls, _, _tmp = happy_drive
+    name, args = calls[I_ENDED_CHECK]
+    assert name == "_kernel_state"
+    assert args == [calls[I_RUN_START][1][0]], args
+    assert calls[I_ENDED_CHECK - 1][0] == "_kernel_record_run_outcome", calls[I_ENDED_CHECK - 1]
+
+
 def test_the_sliced_check_reads_this_run(happy_drive):
     """The read the sliced branch turns on (shaping spec §5) must ask about
     THIS run. It fires the moment `phases` returns, before any of the
@@ -634,15 +700,19 @@ def test_the_state_is_read_back_for_this_run_after_start_implementation(happy_dr
 
 
 def test_the_outcome_is_derived_before_anything_is_recorded(happy_drive):
-    """`observe_outcome` sits at index 6, between start_implementation and
-    record_output. Everything the kernel records afterwards is derived from
-    what it returned -- so if this call ever moves after the recording, the
-    recorded facts would describe a run nobody had observed yet."""
+    """`observe_outcome` sits between start_implementation and record_output.
+    Everything the kernel records afterwards is derived from what it
+    returned -- so if this call ever moves after the recording, the recorded
+    facts would describe a run nobody had observed yet. `_step_loop`'s own
+    state read (closed-loop spec §2) is allowed directly after it -- a read,
+    not a record -- but `_kernel_record_output` must still be the first
+    RECORDING call downstream."""
     calls, _, _tmp = happy_drive
     name, _args = calls[I_OBSERVE]
     assert name == "observe_outcome", [c[0] for c in calls]
     assert calls[I_OBSERVE - 1][0] == "_kernel_bundle_hash"
-    assert calls[I_OBSERVE + 1][0] == "_kernel_record_output"
+    assert calls[I_OBSERVE + 1][0] == "_kernel_state"
+    assert calls[I_STEP_STATE + 1][0] == "_kernel_record_output"
 
 
 def test_record_output_gets_the_actual_derived_body(happy_drive):
@@ -661,12 +731,17 @@ def test_record_ci_gets_the_ci_field_not_the_outcome_field(happy_drive):
     """The reviewer's finding, reproduced as a positive assertion: the THIRD
     argument to record_ci is $_obs_ci ("green"), never $outcome ("ready") --
     two in-scope variables from the same derived tuple with different
-    vocabularies (see module docstring for the mutation this must catch)."""
+    vocabularies (see module docstring for the mutation this must catch).
+
+    The fifth/sixth/seventh arguments are the PR's state, its failing jobs
+    and its number (closed-loop spec §1, §3) -- empty/empty/PR here, since
+    this fixture's derived tuple carries no pr_state or failing_jobs and the
+    settled PR is unchanged from the one the item started with."""
     calls, _, _tmp = happy_drive
     name, args = calls[I_CI]
     assert name == "_kernel_record_ci"
     run_id = calls[I_RUN_START][1][0]
-    assert args == [run_id, "2", "green", HEAD_SHA], args
+    assert args == [run_id, "2", "green", HEAD_SHA, "", "", PR], args
 
 
 def test_the_reviewer_dispatch_gets_the_recovery_reviewer(happy_drive):
@@ -741,10 +816,11 @@ def test_the_review_record_carries_the_range():
     variables threaded into the call are the ones this file's own extraction
     helper sees, using the same find-the-matching-close-brace mechanism
     `_extracted_script` already relies on to isolate `run_item` from the rest
-    of `batch/run-queue.sh`.
+    of `batch/run-queue.sh`. The call itself now lives in `_step_loop`
+    (closed-loop spec §2), not `run_item`.
     """
     src_lines = RUN_QUEUE.read_text().splitlines()
-    run_item_src = _extract_function(src_lines, "run_item")
+    run_item_src = _extract_function(src_lines, "_step_loop")
     call = run_item_src[run_item_src.index('_kernel_record_review "$BIRCHER_RUN_ID"'):]
     call = call[:call.index("\n")]
     for name in ('"$observed_head"', '"$_merge_base"', '"$_delta_digest"'):

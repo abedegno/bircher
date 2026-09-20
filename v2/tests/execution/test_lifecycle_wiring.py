@@ -27,6 +27,20 @@ def _run_item():
     return "\n".join(src[start:end])
 
 
+def _run_item_and_tail():
+    """`run_item`'s own body, followed by `_step_loop` and `_merge_step`
+    (closed-loop spec §2) -- in that order, which is also the order run_item
+    itself reaches them (its tail calls `_step_loop`, then `_merge_step` on a
+    `merge` step) even though both are DEFINED earlier in the file. The
+    lifecycle calls this file pins by name -- `_kernel_record_output`,
+    `_kernel_record_ci`, `_kernel_record_review`, `_kernel_request_merge` and
+    the reviewer/implementer dispatches around them -- now live in
+    `_step_loop`; the in-run merge (`_kernel_request_merge`, `merge_ready_pr`)
+    lives in `_merge_step`. Order-sensitive checks that used to read straight
+    through `run_item` still read straight through this concatenation."""
+    return "\n".join([_run_item(), _helper_body("_step_loop"), _helper_body("_merge_step")])
+
+
 def test_run_item_is_found():
     """A parser that finds nothing reports total compliance."""
     assert len(_run_item().splitlines()) > 100
@@ -53,21 +67,26 @@ _STAGE_CALLS = {
 @pytest.mark.parametrize("name", sorted(_STAGE_CALLS))
 def test_each_stage_calls_the_kernel(name):
     fn = _STAGE_CALLS[name]
-    assert fn in _run_item(), f"run_item never calls {fn}, which performs {name}"
+    assert fn in _run_item_and_tail(), (
+        f"run_item (or its tail, _step_loop/_merge_step) never calls {fn}, "
+        f"which performs {name}")
 
 
 def test_the_reviewer_gets_its_own_dispatch():
     """validate_review refuses a review whose attempt was not dispatched in
     the reviewer role. One dispatch at session creation grants implementer
-    only, so without this every run shadow-rejects its review."""
-    body = _run_item()
+    only, so without this every run shadow-rejects its review. The dispatch
+    is in `_step_loop` now (closed-loop spec §2)."""
+    body = _run_item_and_tail()
     assert "_kernel_dispatch \"$RECOVERY_REVIEWER\" reviewer" in body
 
 
 def test_the_merge_request_redispatches_as_implementer():
     """A dispatch re-fences the generation, so after the reviewer dispatch the
-    implementer needs a fresh one."""
-    body = _run_item()
+    implementer needs a fresh one. `record_review` is in `_step_loop`;
+    `request_merge` is in `_merge_step`, which follows it in
+    `_run_item_and_tail`'s concatenation."""
+    body = _run_item_and_tail()
     review = body.index("record_review")
     merge = body.index("request_merge")
     between = body[review:merge]
@@ -114,7 +133,8 @@ def test_no_kernel_call_is_tested_for_success():
     "_kernel_record_review", "_kernel_request_merge", "_kernel_record_outcome",
 ])
 def test_run_item_calls_the_named_lifecycle_function(fn):
-    assert fn in _run_item(), f"run_item never calls {fn}"
+    assert fn in _run_item_and_tail(), (
+        f"run_item (or its tail, _step_loop/_merge_step) never calls {fn}")
 
 
 def test_the_phase_loop_runs_between_run_creation_and_the_implementer():
@@ -128,8 +148,10 @@ def test_the_phase_loop_runs_between_run_creation_and_the_implementer():
     runner calls HERE -- after the run exists and before any implementer is
     dispatched. Dispatching the implementer first would fence a generation
     across the whole front half; calling phases after start_implementation
-    would ask it to author a spec for a run already implementing."""
-    body = _run_item()
+    would ask it to author a spec for a run already implementing.
+    `_kernel_record_output` is `_step_loop`'s now (closed-loop spec §2), which
+    `_run_item_and_tail` appends after run_item's own body."""
+    body = _run_item_and_tail()
     run_start = body.index("_kernel_run_start")
     phases = body.index("coordinator.cli phases")
     dispatch = body.index('_kernel_dispatch "$vendor" implementer')
@@ -217,13 +239,13 @@ _NO_KERNEL_OUTCOME = {
         "and decided nothing about the run's outcome, and `record_run_outcome` "
         "is TERMINAL -- ending a run this pass merely declined to touch would "
         "close it against the next one that can",
-    "beyond the front half; this pass drives nothing":
-        "same: the run is the BACK half's, still live, and this pass is "
-        "reporting that it cannot drive it -- not deciding how it ended",
-    "the back half owns it and this pass drives nothing":
-        "the third of the same shape. The STATE says `planned` and the "
-        "JOURNAL says implementation already started, so the run is the back "
-        "half's exactly as the row above is -- reported, not ended",
+    "which no pass resumes; this pass drives nothing":
+        "closed-loop spec §2: this one row now covers what were two rows --"
+        " a state beyond the front half, or `planned` with the journal "
+        "saying implementation already started -- neither a front-half nor "
+        "a back-half state this pass can drive. The run is still live and "
+        "this pass is reporting that it cannot drive it, not deciding how "
+        "it ended",
 }
 
 #: Scorecard rows whose run is NOT OVER. A distinct exemption from the one
@@ -482,7 +504,12 @@ def test_no_effect_in_run_item_runs_before_a_generation_exists():
 #: Functions containing an `_effect` call, and the generation context they run
 #: in. REACHED = called from run_item, so the exported generation is this run's.
 _EFFECT_SITE_CONTEXT = {
-    "run_item": "REACHED",
+    # `run_item` itself is NOT here any more. Its one direct `_effect` call
+    # was the running-label swap, and F7 lifted that into `_label_running` so
+    # the back half can perform it after the park reply rather than before
+    # it. Every effect run_item causes now goes through one of the functions
+    # below; the table's second assertion is what says so, by refusing a name
+    # that no longer contains an `_effect` call.
     "_send_prompt": "REACHED",
     "_prune_session": "REACHED",
     "_post_cross_review_status": "REACHED",
@@ -514,6 +541,19 @@ _EFFECT_SITE_CONTEXT = {
     # above session creation in the first place.
     "_create_session": "REACHED",
     "_stop_session": "REACHED",
+    # Added by the closed loop's Task 7 as unused code; Task 9 wires it into
+    # `_step_loop`'s park branches, which run inside `run_item` exactly as
+    # `_issue_writeback` and `_ensure_issue_closed` do -- BIRCHER_RUN_ID and
+    # BIRCHER_GENERATION are already established by dynamic scope.
+    "_park_back_half": "REACHED",
+    # The running-label swap, lifted out of `run_item`'s own body into a
+    # function (F7) so the back half can perform it AFTER the park reply
+    # rather than before it. Same site, same generation-keyed idempotency
+    # key, same context: both callers -- `run_item` and `_resume_back_half`,
+    # which `run_item` calls -- are downstream of the operator fence, so
+    # BIRCHER_RUN_ID and BIRCHER_GENERATION are already established by
+    # dynamic scope exactly as they were when the line sat inline.
+    "_label_running": "REACHED",
 }
 
 #: WHAT THESE TESTS CAN AND CANNOT SHOW. The table is a REVIEWED CLAIM about
@@ -761,14 +801,23 @@ def test_binding_variables_are_declared_at_run_item_scope():
     MARKER path only, so the branch that declares the variable always ran. This
     is structural because the behavioural version would have to drive
     `recover_from_ground_truth` for real.
+
+    The two binding calls are `_step_loop`'s now (closed-loop spec §2), so the
+    variable names are read from there -- but they must still be declared
+    `local` in `run_item` ITSELF: `_step_loop` runs in run_item's dynamic
+    scope (the docstring above `_step_loop` in run-queue.sh states this), so a
+    binding variable declared inside `_step_loop` rather than at run_item's own
+    indent-2 scope would be exactly the same unbound-variable shape on
+    whichever call path skips the assignment.
     """
     body = _run_item().splitlines()
     base = "  "                      # run_item's own body indent
 
     used_in_bindings = set()
-    for _, logical in _logical_lines():
-        if "_kernel_record_review" in logical or "_kernel_request_merge" in logical:
-            used_in_bindings.update(re.findall(r'"\$(_[a-z_]+)"', logical))
+    for fname in ("_step_loop", "_merge_step"):
+        for _, logical in _logical(_helper_body(fname)):
+            if "_kernel_record_review" in logical or "_kernel_request_merge" in logical:
+                used_in_bindings.update(re.findall(r'"\$(_[a-z_]+)"', logical))
     assert used_in_bindings, "found no binding variables; the parser is wrong"
 
     for var in sorted(used_in_bindings):
@@ -866,14 +915,17 @@ def test_recover_pr_cmd_writes_back_to_the_issue():
         "adopts a PR and may never have seen the queue item that created it")
 
 
-@pytest.mark.parametrize("fn", ["recover_pr_cmd", "run_item"])
+@pytest.mark.parametrize("fn", ["recover_pr_cmd", "_step_loop"])
 def test_an_empty_recovery_tuple_is_treated_as_a_failure(fn):
     """observe_outcome has ONE exit and always emits seven fields, so
     no output means it died before reaching that line -- and `rec=$(...)`
     swallows the death into an empty string. Parsed straight it reads as
     outcome="" and the caller reports "NOT ready", which is a benign-looking
     sentence for "the recovery crashed". Seen once on the smoke repo and not
-    reproducible since; the misreading is the part worth making impossible."""
+    reproducible since; the misreading is the part worth making impossible.
+    The tuple parse is `_step_loop`'s now (closed-loop spec §2), not
+    `run_item`'s own -- `run_item` calls it and nothing else parses the tuple
+    on that side."""
     src = RUN_QUEUE.read_text().splitlines()
     start = next(i for i, l in enumerate(src) if l.startswith(f"{fn}()"))
     end = next(i for i in range(start + 1, len(src)) if src[i] == "}")

@@ -94,7 +94,7 @@ def test_the_branch_is_actually_passed_to_the_api():
 
 @pytest.mark.parametrize("verdict,expected", [
     ("PASS", ("ready", "codex:pass")),
-    ("FAIL", ("failed", "codex:fail")),
+    ("FAIL", ("repair", "codex:fail")),
     ("NONE", ("escalated", "codex:na")),
     (None, ("escalated", "codex:na")),
     ("", ("escalated", "codex:na")),
@@ -116,15 +116,18 @@ def test_no_pr_is_a_timeout_regardless_of_everything_else():
     assert (o.outcome, o.ci) == ("timeout", "na")
 
 
-def test_red_ci_fails_without_consulting_the_verdict():
-    """CI is checked BEFORE the verdict: a PASS on a red PR must not merge."""
-    o = classify("42", "red", "PASS", reviewer="codex")
-    assert (o.outcome, o.ci) == ("failed", "red")
+def test_red_ci_is_a_repair_not_an_ending():
+    o = classify("7", "red", "PASS", reviewer="codex")
+    assert o.outcome == "repair" and o.ci == "red" and o.review == "na"
 
 
-def test_pending_ci_escalates_rather_than_guessing():
-    o = classify("42", "pending", "PASS", reviewer="codex")
-    assert o.outcome == "escalated"
+def test_pending_ci_waits():
+    assert classify("7", "pending", None, reviewer="codex").outcome == "waiting"
+
+
+def test_a_fail_is_a_repair():
+    o = classify("7", "green", "FAIL", reviewer="codex")
+    assert o.outcome == "repair" and o.review == "codex:fail"
 
 
 def test_the_reviewer_name_travels_into_the_verdict_string():

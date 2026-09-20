@@ -55,11 +55,6 @@ class Deps:
     #: to ignore it. Threading it here means there is one policy rather than
     #: one per call site.
     ignore: str = _DEFAULT_IGNORED
-    #: How many revision rounds this run may still have, from the journal.
-    #: 0 -- the default -- reproduces the behaviour before the repair loop, so
-    #: BIRCHER_MAX_REVISIONS=0 is a real rollback rather than a code path that
-    #: merely usually agrees.
-    revisions_left: int = 0
     #: The target repository, `owner/name`. EVERY effect argv must name it.
     #: `gh` resolves an omitted `--repo` from the CURRENT WORKING DIRECTORY's
     #: git remote -- which for the coordinator is the bircher checkout, not the
@@ -96,9 +91,10 @@ class Derived:
     #: authorize and merge the number it started with. muesli #723: the
     #: derivation reviewed #738 and the caller tried to merge closed #737.
     pr: str = ""
-    #: The reviewer's output, carried out ONLY on a `revise` outcome so the
-    #: runner can put the blocking findings in front of the next implementer.
-    #: That routing is what merged #740 and #750 when done by hand.
+    #: The reviewer's output, carried out on every FAIL (closed-loop spec §1)
+    #: so the repair round can put the blocking findings in front of the next
+    #: implementer. That routing is what merged #740 and #750 when done by
+    #: hand.
     #:
     #: LAST in the field order deliberately: `pr` is passed positionally by
     #: `derive`, and inserting anything before it silently rebinds arguments.
@@ -109,25 +105,40 @@ class Derived:
     #: the verdict fact (spec §4).
     merge_base: str = ""
     delta_digest: str = ""
+    #: The blocking findings' fingerprints (closed-loop spec §3), comma-joined
+    #: hex, on a FAIL; empty otherwise. The runner records them on the verdict
+    #: fact so the no-progress judgement can compare rounds.
+    fingerprints: str = ""
+    #: The PR's state as this derivation saw it -- open, closed or merged, or
+    #: "" when there was no PR to ask about. For the PR the derivation settled
+    #: on, or for the caller's own PR when the settle discarded it: a PR a
+    #: person closed still has to reach the journal, or the run cannot end
+    #: (spec §1).
+    pr_state: str = ""
+    #: The failing blocking checks' names, comma-joined and sorted, on a red;
+    #: empty otherwise. A `ci_red` repair's evidence (spec §3).
+    failing_jobs: str = ""
 
     def as_tuple(self):
         return (self.outcome, self.review, self.note, self.sha, self.ci,
                 self.ci_first, self.resubmissions, self.pr, self.merge_base,
-                self.delta_digest)
+                self.delta_digest, self.fingerprints, self.pr_state,
+                self.failing_jobs)
 
     #: Field count, so a consumer can assert it rather than assume it. The
     #: absorption hazard below is silent, and silence is what made the missing
     #: `pr` field survive a live run that looked like it worked.
-    FIELDS = 10
+    FIELDS = 13
 
     def as_line(self) -> str:
-        """The TEN-field form the shell parses. A caller reading fewer
+        """The THIRTEEN-field form the shell parses. A caller reading fewer
         absorbs the last into its neighbour, silently -- `read -r a b c` puts
         every remaining field into `c`, so a short reader does not error, it
         corrupts one value."""
         r = "" if self.resubmissions is None else self.resubmissions
         return (f"{self.outcome}|{self.review}|{self.note}|{self.sha}|"
-                f"{self.ci}|{self.ci_first}|{r}|{self.pr}|{self.merge_base}|{self.delta_digest}")
+                f"{self.ci}|{self.ci_first}|{r}|{self.pr}|{self.merge_base}|{self.delta_digest}|"
+                f"{self.fingerprints}|{self.pr_state}|{self.failing_jobs}")
 
 
 def _settle_pr(item, code, pr, issue, d: Deps) -> str:
@@ -221,10 +232,47 @@ def _post_status(item, pr, head, verdict, reviewer_out, merge_base, d: Deps) -> 
               f"derived from the repository and is unaffected")
 
 
+def _failing_names(checks: str, ignore: str) -> list[str]:
+    """The failing blocking checks' names from gh's `name|bucket` rows, with
+    the ignore pattern applied as `keep_blocking` applies it.
+
+    Each name has its own commas replaced with a space and its whitespace
+    collapsed. A GitHub matrix name carries a comma of its own (`build
+    (ubuntu-latest, node 18)`), and `as_line` joins this field's names with a
+    comma too -- so a name with a raw comma in it would read back as two
+    names. The name is never an identifier the loop looks up again: it is
+    evidence for a set comparison (`test_red_ci_names_its_failing_jobs_
+    sorted_and_ignoring_the_ignored`) and for a repair brief's text, and a
+    lossy-but-unambiguous name serves both exactly as well as the original --
+    so normalising it here keeps the comma-joined transport a single shape
+    rather than adding a second escaping convention just for names that
+    happen to contain a comma.
+    """
+    from coordinator.ci import drop_ignored
+    out = set()
+    for line in drop_ignored(checks or "", ignore).splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[1].strip() in ("fail", "cancel"):
+            name = " ".join(parts[0].replace(",", " ").split())
+            out.add(name)
+    return sorted(out)
+
+
+def _pr_state_word(d: Deps, pr: str) -> str:
+    """open | closed | merged | "" for *pr*."""
+    if not pr:
+        return ""
+    state, merged_at = d.pr_state(pr)
+    if merged_at and merged_at != "null":
+        return "merged"
+    return {"OPEN": "open", "CLOSED": "closed", "MERGED": "merged"}.get((state or "").upper(), "")
+
+
 def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
            rerun_max: int = 4) -> Derived:
-    """The whole derivation. Returns the ten fields."""
+    """The whole derivation. Returns the thirteen fields."""
     d = deps
+    known = pr
     pr = _settle_pr(item, code, pr, issue, d)
 
     ci_first, resubmissions = "unknown", None
@@ -233,26 +281,30 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
         if branch:
             ci_first, resubmissions = d.history(branch)
 
-    ci, verdict, reviewed_sha, reviewer_out = "na", None, "", ""
+    ci, verdict, head_sha, reviewer_out = "na", None, "", ""
     merge_base, digest = "", ""
+    failing = []
     if pr:
         ci = _settle_ci(item, pr, d, rerun_max)
+        # THE HEAD CI RAN ON, captured once CI has settled and never re-read
+        # (#66), on every colour: a red head is what a ci_red repair names
+        # (closed-loop spec §1) and what the CI observation is recorded
+        # against.
+        head = (d.head_of(pr) or "").strip()
+        if _FULL_SHA.match(head):
+            head_sha = head
+        else:
+            d.log(f"{item}: could not capture a full 40-hex head for PR #{pr} "
+                  f"(got {head or '<empty>'!r}) -> cannot pin a merge")
+        if ci == "red":
+            failing = _failing_names(d.checks(pr), d.ignore)
 
         if ci == "green":
-            # CAPTURED BEFORE THE REVIEW, never re-read after (#66). A push
-            # landing between the verdict and a later read would be blessed as
-            # reviewed, defeating the --match-head-commit guard it feeds.
-            head = (d.head_of(pr) or "").strip()
-            if _FULL_SHA.match(head):
-                reviewed_sha = head
-            else:
-                d.log(f"{item}: could not capture a full 40-hex head for PR #{pr} "
-                      f"(got {head or '<empty>'!r}) -> cannot pin a merge")
-            d.log(f"{item}: PR #{pr} CI green -> {d.reviewer} review at {reviewed_sha[:7]}")
-            verdict, reviewer_out = d.review(pr, reviewed_sha)
+            d.log(f"{item}: PR #{pr} CI green -> {d.reviewer} review at {head_sha[:7]}")
+            verdict, reviewer_out = d.review(pr, head_sha)
             if verdict == "NONE":
                 verdict = None
-            if reviewed_sha:
+            if head_sha:
                 # WHAT WAS REVIEWED, captured against the same pinned head the
                 # reviewer was told to check out (spec §4): the merge-base with
                 # the PR's base and the digest of the PR's own delta.
@@ -263,20 +315,19 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                 # description and, through the runner, into hand-built JSON.
                 # Anything that is not a 40-hex sha is "unknown" (`""`), which
                 # the description already renders as `?`.
-                raw_base = (d.merge_base(base, reviewed_sha) or "").strip()
+                raw_base = (d.merge_base(base, head_sha) or "").strip()
                 merge_base = raw_base if _FULL_SHA.match(raw_base) else ""
                 if raw_base and not merge_base:
                     d.log(f"{item}: merge-base for PR #{pr} is not a 40-hex sha "
                           f"({raw_base!r}) -> recording it as unknown")
-                digest = d.delta_digest(base, reviewed_sha) or ""
-                _post_status(item, pr, reviewed_sha, verdict, reviewer_out,
+                digest = d.delta_digest(base, head_sha) or ""
+                _post_status(item, pr, head_sha, verdict, reviewer_out,
                              merge_base, d)
 
-    o = classify(pr or None, ci, verdict, reviewer=d.reviewer,
-                 revisions_left=d.revisions_left)
+    o = classify(pr or None, ci, verdict, reviewer=d.reviewer)
 
     if pr:
-        head_field = f" head={reviewed_sha}" if o.outcome == "ready" and reviewed_sha else ""
+        head_field = f" head={head_sha}" if o.outcome == "ready" and head_sha else ""
         # THE REVIEWER'S FINDINGS STAY. Decision 3 of C8 Phase 2 kept them
         # deliberately: they are the most useful thing on the PR for a human,
         # and only the machine-readable `bircher-status:` prefix was retired.
@@ -310,34 +361,26 @@ def derive(item: str, code: str, pr: str, issue: str, *, deps: Deps,
                   f"({type(exc).__name__}: {exc}) -> continuing; the outcome "
                   f"is derived from the repository and is unaffected")
 
-    # The sha rides out on READY and on REVISE, and on nothing else.
-    #
-    # `ready` because it is the merge-authorising evidence. `revise` because a
-    # revision is a CONTINUATION, not an ending: the runner needs the head to
-    # record `record_ci_observation` and to bind the `record_review` that
-    # carries `request_revision`. Those three commands ARE the repair loop's
-    # kernel half, and the runner performs them only inside `if [ -n
-    # "$observed_head" ]`.
-    #
-    # Withholding it here is what the FIRST LIVE RUN of the loop did (muesli
-    # #711, PR #751, 2026-08-31). The reviewer returned FAIL, the coordinator
-    # correctly derived `revise` -- and with an empty head the runner skipped
-    # the whole lifecycle block, so no REVIEW_VERDICT fact was ever written, the
-    # durability gate found nothing to confirm, and the item escalated with an
-    # empty causal id. The journal shows `implementing` going straight to
-    # `ended`: no output, no CI observation, no review.
-    #
-    # The original rule -- "a failed or escalated derivation must never carry a
-    # head" -- is unchanged and still enforced, because `revise` is neither. And
-    # it cannot authorise a merge by accident: the runner's merge gate is
-    # `[ "$outcome" = "ready" ]`, and `revise` never reaches the scorecard at
-    # all. The head here binds a review that the next round supersedes.
-    sha_out = reviewed_sha if o.outcome in ("ready", "revise") else ""
-    # The findings ride out only on `revise`: on any other outcome the runner
-    # has nothing to route them to, and a scorecard note is not the place for a
-    # multi-paragraph review.
+    # The head rides out whenever there is one (closed-loop spec §1). The
+    # merge gate is the runner's `outcome == ready`; a sha on a failed or
+    # escalated derivation authorises nothing and is the evidence a repair
+    # round and a CI observation need.
+    sha_out = head_sha
+    # THE VERDICT'S FINGERPRINTS (closed-loop spec §3): one per blocking
+    # finding, so a later round can tell "the same defect, unmoved" from "a
+    # different one". Only on a FAIL -- a PASS or an escalation names no
+    # findings to fingerprint.
+    fps = ",".join(attest.fingerprints(reviewer_out)) if verdict == "FAIL" else ""
+    # THE PR'S STATE, for the PR this derivation actually settled on, or for
+    # the caller's own PR when the settle discarded it (spec §1): a PR a
+    # person closed still has to reach the journal, or the run cannot end.
+    pr_state = _pr_state_word(d, pr or known)
+    # The findings ride out on every FAIL: the repair round is briefed from
+    # them.
     return Derived(o.outcome, o.review, o.note, sha_out, o.ci,
                    ci_first, resubmissions, str(pr or ""),
-                   findings=(reviewer_out if o.outcome == "revise" else ""),
-                   merge_base=merge_base if reviewed_sha else "",
-                   delta_digest=digest if reviewed_sha else "")
+                   findings=(reviewer_out if verdict == "FAIL" else ""),
+                   merge_base=merge_base if head_sha else "",
+                   delta_digest=digest if head_sha else "",
+                   fingerprints=fps, pr_state=pr_state,
+                   failing_jobs=",".join(failing))

@@ -2388,6 +2388,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
     return 1
   fi
   local rec r_outcome r_review r_note r_sha r_ci r_settled_pr r_merge_base r_delta_digest
+  local r_fingerprints r_pr_state r_failing_jobs
   # An EMPTY tuple is a CRASH, not a verdict. observe_outcome has a
   # single exit and always emits five fields, so no output means it died before
   # reaching that line -- and `rec=$(...)` swallows the death into an empty
@@ -2410,7 +2411,7 @@ print("halted" if d.get("halted") else "clear", len(d.get("pending") or []))' 2>
   # added to fix: `observe_outcome` runs the same `_settle_pr`, so recovery can
   # review and comment a sibling PR and then authorize and merge the stale one
   # it was invoked with.
-  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr r_merge_base r_delta_digest <<EOF
+  IFS='|' read -r r_outcome r_review r_note r_sha r_ci _ _ r_settled_pr r_merge_base r_delta_digest r_fingerprints r_pr_state r_failing_jobs <<EOF
 $rec
 EOF
   if [ -n "${r_settled_pr:-}" ] && [ "$r_settled_pr" != "$pr" ]; then
@@ -2494,18 +2495,26 @@ EOF
     _rp_out=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" \
       "recovered: outcome=$r_outcome review=$r_review head=$r_sha note=$r_note")
     _rp_ctx=$(_kernel_put_artifact "recover-pr context: repo=$REPO pr=$pr code=$code")
-    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${r_ci:-na}" "$r_sha"
-    BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-    export BIRCHER_GENERATION
-    # THE RANGE RIDES OUT HERE TOO. `observe_outcome` is the same derivation
-    # `run_item` drives, so its two trailing fields are the merge-base and the
-    # delta digest of what the reviewer read (spec §4) -- and a recovery's
-    # verdict fact was the one place they were parsed and dropped. Arguments
-    # 7-8 are the optional key and terminal flag, empty here exactly as they
-    # are on every non-revise path.
-    _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
-      "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx" "" "" \
-      "$r_sha" "$r_merge_base" "$r_delta_digest"
+    _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${r_ci:-na}" "$r_sha" "$r_pr_state" "$r_failing_jobs" "$pr"
+    # A VERDICT IS RECORDED ONLY WHEN THERE IS ONE: the head now rides out on
+    # every colour (closed-loop spec §1), including a red or pending PR, where
+    # `r_review` is `na`/`<reviewer>:na` -- not a verdict the kernel accepts.
+    case "$r_review" in
+      *:pass|*:fail)
+        BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
+        export BIRCHER_GENERATION
+        # THE RANGE RIDES OUT HERE TOO. `observe_outcome` is the same derivation
+        # `run_item` drives, so its trailing fields are the merge-base and the
+        # delta digest of what the reviewer read (spec §4), and the fingerprints
+        # of what it found (closed-loop spec §3) -- and a recovery's verdict fact
+        # was the one place they were parsed and dropped. Arguments 7-8 are the
+        # optional key and terminal flag, empty here exactly as they are on every
+        # non-revise path.
+        _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$r_review" \
+          "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx" "" "" \
+          "$r_sha" "$r_merge_base" "$r_delta_digest" "$r_fingerprints"
+        ;;
+    esac
     _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$r_sha" \
       "$_rp_out" "${BIRCHER_RUN_BASE:-$_rec_base}" "$_rp_ctx"
   fi
@@ -2682,7 +2691,7 @@ _derive_budget() {
   printf '%s' "$floor"
 }
 
-# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of ten fields.
+# _derived_width_ok <tuple> -> rc 0 if it is exactly one line of thirteen fields.
 #
 # FAIL CLOSED. The old reader could not tell a short tuple from a full one:
 # `read -r a..j` simply leaves the tail empty, so a short result -- version
@@ -2701,22 +2710,8 @@ _derived_width_ok() {
   # every input -- the check rejected everything, including valid tuples.
   case $line in *$'\n'*) return 1 ;; esac
   n=$(printf '%s' "$line" | awk -F'|' '{print NF}')
-  [ "$n" = 10 ]
+  [ "$n" = 13 ]
 }
-
-# _max_revisions -> how many repair rounds this run may spend, 0-5.
-#
-# `_clamp_int` returns its DEFAULT for anything outside the range, NOT a
-# truncation to the nearest bound -- a distinction that already cost this file
-# a silent 300s budget where 5300s was intended. Here it means
-# BIRCHER_MAX_REVISIONS=9 gets 2, not 5. That is the safe direction (an
-# operator asking for more rounds than the range allows gets the default rather
-# than the maximum) and it is stated because the alternative reading is the
-# obvious one.
-#
-# 0 disables the loop and restores the pre-loop behaviour exactly, which is
-# what makes this shippable behind a switch rather than as a rewrite.
-_max_revisions() { _clamp_int "${BIRCHER_MAX_REVISIONS:-2}" 2 0 5; }
 
 # _repair_prompt <item> <pr> <branch> <findings> -> the brief for a repair round.
 #
@@ -2748,43 +2743,6 @@ branch, not a second implementation.
 The original task, for context:
 
 $1"
-}
-
-# _terminal_review_flag <outcome> -> `terminal` when this review failure ENDS
-# the item, empty otherwise.
-#
-# A FUNCTION so a test can reach it. The call site is inside run_item and
-# nothing can drive that, and the distinction it draws is not obvious enough to
-# leave to a grep: `failed` is reached from exactly one place -- a reviewer FAIL
-# with no repair rounds left -- so it means "the bound is spent, record a
-# rejection". Every other escalation keeps `request_revision`, because a
-# revision genuinely IS owed there and nothing performed it; telling a resume
-# to dispatch an implementer is the right answer in those cases and the wrong
-# one here.
-_terminal_review_flag() {  # <outcome>
-  [ "${1:-}" = failed ] && printf 'terminal'
-  return 0
-}
-
-# _revision_is_recorded <revisions-tuple> -> rc 0 only if the kernel journalled
-# the revision we submitted. The tuple is `used|left|confirmed` from
-# `coordinator.cli revisions --confirm-command <key>`.
-#
-# A FUNCTION, and not `[ "${state##*|}" = yes ]` at the call site, for one
-# reason: the call site is inside run_item and nothing can drive it. The branch
-# it guards is the one criterion 7 of the design exists for -- "the runner must
-# observe an accepted REVIEW_VERDICT carrying the submitted command's causal id
-# before it dispatches any repair work" -- and a guard on the most consequential
-# branch in the loop, with no test able to reach it, is the shape that let a
-# whole coordinator arm ship with zero executing coverage.
-#
-# EMPTY IS NO. An unreadable journal, a crashed lookup and a bounded call that
-# timed out all arrive here as "", and every one of them means the same thing:
-# we did not observe the fact. Reading absence as permission is how a repair
-# gets dispatched against a run the kernel never revised.
-_revision_is_recorded() {  # <used|left|confirmed>
-  case "${1:-}" in *"|yes") return 0 ;; esac
-  return 1
 }
 
 # _recovery_action <run_id> <base_sha> <context_hash> -> `do|why`, or empty.
@@ -2829,21 +2787,11 @@ _recovery_forbids_merge() {  # <action>
   return 1
 }
 
-# _findings_path <code> -> where this round's findings go, or EMPTY when the
-# repair loop is disabled.
+# _findings_path <code> -> where this round's findings go.
 #
-# EMPTY IS THE POINT. `observe_outcome` omits `--findings-out` entirely for an
-# empty value, and the CLI's unlink-then-replace only runs when that flag is
-# present -- so BIRCHER_MAX_REVISIONS=0 performs no file operation at all, which
-# is what "restores the previous behaviour exactly" has to mean.
-#
-# It did not, in the first cut: the path was passed unconditionally, so a
-# disabled loop still made derivation depend on being able to unlink a file in
-# NOOP_DIR. An unwritable or misowned directory there turned a healthy item into
-# a nonzero exit, an empty tuple and an escalation -- a live item failing for
-# repair-loop storage it was configured never to use. Found by cross-review.
+# ALWAYS a path now: the findings ride out on every FAIL (closed-loop spec
+# §1), and there is no disabled loop left to leave them unwritten.
 _findings_path() {  # <code>
-  [ "$(_max_revisions)" = 0 ] && return 0
   printf '%s' "${NOOP_DIR}/${1}.findings"
 }
 
@@ -2939,7 +2887,357 @@ _repair_round() {  # <item> <code> <pr> <branch> <findings> <round> <vendor>
   return 0
 }
 
-observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out]
+# _park_carrier_prompt <item> <reason> [cause] [evidence_csv] -> the prompt
+# the park's carrier session opens with: what happened and the two words.
+_park_carrier_prompt() {  # <item> <reason> [cause] [evidence_csv]
+  local ev="${4:-}"
+  printf 'bircher: the run for %s is parked (%s%s%s).\n\nReply with the single word `retry` for another round, or `stop` to close the run without merging. Anything else is ignored. Your reply is read by the next wave, not the moment you send it.\n' \
+    "$1" "$2" "${3:+: $3}" "${ev:+ on $ev}"
+}
+
+# _park_back_half <item> <code> <reason> [cause] [evidence_csv]
+#
+# A back-half park (closed-loop spec §3): a fresh CARRIER session so the
+# person has somewhere to type `retry` or `stop` that the next wave can read
+# (the repair sessions are stopped and cannot carry a reply), the park fact
+# naming that session and its cursor, the notice on the issue keyed on the
+# park fact, and the sidecar. Reads BIRCHER_RUN_ID, BIRCHER_GENERATION and
+# _iss by dynamic scope. rc 0 only when the kernel recorded the park: a
+# caller must not report `parked` for a run the journal does not park.
+_park_back_half() {  # <item> <code> <reason> [cause] [evidence_csv]
+  local item="$1" code="$2" reason="$3" cause="${4:-}" ev="${5:-}"
+  local host_id conv_id="" cur=""
+  host_id=$(_local_host_id 2>/dev/null) || host_id=""
+  conv_id=$(_create_session "$AGENT_ID" "$host_id" "$WORKDIR")
+  if [ -n "$conv_id" ]; then
+    _send_prompt "$conv_id" "$(_park_carrier_prompt "$item" "$reason" "$cause" "$ev")" || conv_id=""
+  fi
+  if [ -n "$conv_id" ]; then
+    cur=$(_coordinator session-last-item --server "${SERVER:-}" --id "$conv_id") || cur=""
+  else
+    echo "[batch] $item: no carrier session for the park; a reply must come through the operator's shell (coordinator.cli grant-round / cancel)" >&2
+  fi
+  _kernel_park_back "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$reason" "$conv_id" "$cur" "$cause" "$ev"
+  local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _park=""
+  if [ -z "$_park" ]; then
+    echo "[batch] $item: the kernel did NOT record the park ($reason) -> not reporting parked" >&2
+    return 1
+  fi
+  local _pid; _pid=$(printf '%s' "$_park" | _json_get id)
+  if [ -n "$_iss" ]; then
+    local _notice; _notice=$("${BIRCHER_PY:-python3}" -m coordinator.cli park-notice --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _notice=""
+    [ -n "$_notice" ] && _effect comment "park-notice:$BIRCHER_RUN_ID:$_pid" - gh issue comment "$_iss" --repo "$REPO" --body "$_notice" >/dev/null 2>&1 || true
+  fi
+  _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$reason"
+  return 0
+}
+
+# _step_loop -- THE CLOSED LOOP (closed-loop spec §2). One pass: derive the
+# ground truth, record it, ask `next_step` for the one action it names, do it,
+# and go round again until the action ends the pass (wait, park, merge,
+# done) or there is no pull request to loop on.
+#
+# DYNAMIC SCOPE, stated: reads item code pr _iss vendor RECOVERY_REVIEWER
+# _base_sha _ctx_hash _ffile BIRCHER_RUN_ID BIRCHER_GENERATION; assigns
+# outcome review note observed_head _obs_ci ci_first resubmissions
+# _settled_pr _merge_base _delta_digest _fingerprints _pr_state _failing_jobs
+# _out_hash _rev_round _step _step_cause _step_evidence _step_reason. Every
+# one of those is declared `local` by BOTH callers (run_item and
+# _resume_back_half); a name missing there is unbound under `set -u` and
+# kills the pass, which is the failure `_out_hash` once had.
+#
+# `_step` on return: wait | park | merge | done | none. `none` means no PR:
+# the caller's own ending (timeout, escalated) stands. `merge` means the
+# caller performs `_merge_step`. `wait` and `park` mean the run is not over.
+_step_loop() {
+  local obs _stepline _st_now _redispatch _rbranch _findings _known_pr _recorded_verdict
+  _step=""; _step_cause=""; _step_evidence=""; _step_reason=""
+  while :; do
+    _merge_base=""; _delta_digest=""; _fingerprints=""; _pr_state=""; _failing_jobs=""
+    # Per ITERATION, not per pass: "this round recorded a verdict" is what
+    # tells a kernel refusal apart from a silent reviewer below, and a flag
+    # left standing from the previous round would answer for this one.
+    _recorded_verdict=0
+    echo "[batch] $item: deriving the ground truth from the repository (repair rounds so far: $_rev_round)" >&2
+    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" "$_ffile")
+    # A CRASHED OR MALFORMED DERIVATION IS NOT A VERDICT: nothing is recorded,
+    # the run stays open, and the next wave derives again.
+    if [ -z "${obs//[[:space:]]/}" ] || ! _derived_width_ok "$obs"; then
+      echo "[batch] $item: derivation produced no usable tuple -> waiting for the next wave" >&2
+      outcome=waiting; review=na; ci_first=unknown; resubmissions=""; observed_head=""
+      note="outcome derivation failed (no tuple, or a malformed one); the next wave re-derives"
+      _step=wait; return 0
+    fi
+    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr _merge_base _delta_digest _fingerprints _pr_state _failing_jobs <<EOF
+$obs
+EOF
+    : "${outcome:=timeout}" "${ci_first:=unknown}"
+    # ADOPT WHAT THE DERIVATION SETTLED ON, including nothing: an empty
+    # `_settled_pr` in a well-formed tuple means the PR it was given is gone.
+    _known_pr="${pr:-}"
+    if [ "${_settled_pr:-}" != "${pr:-}" ]; then
+      echo "[batch] $item: derivation settled on PR #${_settled_pr:-none} (was ${pr:-none}) -> adopting" >&2
+      pr="${_settled_pr:-}"
+    fi
+    if [ -z "${pr:-}" ]; then
+      # A PR a person closed is observed so the run can end (spec §1); the
+      # caller's own ending then stands.
+      #
+      # WHENEVER A PR WAS KNOWN, not only on a word this pass recognised.
+      # Recording `closed|merged` alone meant a PR `gh` could not describe --
+      # deleted, an API error, a word nothing maps -- reached the journal not
+      # at all, `back.latest_pr_state` stayed frozen, and the run could never
+      # end. `_kernel_record_ci` omits an empty `pr_state` from the payload
+      # and an absent state reads as open, which is the fail-safe direction:
+      # a run that should have ended waits for the next wave, rather than one
+      # that should not have ended being ended on a word nobody read.
+      [ -n "$_known_pr" ] && _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" na "" "$_pr_state" "" "$_known_pr"
+      _step=none; return 0
+    fi
+    _st_now=$(_kernel_state "$BIRCHER_RUN_ID")
+    if [ -n "${observed_head:-}" ]; then
+      if [ "$_st_now" = implementing ]; then
+        local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
+        _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
+      fi
+      # At `reviewing` the output on record is the one the binding must name.
+      if [ -z "$_out_hash" ]; then
+        _out_hash=$(_kernel_back_state "$BIRCHER_RUN_ID"); _out_hash="${_out_hash##*|}"
+      fi
+      _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head" "$_pr_state" "$_failing_jobs" "$pr"
+      # A VERDICT IS RECORDED ONLY WHEN THERE IS ONE. `na` on a red or a
+      # silent reviewer is not a verdict, and the kernel would refuse it.
+      case "$review" in
+        *:pass|*:fail)
+          BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer); export BIRCHER_GENERATION
+          _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "" "" "$observed_head" "$_merge_base" "$_delta_digest" "$_fingerprints"
+          BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer); export BIRCHER_GENERATION
+          _recorded_verdict=1
+          ;;
+      esac
+    fi
+    _stepline=$(_coordinator step --db "${BIRCHER_KERNEL_DB:-}" --run-id "$BIRCHER_RUN_ID" \
+                  --pr-state "$_pr_state" --head "${observed_head:-}" --ci "${_obs_ci:-na}" \
+                  --failing-jobs "$_failing_jobs") || _stepline=""
+    if [ -z "$_stepline" ]; then
+      echo "[batch] $item: could not read the next step from the journal -> waiting for the next wave" >&2
+      outcome=waiting; note="${note:+$note; }next step unreadable; the next wave re-derives"; _step=wait; return 0
+    fi
+    IFS='|' read -r _step _step_cause _step_evidence _step_reason _redispatch <<EOF
+$_stepline
+EOF
+    echo "[batch] $item: next step: $_step${_step_cause:+ ($_step_cause: ${_step_evidence:-no evidence})}" >&2
+    case "$_step" in
+      wait)
+        outcome=waiting; note="${note:+$note; }waiting on PR #$pr (ci=${_obs_ci:-na}); the next wave resumes"
+        return 0 ;;
+      done)
+        # The PR left the loop by another hand, or the run is already over.
+        # The derivation's own word can be `repair` or `waiting` here --
+        # neither is in `_kernel_record_run_outcome`'s vocabulary
+        # (merged|ready|escalated|noop|skipped|failed|timeout), and the
+        # kernel refuses an `unrecognised` payload -- leaving the run with no
+        # terminal fact at all. Name a terminal word from the PR's own state
+        # instead: a merge is `ready`, a close (unmerged) is `escalated`.
+        # Anything else -- open, or a state this pass could not read -- means
+        # the run ended some other way (a resumed `merged`/`cancelled` state,
+        # handled before this loop even starts) and the derivation's word was
+        # already terminal, so it stands.
+        case "$_pr_state" in
+          merged) outcome=ready ;;
+          closed) outcome=escalated ;;
+        esac
+        # THE OTHER ROUTE INTO `done` is a terminal run state (step.py), and
+        # it arrives with whatever word the derivation produced -- which the
+        # two cases above do not touch when the PR's state is open or
+        # unreadable. `repair` and `waiting` are not terminal words:
+        # `_kernel_record_run_outcome` maps them to `unrecognised` and the
+        # kernel refuses, leaving the run with no terminal fact at all. Every
+        # `done` must name a word the kernel accepts.
+        case "$outcome" in
+          repair|waiting) outcome=escalated ;;
+        esac
+        note="${note:+$note; }PR #$pr is ${_pr_state:-unknown}; the run ends"
+        return 0 ;;
+      merge)
+        outcome=ready
+        return 0 ;;
+      review)
+        # A VERDICT THIS PASS RECORDED, and the journal still holds none for
+        # this head: the KERNEL refused the record. Almost always the seating
+        # -- the reviewer was in the run's conflicted set (`_seat_vendors`
+        # above fixes that for the next wave, and cannot when BOTH vendors
+        # are conflicted). Parking `no_verdict` here blames a reviewer that
+        # did its job and hands a person a question they cannot answer, so
+        # say what happened and let the next wave retry.
+        if [ "$_recorded_verdict" = 1 ]; then
+          echo "[batch] $item: the kernel did not record the verdict '$review' for head ${observed_head:0:7} (the reviewer is NOT at fault: a refused record, not a silent seat) -> waiting for the next wave" >&2
+          outcome=waiting; note="${note:+$note; }the kernel refused the recorded verdict ($review); the next wave re-seats and retries"; _step=wait; return 0
+        fi
+        # This pass reviewed the head and got no verdict; a person says
+        # whether to review again (`retry`) or stop.
+        if _park_back_half "$item" "$code" no_verdict; then
+          # `review` is not in the returned vocabulary (wait|park|merge|done|
+          # none): this pass ended in a park exactly as the `park` case does.
+          _step=park; outcome=parked; note="${note:+$note; }parked no_verdict"; return 0
+        fi
+        outcome=waiting; note="${note:+$note; }no verdict, and the park was refused; the next wave re-derives"; _step=wait; return 0 ;;
+      park)
+        if _park_back_half "$item" "$code" "$_step_reason" "$_step_cause" "$_step_evidence"; then
+          outcome=parked; note="${note:+$note; }parked $_step_reason ($_step_cause: $_step_evidence)"; return 0
+        fi
+        outcome=waiting; note="${note:+$note; }park $_step_reason refused; the next wave re-derives"; _step=wait; return 0 ;;
+      repair) ;;
+      *)
+        echo "[batch] $item: unknown step '$_step' -> waiting for the next wave" >&2
+        outcome=waiting; _step=wait; return 0 ;;
+    esac
+    # A REPAIR. Request it -- the one door back to `planned` (spec §1) --
+    # unless a pass that died before dispatching already requested it for
+    # this head.
+    if [ "$_redispatch" != yes ]; then
+      _kernel_request_repair "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_step_cause" "$observed_head" "$_step_evidence"
+      if [ "$(_kernel_state "$BIRCHER_RUN_ID")" != planned ]; then
+        echo "[batch] $item: the kernel did not open a repair round -> waiting for the next wave" >&2
+        outcome=waiting; note="${note:+$note; }repair request refused"; _step=wait; return 0
+      fi
+    fi
+    # THE BRIEF. A review_fail round is briefed on the reviewer's verbatim
+    # findings, which this derivation wrote; a ci_red round on the failing
+    # jobs by name.
+    _findings=""
+    if [ "$_step_cause" = review_fail ]; then
+      [ -n "$_ffile" ] && [ -s "$_ffile" ] && _findings=$(cat "$_ffile")
+      if _is_blank "$_findings"; then
+        echo "[batch] $item: a review_fail repair is owed but no findings were written -> waiting for the next wave" >&2
+        outcome=waiting; note="${note:+$note; }no findings to brief the repair"; _step=wait; return 0
+      fi
+    else
+      _findings="CI is red on ${observed_head:0:7}. Failing jobs: ${_step_evidence:-unknown}. Make CI green on this branch without disabling, skipping or weakening the failing checks."
+    fi
+    _rev_round=$((_rev_round + 1))
+    _rbranch=$(_pr_branch "$pr")
+    if [ -z "${_rbranch//[[:space:]]/}" ]; then
+      echo "[batch] $item: could not read PR #$pr's head branch -> waiting for the next wave" >&2
+      outcome=waiting; note="${note:+$note; }could not read PR #$pr's head branch"; _step=wait; return 0
+    fi
+    if ! _repair_round "$item" "$code" "$pr" "$_rbranch" "$_findings" "$_rev_round" "$vendor"; then
+      outcome=waiting; note="${note:+$note; }repair round $_rev_round could not be started; the next wave retries"; _step=wait; return 0
+    fi
+  done
+}
+
+# _finish_pass <item> <queue-file> <issue> -- the pass's ending, shared by
+# run_item and _resume_back_half. Reads outcome pr ci_first review
+# resubmissions elapsed note bound_outcome vendor rounds _step merge_rc by
+# dynamic scope. A `wait` or `park` step leaves the run OPEN: no terminal
+# fact, and the queue file stays where it is for the next wave, as a
+# front-half park's does.
+#
+# AND SO DOES A TERMINAL FACT THE KERNEL REFUSED. `_kernel` is ADVISORY: it
+# returns 0 whether the kernel accepted the command or refused it, and in the
+# default `shadow` mode logs nothing. So this used to write the scorecard row,
+# write back to the issue and retire the queue file on the STRENGTH OF HAVING
+# ASKED -- reporting a run finished that the journal still holds open, with
+# nothing left to drive it. Every closed-loop defect ends here, so the state
+# is read back and a refusal takes the same path a `wait` takes.
+_finish_pass() {  # <item> <queue-file> <issue>
+  local item="$1" f="$2" issue="$3"
+  local _terminal_ok=1
+  mkdir -p "$(dirname "$SCORECARD")"
+  case "${_step:-}" in
+    wait|park) ;;
+    *)
+      # record_run_outcome
+      _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
+      if [ "$(_kernel_state "$BIRCHER_RUN_ID")" != ended ]; then
+        _terminal_ok=0
+        echo "[batch] $item: the kernel REFUSED the terminal fact outcome=$outcome for run $BIRCHER_RUN_ID -- the journal still holds this run open. NOT retiring the queue file; the next wave resumes it." >&2
+        note="${note:+$note; }the kernel refused the terminal fact (outcome=$outcome); the run is still open and the next wave resumes it"
+      fi
+      ;;
+  esac
+  # The row is written either way: a row is a record of the PASS, not a claim
+  # that the run ended.
+  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" "${rounds:-}" >> "$SCORECARD"
+  _issue_writeback "$issue" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}" "${rounds:-}"
+  [ "$outcome" = "ready" ] && _ensure_issue_closed "$issue" "${pr:-}"
+  echo "[batch] $item -> outcome=$outcome pr=${pr:-none} review=${review:-na} rounds=${rounds:-?} bound=$bound_outcome step=${_step:-none}"
+  case "${_step:-}" in
+    wait|park) return "$merge_rc" ;;
+  esac
+  [ "$_terminal_ok" = 1 ] || return "$merge_rc"
+  mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+  return "$merge_rc"
+}
+
+# _merge_step -- the in-run merge (B-1), performed when the step is `merge`.
+# Reads pr observed_head _out_hash _base_sha _ctx_hash _merge_base _iss item
+# BIRCHER_RUN_ID BIRCHER_GENERATION by dynamic scope; assigns note outcome
+# merge_rc. The body is the merge block `run_item` carried until the closed
+# loop, unchanged: the reviewed head comes from the derivation, the fallback
+# status names the reviewed range, the kernel requests and records the merge,
+# and an unreviewed merge downgrades the outcome.
+_merge_step() {
+  [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ] || return 0
+  # The reviewed head comes from the REVIEWER (marker `head=`), never from a
+  # re-fetch here (issue #24). A `gh pr view` after the PASS would record whatever
+  # the head is NOW — so a push landing between the reviewer's verdict and this
+  # line would be blessed as "reviewed", defeating the --match-head-commit guard
+  # it feeds. Only the reviewer knows which commit it actually read.
+  #
+  # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
+  # sha to merge_ready_pr used to NOT fail closed — it took an unpinned branch and
+  # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
+  # also refuses an empty sha, so this is now belt and braces rather than the only
+  # guard.
+  # `_merge_gate` reads only its SECOND argument; the first was a
+  # had-a-marker flag it never consulted, and there is no marker now.
+  local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
+  local reviewed_sha=""
+  case "$_gate" in
+    pin\|*)   reviewed_sha="${_gate#pin|}" ;;
+      skip)
+      echo "[batch] $item: no reviewed head available -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
+      MERGE_NOTE="merge skipped: no reviewed head (reviewed commit unverifiable)"
+      note="${note:+$note; }$MERGE_NOTE"
+      merge_rc=0
+      ;;
+  esac
+  if [ "$_gate" != "skip" ]; then
+    # request_merge, record_merge_outcome
+    _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
+      "$_out_hash" "$_base_sha" "$_ctx_hash"
+    # The FALLBACK description, composed HERE because this is where the
+    # reviewed range is. `_post_cross_review_status`'s own default is the
+    # legacy "cross-vendor review PASS (Bircher)" text, and it fires in
+    # exactly the case that matters: the derivation's post did not land (or
+    # could not be read back). Overwriting the merge head's range-naming
+    # description with text that names nothing is the gate losing the one
+    # thing the status is for. Empty when the range is unknown -- then the
+    # legacy text is the honest answer.
+    local _status_desc=""
+    [ -n "${_merge_base:-}" ] && [ -n "${observed_head:-}" ] && \
+      _status_desc="cross-review PASS (Bircher fallback) on ${_merge_base:0:7}..${observed_head:0:7}"
+    merge_ready_pr "$item" "$pr" "$reviewed_sha" "$_status_desc"; merge_rc=$?
+    local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
+    _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
+    [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
+    # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
+    # scorecard row is written from $outcome -- captured from the item's MARKER, not
+    # from merge_rc -- and _ensure_issue_closed fires on outcome=ready. Left alone, an
+    # unreviewed merge would halt AND still close its issue as done; worse, on the
+    # red path it would close the very issue _reopen_reverted_issues had just
+    # reopened. Downgrading the outcome stops both, because the close is gated on it.
+    if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
+      note="${note:+$note; }$MERGE_UNREVIEWED_NOTE"
+      outcome=escalated
+    fi
+    _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
+  fi
+}
+
+observe_outcome() {  # <item> <code> <pr> [issue] [findings_out]
   # THE DERIVATION, in Python since 2026-08-29. What was 192 lines here is now
   # v2/coordinator/outcome.py with eighteen tests driving it directly, plus its
   # dependencies -- discovery, reconciliation, CI classification, the review
@@ -2953,12 +3251,11 @@ observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out
   # Emits the same SEVEN fields it always did:
   #   outcome|review|note|head|ci|ci_first|resubmissions
   #
-  # The last two arguments are the repair loop's, and both default to the
-  # pre-loop behaviour: no allowance, and nowhere to write findings. A
-  # `--revisions-left` of 0 makes `revise` unreachable, so every caller that
-  # does not pass them gets exactly what it got before.
+  # The last argument names where to write the reviewer's findings on a FAIL
+  # (closed-loop spec §1); omitted, the CLI derives exactly the same tuple and
+  # simply writes nothing to disk.
   local out="" _budget _rc=0 _pw _pr _prw
-  local _rl="${5:-0}" _fo="${6:-}"
+  local _fo="${5:-}"
   _budget=$(_derive_budget)
   # The SAME validated numbers the budget was computed from.
   read -r _pw _pr _prw <<<"$(_ci_policy)"
@@ -2970,7 +3267,7 @@ observe_outcome() {  # <item> <code> <pr> [issue] [revisions_left] [findings_out
            --server "$SERVER" --bundle-dir "$BUNDLE_DIR" \
            --poll-interval "$MAIN_CI_POLL_INTERVAL" \
            --ci-wait "$_pw" --rerun-max "$_pr" --rerun-wait "$_prw" \
-           --revisions-left "$_rl" ${_fo:+--findings-out "$_fo"}
+           ${_fo:+--findings-out "$_fo"}
   ) || { _rc=$?; out=""; }
   # A TIMEOUT AND A CRASH BOTH YIELD AN EMPTY TUPLE, and the caller correctly
   # escalates either way -- but a human reading the log cannot tell them apart,
@@ -3812,6 +4109,11 @@ _issue_writeback() {
   local issue="$1" outcome="$2" pr="$3" review="$4" resubmissions="$5" ci_first="$6"
   local rounds="${7:-}"
   [ -n "$issue" ] || return 0
+  # A pass that leaves the run open writes nothing on the issue: `waiting`
+  # every half hour is noise, and a park's notice is its own comment, keyed
+  # on the park fact. Labels stay as they are (state-derived labels are the
+  # next PR's).
+  case "$outcome" in waiting|parked) return 0 ;; esac
   [ "${BIRCHER_ISSUE_WRITEBACK:-1}" = "1" ] || return 0
   local plan add rm; plan=$(_writeback_plan "$outcome"); IFS='|' read -r add rm _ <<EOF
 $plan
@@ -3925,6 +4227,146 @@ _front_half_resumable() {
     shaping|slices_submitted|slices_accepted|sliced|queued|spec_submitted|spec_accepted|specified|plan_submitted|plan_accepted|planned) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _back_half_state <state> -> rc 0 for a state the closed loop resumes from
+# (closed-loop spec §2). `merged` and `cancelled` are here so a pass that
+# died between the transition and its terminal fact gets that fact written.
+_back_half_state() {
+  case "$1" in implementing|reviewing|merge_requested|merged|cancelled) return 0 ;; *) return 1 ;; esac
+}
+
+# _label_running -- swap `bircher:queued` for `bircher:running` on the run's
+# issue. Reads `_iss`, `_st`, `BIRCHER_GENERATION` and `REPO` by dynamic scope,
+# exactly as the inline call it replaces did.
+#
+# A FUNCTION so the back half can do it LATER. The swap used to fire on every
+# resumed pass, a resumed pass that then found a standing park included -- so
+# the only signal a person sees said "being worked" while the run waited on
+# that same person to reply `retry` or `stop`. `_resume_back_half` calls this
+# after it has read the park reply, which is the point at which the run really
+# is about to be worked; everything else calls it where it always did.
+#
+# The key carries the GENERATION. Keyed on the issue alone it said "this
+# run's running label" and could be attempted exactly once: a swap that
+# failed half-way (the label absent on the repo, 2026-09-08) was reconciled
+# as not delivered, the key was spent, and no later pass could try again --
+# the issue kept bircher:queued for the rest of the run. Under a generation
+# the same pass replays (a retry within it is still the same act) and the
+# next pass, a new generation, attempts it afresh.
+_label_running() {
+  [ -n "$_iss" ] && [ "${_st:-}" != sliced ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true  # a sliced run resumed mid-filing owns no running label to swap: the kernel refuses every other edit there
+}
+
+# _seat_vendors <run_id> -- seat the implementer and the reviewer from the
+# JOURNAL, and assign `vendor` and `RECOVERY_REVIEWER` in the caller's scope.
+#
+# The reviewer must be independent of THIS RUN'S OWN IMPLEMENTER, not of
+# whichever vendor this wave's usage gate happened to pick. `run_item` derives
+# `RECOVERY_REVIEWER` from `vendor`, and `vendor` defaults to `PICKED_VENDOR`,
+# which the gate re-picks every wave to balance the two providers' windows. So
+# on a resumed run whose previous implementer was claude_code, a wave that
+# picks codex seats claude_code as the reviewer; the kernel refuses that
+# verdict (`authz._conflicted_actors`), the loop finds no verdict on the head
+# and parks `no_verdict`, blaming a reviewer for a refusal the kernel made.
+#
+# THREE ANSWERS, not two. Exactly one known vendor conflicted is the ordinary
+# case and seats both roles. An empty or unreadable set is "the journal did
+# not say" -- leave the wave's pick alone rather than guess. BOTH conflicted
+# happens when a pass died between a repair's `start_implementation` and its
+# output, and then NO reviewer is acceptable: say so and leave the seats
+# where they are, so `_step_loop`'s own refusal handling keeps the run moving
+# instead of parking it on a question a person cannot answer.
+_seat_vendors() {  # <run_id>
+  local _cf _a _cc=0 _cx=0 _oifs
+  _cf=$(_kernel_conflicted "$1")
+  _oifs="$IFS"; IFS=','
+  for _a in $_cf; do
+    case "$_a" in claude_code) _cc=1 ;; codex) _cx=1 ;; esac
+  done
+  IFS="$_oifs"
+  if [ "$_cc" = 1 ] && [ "$_cx" = 1 ]; then
+    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- no reviewer the kernel will accept; leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick) and letting the loop wait rather than parking" >&2
+    return 0
+  fi
+  if [ "$_cc" = 1 ]; then
+    vendor=claude_code; RECOVERY_REVIEWER=codex
+  elif [ "$_cx" = 1 ]; then
+    vendor=codex; RECOVERY_REVIEWER=claude_code
+  else
+    echo "[batch] ${item:-?}: implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick; the journal names no conflicted actor for run $1)" >&2
+    return 0
+  fi
+  echo "[batch] ${item:-?}: implementer=$vendor reviewer=$RECOVERY_REVIEWER (from the journal's conflicted set for run $1: $_cf)" >&2
+}
+
+# _resume_back_half <item> <code> <queue-file> <issue> <state>
+#
+# One pass of the closed loop for a run another pass started (spec §2: waves
+# resume every open back-half run). Reads BIRCHER_RUN_ID and
+# BIRCHER_GENERATION from run_item's scope; declares every name `_step_loop`,
+# `_merge_step` and `_finish_pass` assign. `vendor` and `RECOVERY_REVIEWER`
+# are declared `local` here and re-seated from the journal by `_seat_vendors`,
+# so run_item's own pick survives this call unchanged.
+_resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
+  local item="$1" code="$2" f="$3" _iss="$4" _st="$5"
+  local start; start=$(date +%s)
+  local elapsed=0 bound_outcome="ok" merge_rc=0
+  local outcome="" ci_first="unknown" review="" rounds="" note="" resubmissions="" observed_head="" _obs_ci=""
+  local pr="" _out_hash="" _rev_round=0
+  local _merge_base="" _delta_digest="" _fingerprints="" _pr_state="" _failing_jobs="" _settled_pr=""
+  local _step="" _step_cause="" _step_evidence="" _step_reason=""
+  # LOCAL, seeded from run_item's own pick and re-seated below. Without the
+  # `local` this function's seating would clobber the caller's values.
+  local vendor="${vendor:-}" RECOVERY_REVIEWER="${RECOVERY_REVIEWER:-}"
+  local _base_sha; _base_sha=$(_kernel_run_base "$BIRCHER_RUN_ID")
+  local _ctx_hash; _ctx_hash=$(_kernel_bundle_hash "$BIRCHER_RUN_ID")
+  local _ffile; _ffile=$(_findings_path "$code")
+  [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
+  echo "[batch] $item: resuming run $BIRCHER_RUN_ID at $_st (closed loop)" >&2
+  # THE ENDING BRANCHES STILL SWAP. Only the pass that returns on a standing
+  # park skips it (see `_label_running`): a run that ends here is retired, and
+  # an issue left carrying `bircher:queued` would be re-queued by
+  # `issues-to-queue.sh` and mint a second run over a finished one.
+  case "$_st" in
+    merged)
+      outcome=ready; note="run resumed at merged: recording the outcome an earlier pass lost"; _step=done
+      _label_running
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+    cancelled)
+      outcome=escalated; note="stopped by a person"; _step=done
+      _label_running
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+  esac
+  # A PARKED RUN READS ITS REPLY FIRST and derives nothing until a person
+  # says `retry`: every derivation is a review, and a run waiting on a human
+  # must not spend one per wave.
+  local _reply; _reply=$(_coordinator park-reply --db "${BIRCHER_KERNEL_DB:-}" --run-id "$BIRCHER_RUN_ID" --server "${SERVER:-}") || _reply=""
+  case "$_reply" in
+    nopark) ;;
+    retry) echo "[batch] $item: a person granted another round" >&2 ;;
+    stop)
+      echo "[batch] $item: stopped by a person" >&2
+      outcome=escalated; note="stopped by a person"; _step=done
+      _label_running
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+    *)
+      echo "[batch] $item: parked; no reply yet (${_reply:-reply unreadable})" >&2
+      outcome=parked; note="parked; no reply yet (${_reply:-reply unreadable})"; _step=park
+      elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
+  esac
+  # The run really is about to be worked now, so the label can say so (see
+  # `_label_running`: the swap used to fire before the park reply was read).
+  _label_running
+  # THE SEATS, from the journal rather than from this wave's pick.
+  _seat_vendors "$BIRCHER_RUN_ID"
+  local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
+  _step_loop
+  [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
+  [ "$_rev_round" != 0 ] && rounds="$_rev_round"
+  [ "$_step" = merge ] && _merge_step
+  elapsed=$(( $(date +%s) - start ))
+  _finish_pass "$item" "$f" "$_iss"
 }
 
 # _finish_sliced_item <item> <queue-file> <run_id>: the scorecard row for a
@@ -4369,6 +4811,7 @@ run_item() {
   _project_config > "$_cfg_json"
 
   # RESUME OR MINT (spec §5). The kernel is the truth; the sidecar a hint.
+  local _side=""
   local resumed=0 _open
   _open=$(_kernel_find_run "$code" open)
   if [ -n "$_open" ]; then
@@ -4384,28 +4827,17 @@ run_item() {
       return 0
     fi
     local _st; _st=$(_kernel_state "$_open")
-    if ! _front_half_resumable "$_st"; then
-      # THE DAMAGING ONE. A pass that dies after `start_implementation`
-      # leaves the run at `implementing`, and every later pass then logs
-      # this line and moves on -- forever, with the queue file still there
-      # and nothing on the channel a human reads. The row is the handoff.
-      echo "[batch] $item: run $_open is at $_st (beyond the front half); skipping" >&2
+    if _back_half_state "$_st" || { [ "$_st" = planned ] && _kernel_implementation_started "$_open"; }; then
+      # The back half owns it (closed-loop spec §2): a state past the seam, or
+      # `planned` reached through request_repair -- which the journal, not
+      # the state name, can tell from `planned` before implementation.
+      _side=back
+    elif _front_half_resumable "$_st"; then
+      _side=front
+    else
+      echo "[batch] $item: run $_open is at '${_st:-unreadable}', which no pass resumes; skipping" >&2
       mkdir -p "$(dirname "$SCORECARD")"
-      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at '$_st', beyond the front half; this pass drives nothing and the item needs a human" "n/a" >> "$SCORECARD"
-      return 0
-    fi
-    if [ "$_st" = planned ] && _kernel_implementation_started "$_open"; then
-      # THE THIRD OF THE SAME SHAPE, and the least obvious. `planned` is
-      # reachable twice -- before implementation, and again when a review
-      # requests a revision -- so the state name alone cannot say which side of
-      # the seam this run is on; the journal can, and it says the back half
-      # already has it. From here that is the same situation as the branch
-      # above: the queue file stays, this pass drives nothing, and a run whose
-      # repair loop then died would be skipped on every later pass with nothing
-      # on the channel a human reads.
-      echo "[batch] $item: run $_open already started implementation; skipping" >&2
-      mkdir -p "$(dirname "$SCORECARD")"
-      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at 'planned' but its implementation has already started; the back half owns it and this pass drives nothing" "n/a" >> "$SCORECARD"
+      json_row "$item" "" "escalated" "false" "" "" 0 "run '$_open' is at '${_st:-unreadable}', which no pass resumes; this pass drives nothing and the item needs a human" "n/a" >> "$SCORECARD"
       return 0
     fi
     if [ "${BIRCHER_HAVE_LOCK:-0}" != 1 ]; then
@@ -4445,19 +4877,23 @@ run_item() {
   # that took one would spend the run's seat budget on its own bookkeeping.
   BIRCHER_GENERATION=$(_kernel_dispatch runner operator); export BIRCHER_GENERATION
   [ -n "$BIRCHER_GENERATION" ] || { echo "[batch] $item: operator dispatch failed" >&2; return 5; }
-  # Now that a generation exists, the label is a routed effect like any other.
-  # The key carries the GENERATION. Keyed on the issue alone it said "this
-  # run's running label" and could be attempted exactly once: a swap that
-  # failed half-way (the label absent on the repo, 2026-09-08) was reconciled
-  # as not delivered, the key was spent, and no later pass could try again --
-  # the issue kept bircher:queued for the rest of the run. Under a generation
-  # the same pass replays (a retry within it is still the same act) and the
-  # next pass, a new generation, attempts it afresh.
-  [ -n "$_iss" ] && [ "${_st:-}" != sliced ] && _effect issue_or_label "running:$_iss:$BIRCHER_GENERATION" - gh issue edit "$_iss" --repo "$REPO" --add-label bircher:running --remove-label bircher:queued >/dev/null 2>&1 || true  # a sliced run resumed mid-filing owns no running label to swap: the kernel refuses every other edit there
+  # Now that a generation exists, the label is a routed effect like any other
+  # (`_label_running`, which carries the generation in its key).
+  #
+  # NOT ON A BACK-HALF RESUME. That pass may find a standing park and return
+  # without doing anything, and relabelling it `bircher:running` tells the
+  # person it is waiting on that it is being worked. `_resume_back_half`
+  # calls `_label_running` itself, after it has read the park reply.
+  [ "$_side" = back ] || _label_running
   if [ "$resumed" = 1 ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.
     _kernel_revise_bundle "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_issue_json"
+  fi
+
+  if [ "$_side" = back ]; then
+    _resume_back_half "$item" "$code" "$f" "$_iss" "$_st"
+    return $?
   fi
 
   local host_id; host_id=$(_local_host_id 2>/dev/null) || host_id=""
@@ -4867,325 +5303,39 @@ run_item() {
   fi
 
   local outcome ci_first review rounds note resubmissions observed_head _obs_ci
-  # AT RUN_ITEM SCOPE, indent 2, not inside the branch that assigns them.
-  #
-  # `_rev_key` feeds a kernel binding and `_rev_round` is read below at the
-  # scorecard, which every path reaches -- including the `_blind` path that
-  # never enters the derivation branch. Declared inside that branch they would
-  # be unbound there, and `set -u` kills run_item AFTER the implementer has
-  # already opened its PR. That is not hypothetical: it is what `_out_hash`
-  # did, and `test_binding_variables_are_declared_at_run_item_scope` exists
-  # because of it -- it caught this one too, by indent, after I had already
-  # moved them once for the same test and satisfied only half of what it says.
-  local _rev_key=""
   local _rev_round=0
-  local _rev_terminal=""
   local _merge_base=""
   local _delta_digest=""
+  local _fingerprints=""
+  local _pr_state=""
+  local _failing_jobs=""
+  local _settled_pr=""
+  local _step=""
+  local _step_cause=""
+  local _step_evidence=""
+  local _step_reason=""
+  local merge_rc=0
+  local _ffile; _ffile=$(_findings_path "$code")
+  [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
   if [ "${_blind:-0}" = 1 ]; then
-    # Unchanged from the marker era, and still correct: the cancel was never
-    # confirmed, so the coordinator may still be running. Deriving an outcome
-    # means READING and WRITING the PR, which races a live session.
-    outcome="escalated"; review="na"; ci_first="unknown"; resubmissions=""
-    observed_head=""
-    note="server unreachable at cap; could not confirm the session stopped, so outcome derivation was skipped to avoid racing a live coordinator - needs a human"
-    echo "[batch] $item: blind at teardown -> escalating without derivation" >&2
+    # The cancel was never confirmed, so the coordinator may still be running,
+    # and deriving would race it. The run stays open, and the next wave resumes
+    # it from the journal (closed-loop spec §2).
+    outcome="waiting"; review="na"; ci_first="unknown"; resubmissions=""; observed_head=""
+    note="server unreachable at cap; could not confirm the session stopped, so derivation was skipped to avoid racing a live coordinator; the next wave resumes"
+    _step=wait
+    echo "[batch] $item: blind at teardown -> waiting for the next wave" >&2
   else
-    # THE REPAIR LOOP. Derive; if the coordinator says the reviewer found
-    # blocking problems and rounds remain, dispatch a repair and derive again.
-    #
-    # Measured basis: 8 of 18 muesli item-runs ended `failed` on a reviewer
-    # FAIL, every one a specific actionable finding. Routing them back by hand
-    # merged #740 in one round and #750 in two.
-    #
-    # The allowance is re-read FROM THE JOURNAL every round, never carried in a
-    # variable, so a coordinator that dies and is re-driven gets no fresh
-    # rounds. `_max_revisions` of 0 makes `revise` unreachable and this loop
-    # runs exactly once -- the pre-loop behaviour, byte for byte.
-    # ONE `local` PER NAME, deliberately. `test_binding_variables_are_declared
-    # _at_run_item_scope` matches `local <var>`, so a name riding second on a
-    # shared `local` line reads to it as undeclared -- and it caught exactly
-    # that here. The check exists because `_out_hash` was once declared inside
-    # the branch that assigned it and killed run_item on `set -u` AFTER the
-    # implementer had opened its PR, so satisfying it by splitting the line is
-    # the honest fix and loosening its regex would not be.
-    local obs
-    local _rev_left=0
-    local _rev_state=""
-    local _findings=""
-    local _last_finding=""
-    local _ffile; _ffile=$(_findings_path "$code")
-    [ -n "$_ffile" ] && mkdir -p "$NOOP_DIR"
-    while :; do
-    # RESET EVERY ROUND, at the top, before anything can be read.
-    #
-    # `_rev_key` is assigned inside the `observed_head` branch below, so a round
-    # that skips that branch would otherwise still be holding the PREVIOUS
-    # round's key -- and the durability check would confirm this round's
-    # revision using last round's fact, dispatching a repair for a round the
-    # kernel never opened. Same class as a stale findings file, and invisible
-    # for the same reason: every signal looks normal.
-    _rev_key=""
-    _rev_left=0
-    _merge_base=""
-    _delta_digest=""
-    if [ "$(_max_revisions)" != 0 ] && [ -n "${BIRCHER_RUN_ID:-}" ]; then
-      # `used|left|confirmed`. A LOOKUP FAILURE leaves _rev_left at 0, which
-      # ends the loop and escalates -- deliberately, because the alternative
-      # reading of an unreadable journal is "no revisions used yet", and that
-      # hands the loop a full allowance every round and never terminates.
-      _rev_state=$(_coordinator revisions --db "${BIRCHER_KERNEL_DB:-}" \
-                     --run-id "$BIRCHER_RUN_ID" --max "$(_max_revisions)") || _rev_state=""
-      if [ -n "$_rev_state" ]; then
-        _rev_left="${_rev_state#*|}"; _rev_left="${_rev_left%%|*}"
-        _rev_left=$(_clamp_int "$_rev_left" 0 0 5)
-      else
-        echo "[batch] $item: could not read the revision allowance from the journal -> no repair rounds this derivation" >&2
-      fi
-    fi
-    echo "[batch] $item: deriving the outcome from the repository (repair rounds left: $_rev_left)" >&2
-    obs=$(observe_outcome "$item" "$code" "$pr" "$_iss" "$_rev_left" "$_ffile")
-    # An EMPTY tuple is a CRASH, not a verdict -- and since Phase 2 this is the
-    # ONLY path, so the guard that used to protect recovery alone now protects
-    # every item. `obs=$(...)` swallows a mid-function death into an empty
-    # string, which parses as outcome="" and reports "NOT ready": a crash
-    # wearing a verdict's clothes.
-    if [ -z "${obs//[[:space:]]/}" ]; then
-      echo "[batch] $item: derivation produced NO tuple -> it failed; escalating rather than reading it as a verdict" >&2
-      obs="escalated|na|outcome derivation failed (no tuple); needs a human||na|unknown||||"
-    fi
-    # TEN fields. The eighth is the PR the DERIVATION settled on, which is not
-    # always the one passed in: it discards an abandoned PR, discovers one by
-    # code or issue linkage, and adopts a CI-green sibling. The last two are
-    # the reviewed range (spec §4): the merge-base against the PR's base and
-    # the digest of the PR's own delta at the reviewed head. Reading fewer
-    # names than the tuple has absorbs the remainder into the last one
-    # silently -- `read` does not error on a short variable list, it
-    # concatenates the remainder into the last name.
-    # WIDTH CHECKED BEFORE PARSING. A short tuple leaves `_settled_pr` empty,
-    # which used to mean "keep the PR I started with" -- indistinguishable from
-    # a derivation that legitimately settled on nothing.
-    if ! _derived_width_ok "$obs"; then
-      echo "[batch] $item: derivation returned a malformed tuple (not ten fields on one line) -> escalating rather than guessing which field is which" >&2
-      obs="escalated|na|derivation returned a malformed tuple; needs a human||na|unknown||||"
-    fi
-    IFS='|' read -r outcome review note observed_head _obs_ci ci_first resubmissions _settled_pr _merge_base _delta_digest <<EOF
-$obs
-EOF
-    : "${outcome:=timeout}" "${ci_first:=unknown}"
-    # ADOPT IT BEFORE THE MERGE AUTHORIZATION, not after. `$pr` feeds the
-    # kernel merge command, the merge itself and the scorecard line, so a
-    # stale value authorizes one PR and reports another. On muesli #723 the
-    #
-    # (The kernel command is not named literally here on purpose:
-    # `test_the_merge_request_redispatches_as_implementer` slices this
-    # function between the FIRST occurrence of two identifiers, so naming one
-    # in a comment above the real call gives it an empty slice to search.)
-    # derivation reviewed #738, posted its cross-review there, and the caller
-    # then tried to merge #737 -- which the implementer had already closed.
-    if [ -n "${_settled_pr:-}" ] && [ "${_settled_pr}" != "${pr:-}" ]; then
-      echo "[batch] $item: derivation settled on PR #$_settled_pr (was ${pr:-none}) -> adopting" >&2
-      pr="$_settled_pr"
-    fi
-
-    # The kernel lifecycle, unchanged in order and in roles. Its INPUTS are now
-    # observations; the sequence is the one the marker branch used to drive.
-    #
-    # GUARDED ON A HEAD, and that guard does the work: the blind path above
-    # never reaches here, so a bare "na" verdict cannot arrive at
-    # _kernel_record_review from this function.
-    if [ -n "${observed_head:-}" ]; then
-      local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
-      _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
-      _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head"
-      BIRCHER_GENERATION=$(_kernel_dispatch "$RECOVERY_REVIEWER" reviewer)
-      export BIRCHER_GENERATION
-      # The key is passed ONLY on a revise. Every other path keeps
-      # `kernel.cli`'s own default key, so the accept and reject branches are
-      # unchanged -- which is what makes BIRCHER_MAX_REVISIONS=0 a real
-      # rollback rather than a path that merely usually agrees.
-      _rev_key=""
-      [ "$outcome" = revise ] && \
-        _rev_key="revise:${BIRCHER_RUN_ID}:${_rev_round}:${BIRCHER_GENERATION}"
-      # TERMINAL only when the bound is spent. `failed` is reached from exactly
-      # one place -- a reviewer FAIL with no rounds left -- so it is the signal
-      # for "record a rejection, not a revision request". The mechanism
-      # escalations below set `escalated` and keep `request_revision`, because a
-      # revision genuinely is owed there and nothing performed it.
-      _rev_terminal=$(_terminal_review_flag "$outcome")
-      # The reviewed range rides out on the SAME call, not a follow-up one:
-      # `observed_head` is the head this branch is guarded on, and
-      # `_merge_base`/`_delta_digest` are the derivation's own two trailing
-      # fields (spec §4) -- what the reviewer's verdict actually covered.
-      _kernel_record_review "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$review" "$_out_hash" "$_base_sha" "$_ctx_hash" "$_rev_key" "$_rev_terminal" "$observed_head" "$_merge_base" "$_delta_digest"
-      BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer)
-      export BIRCHER_GENERATION
-    fi
-
-    # Not a revision -> the derivation is final and the loop ends.
-    [ "$outcome" != revise ] && break
-
-    # A REVISION IS OWED. Before dispatching any repair work, confirm the
-    # kernel actually RECORDED it, by its causal id.
-    #
-    # Not the adapter's exit code and not the absence of an error: `_kernel` is
-    # advisory and always returns 0, and `commands.py` validates a review, bumps
-    # the version under CAS, then appends REVIEW_VERDICT -- in that order -- so a
-    # review can validate and then lose the CAS, producing no fact at all. Either
-    # way the run is still in `reviewing`, `start_implementation` would be
-    # refused, and the repair session would work against a run that never
-    # authorised it.
-    _rev_state=$(_coordinator revisions --db "${BIRCHER_KERNEL_DB:-}" \
-                   --run-id "$BIRCHER_RUN_ID" --max "$(_max_revisions)" \
-                   --confirm-command "$_rev_key") || _rev_state=""
-    if ! _revision_is_recorded "$_rev_state"; then
-      echo "[batch] $item: the revision was NOT recorded in the journal (${_rev_state:-lookup failed}) -> escalating instead of repairing" >&2
-      outcome="escalated"
-      note="${note:+$note; }reviewer found blocking problems but the kernel did not record the revision (causal id $_rev_key); no repair was dispatched"
-      break
-    fi
-
-    # The findings the repair is briefed on. The file exists BECAUSE this
-    # derivation wrote it -- the coordinator unlinks the path before deriving
-    # and replaces it atomically after -- so an empty or missing one here means
-    # something went wrong in this round, never that a previous round is
-    # speaking.
-    _findings=""
-    [ -s "$_ffile" ] && _findings=$(cat "$_ffile")
-    if _is_blank "$_findings"; then
-      echo "[batch] $item: a revision is owed but no findings were written -> escalating rather than dispatching a repair with an empty brief" >&2
-      outcome="escalated"
-      note="${note:+$note; }reviewer found blocking problems but wrote no findings to brief a repair with"
-      break
-    fi
-    _last_finding=$(printf '%s' "$_findings" | head -c 400)
-    _rev_round=$((_rev_round + 1))
-    echo "[batch] $item: review FAILED with $_rev_left round(s) left -> repair round $_rev_round" >&2
-    local _rbranch; _rbranch=$(_pr_branch "$pr")
-    if [ -z "${_rbranch//[[:space:]]/}" ]; then
-      # Without the branch the prompt cannot name what to push to, and an
-      # implementer left to infer it opens a second PR -- which strands the
-      # reviewed one and makes the next derivation escalate on ambiguity
-      # instead of on this.
-      echo "[batch] $item: could not read PR #$pr's head branch -> escalating rather than briefing a repair that cannot push" >&2
-      outcome="escalated"
-      note="${note:+$note; }could not read PR #$pr's head branch to brief a repair round"
-      break
-    fi
-    if ! _repair_round "$item" "$code" "$pr" "$_rbranch" "$_findings" "$_rev_round" "$vendor"; then
-      outcome="escalated"
-      note="${note:+$note; }repair round $_rev_round could not be started"
-      break
-    fi
-    done
+    _step_loop
     [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
-    # TERMINAL ESCALATION names what the last reviewer objected to, so a human
-    # sees the finding instead of having to open N review logs to find it.
-    if [ "$_rev_round" != 0 ]; then
-      note="${note:+$note; }after $_rev_round repair round(s)"
-      [ "$outcome" != ready ] && [ -n "$_last_finding" ] && \
-        note="$note; last finding: $_last_finding"
-    fi
   fi
-  # `rounds` REPORTS SOMETHING AGAIN, and it is a different measurement from the
-  # one that used to bear the name. It was the coordinator's count of its own
-  # internal fix loop and nothing observed it, so it was emptied. It is now the
-  # number of REPAIR ROUNDS this runner dispatched -- observed, because the
-  # runner performed each one, and cross-checkable against the run's
-  # request_revision facts. `resubmissions` keeps its own name and meaning
-  # (distinct commits CI ran on, minus one), which is still a third thing.
-  #
-  # Empty, not 0, when the loop is disabled: a 0 would claim the loop ran and
-  # found nothing to repair, which is not what BIRCHER_MAX_REVISIONS=0 means.
+  # `rounds` is the number of REPAIR ROUNDS this pass dispatched -- observed,
+  # because the runner performed each one, and cross-checkable against the
+  # run's repair_requested facts. Empty when none.
   rounds=""
   [ "$_rev_round" != 0 ] && rounds="$_rev_round"
-
-  # B-1 in-run merge: merge a ready PR now so the NEXT item builds on it
-  # (eliminates the merge-order conflict class). Deferral appends to the note;
-  # a red/unresolved main after merge HALTS the run (rc 2 propagates to main).
-  local merge_rc=0
-  if [ "$INRUN_MERGE" != "0" ] && [ "$outcome" = "ready" ] && [ -n "${pr:-}" ]; then
-    # The reviewed head comes from the REVIEWER (marker `head=`), never from a
-    # re-fetch here (issue #24). A `gh pr view` after the PASS would record whatever
-    # the head is NOW — so a push landing between the reviewer's verdict and this
-    # line would be blessed as "reviewed", defeating the --match-head-commit guard
-    # it feeds. Only the reviewer knows which commit it actually read.
-    #
-    # Fail closed when a marker exists but carries no head=. NOTE: passing an empty
-    # sha to merge_ready_pr used to NOT fail closed — it took an unpinned branch and
-    # merged anyway — so the skip happens HERE, before the call. Since #66 the callee
-    # also refuses an empty sha, so this is now belt and braces rather than the only
-    # guard.
-    # `_merge_gate` reads only its SECOND argument; the first was a
-    # had-a-marker flag it never consulted, and there is no marker now.
-    local _gate; _gate=$(_merge_gate "" "${observed_head:-}")
-    local reviewed_sha=""
-    case "$_gate" in
-      pin\|*)   reviewed_sha="${_gate#pin|}" ;;
-        skip)
-        echo "[batch] $item: no reviewed head available -> reviewed commit unverifiable; NOT merging PR #$pr (left for a human)" >&2
-        MERGE_NOTE="merge skipped: no reviewed head (reviewed commit unverifiable)"
-        note="${note:+$note; }$MERGE_NOTE"
-        merge_rc=0
-        ;;
-    esac
-    if [ "$_gate" != "skip" ]; then
-      # request_merge, record_merge_outcome
-      _kernel_request_merge "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$pr" "$REPO" "$observed_head" \
-        "$_out_hash" "$_base_sha" "$_ctx_hash"
-      # The FALLBACK description, composed HERE because this is where the
-      # reviewed range is. `_post_cross_review_status`'s own default is the
-      # legacy "cross-vendor review PASS (Bircher)" text, and it fires in
-      # exactly the case that matters: the derivation's post did not land (or
-      # could not be read back). Overwriting the merge head's range-naming
-      # description with text that names nothing is the gate losing the one
-      # thing the status is for. Empty when the range is unknown -- then the
-      # legacy text is the honest answer.
-      local _status_desc=""
-      [ -n "${_merge_base:-}" ] && [ -n "${observed_head:-}" ] && \
-        _status_desc="cross-review PASS (Bircher fallback) on ${_merge_base:0:7}..${observed_head:0:7}"
-      merge_ready_pr "$item" "$pr" "$reviewed_sha" "$_status_desc"; merge_rc=$?
-      local _k_outcome; [ "$merge_rc" = 0 ] && _k_outcome=merged || _k_outcome=failed
-      _kernel_record_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_k_outcome"
-      [ -n "$MERGE_NOTE" ] && note="${note:+$note; }$MERGE_NOTE"
-      # #71: what LANDED was not what was reviewed. rc 2 already halts the run, but the
-      # scorecard row is written from $outcome -- captured from the item's MARKER, not
-      # from merge_rc -- and _ensure_issue_closed fires on outcome=ready. Left alone, an
-      # unreviewed merge would halt AND still close its issue as done; worse, on the
-      # red path it would close the very issue _reopen_reverted_issues had just
-      # reopened. Downgrading the outcome stops both, because the close is gated on it.
-      if [ "${MERGE_UNREVIEWED:-0}" = 1 ]; then
-        note="${note:+$note; }$MERGE_UNREVIEWED_NOTE"
-        outcome=escalated
-      fi
-      _record_deferred_ready "$item" "$pr" "$merge_rc" "$_iss" "$reviewed_sha"
-    fi
-  fi
-
-  mkdir -p "$(dirname "$SCORECARD")"
-  # The run is over: close its ledger before the scorecard row. The kernel's
-  # terminal fact is written first, but the two are NOT guaranteed to agree:
-  # `_kernel` is advisory and always returns 0, so a failed or refused command
-  # leaves no terminal fact while the scorecard row below is written anyway.
-  # An earlier version of this comment claimed they "agree by construction",
-  # which is the unearned-claim shape this change exists to remove.
-  #
-  # This site could once diverge on VALUE: $outcome came from a model-authored
-  # marker parsed with no schema validation, so a word outside the kernel's
-  # vocabulary was refused -- correctly and visibly -- while the scorecard
-  # recorded it regardless. Since Phase 2 the value comes from
-  # `classify_recovery`, which emits only the fixed vocabulary, so that
-  # particular divergence has no route left. The two records can still
-  # disagree for other reasons, which is why this note stays.
-  _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-  json_row "$item" "${pr:-}" "$outcome" "$ci_first" "${review:-}" "${resubmissions:-}" "$elapsed" "$note" "$bound_outcome" "$vendor" "${rounds:-}" >> "$SCORECARD"
-  _issue_writeback "$(_item_issue "$prompt")" "$outcome" "${pr:-}" "${review:-}" "${resubmissions:-}" "${ci_first:-}" "${rounds:-}"
-  # #3: guarantee the issue closes when its PR actually merged (backstops a
-  # missed GitHub `Closes #N` auto-close). No-op unless outcome=ready + PR merged.
-  [ "$outcome" = "ready" ] && _ensure_issue_closed "$(_item_issue "$prompt")" "${pr:-}"
-  echo "[batch] $item -> outcome=$outcome pr=${pr:-none} review=${review:-na} rounds=${rounds:-?} bound=$bound_outcome"
-  mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
-  return "$merge_rc"
+  [ "$_step" = merge ] && _merge_step
+  _finish_pass "$item" "$f" "$(_item_issue "$prompt")"
 }
 
 self_test() {
@@ -5729,7 +5879,7 @@ SH
   # for the branch lookup, so they are `unknown` and empty -- which is the
   # correct answer to "no history was visible", and is pinned here so a change
   # that starts inventing `false|0` on a failed lookup is caught.
-  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7||" ] \
+  [ "$rec_out" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||7|||||" ] \
     || { echo "FAIL derive happy-path tuple: '$rec_out'"; exit 1; }
   grep -q 'head=a502a88e20f959c908d00871ee7f25572512dd6d' "$shimdir/comment.txt" \
     || { echo "FAIL derive: comment must carry head= on a ready outcome"; cat "$shimdir/comment.txt"; exit 1; }
@@ -5748,35 +5898,19 @@ SH
   # 5th field is "na" here: no PR means no CI was ever observed, and "na" is
   # not a value _kernel_ci_status maps to success, so it cannot be mistaken for
   # green by the merge gate.
-  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown||||" ] \
+  [ "$rec_nopr" = "timeout|na|no PR at timeout (reaped before implement delivered)||na|unknown|||||||" ] \
     || { echo "FAIL derive no-pr tuple: '$rec_nopr'"; exit 1; }
   rm -rf "$shimdir"
   echo "observe_outcome OK"
 
   # --- The repair loop: shell -> Python -> back, over the real call path ------
   #
-  # tests/coordinator/ already drives `classify`, `revisions_used` and the
-  # findings transport directly, and none of that can see what these check:
-  # that THIS shell passes the two new arguments in a form the CLI accepts, and
-  # that the file the CLI writes is the file this shell can read. Both sides
-  # were green while disagreeing about a vocabulary before -- twice -- and
-  # neither time was it visible from either side alone.
-  [ "$(BIRCHER_MAX_REVISIONS= _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: default is not 2"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=0 _max_revisions)" = 0 ] \
-    || { echo "FAIL _max_revisions: 0 must disable the loop"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=5 _max_revisions)" = 5 ] \
-    || { echo "FAIL _max_revisions: 5 is in range"; exit 1; }
-  # OUT OF RANGE RETURNS THE DEFAULT, not the nearest bound. `_clamp_int` has
-  # always done this and the misreading of it silently turned a 5300s budget
-  # into 300s once already. Pinned so the behaviour is a decision, not a
-  # surprise a future reader has to rediscover.
-  [ "$(BIRCHER_MAX_REVISIONS=9 _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: out of range must give the DEFAULT (2), not the max"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=abc _max_revisions)" = 2 ] \
-    || { echo "FAIL _max_revisions: a non-numeric value must give the default"; exit 1; }
-  echo "_max_revisions OK"
-
+  # tests/coordinator/ already drives `classify` and the findings transport
+  # directly, and none of that can see what this checks: that THIS shell
+  # passes findings-out in a form the CLI accepts, and that the file the CLI
+  # writes is the file this shell can read. Both sides were green while
+  # disagreeing about a vocabulary before -- twice -- and neither time was it
+  # visible from either side alone.
   local rdir; rdir=$(mktemp -d)
   cat >"$rdir/gh" <<'SH'
 #!/usr/bin/env bash
@@ -5794,55 +5928,42 @@ SH
   cat >"$rdir/omnigent" <<'SH'
 #!/usr/bin/env bash
 # A reviewer that BLOCKS, with findings shaped like the real ones: multiple
-# paragraphs, a pipe, and newlines -- all three of which the ten-field tuple
-# cannot carry, which is the whole reason the findings travel by file.
+# paragraphs, a pipe, and newlines -- all three of which the thirteen-field
+# tuple cannot carry, which is the whole reason the findings travel by file.
 printf 'Blocking:\n- the retry loop reads `a | b` and drops b\n- no test covers the empty case\n\nVERDICT: FAIL\n'
 exit 0
 SH
   chmod +x "$rdir/gh" "$rdir/omnigent"
 
-  # WITH rounds left: the outcome is `revise` and the findings are on disk.
-  local rev_out
-  rev_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+  # A FAIL derives `repair`, and the findings land on disk (closed-loop spec §1).
+  local rep_out
+  rep_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex \
-            observe_outcome demo demo 7 "" 2 "$rdir/findings.txt")
-  case "$rev_out" in
-    revise\|codex:fail\|*) ;;
-    *) echo "FAIL repair: a FAIL with rounds left must derive 'revise', got '$rev_out'"; exit 1 ;;
+            observe_outcome demo demo 7 "" "$rdir/findings.txt")
+  case "$rep_out" in
+    repair\|codex:fail\|*) ;;
+    *) echo "FAIL repair: a FAIL must derive 'repair', got '$rep_out'"; exit 1 ;;
   esac
-  _derived_width_ok "$rev_out" \
-    || { echo "FAIL repair: the revise tuple is not ten fields on one line: '$rev_out'"; exit 1; }
+  _derived_width_ok "$rep_out" \
+    || { echo "FAIL repair: the repair tuple is not thirteen fields on one line: '$rep_out'"; exit 1; }
   [ -s "$rdir/findings.txt" ] \
-    || { echo "FAIL repair: no findings were written for a revise"; exit 1; }
+    || { echo "FAIL repair: no findings were written for a repair"; exit 1; }
   grep -q 'drops b' "$rdir/findings.txt" \
     || { echo "FAIL repair: the reviewer's findings did not survive the file transport"; cat "$rdir/findings.txt"; exit 1; }
   # The findings contain a pipe and newlines. If any of that had leaked into the
   # tuple the width check above would already have failed -- this pins WHY.
-  case "$rev_out" in
+  case "$rep_out" in
     *"drops b"*) echo "FAIL repair: findings leaked into the tuple"; exit 1 ;;
   esac
 
-  # WITHOUT rounds left: byte-identical to the pre-loop behaviour, and NOTHING
-  # is written. This is the assertion that makes BIRCHER_MAX_REVISIONS=0 a real
-  # rollback rather than a path that merely usually agrees.
-  rm -f "$rdir/findings.txt"
-  local norev_out
-  norev_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
-              RECOVERY_REVIEWER=codex \
-              observe_outcome demo demo 7 "" 0 "$rdir/findings.txt")
-  case "$norev_out" in
-    failed\|codex:fail\|*) ;;
-    *) echo "FAIL repair: a FAIL with NO rounds left must stay 'failed', got '$norev_out'"; exit 1 ;;
-  esac
-  [ ! -e "$rdir/findings.txt" ] \
-    || { echo "FAIL repair: findings were written for a terminal failure"; exit 1; }
-  # And the DEFAULT -- no arguments at all -- must be the terminal one, so every
-  # existing caller of observe_outcome is unaffected by the loop's existence.
+  # WITHOUT a findings-out path -- every non-repair caller -- the TUPLE is
+  # unaffected: the findings ride on every FAIL regardless of whether anyone
+  # asked to write them to disk.
   local dflt_out
   dflt_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
              RECOVERY_REVIEWER=codex observe_outcome demo demo 7)
-  [ "$dflt_out" = "$norev_out" ] \
-    || { echo "FAIL repair: observe_outcome's default is not the pre-loop behaviour: '$dflt_out' vs '$norev_out'"; exit 1; }
+  [ "$dflt_out" = "$rep_out" ] \
+    || { echo "FAIL repair: observe_outcome's tuple changed with no findings-out path: '$dflt_out' vs '$rep_out'"; exit 1; }
   echo "observe_outcome repair arguments OK"
 
   # `_pr_branch` READS the branch. Deriving it from the code instead stalled a
@@ -5891,40 +6012,12 @@ SH
     *) echo "FAIL _repair_round: a missing vendor did not refuse by name (got: ${_rr_err:-<nothing>})"; exit 1 ;;
   esac
   # The durability gate. Criterion 7: an accepted REVIEW_VERDICT carrying the
-  # submitted command's causal id, or no repair work is dispatched.
+  # submitted command's causal id, or no repair work is dispatched. The
+  # allowance itself and its two self-test-only helper functions went with the
+  # rest of the bound; the recovery-table row below is what is left to check
+  # from this file.
   _recovery_forbids_merge "reconciled_ruling_needed|resolution is free text" \
     || { echo "FAIL _recovery_forbids_merge: a human-reconciled merge was not forbidden"; exit 1; }
-  _revision_is_recorded "1|1|yes" \
-    || { echo "FAIL _revision_is_recorded: a confirmed revision was rejected"; exit 1; }
-  ! _revision_is_recorded "1|1|no" \
-    || { echo "FAIL _revision_is_recorded: an unconfirmed revision was accepted"; exit 1; }
-  # EVERY failure shape arrives as an empty string, and every one must be "no".
-  ! _revision_is_recorded "" \
-    || { echo "FAIL _revision_is_recorded: a failed lookup read as confirmation"; exit 1; }
-  ! _revision_is_recorded \
-    || { echo "FAIL _revision_is_recorded: a missing argument read as confirmation"; exit 1; }
-  # A count is not a confirmation. `1|1|` says a revision was used at some point
-  # and says nothing about OURS -- which is precisely the previous round's
-  # revision confirming this round's missing one.
-  ! _revision_is_recorded "1|1|" \
-    || { echo "FAIL _revision_is_recorded: a truncated tuple read as confirmation"; exit 1; }
-  # And it must match the FIELD, not the substring: a run whose note or counts
-  # merely contain the word must not pass.
-  ! _revision_is_recorded "yes|1|no" \
-    || { echo "FAIL _revision_is_recorded: matched 'yes' outside the confirmed field"; exit 1; }
-  # The bound-exhausted review is the ONLY one that records a rejection.
-  [ "$(_terminal_review_flag failed)" = terminal ] \
-    || { echo "FAIL _terminal_review_flag: a spent allowance must record a rejection"; exit 1; }
-  for o in revise ready escalated timeout noop skipped ""; do
-    [ -z "$(_terminal_review_flag "$o")" ] \
-      || { echo "FAIL _terminal_review_flag: '$o' must not record a rejection"; exit 1; }
-  done
-  # `escalated` in particular: the revision-not-journalled and no-findings paths
-  # end there, and a revision IS owed on both -- `dispatch_implementer` is the
-  # right answer for a resume, so they must keep request_revision.
-  [ -z "$(_terminal_review_flag escalated)" ] \
-    || { echo "FAIL _terminal_review_flag: a mechanism escalation is not a rejection"; exit 1; }
-  echo "_terminal_review_flag OK"
 
   # --- preflight_kernel, driven for real (gap 10) -----------------------------
   #
@@ -5991,51 +6084,49 @@ SH
     *) echo "FAIL _derive_budget: an over-budget setting was accepted silently -- that is the collapse this warning exists for"; exit 1 ;;
   esac
   echo "_derive_budget defaults fit OK"
-  echo "_revision_is_recorded OK"
 
-  # THE ROLLBACK, asserted as a property of the call and not of the loop.
-  # BIRCHER_MAX_REVISIONS=0 must leave derivation with no findings-file
-  # operation whatever, so a NOOP_DIR that cannot be written to -- unwritable,
-  # misowned, holding a protected stale file -- cannot fail an item that was
-  # configured never to repair.
-  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR=/nonexistent/nope _findings_path c1)" ] \
-    || { echo "FAIL _findings_path: a disabled loop still names a findings file"; exit 1; }
-  [ "$(BIRCHER_MAX_REVISIONS=2 NOOP_DIR=/tmp/nd _findings_path c1)" = "/tmp/nd/c1.findings" ] \
-    || { echo "FAIL _findings_path: an enabled loop must name one"; exit 1; }
-  # And an empty path must make observe_outcome behave as it did before the
-  # loop existed -- proven against a path it could not possibly write to.
+  # `_findings_path` ALWAYS names a path now: the findings ride on every FAIL
+  # (spec §1), and there is no disabled loop left to reproduce.
+  [ "$(NOOP_DIR=/tmp/nd _findings_path c1)" = "/tmp/nd/c1.findings" ] \
+    || { echo "FAIL _findings_path: must always name a path"; exit 1; }
+  # An EMPTY findings-out path (the caller declining to pass one) must
+  # reproduce the same tuple as the no-argument call above -- the file write
+  # is skipped, the derivation is not.
   local ro_out
   ro_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
            RECOVERY_REVIEWER=codex \
-           observe_outcome demo demo 7 "" 0 "")
+           observe_outcome demo demo 7 "" "")
   [ "$ro_out" = "$dflt_out" ] \
-    || { echo "FAIL rollback: an empty findings path did not reproduce the pre-loop tuple: '$ro_out' vs '$dflt_out'"; exit 1; }
-  # THE HAZARD ITSELF, reproduced. A path that merely does not exist is fine --
-  # the CLI tolerates ENOENT on the pre-derivation unlink, because "nothing to
-  # clear" is the normal case. The failure needs a stale file that CANNOT be
-  # removed, which is what an unwritable or misowned NOOP_DIR produces.
+    || { echo "FAIL observe_outcome: an empty findings path did not reproduce the no-path tuple: '$ro_out' vs '$dflt_out'"; exit 1; }
+  # THE HAZARD: a stale findings file that CANNOT be removed must fail the
+  # derivation rather than silently leave a previous round's findings beside a
+  # fresh verdict. A path that merely does not exist is fine -- the CLI
+  # tolerates ENOENT on the pre-derivation unlink, because "nothing to clear"
+  # is the normal case. The failure needs a stale file that CANNOT be removed,
+  # which is what an unwritable or misowned NOOP_DIR produces.
   #
-  # An earlier version of this test used /nonexistent/... and passed while
-  # asserting the opposite of what happened -- the derivation succeeded, ENOENT
-  # having been swallowed exactly as designed. A reproduction that cannot
-  # produce the failure it names proves nothing about the fix.
-  mkdir -p "$rdir/ro"
-  : > "$rdir/ro/f.txt"
-  chmod 500 "$rdir/ro"
+  # ROOT CANNOT STAGE IT. uid 0 ignores a directory's write bit, so `chmod
+  # 500` leaves the file removable, the derivation correctly succeeds, and
+  # this assertion reads that success as a failure. The runner's container
+  # runs as root, so the `exit 1` below stopped its self-test HERE -- at
+  # check 29 of 111 -- and every later check went unrun on every deploy.
+  # Skipped rather than weakened: the hazard still binds for every non-root
+  # run, which is where this suite is developed and where CI runs it.
   local rofail_out
-  rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
-               RECOVERY_REVIEWER=codex \
-               observe_outcome demo demo 7 "" 0 "$rdir/ro/f.txt")
-  # This is the pre-fix behaviour, pinned so the hazard stays visible: passing
-  # an unusable path fails the derivation even with NO revisions allowed.
-  [ -z "$rofail_out" ] \
-    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: an unremovable stale findings file did not fail the derivation, so this test no longer reproduces the hazard: '$rofail_out'"; exit 1; }
-  # And the fix: with the loop disabled, run_item never passes the path at all,
-  # so the same unusable directory cannot reach the derivation.
-  [ -z "$(BIRCHER_MAX_REVISIONS=0 NOOP_DIR="$rdir/ro" _findings_path demo)" ] \
-    || { chmod 700 "$rdir/ro"; echo "FAIL rollback: a disabled loop still names a path in an unwritable directory"; exit 1; }
-  chmod 700 "$rdir/ro"
-  echo "_findings_path rollback OK"
+  if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$rdir/ro"
+    : > "$rdir/ro/f.txt"
+    chmod 500 "$rdir/ro"
+    rofail_out=$(PATH="$rdir:$PATH" WORKDIR="$rdir" REPO=demo/demo SERVER=http://x \
+                 RECOVERY_REVIEWER=codex \
+                 observe_outcome demo demo 7 "" "$rdir/ro/f.txt")
+    [ -z "$rofail_out" ] \
+      || { chmod 700 "$rdir/ro"; echo "FAIL observe_outcome: an unremovable stale findings file did not fail the derivation: '$rofail_out'"; exit 1; }
+    chmod 700 "$rdir/ro"
+  else
+    echo "[self-test] SKIP: running as root -> a stale findings file cannot be made unremovable (uid 0 ignores the write bit); the hazard is exercised by every non-root run" >&2
+  fi
+  echo "_findings_path OK"
 
   # The three recovery rows that must never reach a merge, and the reasons they
   # are three rather than one.
@@ -6227,7 +6318,7 @@ SH
   # DISCOVERS it, so the field carrying it back is exactly what this asserts.
   # Before the field existed the discovery was used internally and the caller
   # never learned of it.
-  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300||" ] \
+  [ "$rec_disc" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||300|||||" ] \
     || { echo "FAIL recover discovery-adopt (1b): '$rec_disc'"; rm -rf "$ddir"; exit 1; }
   rm -rf "$ddir"
   echo "recover discovery-adopt (1b) OK"
@@ -6292,7 +6383,7 @@ SH
   local rec_iss
   rec_iss=$(PATH="$idir:$PATH" WORKDIR="$idir" REPO=demo/demo SERVER=http://x \
             RECOVERY_REVIEWER=codex observe_outcome iwrong iwrong "" 307)
-  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305||" ] \
+  [ "$rec_iss" = "ready|codex:pass|out-of-band review PASS|a502a88e20f959c908d00871ee7f25572512dd6d|green|unknown||305|||||" ] \
     || { echo "FAIL recover issue-linkage adopt: '$rec_iss'"; rm -rf "$idir"; exit 1; }
   rm -rf "$idir"
   echo "issue-linkage fallback (_discover_pr_by_issue + recover) OK"
@@ -9048,6 +9139,100 @@ f._cmd(g, "park", {"reason": "no_verdict", "session_id": None, "cursor_item_id":
   grep -q "^i77-" "$pdir/queue/.manifest" || { echo "FAIL parked run i77 is not in the manifest"; exit 1; }
   rm -rf "$pdir"
   echo "parked runs are queued from the journal OK"
+
+  # --- an open back-half run is queued from the journal (closed-loop spec §2) --
+  # Waves resume every open back-half run that holds implementation output,
+  # whatever its labels -- until it merges, a person stops it, or it parks.
+  local qdir; qdir=$(mktemp -d)
+  cat > "$qdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;           # is_unblocked reads a COUNT, not a list
+  *"--json title"*) echo "open pr issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$qdir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -m tests.kernel.front \
+      --db "$qdir/k.db" --run-id i78-open-pr-1 --to implementing >/dev/null ) \
+    || { echo "FAIL i78 fixture could not be built"; exit 1; }
+  ( cd "$qdir" && QUEUE="$qdir/queue" PATH="$qdir:$PATH" BIRCHER_KERNEL_DB="$qdir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with an open back-half run exited non-zero"; exit 1; }
+  ls "$qdir/queue"/i78-*.md >/dev/null 2>&1 || { echo "FAIL open back-half run i78 was not queued from the journal"; exit 1; }
+  grep -q "^i78-" "$qdir/queue/.manifest" || { echo "FAIL open back-half run i78 is not in the manifest"; exit 1; }
+  rm -rf "$qdir"
+  echo "an open back-half run is queued from the journal OK"
+
+  # --- an ended run is NOT queued (closed-loop spec §2) ------------------------
+  local edir; edir=$(mktemp -d)
+  cat > "$edir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "ended issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$edir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -c '
+import sys
+from tests.kernel.front import Front
+from kernel.dispatch import Role
+from kernel.store import Store
+s = Store.open(sys.argv[1])
+f = Front(s, "i79-ended-1").to_planned()
+g = f._dispatch(Role.IMPLEMENTER, "claude")
+f._cmd(g, "record_run_outcome", {"outcome": "timeout"})
+' "$edir/k.db" ) || { echo "FAIL i79 fixture could not be built"; exit 1; }
+  ( cd "$edir" && QUEUE="$edir/queue" PATH="$edir:$PATH" BIRCHER_KERNEL_DB="$edir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with an ended run exited non-zero"; exit 1; }
+  ls "$edir/queue"/i79-*.md >/dev/null 2>&1 && { echo "FAIL an ended run was queued"; exit 1; }
+  rm -rf "$edir"
+  echo "an ended run is not queued from the journal OK"
+
+  # --- a cancelled run with a pull request IS queued (closed-loop spec §2, fix round 1) --
+  # `ended` is the only terminal state: `cancelled` is a stop, not a close,
+  # and still owes its terminal fact -- the closed loop must be able to
+  # resume it once to write one, not read it as already closed.
+  local cdir; cdir=$(mktemp -d)
+  cat > "$cdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "cancelled issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$cdir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -m tests.kernel.front \
+      --db "$cdir/k.db" --run-id i80-cancelled-1 --to implementing >/dev/null ) \
+    || { echo "FAIL i80 fixture could not be built"; exit 1; }
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -c '
+import sys
+from kernel.commands import Command, submit
+from kernel.dispatch import Role, dispatch
+from kernel.store import Store
+s = Store.open(sys.argv[1])
+g = dispatch(s, "i80-cancelled-1", actor="claude", role=Role.IMPLEMENTER).generation
+submit(s, Command(name="cancel_run", run_id="i80-cancelled-1",
+                   expected_version=s.run_version("i80-cancelled-1"),
+                   idempotency_key="cancel1", generation=g, payload={}))
+' "$cdir/k.db" ) || { echo "FAIL i80 cancel could not be recorded"; exit 1; }
+  ( cd "$cdir" && QUEUE="$cdir/queue" PATH="$cdir:$PATH" BIRCHER_KERNEL_DB="$cdir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with a cancelled run exited non-zero"; exit 1; }
+  ls "$cdir/queue"/i80-*.md >/dev/null 2>&1 || { echo "FAIL a cancelled run with a pull request was not queued from the journal"; exit 1; }
+  grep -q "^i80-" "$cdir/queue/.manifest" || { echo "FAIL cancelled run i80 is not in the manifest"; exit 1; }
+  rm -rf "$cdir"
+  echo "a cancelled run with a pull request is queued from the journal OK"
 
   # --- wave-timer.sh: fires launch.sh with the wave's own log, skips a missing checkout --
   local tdir; tdir=$(mktemp -d)

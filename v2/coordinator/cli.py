@@ -165,12 +165,6 @@ def main(argv=None) -> int:
     # differently: the shell clamped `BIRCHER_CI_RERUN_MAX=abc` to 4 and
     # computed a budget from it, while a bare `int()` here raised ValueError
     # and escalated every item. One malformed operator value, two answers.
-    # The repair loop's two arguments.
-    #
-    # `--revisions-left` is the allowance, computed by the caller from the
-    # journal (`observe.revisions_used`) rather than here, because the caller
-    # owns the kernel database handle. 0 -- the default -- reproduces the
-    # behaviour before the loop existed.
     #
     # `--findings-out` is a PATH and not a tuple field on purpose: the
     # reviewer's blocking findings are multi-paragraph text containing pipes
@@ -179,34 +173,13 @@ def main(argv=None) -> int:
     #
     # The path is REMOVED before derivation and REPLACED atomically after, so
     # the file existing means this derivation wrote it. Without that, a round
-    # that leaves an old file behind pairs a fresh `revise` with a previous
+    # that leaves an old file behind pairs a fresh repair with a previous
     # round's findings -- and a repair briefed on the wrong review looks
     # exactly like a repair briefed on the right one.
-    dv.add_argument("--revisions-left", type=int, default=0, dest="revisions_left")
     dv.add_argument("--findings-out", default="", dest="findings_out")
     dv.add_argument("--ci-wait", type=int, default=1500, dest="ci_wait")
     dv.add_argument("--rerun-max", type=int, default=4, dest="rerun_max")
     dv.add_argument("--rerun-wait", type=int, default=900, dest="rerun_wait")
-
-    # `revisions` is the runner's window onto the journal, and it answers the
-    # two questions the repair loop asks of it:
-    #
-    #   how many rounds are left   -- before derivation, to set --revisions-left
-    #   did the revision land      -- after submitting record_review, before
-    #                                 any repair work is dispatched
-    #
-    # Both read the SAME journal, and neither is answerable from the runner:
-    # bash has no sqlite handle and the kernel adapter is advisory, so an exit
-    # code from it proves nothing about what was recorded.
-    rv = subs.add_parser("revisions")
-    rv.add_argument("--db", required=True)
-    rv.add_argument("--run-id", required=True)
-    rv.add_argument("--max", type=int, default=2, dest="max_revisions")
-    # The idempotency key of the record_review command whose fact we are
-    # looking for. Supplied by the caller and never derived here: deriving it
-    # would rebuild `kernel.cli`'s default-key format in a second place, and
-    # two subsystems that rebuild the same string eventually disagree about it.
-    rv.add_argument("--confirm-command", default="", dest="confirm_command")
 
     # `recover` answers "this run was interrupted -- what now?" from the
     # journal, because the STATE NAME cannot answer it: `reviewing` is reached
@@ -277,6 +250,27 @@ def main(argv=None) -> int:
             sp.add_argument("--findings", required=True)
         if name == "direct":
             sp.add_argument("--text", required=True)
+
+    # The closed loop (spec §2): the runner's window onto the journal. Every
+    # mode is read-only; the runner performs what `step` names and records
+    # the resulting fact itself.
+    st = subs.add_parser("step")
+    st.add_argument("--db", required=True); st.add_argument("--run-id", required=True)
+    st.add_argument("--pr-state", default="", dest="pr_state")
+    st.add_argument("--head", default="")
+    st.add_argument("--ci", default="na")
+    st.add_argument("--failing-jobs", default="", dest="failing_jobs")
+    bs = subs.add_parser("back-state")
+    bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
+    cf = subs.add_parser("conflicted")
+    cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
+    sl = subs.add_parser("session-last-item")
+    sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
+    pn = subs.add_parser("park-notice")
+    pn.add_argument("--db", required=True); pn.add_argument("--run-id", required=True)
+    pr_ = subs.add_parser("park-reply")
+    pr_.add_argument("--db", required=True); pr_.add_argument("--run-id", required=True)
+    pr_.add_argument("--server", required=True)
 
     a = p.parse_args(argv)
 
@@ -406,6 +400,142 @@ def main(argv=None) -> int:
         print(json.dumps(dict(park.payload, seq=park.seq, id=park.id)))
         return RC_OK
 
+    if a.mode == "step":
+        from kernel import back
+        from kernel.store import Store
+
+        from coordinator.step import Ground, next_step
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)  # raises for a run the kernel does not hold
+        verdict, fps = None, ()
+        fact = back.verdict_for_head(store, a.run_id, a.head) if a.head else None
+        if fact is not None:
+            verdict = "PASS" if fact.payload.get("verdict") == "accept" else "FAIL"
+            fps = tuple(fact.payload.get("fingerprints") or ())
+        jobs = tuple(j for j in a.failing_jobs.split(",") if j)
+        s = next_step(store, a.run_id, Ground(pr_state=a.pr_state, head=a.head, ci=a.ci,
+                                              failing_jobs=jobs, verdict=verdict, fingerprints=fps))
+        print(f"{s.kind}|{s.cause}|{','.join(s.evidence)}|{s.reason}|{'yes' if s.redispatch else 'no'}", end="")
+        return RC_OK
+
+    if a.mode == "back-state":
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        ci = back.latest_ci(store, a.run_id) or {}
+        print(f"{ci.get('pr') or ''}|{ci.get('pr_state') or ''}|{ci.get('head_git_sha') or ''}|"
+              f"{store.current_artifact(a.run_id) or ''}", end="")
+        return RC_OK
+
+    if a.mode == "conflicted":
+        # Who the kernel will refuse a review from on this run, so the runner
+        # can seat its implementer and its reviewer from the JOURNAL rather
+        # than from whichever vendor this wave's usage gate picked. Read-only,
+        # and the same shape as `back-state` above: rc 3 for a missing
+        # database, and a run the kernel does not hold raises rather than
+        # printing an answer that would read as "nobody is conflicted".
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        print(",".join(sorted(back.conflicted_actors(store, a.run_id))))
+        return RC_OK
+
+    if a.mode == "session-last-item":
+        from coordinator import session as _session
+        try:
+            listing = _session.list_items(a.server, a.id)
+        except _session.LookupFailed as exc:
+            print(f"session-last-item: {exc}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        print(listing[-1]["id"] if listing else "", end="")
+        return RC_OK
+
+    if a.mode == "park-notice":
+        from types import SimpleNamespace
+
+        from kernel import front
+        from kernel.store import Store
+
+        from coordinator.phases import park_notice_body
+        store = Store.open(a.db)
+        park = front.current_park(store, a.run_id)
+        if park is None:
+            return RC_FAILED
+        print(park_notice_body(SimpleNamespace(run_id=a.run_id), park), end="")
+        return RC_OK
+
+    if a.mode == "park-reply":
+        # The back half's reply reader (closed-loop spec §1): the carrier
+        # session's user items after the park's cursor, discriminated by
+        # `classify_batch`, and the one ruling they make recorded as the
+        # human. No dismissal: a refused or unrecognised reply is reported
+        # and read again next wave, which costs nothing.
+        from kernel import front
+        from kernel.authz import NotAuthorized
+        from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
+        from kernel.store import Store
+
+        from coordinator import session as _session
+        from coordinator.human import classify_batch
+        store = Store.open(a.db)
+        # NOT `state` -- that name is the imported `coordinator.session.state`
+        # function, called elsewhere in this same `main()` (session-state,
+        # settle). Assigning it here as a local shadowed the import for the
+        # WHOLE function under Python's function-scoping rule, so the
+        # session-state mode died `UnboundLocalError` on every call, however
+        # far from a park-reply drive.
+        run_state = store.run_state(a.run_id)
+        park = front.current_park(store, a.run_id)
+        if park is None:
+            print("nopark", end="")
+            return RC_OK
+        sid, cur = park.payload.get("session_id"), park.payload.get("cursor_item_id")
+        if not sid:
+            print("none", end="")
+            return RC_OK
+        try:
+            listing = _session.list_items(a.server, sid)
+        except _session.LookupFailed as exc:
+            print(f"park-reply: cannot read session {sid}: {exc}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        seen = cur is None or all(it["id"] != cur for it in listing)
+        after = []
+        for it in listing:
+            if seen and it["role"] == "user":
+                after.append(it)
+            if it["id"] == cur:
+                seen = True
+        if not after:
+            print("none", end="")
+            return RC_OK
+        kind, _ = classify_batch(after, state=run_state, grill_open=False)
+        name = {"retry": "grant_round", "stop": "cancel_run"}.get(kind)
+        if name is None:
+            print("other", end="")
+            return RC_OK
+        try:
+            execute_as_human(store, Command(
+                name=name, run_id=a.run_id, expected_version=store.run_version(a.run_id),
+                idempotency_key=f"human:{a.run_id}:{after[-1]['id']}", generation=HUMAN_GENERATION,
+                payload={"cursor_item_id": listing[-1]["id"]}))
+        except NotAuthorized as exc:
+            print(f"park-reply: {name} refused: {exc}", file=sys.stderr)
+            print("refused", end="")
+            return RC_OK
+        print(kind, end="")
+        return RC_OK
+
     if a.mode in ("approve", "grant-round", "revise", "direct"):
         from kernel.store import Store
         store = Store.open(a.db)
@@ -528,7 +658,6 @@ def main(argv=None) -> int:
                                   server=a.server, bundle_dir=a.bundle_dir,
                                   poll_interval=a.poll_interval,
                                   ci_wait=a.ci_wait, rerun_wait=a.rerun_wait,
-                                  revisions_left=a.revisions_left,
                                   round_number=_round_number(
                                       os.environ.get("BIRCHER_KERNEL_DB", ""),
                                       os.environ.get("BIRCHER_RUN_ID", ""))),
@@ -560,25 +689,6 @@ def main(argv=None) -> int:
                       file=sys.stderr)
                 return RC_FINDINGS_UNWRITABLE
         print(r.as_line(), end="")
-        return RC_OK
-
-    if a.mode == "revisions":
-        from kernel.store import Store
-
-        from coordinator.observe import revision_confirmed, revisions_used
-        try:
-            facts = Store.open(a.db).facts_for(a.run_id)
-        except Exception as exc:
-            # An unreadable journal is NOT "zero revisions used", which would
-            # hand the loop a full allowance every round and make the bound
-            # unenforceable. It is a lookup failure, and the runner escalates.
-            print(f"could not read the journal at {a.db}: {exc}",
-                  file=sys.stderr)
-            return RC_LOOKUP_FAILED
-        used = revisions_used(facts)
-        left = max(0, a.max_revisions - used)
-        ok = revision_confirmed(facts, a.confirm_command)
-        print(f"{used}|{left}|{'yes' if ok else 'no'}", end="")
         return RC_OK
 
     if a.mode == "recover":

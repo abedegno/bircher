@@ -84,9 +84,11 @@ def ci_history(repo: str, branch: str, *, gh=_gh) -> CiHistory:
 
 @dataclass(frozen=True)
 class Outcome:
-    """The vocabulary is fixed and unchanged from v1: ready, escalated, noop,
-    failed, timeout, skipped. Only `ready`, `failed`, `escalated` and `timeout`
-    are reachable from here; the other two come from signal files."""
+    """`ready`, `repair`, `waiting`, `escalated` and `timeout` are reachable
+    from `classify` (closed loop's words, spec §2); `noop` and `skipped` come
+    from signal files, not from here. `repair` and `waiting` reach the
+    scorecard only when a pass ends on them -- the runner acts on
+    `next_step`, not on this outcome."""
 
     outcome: str
     review: str
@@ -95,7 +97,8 @@ class Outcome:
 
 
 def revisions_used(facts) -> int:
-    """How many revisions this run has already had, from the JOURNAL.
+    """How many implementation-phase revision verdicts this run's journal
+    holds, counted for the round number a status description reports.
 
     Counts `REVIEW_VERDICT` facts whose verdict is `request_revision`. NOT
     `transition_performed`, which records `{"to": ..., "via": "record_review"}`
@@ -106,18 +109,14 @@ def revisions_used(facts) -> int:
     verdict explicitly; it is the same fact `authz.py` reads when deciding
     whether a binding was approved.
 
-    From the journal and not a variable, so a coordinator that dies and is
-    re-driven gets no fresh allowance.
+    A spec- or plan-phase verdict is skipped (`is_front_verdict`): a spec- or
+    plan-phase FAIL is not an implementation repair round.
 
-    A spec- or plan-phase verdict is skipped (`is_front_verdict`): the
-    allowance belongs to the implementation, and a spec-phase FAIL must not
-    spend it.
-
-    NOTE WHAT THIS DOES NOT PROVE. `commands.py` validates a review, THEN bumps
-    the version under CAS, THEN appends this fact -- so a review can validate
-    and lose the CAS, leaving no fact. This counts what was ACCEPTED, which is
-    the right basis for an allowance, but the caller must separately confirm
-    its own revision was recorded before acting on it.
+    Its only caller is `cli._round_number`, which adds one and passes the
+    result as `round_number` for the `bircher/cross-review` status description
+    (`<vendor> round <n> ...`, ARCHITECTURE.md §6b). Rounds are unbounded now
+    (closed-loop spec §3): nothing here gates or bounds a repair -- the count
+    is read for that description alone.
     """
     n = 0
     for f in facts or ():
@@ -133,77 +132,25 @@ def revisions_used(facts) -> int:
     return n
 
 
-def revision_confirmed(facts, key: str) -> bool:
-    """Did the revision we submitted actually land in the journal?
-
-    NOT "did the adapter exit 0". `commands.py` validates a review, bumps the
-    version under CAS, and appends REVIEW_VERDICT -- in that order -- so a
-    review can validate and then lose the CAS as stale, producing no fact at
-    all. The shell adapter is advisory besides, so a caller sees success after
-    a refusal. Both leave the run unrevised while every signal the runner has
-    says otherwise, and it would then dispatch a repair the kernel will refuse
-    to accept work from.
-
-    The fact must carry OUR command's causal id and OUR verdict. Matching on
-    the verdict alone would accept a revision from a previous round, which is
-    the same class of error as reading a stale findings file.
-
-    A spec- or plan-phase verdict is skipped (`is_front_verdict`): our
-    causal id belongs to the implementation's own revision, and a front-phase
-    verdict can never be the confirmation we are looking for.
-    """
-    if not key:
-        return False
-    for f in facts or ():
-        kind = getattr(f, "kind", None)
-        kind = getattr(kind, "value", kind)
-        if kind != "review_verdict":
-            continue
-        if getattr(f, "causal_command_id", None) != key:
-            continue
-        payload = getattr(f, "payload", None) or {}
-        if is_front_verdict(payload):
-            continue
-        if payload.get("verdict") == "request_revision":
-            return True
-    return False
-
-
-def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str,
-             revisions_left: int = 0) -> Outcome:
+def classify(pr: str | None, ci: str, verdict: str | None, *, reviewer: str) -> Outcome:
     """Ground truth to outcome. PURE -- no I/O, no globals.
 
-    The reviewed sha is deliberately NOT an input: it is evidence attached to
-    the result, not a classification input, and threading it through here once
-    made this function impossible to self-test.
+    `repair` and `waiting` are the closed loop's words (spec §2): the runner
+    acts on `next_step`, and these reach the scorecard only when a pass ends
+    on them. The reviewed sha is deliberately NOT an input: it is evidence
+    attached to the result, not a classification input.
     """
     if not pr:
         return Outcome("timeout", "na", "na",
                        "no PR at timeout (reaped before implement delivered)")
     if ci == "red":
-        return Outcome("failed", "na", "red",
-                       "PR up, CI red, coordinator died before fix")
+        return Outcome("repair", "na", "red", "PR up, CI red; a repair round is owed")
     if ci == "pending":
-        return Outcome("escalated", "na", "pending", "CI still pending at timeout")
-
+        return Outcome("waiting", "na", "pending", "CI still pending; the next wave resumes")
     if verdict == "PASS":
-        return Outcome("ready", f"{reviewer}:pass", "green",
-                       "out-of-band review PASS")
+        return Outcome("ready", f"{reviewer}:pass", "green", "out-of-band review PASS")
     if verdict == "FAIL":
-        # A FAIL WITH ROUNDS LEFT IS A REVISION, NOT AN ENDING. Eight of
-        # eighteen muesli item-runs stopped here, every one on a specific
-        # actionable finding; routing them back by hand merged two of three.
-        #
-        # `revise` is the coordinator's vocabulary only -- the runner acts on
-        # it and never records it, so the scorecard still ends `ready` or
-        # `failed`. With `revisions_left <= 0` this is byte-identical to the
-        # behaviour before the loop existed, which is what makes
-        # BIRCHER_MAX_REVISIONS=0 a real rollback.
-        if revisions_left > 0:
-            return Outcome("revise", f"{reviewer}:fail", "green",
-                           "out-of-band review FAIL; revising")
-        return Outcome("failed", f"{reviewer}:fail", "green",
-                       "out-of-band review FAIL")
+        return Outcome("repair", f"{reviewer}:fail", "green", "out-of-band review FAIL; a repair round is owed")
     # NONE, empty, or anything unrecognised. A reviewer that crashed, timed out
     # or rambled has approved NOTHING; reading silence as approval is how a
     # merge gets authorised by an absence.

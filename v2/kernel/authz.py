@@ -14,9 +14,14 @@ a workflow language."
 
 from __future__ import annotations
 
+import re
+
 from kernel.artifacts import VerdictBinding, binding_hash
 from kernel.dispatch import Role, actor_for, role_for
 from kernel.events import EventKind
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 class NotAuthorized(Exception):
@@ -40,6 +45,9 @@ FRONT_HALF_STATES = frozenset({
 #: very model_ruling shape record_one_piece records, with none of its
 #: guards. Membership is stated per site below, never inherited (ruling 13).
 SHAPING_STATES = frozenset({"shaping", "slices_submitted", "slices_accepted"})
+
+#: spec §1 (closed loop): the states a run with a pull request moves between.
+BACK_HALF_STATES = frozenset({"planned", "implementing", "reviewing"})
 
 _PHASE_OF_STATE = {
     "shaping": "slices", "slices_submitted": "slices", "slices_accepted": "slices", "sliced": "slices",
@@ -67,7 +75,12 @@ PARK_REASONS = frozenset({
     # notice and the prompt can key on it and no ordinary gate park carries
     # its text.
     "disagreement",
+    # The closed loop (spec §3): the repair about to be requested would be the third identical in a row.
+    "no_progress",
 })
+
+#: spec §1: why a run is sent back to `planned`.
+REPAIR_CAUSES = frozenset({"ci_red", "review_fail", "plan_conformance"})
 
 #: spec §3 *The turn's end is a fact*: the four ways a turn ends.
 TURN_ENDS = frozenset({"file", "dead", "cap", "displaced"})
@@ -140,9 +153,12 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_children_observed_closed": (frozenset({"sliced"}), None),
     "start_implementation": (frozenset({"planned"}), "implementing"),
     # Destination depends on state, verdict and the run's gates: computed in
-    # authorize() by _review_destination. In the back half a revision request
-    # must return the run to `planned` so implementation can start again;
-    # landing every review in `reviewing` left it nowhere to do the revision.
+    # authorize() by _review_destination. In the back half the verdict does
+    # NOT route the run: `_BACK_HALF_DESTINATIONS` below lands accept,
+    # request_revision and reject alike in `reviewing`. The closed loop has
+    # one door back to `planned` and it is `request_repair`, which the runner
+    # issues after reading the verdict -- so a revision that transitioned the
+    # run here would open that door twice, from two different facts.
     "record_review": (
         frozenset({"slices_submitted", "slices_accepted", "spec_submitted", "spec_accepted",
                    "plan_submitted", "plan_accepted", "implementing", "reviewing"}),
@@ -154,7 +170,7 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # The membership table (shaping spec §2): the carrier session's items and
     # the gate park are legal in the shaping states too; the model's two
     # channels are NOT.
-    "park": (FRONT_HALF_STATES | SHAPING_STATES, None),
+    "park": (FRONT_HALF_STATES | SHAPING_STATES | BACK_HALF_STATES, None),
     # merge_requested must not be a dead end. Without an outbound transition a
     # merge that comes back uncertain can never be retried after
     # reconciliation, and the only escape -- cancel_run -- records 'cancelled'
@@ -173,11 +189,23 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # Destination by phase: computed in authorize().
     "approve_artifact": (frozenset({"slices_accepted", "spec_accepted", "plan_accepted"}), None),
     "grant_round": (frozenset({"shaping", "slices_submitted", "queued", "specified",
-                               "spec_submitted", "plan_submitted"}), None),
+                               "spec_submitted", "plan_submitted", "planned", "implementing", "reviewing"}), None),
     # Records what the implementation produced; does not itself transition.
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
-    "record_ci_observation": (frozenset({"implementing", "reviewing"}), None),
+    # `planned` too. A CI observation is a fact about the WORLD, not about the
+    # phase the run is in, and the closed loop now resumes from `planned` -- a
+    # repair requested whose session has not started, or did not finish. A run
+    # that cannot record there has `back.latest_pr_state` frozen at whatever it
+    # last saw, so it can neither observe nor end: the ending rule below
+    # depends on this being writable from every state the loop resumes from.
+    "record_ci_observation": (frozenset({"planned", "implementing", "reviewing"}), None),
+    # The closed loop (spec §1): the ONE door back to `planned` in the back
+    # half. A repair round is an implementation round, so the run re-enters
+    # `planned` and `start_implementation` dispatches it. Refused from
+    # `planned` itself (nothing to repair yet) and from every front-half
+    # state by this from-set.
+    "request_repair": (frozenset({"implementing", "reviewing"}), "planned"),
     "request_merge": (frozenset({"reviewing"}), "merge_requested"),
     # The terminal record every path can reach. Legal from every state except
     # `ended` itself, because a run can finish from anywhere: the coordinator
@@ -226,9 +254,10 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
 #: run is no longer a property of the word alone -- see `_review_destination`.
 _VERDICT_WORDS = frozenset({"accept", "request_revision", "reject"})
 
-#: Back-half destinations, unchanged from v1.
+# The closed loop (spec §1): a verdict is evidence, not a transition. The one
+# door back to planned is request_repair.
 _BACK_HALF_DESTINATIONS: dict[str, str] = {
-    "accept": "reviewing", "request_revision": "planned", "reject": "reviewing",
+    "accept": "reviewing", "request_revision": "reviewing", "reject": "reviewing",
 }
 
 
@@ -781,7 +810,7 @@ def _check_cursor(cmd) -> None:
 
 def _check_park(store, cmd) -> None:
     """A park records why a pass stopped. Bounded here so the reason is one
-    of the seven the loop has, not free text the coordinator invents."""
+    of the eight the loop has, not free text the coordinator invents."""
     if cmd.payload.get("reason") not in PARK_REASONS:
         raise NotAuthorized(f"park reason {cmd.payload.get('reason')!r} is not one of {sorted(PARK_REASONS)}")
     if cmd.payload.get("reason") == "disagreement":
@@ -798,6 +827,13 @@ def _check_park(store, cmd) -> None:
                 "park disagreement: the run holds no unresolved disagreement; the dispute was resolved "
                 "between the listing and this park, and the pass continues without parking"
             )
+    if cmd.payload.get("reason") == "no_progress":
+        from kernel import back
+        # Like `disagreement`: legal only when the journal itself says so,
+        # so a coordinator cannot park a run that is still making progress.
+        if not back.would_be_third_identical(store, cmd.run_id, cmd.payload.get("cause"),
+                                             cmd.payload.get("evidence") or []):
+            raise NotAuthorized("park no_progress: the journal shows progress; the repair is not the third identical")
     # Three literal `.get(...)` reads, not a loop over a variable key: the
     # provenance extractor matches `cmd.payload.get("literal")` syntactically,
     # and a dynamic key defeats it -- these three rows would then be unbound
@@ -1192,7 +1228,25 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
         verdict = cmd.payload.get("verdict")
         if verdict not in _VERDICT_WORDS:
             raise NotAuthorized(f"verdict {verdict!r} is not one of {sorted(_VERDICT_WORDS)}")
+        fps = cmd.payload.get("fingerprints")
+        if fps is not None and (not isinstance(fps, list) or not all(isinstance(x, str) for x in fps)):
+            raise NotAuthorized("record_review fingerprints must be a list of strings or absent")
         return _review_destination(store, cmd.run_id, current, verdict, ruling)
+
+    if cmd.name == "record_ci_observation":
+        # The PR's state and its failing jobs ride beside the CI status
+        # (closed-loop spec §1, §3): an external observation, validated here
+        # so `back.py` can trust what it reads.
+        ps = cmd.payload.get("pr_state")
+        if ps not in (None, "open", "closed", "merged"):
+            raise NotAuthorized("record_ci_observation pr_state must be open, closed, merged or absent")
+        jobs = cmd.payload.get("failing_jobs")
+        if jobs is not None and (not isinstance(jobs, list) or not all(isinstance(j, str) for j in jobs)):
+            raise NotAuthorized("record_ci_observation failing_jobs must be a list of strings or absent")
+        prn = cmd.payload.get("pr")
+        if prn is not None and (not isinstance(prn, str) or not prn.isdigit()):
+            raise NotAuthorized("record_ci_observation pr must be a string of digits or absent")
+        return next_state
 
     if cmd.name == "record_turn_ended":
         _check_turn_ended(store, cmd, current)
@@ -1226,6 +1280,17 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
     if cmd.name == "park":
         _check_park(store, cmd)
         return None
+
+    if cmd.name == "request_repair":
+        if cmd.payload.get("cause") not in REPAIR_CAUSES:
+            raise NotAuthorized(f"request_repair cause {cmd.payload.get('cause')!r} is not one of {sorted(REPAIR_CAUSES)}")
+        head = cmd.payload.get("head_sha")
+        if not isinstance(head, str) or not _FULL_SHA.fullmatch(head):
+            raise NotAuthorized("request_repair head_sha must be a 40-hex sha")
+        ev = cmd.payload.get("evidence")
+        if not isinstance(ev, list) or not all(isinstance(e, str) for e in ev):
+            raise NotAuthorized("request_repair evidence must be a list of strings")
+        return next_state
 
     if cmd.name == "record_human_answer":
         ids = cmd.payload.get("question_ids")
@@ -1325,6 +1390,17 @@ def authorize(store, cmd, actor: str, *, ruling: str = "review_ruling") -> str |
             raise NotAuthorized(
                 f"outcome {outcome!r} is not one of {sorted(_RUN_OUTCOMES)}"
             )
+        # The closed loop (spec §1): a run whose pull request is open does not
+        # end. Its exits are a merge (from `merged`) or a person's stop (from
+        # `cancelled`); both are outside _ALL_ACTIVE and pass this check. An
+        # unobserved PR counts as open: silence must not end a run.
+        if current in _ALL_ACTIVE:
+            from kernel import back
+            if back.implementation_output_recorded(store, cmd.run_id) and \
+                    back.latest_pr_state(store, cmd.run_id) in (None, "open"):
+                raise NotAuthorized(
+                    "a run with an open pull request cannot end: merge it, or a person stops it (spec §1)"
+                )
         # A run that entered `sliced` may have filed children; `failed` over
         # them would end the epic with its filing half done and nothing left
         # to repair it (shaping spec §2, ruling 15). cancel_run is the other exit.

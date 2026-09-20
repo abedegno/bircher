@@ -97,6 +97,11 @@ def test_the_command_interface_is_closed_and_explicit():
         # *Brief*): a front-half review_ruling is refused unless its
         # generation carries one.
         "issue_review_brief",
+        # The closed loop (spec §1): red CI, a failed review or a
+        # plan-conformance gap returns a back-half run to `planned` through
+        # this one door, so the runner never needs a verdict to transition and
+        # the no-progress judgement can count rounds from the fact.
+        "request_repair",
         # Task 3, the shaping phase (shaping spec §2 *States*), each with its
         # argument. record_one_piece -- the shaping round's other outcome:
         # without it the only way out of `shaping` is a slice plan, so a

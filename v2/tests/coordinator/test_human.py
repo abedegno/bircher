@@ -475,3 +475,17 @@ def test_the_park_prompt_tells_the_agent_it_is_not_for_it(world):
     assert text.startswith(human.NOT_FOR_THE_AGENT), text[:200]
     assert "do not write or change any file" in text
     assert "approve" in text
+
+
+@pytest.mark.parametrize("state", ["planned", "implementing", "reviewing", "merge_requested"])
+def test_the_back_half_takes_retry_and_stop_and_nothing_else(state):
+    from coordinator.human import classify_batch
+    assert classify_batch([{"text": " Retry "}], state=state, grill_open=False) == ("retry", "")
+    assert classify_batch([{"text": "stop"}], state=state, grill_open=False) == ("stop", "")
+    assert classify_batch([{"text": "stop."}], state=state, grill_open=False) == ("direction", "stop.")
+    assert classify_batch([{"text": "please fix it"}], state=state, grill_open=False)[0] == "direction"
+
+
+def test_stop_is_not_a_ruling_in_the_front_half():
+    from coordinator.human import classify_batch
+    assert classify_batch([{"text": "stop"}], state="spec_submitted", grill_open=False) == ("revision", "stop")

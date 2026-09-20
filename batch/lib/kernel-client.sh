@@ -143,8 +143,18 @@ _kernel() {
 # the point. An uncertain effect halts its run and nothing may be performed
 # until someone looks, so this is the "what do I look at" half of the halt.
 # _kernel_find_run <code> [open] -> the newest run id starting "<code>-", or
-# empty. With `open`, only a run whose state is not `ended`/`cancelled` --
+# empty. With `open`, only a run whose state is not `ended` --
 # which is what `run_item` resumes into rather than minting over.
+#
+# `ended` IS THE ONLY TERMINAL STATE (closed-loop spec §2, fix round 1).
+# `cancelled` is a stop, not a close: `record_run_outcome` is legal FROM
+# `cancelled` precisely because a cancelled run still owes its terminal
+# fact, and until something writes it the run is still open work.
+# `coordinator.cli cancel` records `cancel_run` and retires the session, but
+# never `record_run_outcome` -- so filtering `cancelled` out here read that
+# as though it had closed the run, and `run_item` minted a SECOND run over
+# every manually cancelled item instead of resuming the first one once to
+# write the terminal fact it was missing.
 #
 # NON-MINTING, unlike `_kernel_adopt_run`, and that is the whole point.
 # Publication has to be able to ask "did the kernel dispatch this work?" and
@@ -152,7 +162,7 @@ _kernel() {
 # answer yes -- a junk `queued` row per refusal, and a caller that then reads
 # its own minting as provenance.
 #
-# The filter is NEGATIVE -- "not one of the two closed states" -- rather than a
+# The filter is NEGATIVE -- "not the one closed state" -- rather than a
 # positive list of open ones passed to `Store.open_run_ids`. That is the
 # fail-closed direction: a state added to the kernel later is open until
 # someone says otherwise, so the leak guard in `run_item` (never mint over a
@@ -170,7 +180,7 @@ sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 code = os.environ["K_CODE"]
-closed = frozenset({"ended", "cancelled"})
+closed = frozenset({"ended"})
 runs = [r for r in s.all_run_ids() if r.startswith(code + "-")]
 if os.environ["K_MODE"] == "open":
     runs = [r for r in runs if s.run_state(r) not in closed]
@@ -796,6 +806,10 @@ _kernel_ci_status() {
   case "$1" in
     green|success) printf 'success' ;;
     red|failure|failed) printf 'failure' ;;
+    # Neither is green: `_ci_is_green` accepts exactly "success". Recorded as
+    # themselves so a closed PR can be observed with no head.
+    pending) printf 'pending' ;;
+    na) printf 'na' ;;
     # PREFIXED and stripped -- and the prefix is the part that matters.
     #
     # Stripping alone was FAIL-OPEN: the strip happens after the recognised
@@ -813,13 +827,20 @@ _kernel_ci_status() {
   esac
 }
 
-_kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
-  local run_id="$1" generation="$2" status="$3" head="$4"
+_kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha> [pr_state] [failing_jobs_csv] [pr]
+  local run_id="$1" generation="$2" status="$3" head="$4" pr_state="${5:-}" jobs="${6:-}" pr="${7:-}"
   status=$(_kernel_ci_status "$status")
+  # Job names come from `gh pr checks --json name`; quotes and backslashes are
+  # stripped rather than escaped, because the value is spliced into JSON.
+  jobs=$(printf '%s' "$jobs" | tr -d '"\\')
+  local extra=""
+  [ -n "$pr_state" ] && extra="$extra,\"pr_state\":\"$pr_state\""
+  [ -n "$jobs" ] && extra="$extra,\"failing_jobs\":[\"${jobs//,/\",\"}\"]"
+  [ -n "$pr" ] && extra="$extra,\"pr\":\"$pr\""
   # record_ci_observation
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_ci_observation \
-    --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"}"
+    --payload-json "{\"status\":\"$status\",\"head_git_sha\":\"$head\"$extra}"
 }
 
 # _kernel_record_review <run_id> <generation> <verdict> <artifact_hash>
@@ -852,9 +873,9 @@ _kernel_record_ci() {  # <run_id> <generation> <status> <head_git_sha>
 # implementation output; the kernel refuses a review whose phase is not the
 # phase of the state it is recorded from. The front half's spec and plan
 # reviews do not come through here.
-_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal] [head_sha] [merge_base_sha] [delta_digest]
+_kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <context> [key] [terminal] [head_sha] [merge_base_sha] [delta_digest] [fingerprints_csv]
   local run_id="$1" generation="$2" raw="$3" artifact="$4" base="$5" context="$6"
-  local key="${7:-}" terminal="${8:-}" head_sha="${9:-}" merge_base="${10:-}" digest="${11:-}"
+  local key="${7:-}" terminal="${8:-}" head_sha="${9:-}" merge_base="${10:-}" digest="${11:-}" fps="${12:-}"
   local verdict; verdict=$(_kernel_verdict "$raw" "$terminal")
   # No early return: every input now maps to something submittable -- a mapped
   # verdict, or `unmapped:...` which the kernel refuses visibly. The guard that
@@ -868,7 +889,11 @@ _kernel_record_review() {  # <run_id> <generation> <verdict> <artifact> <base> <
   # What was reviewed (spec §4): included only when the derivation pinned a
   # head. Values are shas and a hex digest, so they need no JSON escaping.
   local range=""
-  [ -n "$head_sha" ] && range="\"head_sha\":\"$head_sha\",\"merge_base_sha\":\"$merge_base\",\"delta_digest\":\"$digest\","
+  if [ -n "$head_sha" ]; then
+    range="\"head_sha\":\"$head_sha\",\"merge_base_sha\":\"$merge_base\",\"delta_digest\":\"$digest\","
+    # Hex digests, comma-joined by the derivation; no escaping needed.
+    [ -n "$fps" ] && range="$range\"fingerprints\":[\"${fps//,/\",\"}\"],"
+  fi
   # An empty key must not become `--idempotency-key ""`: the CLI would take the
   # empty string as the key rather than falling back to its default, and every
   # record_review in the run would collide on it.
@@ -957,4 +982,62 @@ _kernel_record_outcome() {  # <run_id> <generation> <outcome>
   # record_merge_outcome
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name record_merge_outcome --payload-json "{\"outcome\":\"$outcome\"}"
+}
+
+# _kernel_request_repair <run_id> <generation> <cause> <head_git_sha> [evidence_csv]
+#
+# The one door back to `planned` in the back half (closed-loop spec §1).
+# *evidence_csv* is failing job names or finding fingerprints, comma-joined;
+# quotes and backslashes are stripped because the value is spliced into JSON.
+_kernel_request_repair() {  # <run_id> <generation> <cause> <head> [evidence_csv]
+  local run_id="$1" generation="$2" cause="$3" head="$4" ev="${5:-}"
+  ev=$(printf '%s' "$ev" | tr -d '"\\')
+  local arr="[]"; [ -n "$ev" ] && arr="[\"${ev//,/\",\"}\"]"
+  # request_repair
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name request_repair --payload-json "{\"cause\":\"$cause\",\"head_sha\":\"$head\",\"evidence\":$arr}"
+}
+
+# _kernel_park_back <run_id> <generation> <reason> [session_id] [cursor_item_id] [cause] [evidence_csv]
+#
+# A back-half park (closed-loop spec §3). The carrier session and its cursor
+# are what `park-reply` reads; cause and evidence are what `no_progress` is
+# checked against by the kernel.
+_kernel_park_back() {  # <run_id> <generation> <reason> [session_id] [cursor] [cause] [evidence_csv]
+  local run_id="$1" generation="$2" reason="$3" sid="${4:-}" cur="${5:-}" cause="${6:-}" ev="${7:-}"
+  ev=$(printf '%s' "$ev" | tr -d '"\\')
+  local arr="[]"; [ -n "$ev" ] && arr="[\"${ev//,/\",\"}\"]"
+  local jsid=null jcur=null jcause=null
+  [ -n "$sid" ] && jsid="\"$sid\""
+  [ -n "$cur" ] && jcur="\"$cur\""
+  [ -n "$cause" ] && jcause="\"$cause\""
+  # park
+  _kernel command --run-id "$run_id" --generation "$generation" \
+    --name park --payload-json "{\"reason\":\"$reason\",\"session_id\":$jsid,\"cursor_item_id\":$jcur,\"findings_hash\":null,\"verdict\":null,\"reviewer\":null,\"cause\":$jcause,\"evidence\":$arr}"
+}
+
+# _kernel_back_state <run_id> -> `pr|pr_state|head|artifact` from the journal
+# (coordinator.cli back-state), or empty when the kernel would not answer.
+_kernel_back_state() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli back-state \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_conflicted <run_id> -> the actors the kernel will refuse a review
+# from, comma-separated in sorted order (coordinator.cli conflicted), or empty
+# when the kernel would not answer.
+#
+# EMPTY IS NOT "nobody": it is "the journal did not say". `_seat_vendors` reads
+# it that way and leaves the wave's own pick alone, because seating a reviewer
+# on a silent answer is exactly the guess that put the implementer back in the
+# reviewer's chair. Same shape as `_kernel_back_state` above.
+_kernel_conflicted() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli conflicted \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
 }

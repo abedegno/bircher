@@ -27,7 +27,7 @@ def _int(name: str, default: int) -> int:
 
 def live_deps(item: str, *, repo: str, reviewer: str, server: str,
               bundle_dir: str, poll_interval: int, ci_wait: int = 1500,
-              rerun_wait: int = 900, revisions_left: int = 0,
+              rerun_wait: int = 900,
               round_number: int = 1, log=None) -> Deps:
     """Wire `derive` to the real world.
 
@@ -164,7 +164,6 @@ def live_deps(item: str, *, repo: str, reviewer: str, server: str,
         reviewer=reviewer,
         ignore=ignore,
         repo=repo,
-        revisions_left=revisions_left,
         base_of=base_of,
         merge_base=merge_base,
         delta_digest=lambda base, head: delta.delta_digest(repo, base, head),

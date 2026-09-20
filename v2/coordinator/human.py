@@ -7,13 +7,13 @@ import json
 from coordinator import seat, sessions
 from coordinator.session import LookupFailed, list_items
 from kernel import front
-from kernel.authz import SHAPING_STATES, NotAuthorized, phase_of
+from kernel.authz import BACK_HALF_STATES, SHAPING_STATES, NotAuthorized, phase_of
 from kernel.canon import content_hash
 from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
 from kernel.policy import policy_of
 from kernel.events import EventKind
 
-APPROVE, RETRY = "approve", "retry"
+APPROVE, RETRY, STOP = "approve", "retry", "stop"
 
 
 def cursor(store, run_id: str, session_id: str | None, listing: list) -> str | None:
@@ -148,6 +148,14 @@ def classify_batch(items: list, *, state: str, grill_open: bool, dispute: bool =
         # shaping round and opens a new visit.
         if single == APPROVE:
             return "approve_one_piece", ""
+        return ("retry", "") if single == RETRY else ("direction", joined)
+    if state in BACK_HALF_STATES or state == "merge_requested":
+        # The back half (closed-loop spec §1): a parked run with a pull
+        # request takes the two words its notice asked for. There is no
+        # author seat to correct, so anything else is a direction, which the
+        # kernel refuses here and the reader reports as `other`.
+        if single == STOP:
+            return "stop", ""
         return ("retry", "") if single == RETRY else ("direction", joined)
     if single == RETRY:
         return "retry", ""

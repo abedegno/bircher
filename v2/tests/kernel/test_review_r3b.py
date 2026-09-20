@@ -111,16 +111,22 @@ def test_a_review_over_an_unrecorded_artifact_is_refused():
              actor="codex", policy_version=1)
 
 
-# --- 4. a revision request must allow revised implementation -----------------
+# --- 4. a revision request must be repaired before reimplementation ----------
 
-def test_request_revision_allows_reimplementation():
-    """Every record_review transitioned to `reviewing`, and
-    start_implementation is legal only from `planned` -- so asking for a
-    revision left nowhere to do it."""
+def test_request_repair_after_a_revision_allows_reimplementation():
+    """A verdict is evidence, not a transition (closed-loop spec §1): every
+    record_review leaves the run in `reviewing`, where start_implementation
+    is illegal; request_repair, not request_revision, is the door back to
+    `planned`."""
     s, spec = _to_implementing(_store())
     _sub(s, "record_review", "rv", verdict="request_revision",
          artifact_hash=spec, base_sha=BASE, context_bundle_hash=BUNDLE,
          actor="codex", policy_version=1)
+    assert s.run_state("r") == "reviewing"
+    with pytest.raises(NotAuthorized):
+        _sub(s, "start_implementation", "impl1", actor="claude")
+    _sub(s, "request_repair", "rr1", actor="claude", cause="review_fail",
+         head_sha=HEAD, evidence=["codex review"])
     assert _sub(s, "start_implementation", "impl2",
                 actor="claude").accepted
 
@@ -234,10 +240,10 @@ def test_the_verdict_records_what_it_reviewed(store_and_run):
     assert fact.payload["head_sha"] == "e" * 40
     assert fact.payload["merge_base_sha"] == "2" * 40
     assert fact.payload["delta_digest"] == "d" * 64
-    assert fact.schema_version == 2
+    assert fact.schema_version == 3
 
 
-def test_the_round_advances_once_a_revision_is_recorded(tmp_path):
+def test_the_round_advances_once_a_request_revision_verdict_is_recorded(tmp_path):
     """`_round_number` is what the status description calls the round, and
     nothing proved it ever returned more than 1 -- a function stubbed to
     `return 1` passed every test it had. One recorded back-half

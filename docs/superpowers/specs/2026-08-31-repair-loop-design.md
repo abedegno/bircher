@@ -1,5 +1,7 @@
 # The coordinator repairs, bounded
 
+> **Superseded 2026-09-19** by [the back-half closed loop](2026-09-19-back-half-closed-loop-design.md): the bound, `revise` and the runner-owned while-loop are gone. Kept as the record of what the repair loop proved.
+
 **Status:** design, before code. It changes when a merge can be authorised, so
 a mistake lets a PR merge on a review that no longer describes it.
 

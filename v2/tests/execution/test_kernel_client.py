@@ -443,24 +443,33 @@ def test_kernel_unresolved_disagreement_reads_the_run_back_from_a_REAL_store(tmp
     assert _run('_kernel_unresolved_disagreement NOPE-1-a', env=env).stdout.strip() == ""
 
 
-def test_find_run_open_skips_ended_and_cancelled_runs(tmp_path):
+def test_find_run_open_skips_only_ended_runs(tmp_path):
     """`open` is what stops `run_item` minting a second run over a live one.
 
-    The filter is NEGATIVE -- everything but `ended` and `cancelled` counts as
-    open -- and that is the fail-closed direction: a state the kernel gains
-    later reads as open, so the leak guard keeps holding. A positive list would
-    read the new state as closed and mint over it.
+    `ended` is the only terminal state (closed-loop spec §2, fix round 1):
+    `cancelled` is a stop, not a close -- `record_run_outcome` is legal FROM
+    `cancelled`, so a cancelled run still owes its terminal fact. Filtering
+    it out here read a manually cancelled run as already closed and minted a
+    second run over it instead of letting the closed loop resume the first
+    one once to write the terminal fact it was missing. The filter is
+    NEGATIVE -- everything but `ended` counts as open -- which is the
+    fail-closed direction: a state the kernel gains later reads as open, so
+    the leak guard keeps holding. A positive list would read the new state
+    as closed and mint over it.
     """
     db = tmp_path / "kernel.db"
     store = Store.open(db)
-    for run_id, state in (("ITEM-9-a", "ended"), ("ITEM-9-b", "specified"),
-                          ("ITEM-9-c", "cancelled")):
+    for run_id, state in (("ITEM-9-a", "specified"), ("ITEM-9-b", "cancelled"),
+                          ("ITEM-9-c", "ended")):
         store.create_run(run_id=run_id, base_repo="o/r", base_sha="ab" * 20)
         store.set_run_state(run_id, state)
 
     env = {"BIRCHER_KERNEL_DB": str(db)}
-    # Without the filter the answer is the NEWEST, which here is cancelled.
+    # Without the filter the answer is the NEWEST, which here is ended.
     assert _run('_kernel_find_run ITEM-9', env=env).stdout == "ITEM-9-c"
+    # With it, `ended` is skipped but `cancelled` is NOT -- the answer is the
+    # cancelled run, not the older specified one it would fall back to if
+    # cancelled were (wrongly) read as closed too.
     assert _run('_kernel_find_run ITEM-9 open', env=env).stdout == "ITEM-9-b"
 
 

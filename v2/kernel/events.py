@@ -59,6 +59,10 @@ class EventKind:
     # shaping. Its `visit` is the one it opens.
     RESHAPE_REQUESTED = "reshape_requested"
 
+    # The closed loop (spec §1): the one door back to `planned` in the back
+    # half, and why it was opened.
+    REPAIR_REQUESTED = "repair_requested"
+
 
 SCHEMA_VERSIONS = {
     EventKind.RUN_STARTED: 1,
@@ -66,7 +70,7 @@ SCHEMA_VERSIONS = {
     EventKind.COMMAND_ACCEPTED: 1,
     EventKind.COMMAND_REJECTED: 1,
     EventKind.ARTIFACT_CREATED: 1,
-    EventKind.REVIEW_VERDICT: 2,  # 2: head_sha, merge_base_sha, delta_digest (gate integrity)
+    EventKind.REVIEW_VERDICT: 3,  # 3: fingerprints (closed loop)
     EventKind.TRANSITION: 1,
     EventKind.OBSERVATION: 1,
     EventKind.HUMAN_RULING: 1,
@@ -101,6 +105,7 @@ SCHEMA_VERSIONS = {
     EventKind.SLICE_REOPENED: 1,
     EventKind.CHILDREN_OBSERVED_CLOSED: 1,
     EventKind.RESHAPE_REQUESTED: 1,
+    EventKind.REPAIR_REQUESTED: 1,
 }
 
 MECHANISM_VERSION = 1
