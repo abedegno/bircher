@@ -262,6 +262,8 @@ def main(argv=None) -> int:
     st.add_argument("--failing-jobs", default="", dest="failing_jobs")
     bs = subs.add_parser("back-state")
     bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
+    cf = subs.add_parser("conflicted")
+    cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
     sl = subs.add_parser("session-last-item")
     sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
     pn = subs.add_parser("park-notice")
@@ -430,6 +432,23 @@ def main(argv=None) -> int:
         ci = back.latest_ci(store, a.run_id) or {}
         print(f"{ci.get('pr') or ''}|{ci.get('pr_state') or ''}|{ci.get('head_git_sha') or ''}|"
               f"{store.current_artifact(a.run_id) or ''}", end="")
+        return RC_OK
+
+    if a.mode == "conflicted":
+        # Who the kernel will refuse a review from on this run, so the runner
+        # can seat its implementer and its reviewer from the JOURNAL rather
+        # than from whichever vendor this wave's usage gate picked. Read-only,
+        # and the same shape as `back-state` above: rc 3 for a missing
+        # database, and a run the kernel does not hold raises rather than
+        # printing an answer that would read as "nobody is conflicted".
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        print(",".join(sorted(back.conflicted_actors(store, a.run_id))))
         return RC_OK
 
     if a.mode == "session-last-item":

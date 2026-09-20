@@ -188,8 +188,11 @@ So the successful path is
 Genuinely non-transitioning: `record_implementation_output`,
 `record_ci_observation`. `cancel_run` is legal from any live state.
 `record_run_outcome` is legal from every state except `ended`, and refused
-from an active state while the run's pull request is open or unobserved.
-`ended` is terminal and unreachable-from.
+from an active state while the run HOLDS AN IMPLEMENTATION OUTPUT and its
+pull request is open or unobserved. That first condition is load-bearing: a
+run that never produced one — skipped, escalated out of the front half, or
+stopped before `record_implementation_output` — has no pull request to wait
+on and ends freely. `ended` is terminal and unreachable-from.
 
 `park` and `grant_round` are legal in the back half too: a run with a pull
 request can park — `no_progress` among its reasons — and a person's `retry`

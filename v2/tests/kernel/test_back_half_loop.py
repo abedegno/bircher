@@ -282,6 +282,46 @@ def test_a_run_without_an_implementation_still_ends():
     assert _sub(s, "record_run_outcome", "o1", actor="claude", outcome="timeout").accepted
 
 
+def test_a_ci_observation_is_accepted_from_planned():
+    """F2. A repair was requested and the run sits at `planned` with its
+    session not yet started. A CI observation is a fact about the WORLD, not
+    about the phase, and the ending rule reads the newest one -- so a run that
+    cannot record here has `latest_pr_state` frozen at whatever it last saw
+    and can never satisfy the rule."""
+    s, _ = _to_implementing(_store())
+    _repair(s, "rr1")
+    assert s.run_state("r") == "planned"
+    assert _ci(s, "c1", "failure").accepted
+    assert back.latest_ci(s, "r")["status"] == "failure"
+
+
+def test_a_run_at_planned_whose_pr_is_closed_can_end():
+    """F2, the consequence: the ending rule depends on the observation being
+    writable from every state the loop resumes from."""
+    s, _ = _to_implementing(_store())
+    _repair(s, "rr1")
+    assert s.run_state("r") == "planned"
+    _ci(s, "c1", "failure", pr_state="closed")
+    assert _sub(s, "record_run_outcome", "o1", actor="claude", outcome="escalated").accepted
+    assert s.run_state("r") == "ended"
+
+
+def test_conflicted_actors_names_the_implementer():
+    """F1. What the runner has to read before it seats a reviewer."""
+    s, _ = _to_implementing(_store())
+    assert back.conflicted_actors(s, "r") == {"claude"}
+
+
+def test_conflicted_actors_delegates_to_authz(monkeypatch):
+    """F1. ONE source of truth. A reimplementation in `back` would drift from
+    the rule the kernel actually refuses on, and the drift would be invisible:
+    the seating would look right and every verdict would be refused."""
+    from kernel import authz
+    monkeypatch.setattr(authz, "_conflicted_actors", lambda store, run_id: {"sentinel"})
+    s, _ = _to_implementing(_store())
+    assert back.conflicted_actors(s, "r") == {"sentinel"}
+
+
 def test_a_cancelled_run_ends():
     # The generation is taken BEFORE the cancel: the runner records the
     # terminal fact under the generation it already holds, and `dispatch`

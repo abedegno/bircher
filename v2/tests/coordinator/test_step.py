@@ -121,6 +121,35 @@ def test_a_fail_is_a_review_fail_repair_with_the_fingerprints():
     assert st == Step("repair", "review_fail", ("aa" * 20,))
 
 
+def test_merge_requested_is_a_merge_even_while_ci_is_pending():
+    """M2. `merge_requested -> merge` had no test at all: deleting the branch
+    left every suite green. Driven with `ci="pending"`, which is a `wait` from
+    every other state, so the assertion can only pass through this branch."""
+    s, spec = _to_implementing(_store())
+    _ci(s, "c1", "success")
+    _sub(s, "record_review", "v1", verdict="accept", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    _sub(s, "request_merge", "m1", head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1)
+    assert s.run_state("r") == "merge_requested"
+    assert next_step(s, "r", g(ci="pending")).kind == "merge"
+
+
+def test_a_repair_owed_at_planned_is_redispatched_even_when_the_head_moved():
+    """F3. Someone pushed to the branch while the run sat at `planned`, so no
+    repair names the current head. A repair round is still OWED -- in the back
+    half `planned` is only ever reached through `request_repair` -- and
+    `request_repair` is refused from `planned`, so a plain `repair` here is a
+    wave burnt on a derivation and a cross-review, every wave, forever."""
+    s, _ = _to_implementing(_store())
+    _repair(s, "r1", evidence=["server (go)"])
+    assert s.run_state("r") == "planned"
+    moved = "7" * 40
+    assert back.repair_for_head(s, "r", moved) is None
+    st = next_step(s, "r", g(head=moved, ci="red", failing_jobs=("server (go)",)))
+    assert st.kind == "repair" and st.redispatch is True and st.cause == "ci_red"
+
+
 def test_a_repair_already_requested_on_this_head_is_redispatched_from_planned():
     s, _ = _to_implementing(_store())
     _repair(s, "r1", evidence=["server (go)"])
@@ -224,6 +253,34 @@ def test_back_state_before_any_observation_is_blank_but_for_the_artifact(tmp_pat
     _, spec = _to_implementing(s)
     assert main(["back-state", "--db", db, "--run-id", "r"]) == 0
     assert capsys.readouterr().out == f"|||{spec}"
+
+
+def test_conflicted_prints_the_runs_implementer(tmp_path, capsys):
+    """F1. The runner seats the reviewer from THIS, not from the wave's pick:
+    the kernel refuses a review whose actor is in the conflicted set, and the
+    loop then sees no verdict and parks `no_verdict` for a refusal the kernel
+    made."""
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["conflicted", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "claude\n"
+
+
+def test_conflicted_prints_an_empty_line_before_any_implementation(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    Front(s, "r", base_sha=BASE, existing=True).to_planned()
+    assert main(["conflicted", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "\n"
+
+
+def test_conflicted_is_rc_3_without_a_database(tmp_path):
+    assert main(["conflicted", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
+
+
+def test_conflicted_refuses_a_run_the_kernel_does_not_hold(tmp_path):
+    _, db = _file_store(tmp_path)
+    with pytest.raises(Exception):
+        main(["conflicted", "--db", db, "--run-id", "nope"])
 
 
 def test_session_last_item_prints_the_last_id(monkeypatch, capsys):

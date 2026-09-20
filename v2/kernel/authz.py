@@ -153,9 +153,12 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     "record_children_observed_closed": (frozenset({"sliced"}), None),
     "start_implementation": (frozenset({"planned"}), "implementing"),
     # Destination depends on state, verdict and the run's gates: computed in
-    # authorize() by _review_destination. In the back half a revision request
-    # must return the run to `planned` so implementation can start again;
-    # landing every review in `reviewing` left it nowhere to do the revision.
+    # authorize() by _review_destination. In the back half the verdict does
+    # NOT route the run: `_BACK_HALF_DESTINATIONS` below lands accept,
+    # request_revision and reject alike in `reviewing`. The closed loop has
+    # one door back to `planned` and it is `request_repair`, which the runner
+    # issues after reading the verdict -- so a revision that transitioned the
+    # run here would open that door twice, from two different facts.
     "record_review": (
         frozenset({"slices_submitted", "slices_accepted", "spec_submitted", "spec_accepted",
                    "plan_submitted", "plan_accepted", "implementing", "reviewing"}),
@@ -190,7 +193,13 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # Records what the implementation produced; does not itself transition.
     # The run stays in `implementing` until a review moves it.
     "record_implementation_output": (frozenset({"implementing"}), None),
-    "record_ci_observation": (frozenset({"implementing", "reviewing"}), None),
+    # `planned` too. A CI observation is a fact about the WORLD, not about the
+    # phase the run is in, and the closed loop now resumes from `planned` -- a
+    # repair requested whose session has not started, or did not finish. A run
+    # that cannot record there has `back.latest_pr_state` frozen at whatever it
+    # last saw, so it can neither observe nor end: the ending rule below
+    # depends on this being writable from every state the loop resumes from.
+    "record_ci_observation": (frozenset({"planned", "implementing", "reviewing"}), None),
     # The closed loop (spec §1): the ONE door back to `planned` in the back
     # half. A repair round is an implementation round, so the run re-enters
     # `planned` and `start_implementation` dispatches it. Refused from

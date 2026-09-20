@@ -60,9 +60,18 @@ def next_step(store, run_id: str, g: Ground) -> Step:
     else:
         cause, evidence = "review_fail", tuple(g.fingerprints)
 
-    # A repair already requested against this head and not yet worked: the
-    # run sits at `planned`; dispatch the session, request nothing new.
-    if state == "planned" and back.repair_for_head(store, run_id, g.head) is not None:
+    # A repair already requested and not yet worked: the run sits at
+    # `planned`; dispatch the session, request nothing new.
+    #
+    # THE STATE ALONE, not the head. In the back half `planned` is only ever
+    # reached through `request_repair`, so a repair round is already owed
+    # whatever the head now is -- and the head moves the moment anyone pushes
+    # to the branch while the run waits here. Also matching `repair_for_head`
+    # stranded such a run: no repair named the new head, so this returned a
+    # plain `repair`, `request_repair` is refused from `planned`, and the
+    # runner logged "the kernel did not open a repair round" and waited --
+    # every wave, forever, spending a derivation and a cross-review each time.
+    if state == "planned":
         return Step("repair", cause, evidence, redispatch=True)
     if back.would_be_third_identical(store, run_id, cause, evidence):
         return Step("park", cause, evidence, reason="no_progress")

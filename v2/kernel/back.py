@@ -32,6 +32,26 @@ def latest_pr_state(store, run_id: str) -> str | None:
     return None if ci is None else ci.get("pr_state")
 
 
+def conflicted_actors(store, run_id: str) -> set[str]:
+    """Everyone the kernel will refuse a review from on this run, right now.
+
+    The runner needs this to seat its two roles: the reviewer must be
+    independent of the run's OWN implementer, not of whichever vendor this
+    wave's usage gate happened to pick. Seated from the pick instead, a
+    resumed run whose previous implementer was claude_code gets claude_code
+    back as its reviewer whenever the gate flips, the kernel refuses the
+    verdict, and the loop reads the missing verdict as a silent reviewer.
+
+    DELEGATES to `kernel.authz._conflicted_actors`, the rule the kernel
+    actually enforces. Restating it here would leave two copies to drift
+    apart, and the drift would be invisible: the seating would look right and
+    every verdict would be refused. Imported inside the function because
+    `authz` reaches into this module.
+    """
+    from kernel import authz
+    return authz._conflicted_actors(store, run_id)
+
+
 def back_verdicts(store, run_id: str) -> list:
     """Implementation-phase verdicts, oldest first."""
     return [f for f in store.facts_for(run_id)
