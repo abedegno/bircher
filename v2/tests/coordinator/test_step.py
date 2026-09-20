@@ -366,3 +366,19 @@ def test_park_reply_without_a_park_says_so(tmp_path, capsys):
     _to_implementing(s)
     assert main(["park-reply", "--db", db, "--run-id", "r", "--server", "http://x"]) == 0
     assert capsys.readouterr().out == "nopark"
+
+
+def test_back_state_falls_back_to_the_merge_requests_pr(tmp_path, capsys):
+    """A run implemented before the closed loop has observations with no
+    `pr`; the runner still needs a number to derive against, or the run can
+    never be observed closed and never ends."""
+    s, db = _file_store(tmp_path)
+    _, spec = _to_implementing(s)
+    _sub(s, "record_ci_observation", "c0", actor="claude", status="success", head_git_sha=HEAD)
+    _sub(s, "record_review", "v1", verdict="accept", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    _sub(s, "request_merge", "m1", actor="claude", pr=730, repo="abedegno/muesli",
+         head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1)
+    assert main(["back-state", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == f"730||{HEAD}|{spec}"
