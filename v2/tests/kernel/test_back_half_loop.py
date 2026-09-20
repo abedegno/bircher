@@ -334,3 +334,30 @@ def test_a_cancelled_run_ends():
     assert submit(s, Command(name="record_run_outcome", run_id="r", expected_version=s.run_version("r"),
                              idempotency_key="o1", generation=gen, payload={"outcome": "escalated"})).accepted
     assert s.run_state("r") == "ended"
+
+
+def test_the_pr_comes_from_the_observation_when_it_carries_one():
+    s, _ = _to_implementing(_store())
+    _ci(s, "c1", "failure", pr="77")
+    assert back.latest_pr(s, "r") == "77"
+
+
+def test_a_legacy_run_takes_its_pr_from_the_merge_request():
+    """An observation recorded before the closed loop carries no `pr`. The
+    merge request does, and without that fallback the run can never be
+    observed closed and never ends (live, 2026-09-20: two runs at
+    `merge_requested` re-derived every wave)."""
+    s, spec = _to_implementing(_store())
+    _sub(s, "record_ci_observation", "c0", actor="claude", status="success", head_git_sha=HEAD)
+    assert back.latest_pr(s, "r") == ""
+    _sub(s, "record_review", "v1", verdict="accept", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    _sub(s, "request_merge", "m1", actor="claude", pr=730, repo="abedegno/muesli",
+         head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1)
+    assert back.latest_pr(s, "r") == "730"
+
+
+def test_no_pr_anywhere_in_the_journal_is_empty():
+    s, _ = _to_implementing(_store())
+    assert back.latest_pr(s, "r") == ""

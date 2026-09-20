@@ -27,6 +27,27 @@ def latest_ci(store, run_id: str) -> dict | None:
     return (obs[-1].payload.get("payload") or {}) if obs else None
 
 
+def latest_pr(store, run_id: str) -> str:
+    """Which pull request this run owns, from the journal.
+
+    The newest CI observation carries it, but only since the closed loop
+    added the field: a run implemented before then has observations without
+    one, and a wave that cannot rediscover the PR by branch code or issue
+    linkage would have nothing to observe and could never satisfy the ending
+    rule -- it would re-derive the same run every wave for good. The merge
+    request is the other place the journal names a PR, and a run that asked
+    to merge one owns it whatever discovery can still see.
+    """
+    ci = latest_ci(store, run_id) or {}
+    if ci.get("pr"):
+        return str(ci["pr"])
+    for fact in reversed(_accepted(store, run_id, "request_merge")):
+        pr = (fact.payload.get("payload") or {}).get("pr")
+        if pr:
+            return str(pr)
+    return ""
+
+
 def latest_pr_state(store, run_id: str) -> str | None:
     ci = latest_ci(store, run_id)
     return None if ci is None else ci.get("pr_state")

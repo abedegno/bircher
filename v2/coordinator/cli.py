@@ -430,7 +430,11 @@ def main(argv=None) -> int:
         store = Store.open(a.db)
         store.run_state(a.run_id)
         ci = back.latest_ci(store, a.run_id) or {}
-        print(f"{ci.get('pr') or ''}|{ci.get('pr_state') or ''}|{ci.get('head_git_sha') or ''}|"
+        # The PR comes from `back.latest_pr`, not from the observation alone:
+        # a run implemented before the closed loop has observations with no
+        # `pr`, and the runner needs a number to derive against or the run can
+        # never be observed closed and never end.
+        print(f"{back.latest_pr(store, a.run_id)}|{ci.get('pr_state') or ''}|{ci.get('head_git_sha') or ''}|"
               f"{store.current_artifact(a.run_id) or ''}", end="")
         return RC_OK
 
