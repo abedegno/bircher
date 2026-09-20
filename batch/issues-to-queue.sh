@@ -95,7 +95,11 @@ import os, re, sys
 from kernel import back, front
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
-closed = {"ended", "cancelled"}
+# `ended` is the only terminal state (closed-loop spec §2, fix round 1):
+# `cancelled` is a stop, not a close, and still owes its terminal fact --
+# excluding it here would leave a manually cancelled run with a pull request
+# unreconciled forever.
+closed = {"ended"}
 out = []
 for rid in s.all_run_ids():
     m = re.match(r"^i(\d+)-", rid)

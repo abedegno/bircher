@@ -4268,9 +4268,11 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
     nopark) ;;
     retry) echo "[batch] $item: a person granted another round" >&2 ;;
     stop)
+      echo "[batch] $item: stopped by a person" >&2
       outcome=escalated; note="stopped by a person"; _step=done
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
     *)
+      echo "[batch] $item: parked; no reply yet (${_reply:-reply unreadable})" >&2
       outcome=parked; note="parked; no reply yet (${_reply:-reply unreadable})"; _step=park
       elapsed=$(( $(date +%s) - start )); _finish_pass "$item" "$f" "$_iss"; return $? ;;
   esac
@@ -9175,6 +9177,44 @@ f._cmd(g, "record_run_outcome", {"outcome": "timeout"})
   ls "$edir/queue"/i79-*.md >/dev/null 2>&1 && { echo "FAIL an ended run was queued"; exit 1; }
   rm -rf "$edir"
   echo "an ended run is not queued from the journal OK"
+
+  # --- a cancelled run with a pull request IS queued (closed-loop spec §2, fix round 1) --
+  # `ended` is the only terminal state: `cancelled` is a stop, not a close,
+  # and still owes its terminal fact -- the closed loop must be able to
+  # resume it once to write one, not read it as already closed.
+  local cdir; cdir=$(mktemp -d)
+  cat > "$cdir/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"issue list"*) echo '[]' ;;
+  *"blocked_by"*) echo 0 ;;
+  *"--json title"*) echo "cancelled issue" ;;
+  *"--json body"*) echo "a body" ;;
+  *"--json comments"*) echo '[]' ;;
+  *) echo '[]' ;;
+esac
+SH
+  chmod +x "$cdir/gh"
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -m tests.kernel.front \
+      --db "$cdir/k.db" --run-id i80-cancelled-1 --to implementing >/dev/null ) \
+    || { echo "FAIL i80 fixture could not be built"; exit 1; }
+  ( cd "$BUNDLE_DIR/v2" && PYTHONPATH=. "${BIRCHER_PY:-python3}" -c '
+import sys
+from kernel.commands import Command, submit
+from kernel.dispatch import Role, dispatch
+from kernel.store import Store
+s = Store.open(sys.argv[1])
+g = dispatch(s, "i80-cancelled-1", actor="claude", role=Role.IMPLEMENTER).generation
+submit(s, Command(name="cancel_run", run_id="i80-cancelled-1",
+                   expected_version=s.run_version("i80-cancelled-1"),
+                   idempotency_key="cancel1", generation=g, payload={}))
+' "$cdir/k.db" ) || { echo "FAIL i80 cancel could not be recorded"; exit 1; }
+  ( cd "$cdir" && QUEUE="$cdir/queue" PATH="$cdir:$PATH" BIRCHER_KERNEL_DB="$cdir/k.db" REPO=o/r \
+      bash "$BUNDLE_DIR/batch/issues-to-queue.sh" >/dev/null 2>&1 ) || { echo "FAIL issues-to-queue with a cancelled run exited non-zero"; exit 1; }
+  ls "$cdir/queue"/i80-*.md >/dev/null 2>&1 || { echo "FAIL a cancelled run with a pull request was not queued from the journal"; exit 1; }
+  grep -q "^i80-" "$cdir/queue/.manifest" || { echo "FAIL cancelled run i80 is not in the manifest"; exit 1; }
+  rm -rf "$cdir"
+  echo "a cancelled run with a pull request is queued from the journal OK"
 
   # --- wave-timer.sh: fires launch.sh with the wave's own log, skips a missing checkout --
   local tdir; tdir=$(mktemp -d)

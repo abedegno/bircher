@@ -143,8 +143,18 @@ _kernel() {
 # the point. An uncertain effect halts its run and nothing may be performed
 # until someone looks, so this is the "what do I look at" half of the halt.
 # _kernel_find_run <code> [open] -> the newest run id starting "<code>-", or
-# empty. With `open`, only a run whose state is not `ended`/`cancelled` --
+# empty. With `open`, only a run whose state is not `ended` --
 # which is what `run_item` resumes into rather than minting over.
+#
+# `ended` IS THE ONLY TERMINAL STATE (closed-loop spec §2, fix round 1).
+# `cancelled` is a stop, not a close: `record_run_outcome` is legal FROM
+# `cancelled` precisely because a cancelled run still owes its terminal
+# fact, and until something writes it the run is still open work.
+# `coordinator.cli cancel` records `cancel_run` and retires the session, but
+# never `record_run_outcome` -- so filtering `cancelled` out here read that
+# as though it had closed the run, and `run_item` minted a SECOND run over
+# every manually cancelled item instead of resuming the first one once to
+# write the terminal fact it was missing.
 #
 # NON-MINTING, unlike `_kernel_adopt_run`, and that is the whole point.
 # Publication has to be able to ask "did the kernel dispatch this work?" and
@@ -152,7 +162,7 @@ _kernel() {
 # answer yes -- a junk `queued` row per refusal, and a caller that then reads
 # its own minting as provenance.
 #
-# The filter is NEGATIVE -- "not one of the two closed states" -- rather than a
+# The filter is NEGATIVE -- "not the one closed state" -- rather than a
 # positive list of open ones passed to `Store.open_run_ids`. That is the
 # fail-closed direction: a state added to the kernel later is open until
 # someone says otherwise, so the leak guard in `run_item` (never mint over a
@@ -170,7 +180,7 @@ sys.path.insert(0, os.environ.get("BIRCHER_V2_DIR", "v2"))
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 code = os.environ["K_CODE"]
-closed = frozenset({"ended", "cancelled"})
+closed = frozenset({"ended"})
 runs = [r for r in s.all_run_ids() if r.startswith(code + "-")]
 if os.environ["K_MODE"] == "open":
     runs = [r for r in runs if s.run_state(r) not in closed]

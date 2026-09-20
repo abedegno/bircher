@@ -975,6 +975,32 @@ def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):
         "the resumed pass ran the loop to a merge and should retire the queue file")
 
 
+def test_a_cancelled_run_is_resumed_to_record_its_terminal_fact(tmp_path):
+    """A cancelled run is a stop, not a close (closed-loop spec §2, fix round
+    1): `record_run_outcome` is legal FROM `cancelled`, so a manually
+    cancelled run still owes its terminal fact -- `coordinator.cli cancel`
+    records `cancel_run` and retires the session, never `record_run_outcome`.
+    The next pass reaches `_resume_back_half`'s own `cancelled` case, which
+    writes that fact, rather than minting a second run over one a person
+    already stopped. `_resume_back_half`'s `merged`/`cancelled` cases return
+    before `_kernel_back_state` (there is no derivation left to do), so the
+    proof here is `_kernel_record_run_outcome` -- reached only through
+    `_finish_pass`, which the old escalate-and-strand branches never got
+    close to, since they returned before a generation even existed."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "cancelled",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert "_kernel_run_start" not in d.names, "it minted a second run"
+    assert "_kernel_record_run_outcome" in d.names, (
+        "the back half never resumed the run to record its terminal fact")
+    assert d.args_of("_kernel_record_run_outcome")[0] == OPEN_RUN
+    note = d.args_of("json_row")[7]
+    assert note == "stopped by a person", note
+
+
 def test_planned_WITHOUT_a_start_implementation_is_resumed_not_escalated(tmp_path):
     """The other half of the journal question. A run that reached `planned` and
     stopped there is exactly what this pass exists to carry forward -- and a
