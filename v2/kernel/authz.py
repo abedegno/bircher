@@ -46,6 +46,11 @@ FRONT_HALF_STATES = frozenset({
 #: guards. Membership is stated per site below, never inherited (ruling 13).
 SHAPING_STATES = frozenset({"shaping", "slices_submitted", "slices_accepted"})
 
+#: The states the runner's step loop DERIVES at, and therefore the states a
+#: CI observation has to be legal from. `merge_requested` is in it because
+#: the loop resumes a run stranded between the merge request and the merge.
+BACK_HALF_DERIVING_STATES = frozenset({"planned", "implementing", "reviewing", "merge_requested"})
+
 #: spec §1 (closed loop): the states a run with a pull request moves between.
 BACK_HALF_STATES = frozenset({"planned", "implementing", "reviewing"})
 
@@ -199,7 +204,14 @@ _TRANSITIONS: dict[str, tuple[frozenset[str], str | None]] = {
     # that cannot record there has `back.latest_pr_state` frozen at whatever it
     # last saw, so it can neither observe nor end: the ending rule below
     # depends on this being writable from every state the loop resumes from.
-    "record_ci_observation": (frozenset({"planned", "implementing", "reviewing"}), None),
+    # `merge_requested` too, for the same reason and found the same way: the
+    # loop resumes from it (a pass that died between the merge request and
+    # the merge), derives, and has a `pr_state` to write. Live on
+    # 2026-09-20 two runs sat there with a merged PR, could not record the
+    # observation, and so could not satisfy the ending rule -- every wave,
+    # for good. `BACK_HALF_DERIVING_STATES` is the set the runner can derive
+    # at, and the test beside it keeps the two from drifting apart.
+    "record_ci_observation": (BACK_HALF_DERIVING_STATES, None),
     # The closed loop (spec §1): the ONE door back to `planned` in the back
     # half. A repair round is an implementation round, so the run re-enters
     # `planned` and `start_implementation` dispatches it. Refused from

@@ -361,3 +361,41 @@ def test_a_legacy_run_takes_its_pr_from_the_merge_request():
 def test_no_pr_anywhere_in_the_journal_is_empty():
     s, _ = _to_implementing(_store())
     assert back.latest_pr(s, "r") == ""
+
+
+def _to_merge_requested(s, spec):
+    """implementing -> reviewing -> merge_requested, the way the runner does."""
+    _sub(s, "record_ci_observation", "mc", actor="claude", status="success", head_git_sha=HEAD)
+    _sub(s, "record_review", "mv", verdict="accept", artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1, head_sha=HEAD)
+    _sub(s, "request_merge", "mm", actor="claude", pr=730, repo="abedegno/muesli",
+         head_git_sha=HEAD, artifact_hash=spec, base_sha=BASE,
+         context_bundle_hash=BUNDLE, policy_version=1)
+    assert s.run_state("r") == "merge_requested"
+
+
+def test_a_ci_observation_is_accepted_from_merge_requested():
+    """The loop resumes a run stranded between the merge request and the
+    merge, derives, and has a `pr_state` to write. Live on 2026-09-20 this
+    was refused, so the run could never satisfy the ending rule."""
+    s, spec = _to_implementing(_store())
+    _to_merge_requested(s, spec)
+    assert _ci(s, "c9", "success", pr_state="merged", pr="730").accepted
+    assert back.latest_pr_state(s, "r") == "merged"
+
+
+def test_a_run_at_merge_requested_whose_pr_merged_can_end():
+    s, spec = _to_implementing(_store())
+    _to_merge_requested(s, spec)
+    _ci(s, "c9", "success", pr_state="merged", pr="730")
+    assert _sub(s, "record_run_outcome", "o9", actor="claude", outcome="ready").accepted
+    assert s.run_state("r") == "ended"
+
+
+def test_an_observation_is_legal_from_every_state_the_loop_derives_at():
+    """The from-set and the runner's resume set must not drift. Two live
+    defects came from exactly that gap: `planned` (fixed in the branch) and
+    `merge_requested` (fixed after the first wave)."""
+    from kernel.authz import BACK_HALF_DERIVING_STATES, legal_states_for
+    assert BACK_HALF_DERIVING_STATES == {"planned", "implementing", "reviewing", "merge_requested"}
+    assert legal_states_for("record_ci_observation") >= BACK_HALF_DERIVING_STATES
