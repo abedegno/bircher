@@ -103,4 +103,34 @@ def test_cancel_records_cancelled_and_retires(tmp_path, monkeypatch):
     stopped = []
     monkeypatch.setattr("coordinator.phases.retire", lambda ctx: stopped.append(ctx.run_id) or [])
     assert main(["cancel", *_common(db), "--server", "http://srv"]) == 0
-    assert s.run_state("r-1") == "cancelled" and stopped == ["r-1"]
+    # No pull request, so nothing is owed to a later pass: the stop IS the
+    # end (2026-09-26). Waves never sweep a front-half cancelled run, so a
+    # run left at `cancelled` here stayed open forever.
+    assert s.run_state("r-1") == "ended" and stopped == ["r-1"]
+    ends = [f for f in s.facts_of_kind("r-1", EventKind.COMMAND_ACCEPTED)
+            if f.payload.get("command_name") == "record_run_outcome"]
+    assert [e.payload["payload"]["outcome"] for e in ends] == ["escalated"]
+
+
+def test_cancel_finishes_a_run_an_earlier_cancel_left_open(tmp_path, monkeypatch):
+    """The four legacy runs: cancelled by the old `cancel`, never ended."""
+    from kernel.commands import HUMAN_GENERATION, Command, execute_as_human
+    db = tmp_path / "k.db"
+    s = Store.open(db)
+    Front(s, "r-1").to_specified()
+    execute_as_human(s, Command(name="cancel_run", run_id="r-1", expected_version=s.run_version("r-1"),
+                                idempotency_key="old-cancel", generation=HUMAN_GENERATION, payload={}))
+    monkeypatch.setattr("coordinator.phases.retire", lambda ctx: [])
+    assert main(["cancel", *_common(db), "--server", "http://srv"]) == 0
+    assert s.run_state("r-1") == "ended"
+
+
+def test_cancel_leaves_a_run_with_a_pull_request_to_the_wave(tmp_path, monkeypatch):
+    """With implementation output the resume path owns the ending (closed-loop
+    spec §2): it reads the PR and writes the issue back. Unchanged."""
+    db = tmp_path / "k.db"
+    s = Store.open(db)
+    Front(s, "r-1").to_implementing()                     # records output
+    monkeypatch.setattr("coordinator.phases.retire", lambda ctx: [])
+    assert main(["cancel", *_common(db), "--server", "http://srv"]) == 0
+    assert s.run_state("r-1") == "cancelled"

@@ -346,7 +346,10 @@ def main(argv=None) -> int:
         # `cancel` is ONE gesture: the record first, then the sessions. The
         # other order would stop the run's sessions while the run is still
         # live, and the next pass would derive them again.
-        if a.mode == "cancel":
+        # A run an earlier `cancel` already stopped is finished here, not
+        # refused: cancel_run is illegal from `cancelled`, and the old
+        # command left runs there with no terminal fact (2026-09-26).
+        if a.mode == "cancel" and store.run_state(a.run_id) != "cancelled":
             rc = _human_cmd(store, a.run_id, "cancel_run", {})
             if rc != RC_OK:
                 return rc
@@ -361,6 +364,22 @@ def main(argv=None) -> int:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return RC_FAILED
+        # THE END, when nothing is left for a pass to do. With no
+        # implementation output there is no pull request to read and no
+        # issue to write back, and waves never sweep a front-half cancelled
+        # run -- so the terminal fact was owed forever. A run WITH output
+        # keeps its resume path (closed-loop spec §2), which does both.
+        from kernel import back
+        if a.mode == "cancel" and not back.implementation_output_recorded(store, a.run_id):
+            from kernel.commands import Command, submit
+            try:
+                submit(store, Command(name="record_run_outcome", run_id=a.run_id,
+                                      expected_version=store.run_version(a.run_id),
+                                      idempotency_key=f"cancel-end:{a.run_id}", generation=ctx.generation,
+                                      payload={"outcome": "escalated"}))
+            except Exception as exc:
+                print(f"cancelled, but the terminal fact was refused: {exc}", file=sys.stderr)
+                return RC_FAILED
         return RC_OK
 
     # The run's state, for a shell caller that must READ it rather than infer
