@@ -104,3 +104,18 @@ def test_refused_dispatch_leaves_no_generation_or_fact(tmp_path):
         dispatch(s, "r-1", actor="claude", role=Role.AUTHOR)
     after = len(s.dispatches_for("r-1")), len(s.facts_of_kind("r-1", EventKind.ATTEMPT_DISPATCHED))
     assert before == after
+
+
+@pytest.mark.parametrize("to", ["to_implementing", "to_planned"])
+def test_the_seat_bound_does_not_reach_the_back_half(tmp_path, to):
+    """The bound is the front half's (SeatsExhausted: "front-half
+    dispatches"), but every reviewer dispatch counted, so a back-half repair
+    loop -- #768 reached 42 of 50 -- would have met a wall meant for spec and
+    plan authoring, and each wave would have been refused its review."""
+    from tests.kernel.front import Front
+    s = Store.open(tmp_path / "k.db")
+    getattr(Front(s, "r-1"), to)()
+    while front.seats_used(s, "r-1") < front.seat_bound(s, "r-1"):
+        dispatch(s, "r-1", actor="codex", role=Role.REVIEWER)
+    dispatch(s, "r-1", actor="codex", role=Role.REVIEWER)
+    dispatch(s, "r-1", actor="claude", role=Role.REVIEWER)
