@@ -274,6 +274,11 @@ _RUN_NOT_OVER = {
         "`_interrupted_sliced_item`. The coordinator died mid-filing, so the "
         "run is at `sliced` with obligations outstanding -- the kernel refuses "
         "`failed` from there in any case, and the next pass repairs the filing",
+    "is owned by a newer pass":
+        "`phases` exited SUPERSEDED (6): another pass fenced a newer "
+        "generation and owns the run. The terminal fact is the owner's to "
+        "record -- this pass's generation is fenced anyway, and #768 got a "
+        "refused `failed` from exactly this case",
     "could not be read after":
         "`_unreadable_state_item`. The kernel would not say what state the loop "
         "left the run in, so this pass cannot tell whether it is over. Ending "
