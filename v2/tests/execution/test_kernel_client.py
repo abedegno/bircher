@@ -522,10 +522,12 @@ def test_park_back_keeps_a_free_text_cause_that_would_break_the_json(tmp_path):
     store = Store.open(db)
     f = Front(store, "r-pk")
     gen = f.to_implementing()
-    cause = 'codex said "no" \\ then\nstopped'
+    cause = 'codex said "no" \\ then\nstopped \u2014 ' + "\u00e9" * 300
     r = _run(f'_kernel_park_back r-pk {gen} no_verdict "" "" "$CAUSE" ""',
              env={"BIRCHER_KERNEL_DB": str(db), "CAUSE": cause})
     assert r.returncode == 0, r.stderr
     park = front.current_park(Store.open(db), "r-pk")
     assert park is not None, r.stderr
-    assert park.payload["cause"] == "codex said no  then stopped"
+    expected = " ".join(cause.split())[:240]
+    assert park.payload["cause"] == expected
+    assert '"no"' in expected and "\\" in expected       # kept, not stripped
