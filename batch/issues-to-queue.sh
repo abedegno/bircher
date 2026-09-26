@@ -76,7 +76,9 @@ _emit_item() {
 # owing a filing, or (revision 16) an open run whose journal holds an
 # unresolved shape disagreement and no current park -- the pass died between
 # the disputed ruling and its park -- is exactly the work the next wave must
-# pick up, and it is queued here whatever the issue's labels say. Its item
+# pick up, and it is queued here whatever the issue's labels say -- as is
+# (2026-09-26) every open run short of its pull request, which subsumes the
+# dispute case and catches the run a human ruling unparked. Its item
 # renders from the live issue like any other; run_item adopts the open run
 # rather than minting a second one. Off when there is no kernel database to
 # ask.
@@ -93,6 +95,7 @@ if [ -n "${BIRCHER_KERNEL_DB:-}" ] && [ -f "$BIRCHER_KERNEL_DB" ]; then
   parked_nums=$(PYTHONPATH="$HERE/../v2" "${BIRCHER_PY:-python3}" -c '
 import os, re, sys
 from kernel import back, front
+from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES
 from kernel.store import Store
 s = Store.open(os.environ["BIRCHER_KERNEL_DB"])
 # `ended` is the only terminal state (closed-loop spec §2, fix round 1):
@@ -114,9 +117,16 @@ for rid in s.all_run_ids():
     # ... or (closed-loop spec §2) any open run with a pull request: waves
     # resume every one, whatever its labels, until it merges, a person stops
     # it, or it parks.
+    # ... or any open run short of its pull request (2026-09-26): a human
+    # ruling consumes the park, the issue still wears `bircher:running` from
+    # the pass that parked, and neither the park clause nor the labels found
+    # it -- #768 sat at `specified` after its approval until a person
+    # relabelled it. A `cancelled` run without output is a stop, not work,
+    # and stays out. This clause subsumes the revision-16 unresolved-dispute
+    # test, which it replaced: a dispute exists only at `shaping`.
     if front.current_park(s, rid) is not None or (
+            s.run_state(rid) in FRONT_HALF_STATES | SHAPING_STATES | {"planned"}) or (
             s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None) or (
-            front.unresolved_disagreement(s, rid)) or (
             s.run_state(rid) in ("planned", "implementing", "reviewing", "merge_requested", "merged", "cancelled")
             and back.implementation_output_recorded(s, rid)):
         out.append(m.group(1))

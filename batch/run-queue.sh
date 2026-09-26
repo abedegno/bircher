@@ -2918,14 +2918,17 @@ _park_back_half() {  # <item> <code> <reason> [cause] [evidence_csv]
     echo "[batch] $item: no carrier session for the park; a reply must come through the operator's shell (coordinator.cli grant-round / cancel)" >&2
   fi
   _kernel_park_back "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$reason" "$conv_id" "$cur" "$cause" "$ev"
-  local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _park=""
+  # Through `_coordinator`, which sets PYTHONPATH: called bare, the module did
+  # not import from the wave's cwd, this read always came back empty, and
+  # every back-half park concluded it had not been recorded (2026-09-26).
+  local _park; _park=$(_coordinator parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID") || _park=""
   if [ -z "$_park" ]; then
     echo "[batch] $item: the kernel did NOT record the park ($reason) -> not reporting parked" >&2
     return 1
   fi
   local _pid; _pid=$(printf '%s' "$_park" | _json_get id)
   if [ -n "$_iss" ]; then
-    local _notice; _notice=$("${BIRCHER_PY:-python3}" -m coordinator.cli park-notice --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _notice=""
+    local _notice; _notice=$(_coordinator park-notice --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID") || _notice=""
     [ -n "$_notice" ] && _effect comment "park-notice:$BIRCHER_RUN_ID:$_pid" - gh issue comment "$_iss" --repo "$REPO" --body "$_notice" >/dev/null 2>&1 || true
   fi
   _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$reason"
@@ -4929,7 +4932,9 @@ run_item() {
       # stays where it is, no terminal outcome is recorded, and the sidecar
       # names the run so the next pass resumes this one instead of minting a
       # second run for the same item.
-      local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null || echo '{}')
+      # Through `_coordinator` (PYTHONPATH): called bare it never imported,
+      # and every parked row read `parked: ` with the reason lost.
+      local _park; _park=$(_coordinator parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" || echo '{}')
       _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$(printf '%s' "$_park" | _json_get reason)"
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "parked" "false" "" "" 0 "parked: $(printf '%s' "$_park" | _json_get reason)" "parked" >> "$SCORECARD"

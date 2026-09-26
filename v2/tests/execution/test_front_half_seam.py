@@ -251,6 +251,11 @@ _coordinator() {{
   case "$1" in
     step) printf 'merge||||'; return 0 ;;
     park-reply) printf '%s' "${{T_PARK_REPLY:-nopark}}"; return 0 ;;
+    # The park read-back goes through `_coordinator` (it sets PYTHONPATH).
+    # It used to be a bare `python3 -m coordinator.cli parked`, which the fake
+    # interpreter below answered -- so this harness passed while production,
+    # where that bare call could not import the module, always read nothing.
+    parked) if [ -n "${{PARKED_JSON:-}}" ]; then printf '%s' "$PARKED_JSON"; else printf '{{"reason": "gate"}}'; fi; return 0 ;;
     *) printf ''; return 1 ;;
   esac
 }}
@@ -269,15 +274,14 @@ merge_ready_pr()   {{ _log_call merge_ready_pr "$@"; return 0; }}
 _merge_gate() {{ [ -n "${{2:-}}" ] && {{ printf 'pin|%s' {reviewed_sha!r}; return 0; }}; printf 'skip'; }}
 '''
 
-#: `coordinator.cli phases` and `coordinator.cli parked` are reached by name
-#: through `${BIRCHER_PY:-python3}`; every other Python call `run_item` makes is
-#: bare `python3` inside a real helper, so this intercepts exactly those two.
+#: `coordinator.cli phases` is reached by name through `${BIRCHER_PY:-python3}`;
+#: every other Python call `run_item` makes is bare `python3` inside a real
+#: helper, so this intercepts exactly that one. It deliberately does NOT answer
+#: `parked`: a regression back to a bare `parked` call must fail here.
 _FAKE_PY = '''#!/bin/bash
 n=$(cat "@CALLSEQ@"); n=$((n+1)); printf '%s' "$n" > "@CALLSEQ@"
 f="@CALLDIR@/$(printf '%03d' "$n")"
 { printf '%s' BIRCHER_PY; for a in "$@"; do printf '\\0%s' "$a"; done; } > "$f"
-park="${PARKED_JSON:-}"
-[ -n "$park" ] || park='{"reason": "gate"}'
 for a in "$@"; do
   # The sidecar AS IT STANDS WHEN phases RUNS. run_item removes it again when
   # phases exits 0, so a test that looked afterwards could not tell "written
@@ -285,7 +289,6 @@ for a in "$@"; do
   [ "$a" = phases ] && [ -n "${SIDECAR_SNAPSHOT:-}" ] && [ -f "${SIDECAR_SRC:-}" ] \
     && cp "$SIDECAR_SRC" "$SIDECAR_SNAPSHOT"
   [ "$a" = phases ] && exit "${PHASES_RC:-0}"
-  [ "$a" = parked ] && { printf '%s' "$park"; exit 0; }
 done
 exit 0
 '''
