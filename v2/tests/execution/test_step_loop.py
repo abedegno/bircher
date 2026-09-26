@@ -27,12 +27,14 @@ _next() { local f="$T/$1" line=""; IFS= read -r line < "$f" || true; tail -n +2 
 observe_outcome() { _log "observe pr=${3:-}"; _next derive; }
 _coordinator() { if [ "$1" = step ]; then _log "step $*"; _next step; else _log "coordinator $*"; fi; }
 _kernel_state() { _next state; }
-_kernel_record_output() { _log "record_output"; printf 'hash1'; }
+# Models the kernel: an ACCEPTED output becomes the run's current artifact;
+# REFUSE_OUTPUT=1 models the refusal (the blob is stored, the output is not).
+_kernel_record_output() { _log "record_output gen=$2"; [ "${REFUSE_OUTPUT:-0}" = 1 ] || printf 'hash1' > "$T/current_artifact"; printf 'hash1'; }
 _kernel_record_ci() { _log "record_ci status=$3 head=$4 pr_state=${5:-} jobs=${6:-} pr=${7:-}"; }
 _kernel_record_review() { _log "record_review $3 artifact=$4 head=${9:-} fps=${12:-}"; }
 _kernel_dispatch() { _log "dispatch $1 $2"; printf '7'; }
 _kernel_request_repair() { _log "request_repair $3 head=$4 ev=${5:-}"; }
-_kernel_back_state() { printf '42|open|%s|hash0' "$HEAD"; }
+_kernel_back_state() { printf '42|open|%s|%s' "$HEAD" "$(cat "$T/current_artifact" 2>/dev/null || echo hash0)"; }
 _kernel_conflicted() { printf '%s' "${CONFLICTED:-}"; }
 _park_back_half() { _log "park $3 ${4:-} ${5:-}"; return "${PARK_RC:-0}"; }
 _repair_round() { _log "repair_round pr=$3 branch=$4 round=$6 vendor=$7"; _log "brief: $5"; return 0; }
@@ -52,7 +54,7 @@ def _tuple(outcome, review, ci, *, head=HEAD, pr="42", fps="", pr_state="open", 
 
 
 def _run(tmp_path, derive_lines, step_lines, states, *, pr0="42", findings="", park_rc=0,
-         conflicted=None, vendor0=None, reviewer0=None):
+         conflicted=None, vendor0=None, reviewer0=None, refuse_output=False):
     """*conflicted* (the journal's answer), *vendor0* and *reviewer0* (this
     wave's own pick) drive `_seat_vendors`, which is extracted and called
     before `_step_loop` exactly as `_resume_back_half` calls it. Left unset,
@@ -69,7 +71,7 @@ def _run(tmp_path, derive_lines, step_lines, states, *, pr0="42", findings="", p
               + '_step_loop; printf "%s|%s|%s|%s|%s" "$_step" "$outcome" "$pr" "$_rev_round" "$_out_hash"\n')
     env = dict(os.environ, T=str(tmp_path), PR0=pr0, HEAD=HEAD, PARK_RC=str(park_rc),
                CONFLICTED=conflicted or "", VENDOR0=vendor0 or "claude_code",
-               REVIEWER0=reviewer0 or "codex")
+               REVIEWER0=reviewer0 or "codex", REFUSE_OUTPUT="1" if refuse_output else "0")
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr
     log_file = tmp_path / "calls.log"
@@ -279,3 +281,28 @@ def test_both_vendors_conflicted_leaves_the_seats_and_says_so():
 def _tmp():
     import tempfile
     return Path(tempfile.mkdtemp(prefix="steploop-"))
+
+
+def test_a_resumed_pass_takes_the_implementer_seat_before_the_loop():
+    """Live on muesli #768: a wave resumed the run at `implementing` holding
+    the runner's OPERATOR fence, recorded the output under it, and the kernel
+    refused it. `_resume_back_half` must dispatch the implementer after the
+    seats are chosen and before `_step_loop` runs, or the first output of a
+    resumed pass is refused again."""
+    body = _extract_function(RQ.read_text().splitlines(), "_resume_back_half").splitlines()
+    seat = next(i for i, l in enumerate(body) if '_seat_vendors "$BIRCHER_RUN_ID"' in l)
+    loop = next(i for i, l in enumerate(body) if l.strip() == "_step_loop")
+    between = body[seat:loop]
+    assert any('_kernel_dispatch "$vendor" implementer' in l and "BIRCHER_GENERATION=" in l for l in between), between
+
+
+def test_a_refused_output_leaves_the_review_bound_to_what_the_kernel_holds():
+    """The helper echoes the hash it stored even when the kernel refuses the
+    output. Binding the review to that echo is the second refusal of the live
+    failure; the binding must name the run's current artifact instead."""
+    out, log = _run(_tmp(), [_tuple("ready", "codex:pass", "green")],
+                    ["merge||||no"], ["implementing"], refuse_output=True)
+    assert f"record_review codex:pass artifact=hash0 head={HEAD} fps=" in log
+    assert not any("artifact=hash1" in l for l in log)
+    assert out.endswith("|hash0")
+

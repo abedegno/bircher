@@ -339,6 +339,10 @@ _implementer_brief()         {{ _log_call _implementer_brief "$@"; printf 'BRIEF
 _project_config()            {{ printf '{{}}'; }}
 _kernel_start_implementation() {{ _log_call _kernel_start_implementation "$@"; }}
 _kernel_record_output()      {{ _log_call _kernel_record_output "$@"; printf '%s' "{outhash}"; }}
+# The binding is READ BACK from the kernel after the output is recorded (the
+# helper's echo is the hash it stored, not proof the kernel accepted it). The
+# stub models the kernel holding exactly that recorded output.
+_kernel_back_state()         {{ _log_call _kernel_back_state "$@"; printf '%s' "|||{outhash}"; }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
   printf '%s' 'ready|{observed_review}|derived from the repository|{head_sha}|green|true|1|{pr}|{merge_base}|{delta_digest}|||'
@@ -573,7 +577,12 @@ _SEQUENCE = [
     # THIS round's derivation records an implementation output at all, so it
     # sits between the derivation and the recording -- a read, not a record.
     "_kernel_state",
-    "_kernel_record_output", "_kernel_record_ci", "_kernel_dispatch",
+    "_kernel_record_output",
+    # The review's binding is read back from the kernel rather than taken from
+    # `_kernel_record_output`'s echo: a stored-but-refused output must never
+    # be what a verdict binds (live on muesli #768).
+    "_kernel_back_state",
+    "_kernel_record_ci", "_kernel_dispatch",
     "_kernel_record_review", "_kernel_dispatch", "_kernel_request_merge",
     "merge_ready_pr", "_kernel_record_outcome", "_kernel_record_run_outcome",
     # `_finish_pass` READS THE STATE BACK before it retires the queue file.
@@ -586,7 +595,7 @@ _SEQUENCE = [
 ]
 (I_FIND, I_RUN_START, I_OPERATOR, I_PHASES, I_SLICED_CHECK, I_IMPLEMENTER,
  I_START_IMPL, I_STATE, I_BRIEF, I_CTX, I_OBSERVE, I_STEP_STATE, I_OUTPUT,
- I_CI, I_REVIEWER, I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
+ I_BIND, I_CI, I_REVIEWER, I_REVIEW, I_REDISPATCH, I_MERGE_REQ, I_MERGE, I_OUTCOME,
  I_RUN_OUTCOME, I_ENDED_CHECK) = range(len(_SEQUENCE))
 
 
