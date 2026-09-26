@@ -266,6 +266,9 @@ def main(argv=None) -> int:
     bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
     cf = subs.add_parser("conflicted")
     cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
+    st = subs.add_parser("status")
+    st.add_argument("--db", required=True)
+    st.add_argument("--all", action="store_true", help="include ended runs")
     im = subs.add_parser("implementer")
     im.add_argument("--db", required=True); im.add_argument("--run-id", required=True)
     rr = subs.add_parser("rounds")
@@ -478,6 +481,17 @@ def main(argv=None) -> int:
         store = Store.open(a.db)
         store.run_state(a.run_id)
         print(",".join(sorted(back.conflicted_actors(store, a.run_id))))
+        return RC_OK
+
+    # Every open run in one table, for the operator (see coordinator/status.py).
+    if a.mode == "status":
+        from kernel.store import Store
+
+        from coordinator import status as _status
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        print(_status.render(_status.rows(Store.open(a.db), include_ended=a.all)))
         return RC_OK
 
     # Who started the current implementation: the seat `_seat_vendors` gives
