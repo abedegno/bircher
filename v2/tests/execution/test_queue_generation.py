@@ -211,3 +211,16 @@ def test_a_journal_resumption_also_label_queued_is_emitted_exactly_once(tmp_path
     s, f = _disputed_run(tmp_path, park=False)
     n = front.issue_number(s, f.run_id)
     assert _sweep(tmp_path, labelled=[n]) == [n]
+
+
+def test_an_implementing_run_with_no_output_is_queued(tmp_path):
+    """A pass that died between start_implementation and its output (codex
+    review, 2026-09-26). The issue wears `bircher:running`, and the back-half
+    clause asked for output, so no wave found it. Resumed, `_step_loop`
+    adopts the PR the implementer pushed or, finding none, ends the run."""
+    s = Store.open(str(tmp_path / "d.db"))
+    f = Front(s, "i83-died-1").to_planned()
+    g = f._dispatch(Role.IMPLEMENTER, "claude")
+    f._cmd(g, "start_implementation", {})
+    assert s.run_state("i83-died-1") == "implementing"
+    assert _sweep(tmp_path) == [83]

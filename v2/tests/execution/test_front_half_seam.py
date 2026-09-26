@@ -236,6 +236,7 @@ _kernel_dispatch() {{
 }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
+  if [ -n "${{T_OBS:-}}" ]; then printf '%s' "$T_OBS"; return 0; fi
   printf '%s' 'ready|codex:pass|derived from the repository|{head_sha}|green|true|1|{pr}|||||'
 }}
 
@@ -985,6 +986,23 @@ def test_a_run_beyond_the_front_half_is_resumed_not_relaunched(tmp_path):
     # revise_bundle is legal only in the front half and shaping; asked at
     # `implementing` it was refused every wave (2026-09-26, #768's resumes).
     assert "_kernel_revise_bundle" not in d.names, d.names
+
+
+def test_a_run_that_died_before_its_output_ends_when_no_pr_exists(tmp_path):
+    """The sweep now queues an `implementing` run with no output (a pass died
+    mid-implementation). Resumed, it must not wait forever: the derivation
+    finds no PR, `_step_loop` returns before the step function, and the pass
+    records the terminal fact the kernel allows for a run with no output."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": "|||",
+        "T_OBS": "timeout|na|no pull request found||na|unknown|||||||",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert "_kernel_run_start" not in d.names, "it minted a second run"
+    assert d.args_of("_kernel_record_run_outcome")[2] == "timeout", d.calls
 
 
 def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):
