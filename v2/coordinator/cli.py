@@ -380,12 +380,19 @@ def main(argv=None) -> int:
         if a.mode == "cancel" and not back.implementation_output_recorded(store, a.run_id):
             from kernel.commands import Command, submit
             try:
-                submit(store, Command(name="record_run_outcome", run_id=a.run_id,
-                                      expected_version=store.run_version(a.run_id),
-                                      idempotency_key=f"cancel-end:{a.run_id}", generation=ctx.generation,
-                                      payload={"outcome": "escalated"}))
+                res = submit(store, Command(name="record_run_outcome", run_id=a.run_id,
+                                            expected_version=store.run_version(a.run_id),
+                                            idempotency_key=f"cancel-end:{a.run_id}", generation=ctx.generation,
+                                            payload={"outcome": "escalated"}))
+                refused = None if res.accepted else "not accepted"
             except Exception as exc:
-                print(f"cancelled, but the terminal fact was refused: {exc}", file=sys.stderr)
+                refused = str(exc)
+            # Read back, like the runner: a shadow-mode refusal returns rather
+            # than raising. Either way the run stays `cancelled`, and the
+            # journal sweep resumes it to record the fact.
+            if refused or store.run_state(a.run_id) != "ended":
+                print(f"cancelled, but the terminal fact was refused ({refused or 'still open'}); "
+                      "the next wave records it", file=sys.stderr)
                 return RC_FAILED
         return RC_OK
 

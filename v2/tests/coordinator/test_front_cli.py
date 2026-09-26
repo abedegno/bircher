@@ -134,3 +134,18 @@ def test_cancel_leaves_a_run_with_a_pull_request_to_the_wave(tmp_path, monkeypat
     monkeypatch.setattr("coordinator.phases.retire", lambda ctx: [])
     assert main(["cancel", *_common(db), "--server", "http://srv"]) == 0
     assert s.run_state("r-1") == "cancelled"
+
+
+def test_cancel_that_cannot_retire_leaves_the_run_for_the_sweep(tmp_path, monkeypatch):
+    """Retiring fails on a halted run with sessions it cannot stop. The run
+    stays `cancelled` and the command says so; the journal sweep queues every
+    cancelled run, and the resume path records the terminal fact."""
+    db = tmp_path / "k.db"
+    s = Store.open(db)
+    Front(s, "r-1").to_specified()
+
+    def cannot(ctx):
+        raise RuntimeError("run r-1 is halted; these sessions could not be stopped: ['s1']")
+    monkeypatch.setattr("coordinator.phases.retire", cannot)
+    assert main(["cancel", *_common(db), "--server", "http://srv"]) == 1
+    assert s.run_state("r-1") == "cancelled"
