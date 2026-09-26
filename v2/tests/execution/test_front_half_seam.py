@@ -326,6 +326,8 @@ def _extracted_script(tmp_path, extra=()):
     step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
     merge_step_src = _extract_function(src_lines, "_merge_step")
     finish_pass_src = _extract_function(src_lines, "_finish_pass")
+    # Every terminal site reads its fact back through this one helper.
+    finish_pass_src = _extract_function(src_lines, "_run_ended") + "\n\n" + finish_pass_src
     resume_back_half_src = _extract_function(src_lines, "_resume_back_half")
     out = tmp_path / "extracted.sh"
     out.write_text(_PREAMBLE + "\n\n".join(helpers) + "\n\n"
@@ -606,6 +608,22 @@ def test_a_genuine_failure_with_nothing_pending_still_records_failed(tmp_path):
     assert not (d.queue_dir / f"{ITEM}.md").exists()
 
 
+def test_a_refused_failed_keeps_the_queue_file(tmp_path):
+    """#768, 2026-09-25: a pass whose generation was superseded asked for
+    `failed` and the kernel refused it. The adapter is advisory, so the pass
+    retired the queue file anyway over a run still open. Read back now."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_ENDED": "specified",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was retired over an open run"
+    assert "refused the terminal fact" in d.args_of("json_row")[7]
+    assert "REFUSED the terminal fact" in d.result.stderr
+
+
 # --- the post-loop state read: "cannot tell" is not "not sliced" -------------
 
 def test_an_unreadable_state_after_the_loop_does_not_take_the_planned_path(tmp_path):
@@ -808,6 +826,17 @@ def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp
     assert "_create_session" not in d.names, d.names
     assert (d.queue_dir / "processed" / f"{ITEM}.md").exists()
     assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+
+
+def test_a_refused_failed_after_start_keeps_the_queue_file(tmp_path):
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_STATE_AFTER": "plan_submitted",
+        "T_STATE_ENDED": "plan_submitted",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was retired over an open run"
+    assert "refused the terminal fact" in d.args_of("json_row")[7]
 
 
 # --- 4/5. resumption and the sidecar -----------------------------------------
