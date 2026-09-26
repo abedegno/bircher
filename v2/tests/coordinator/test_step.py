@@ -145,7 +145,7 @@ def test_a_repair_owed_at_planned_is_redispatched_even_when_the_head_moved():
     _repair(s, "r1", evidence=["server (go)"])
     assert s.run_state("r") == "planned"
     moved = "7" * 40
-    assert back.repair_for_head(s, "r", moved) is None
+    assert all(f.payload.get("head_sha") != moved for f in back.repairs_since_grant(s, "r"))
     st = next_step(s, "r", g(head=moved, ci="red", failing_jobs=("server (go)",)))
     assert st.kind == "repair" and st.redispatch is True and st.cause == "ci_red"
 

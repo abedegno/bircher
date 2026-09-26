@@ -66,7 +66,7 @@ def next_step(store, run_id: str, g: Ground) -> Step:
     # THE STATE ALONE, not the head. In the back half `planned` is only ever
     # reached through `request_repair`, so a repair round is already owed
     # whatever the head now is -- and the head moves the moment anyone pushes
-    # to the branch while the run waits here. Also matching `repair_for_head`
+    # to the branch while the run waits here. Also matching a repair to the head (the removed `repair_for_head`)
     # stranded such a run: no repair named the new head, so this returned a
     # plain `repair`, `request_repair` is refused from `planned`, and the
     # runner logged "the kernel did not open a repair round" and waited --

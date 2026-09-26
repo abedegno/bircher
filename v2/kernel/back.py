@@ -112,14 +112,6 @@ def repairs_since_grant(store, run_id: str) -> list:
             if f.kind == EventKind.REPAIR_REQUESTED and f.seq > since]
 
 
-def repair_for_head(store, run_id: str, head: str):
-    """The newest repair requested against this head, or None."""
-    for f in reversed(list(store.facts_of_kind(run_id, EventKind.REPAIR_REQUESTED))):
-        if f.payload.get("head_sha") == head:
-            return f
-    return None
-
-
 def would_be_third_identical(store, run_id: str, cause: str, evidence) -> bool:
     """spec §3: no progress is the same cause with the same evidence three
     rounds running. True when the two newest repairs since the grant already
