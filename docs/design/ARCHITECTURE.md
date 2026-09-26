@@ -571,28 +571,32 @@ driving items directly against omnigent, with the kernel unchanged beneath it.
 
 Two consequences worth stating, because they change what to build:
 
-1. **The review/repair split becomes SOLVABLE — it does not solve itself.**
-   An earlier draft claimed longevity alone fixes it. That is wrong:
-   being long-lived supplies *availability*, not repair authority or a
-   protocol. The coordinator's review today is read-only and one-shot, and
-   nothing anywhere defines how a FAIL becomes a fix task.
+1. **The repair protocol now exists** (closed-loop spec,
+   `docs/superpowers/specs/2026-09-19-back-half-closed-loop-design.md`,
+   shipped 2026-09-20 and proven on muesli #765, #767 and #768). This point
+   used to list what a protocol had to specify and say none of it existed.
+   Each question now has an answer:
 
-   A target repair protocol must specify, and none of this exists yet:
+   - **which session gets the fix:** a fresh repair session per round,
+     briefed on the reviewer's verbatim findings or the red jobs
+   - **the kernel transition:** `request_repair` is the only way back to
+     `planned`, and `start_implementation` reopens the round
+   - **generations and roles:** the implementer seat is dispatched per
+     round. A resumed pass takes it before `_step_loop`. When both vendors
+     are conflicted, the vendor that started the round implements again
+   - **invalidating and rebinding:** the output is re-recorded at
+     `implementing`, and the review binds what the kernel holds, read back
+     rather than echoed
+   - **when CI and review repeat, and the bound:** every pass re-derives.
+     Rounds are unbounded by count: the run parks `no_progress` after three
+     identical rounds, and the front-half seat bound stops at the seam
+   - **resuming after a crash:** the journal sweep queues every open run
+     whatever its labels, and `next_step` decides from the journal
+   - **terminal escalation:** a `no_progress` or `no_verdict` park with a
+     carrier session. The person replies `retry` or `stop`
 
-   - which session receives the fix task — the original implementer session
-     (still alive? it is cancelled today) or a fresh one
-   - how the kernel transition works: `record_review(request_revision)` already
-     returns a run to `planned`, so the revision loop exists in the kernel and
-     is unused by this path
-   - how generations and roles advance across a repair round, and what fences
-     the retry
-   - how the reviewed artifact and head are invalidated and rebound after a fix
-   - when CI and review repeat, and the bound on rounds
-   - how a repair resumes idempotently if the coordinator itself dies mid-round
-   - what terminal escalation looks like when the bound is reached
-
-   Until that is designed, gap 1 is NOT "closed by migration" — the migration
-   is a precondition, not the fix.
+   The runner/coordinator split below is still the target. It is no longer
+   what blocks repair.
 2. **New mechanism belongs in Python.** Anything added to `run-queue.sh` from
    here is written to be moved.
 
