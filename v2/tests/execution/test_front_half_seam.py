@@ -551,6 +551,20 @@ def test_parked_rc_writes_the_sidecar_and_keeps_the_queue_file(tmp_path):
     assert "_kernel_record_run_outcome" not in d.names, d.names
 
 
+def test_a_superseded_pass_keeps_the_queue_file_and_records_nothing(tmp_path):
+    """Exit.SUPERSEDED (6): another pass owns the run now. Nothing about it is
+    this pass's to conclude -- no terminal outcome, no sidecar, the queue file
+    stays -- and the row says why, so it is not read as a silent park."""
+    d = _drive(tmp_path, env_extra={"BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "6"})
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["superseded"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not d.sidecar.exists()
+    assert "_create_session" not in d.names, d.names
+
+
 def test_a_halt_this_pass_caused_keeps_the_queue_file_and_escalates(tmp_path):
     """`run_loop` returns Exit.FAILED when an effect goes uncertain and HALTS
     the run -- so the run is not over, it is waiting to be reconciled. The

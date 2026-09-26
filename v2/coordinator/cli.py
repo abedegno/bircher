@@ -32,6 +32,8 @@ RC_FAILED = 1
 RC_USAGE = 2
 RC_LOOKUP_FAILED = 3
 RC_PARKED = 4
+#: `phases.Exit.SUPERSEDED`: the pass lost the run to a newer generation.
+RC_SUPERSEDED = 6
 #: The adapter's `_EFFECT_RC_DENIED`. Kept identical so the two entry points
 #: are interchangeable to a caller that checks the code.
 RC_EFFECT_DENIED = 87

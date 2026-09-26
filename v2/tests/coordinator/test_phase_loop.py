@@ -348,3 +348,20 @@ def test_the_loop_itself_posts_the_park_notice(world, monkeypatch):
         assert len(posted) == before
     finally:
         kernel.cli.subprocess.run = real
+
+
+def test_a_superseded_pass_exits_superseded_not_failed(world, monkeypatch):
+    """Another pass fenced a newer generation mid-loop (2026-09-26, #768: a
+    hand-run loop overlapped a wave). The loser is not a failure of the run
+    -- the winner owns it -- so it must not exit FAILED, which the runner
+    reads as licence to record a terminal `failed` over a live run."""
+    from kernel.ownership import OwnershipLost
+
+    s, f, fake, ctx = world()
+
+    def superseded(c):
+        raise OwnershipLost("generation 3 superseded by 4")
+    monkeypatch.setattr("coordinator.phases.publish_owed", superseded)
+    assert phases.run_loop(ctx) == phases.Exit.SUPERSEDED
+    assert phases.Exit.SUPERSEDED not in (phases.Exit.OK, phases.Exit.FAILED,
+                                          phases.Exit.USAGE, phases.Exit.PARKED)

@@ -11,6 +11,7 @@ from kernel import front
 from kernel.authz import FRONT_HALF_STATES, SHAPING_STATES, NotAuthorized, phase_of
 from kernel.effect_class import EffectClass
 from kernel.events import EventKind
+from kernel.ownership import OwnershipLost
 
 PUBLISH_CAP = 60_000
 APPROVED_AT = {"spec": ("specified", "plan_submitted", "plan_accepted", "planned"),
@@ -330,8 +331,10 @@ def notify_owed(ctx: Ctx) -> list[str]:
 class Exit:
     """The loop's exit codes (spec §3): `planned` is 0, a park is 4, and
     anything the loop cannot act on itself is 1. USAGE is the CLI's, kept
-    here so one table names all four."""
-    OK, FAILED, USAGE, PARKED = 0, 1, 2, 4
+    here so one table names them all. SUPERSEDED (6) is a pass that lost
+    ownership to a newer one: the run is live and owned elsewhere, so the
+    caller must neither end it nor count it failed."""
+    OK, FAILED, USAGE, PARKED, SUPERSEDED = 0, 1, 2, 4, 6
 
 
 def stall(ctx: Ctx, reason: str, *, session_id, findings_hash, verdict, reviewer) -> str:
@@ -561,6 +564,13 @@ def run_loop(ctx: Ctx) -> int:
     except (WorktreeExists, AgentMismatch) as exc:
         ctx.log(f"failed: {exc}")
         return Exit.FAILED
+    except OwnershipLost as exc:
+        # Another pass fenced a newer generation (2026-09-26: a hand-run loop
+        # overlapped a wave on #768). It escaped as a traceback, the runner
+        # read rc 1 as a failure, and recorded `failed` over a run the winner
+        # still owned.
+        ctx.log(f"superseded: {exc}")
+        return Exit.SUPERSEDED
     except ValueError as exc:
         # A bug in the coordinator's own reading -- a batch with nothing in
         # it, an idempotency key reused for different work. It must not

@@ -4939,6 +4939,16 @@ run_item() {
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "parked" "false" "" "" 0 "parked: $(printf '%s' "$_park" | _json_get reason)" "parked" >> "$SCORECARD"
       return 0 ;;                                   # the queue file stays where it is
+    6)
+      # SUPERSEDED: another pass fenced a newer generation and owns the run.
+      # Nothing here is this pass's to conclude -- a terminal `failed` over a
+      # live run is what #768 got from a hand-run loop overlapping a wave
+      # (2026-09-26). The queue file stays for whichever pass comes next.
+      rm -f "$QUEUE/$code.parked"
+      echo "[batch] $item: run $BIRCHER_RUN_ID was superseded by another pass; leaving it to its owner" >&2
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "superseded" "false" "" "" 0 "phases rc=6: run '$BIRCHER_RUN_ID' is owned by a newer pass" "n/a" >> "$SCORECARD"
+      return 0 ;;
     *)
       # Same reason as the refusal below: whichever way this ends, the run is
       # not PARKED, so a sidecar saying it is would outlive what it describes.
