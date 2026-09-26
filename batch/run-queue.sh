@@ -2998,12 +2998,14 @@ EOF
     if [ -n "${observed_head:-}" ]; then
       if [ "$_st_now" = implementing ]; then
         local _body="derived: outcome=$outcome review=$review head=$observed_head note=$note"
-        _out_hash=$(_kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body")
+        _kernel_record_output "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_body" >/dev/null
       fi
-      # At `reviewing` the output on record is the one the binding must name.
-      if [ -z "$_out_hash" ]; then
-        _out_hash=$(_kernel_back_state "$BIRCHER_RUN_ID"); _out_hash="${_out_hash##*|}"
-      fi
+      # THE BINDING NAMES WHAT THE KERNEL HOLDS, read back rather than taken
+      # from `_kernel_record_output`'s echo: that prints the hash it STORED
+      # whether or not the kernel accepted it as this run's output, and a
+      # review bound to a stored-but-refused blob is refused in turn. At
+      # `reviewing` this is also simply the output on record.
+      _out_hash=$(_kernel_back_state "$BIRCHER_RUN_ID"); _out_hash="${_out_hash##*|}"
       _kernel_record_ci "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "${_obs_ci:-na}" "$observed_head" "$_pr_state" "$_failing_jobs" "$pr"
       # A VERDICT IS RECORDED ONLY WHEN THERE IS ONE. `na` on a red or a
       # silent reviewer is not a verdict, and the kernel would refuse it.
@@ -4360,6 +4362,15 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
   _label_running
   # THE SEATS, from the journal rather than from this wave's pick.
   _seat_vendors "$BIRCHER_RUN_ID"
+  # TAKE THE IMPLEMENTER SEAT BEFORE THE LOOP, so a resumed pass enters
+  # `_step_loop` holding the same kind of generation a first pass does. The
+  # runner's resume fence is an OPERATOR attempt, and only an implementer
+  # attempt may record an implementation output: resumed at `implementing`,
+  # the kernel refused the output, the review then bound a hash the run never
+  # produced and was refused too, and every wave re-reviewed the same head
+  # and recorded nothing (live on muesli #768, 2026-09-26). An implementer
+  # dispatch costs no seat -- the budget counts authors and reviewers.
+  BIRCHER_GENERATION=$(_kernel_dispatch "$vendor" implementer); export BIRCHER_GENERATION
   local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
   _step_loop
   [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
