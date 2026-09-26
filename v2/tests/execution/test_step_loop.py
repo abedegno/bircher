@@ -33,6 +33,7 @@ _kernel_record_output() { _log "record_output gen=$2"; [ "${REFUSE_OUTPUT:-0}" =
 _kernel_record_ci() { _log "record_ci status=$3 head=$4 pr_state=${5:-} jobs=${6:-} pr=${7:-}"; }
 _kernel_record_review() { _log "record_review $3 artifact=$4 head=${9:-} fps=${12:-}"; }
 _kernel_dispatch() { _log "dispatch $1 $2"; printf '7'; }
+_kernel_implementer() { printf '%s' "${IMPLEMENTER:-}"; }
 _kernel_request_repair() { _log "request_repair $3 head=$4 ev=${5:-}"; }
 _kernel_back_state() { printf '42|open|%s|%s' "$HEAD" "$(cat "$T/current_artifact" 2>/dev/null || echo hash0)"; }
 _kernel_conflicted() { printf '%s' "${CONFLICTED:-}"; }
@@ -54,7 +55,7 @@ def _tuple(outcome, review, ci, *, head=HEAD, pr="42", fps="", pr_state="open", 
 
 
 def _run(tmp_path, derive_lines, step_lines, states, *, pr0="42", findings="", park_rc=0,
-         conflicted=None, vendor0=None, reviewer0=None, refuse_output=False):
+         conflicted=None, vendor0=None, reviewer0=None, refuse_output=False, implementer=None):
     """*conflicted* (the journal's answer), *vendor0* and *reviewer0* (this
     wave's own pick) drive `_seat_vendors`, which is extracted and called
     before `_step_loop` exactly as `_resume_back_half` calls it. Left unset,
@@ -71,7 +72,8 @@ def _run(tmp_path, derive_lines, step_lines, states, *, pr0="42", findings="", p
               + '_step_loop; printf "%s|%s|%s|%s|%s" "$_step" "$outcome" "$pr" "$_rev_round" "$_out_hash"\n')
     env = dict(os.environ, T=str(tmp_path), PR0=pr0, HEAD=HEAD, PARK_RC=str(park_rc),
                CONFLICTED=conflicted or "", VENDOR0=vendor0 or "claude_code",
-               REVIEWER0=reviewer0 or "codex", REFUSE_OUTPUT="1" if refuse_output else "0")
+               REVIEWER0=reviewer0 or "codex", REFUSE_OUTPUT="1" if refuse_output else "0",
+               IMPLEMENTER=implementer or "")
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr
     log_file = tmp_path / "calls.log"
@@ -267,11 +269,23 @@ def test_an_unreadable_conflicted_set_leaves_this_waves_pick_alone():
     assert "dispatch claude_code reviewer" in log, log
 
 
-def test_both_vendors_conflicted_leaves_the_seats_and_says_so():
+def test_both_vendors_conflicted_seats_the_one_who_started_the_implementation():
     """A pass that died between a repair's `start_implementation` and its
-    output puts both vendors in the set, and then NO reviewer is acceptable.
-    The seats stay where they are and the refusal handling keeps the run
-    moving; the alternative is a park on a question a person cannot answer."""
+    output puts both vendors in the set: the old producer and the new
+    implementer. Left on this wave's pick, every wave paid for a review the
+    kernel then refused. The vendor who started the implementation takes the
+    implementer seat again, its output makes it the only conflicted actor,
+    and the other vendor reviews."""
+    out, log = _run(_tmp(), [_tuple("ready", "codex:pass", "green")], ["merge||||no"], ["reviewing"],
+                    conflicted="claude_code,codex", vendor0="claude_code", reviewer0="codex",
+                    implementer="codex")
+    assert "dispatch claude_code reviewer" in log, log
+    assert "dispatch codex implementer" in log, log
+    assert "dispatch codex reviewer" not in log, log
+
+
+def test_both_vendors_conflicted_with_no_implementer_answer_leaves_the_seats():
+    """No answer is not an answer: the wave's pick stands, as before."""
     out, log = _run(_tmp(), [_tuple("ready", "codex:pass", "green")], ["merge||||no"], ["reviewing"],
                     conflicted="claude_code,codex", vendor0="codex", reviewer0="claude_code")
     assert out.startswith("merge|ready|42|0|")

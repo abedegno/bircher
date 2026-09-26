@@ -1026,6 +1026,17 @@ _kernel_back_state() {  # <run_id>
   printf '%s' "$out"
 }
 
+# _kernel_implementer <run_id> -> who started the run's current
+# implementation (coordinator.cli implementer), or empty when the kernel would
+# not answer or no implementation has started. Empty is "not said", as above.
+_kernel_implementer() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli implementer \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
 # _kernel_conflicted <run_id> -> the actors the kernel will refuse a review
 # from, comma-separated in sorted order (coordinator.cli conflicted), or empty
 # when the kernel would not answer.

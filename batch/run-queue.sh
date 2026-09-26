@@ -4291,9 +4291,8 @@ _label_running() {
 # case and seats both roles. An empty or unreadable set is "the journal did
 # not say" -- leave the wave's pick alone rather than guess. BOTH conflicted
 # happens when a pass died between a repair's `start_implementation` and its
-# output, and then NO reviewer is acceptable: say so and leave the seats
-# where they are, so `_step_loop`'s own refusal handling keeps the run moving
-# instead of parking it on a question a person cannot answer.
+# output: the vendor that started it takes the implementer seat again (see
+# below), and only when the journal will not name it are the seats left.
 _seat_vendors() {  # <run_id>
   local _cf _a _cc=0 _cx=0 _oifs
   _cf=$(_kernel_conflicted "$1")
@@ -4303,7 +4302,19 @@ _seat_vendors() {  # <run_id>
   done
   IFS="$_oifs"
   if [ "$_cc" = 1 ] && [ "$_cx" = 1 ]; then
-    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- no reviewer the kernel will accept; leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick) and letting the loop wait rather than parking" >&2
+    # The old producer and the vendor that started the repair. The one who
+    # STARTED it implements again: its output makes it the only conflicted
+    # actor, and the other can review. Left on the wave's pick, every wave
+    # paid for a review the kernel then refused.
+    local _impl; _impl=$(_kernel_implementer "$1")
+    case "$_impl" in
+      claude_code) vendor=claude_code; RECOVERY_REVIEWER=codex ;;
+      codex) vendor=codex; RECOVERY_REVIEWER=claude_code ;;
+      *)
+        echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) and the journal names no implementer -- leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick)" >&2
+        return 0 ;;
+    esac
+    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- $_impl started the implementation and implements again; reviewer=$RECOVERY_REVIEWER" >&2
     return 0
   fi
   if [ "$_cc" = 1 ]; then

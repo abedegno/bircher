@@ -266,6 +266,8 @@ def main(argv=None) -> int:
     bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
     cf = subs.add_parser("conflicted")
     cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
+    im = subs.add_parser("implementer")
+    im.add_argument("--db", required=True); im.add_argument("--run-id", required=True)
     sl = subs.add_parser("session-last-item")
     sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
     pn = subs.add_parser("park-notice")
@@ -474,6 +476,19 @@ def main(argv=None) -> int:
         store = Store.open(a.db)
         store.run_state(a.run_id)
         print(",".join(sorted(back.conflicted_actors(store, a.run_id))))
+        return RC_OK
+
+    # Who started the current implementation: the seat `_seat_vendors` gives
+    # back when both vendors are conflicted. Same shape as `conflicted`.
+    if a.mode == "implementer":
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        print(back.implementer(store, a.run_id) or "")
         return RC_OK
 
     if a.mode == "session-last-item":

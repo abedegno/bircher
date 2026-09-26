@@ -73,6 +73,14 @@ def conflicted_actors(store, run_id: str) -> set[str]:
     return authz._conflicted_actors(store, run_id)
 
 
+def implementer(store, run_id: str) -> str | None:
+    """Who started the run's current implementation (the last accepted
+    start_implementation). Delegates to the rule the kernel enforces, for
+    the same reason `conflicted_actors` does."""
+    from kernel import authz
+    return authz._implementer_of(store, run_id)
+
+
 def back_verdicts(store, run_id: str) -> list:
     """Implementation-phase verdicts, oldest first."""
     return [f for f in store.facts_for(run_id)

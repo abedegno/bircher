@@ -273,6 +273,21 @@ def test_conflicted_prints_an_empty_line_before_any_implementation(tmp_path, cap
     assert capsys.readouterr().out == "\n"
 
 
+def test_implementer_prints_who_started_the_current_implementation(tmp_path, capsys):
+    """The both-conflicted seat: a pass died between a repair's
+    start_implementation and its output, so the producer and the new
+    implementer differ. Seating the one who STARTED it lets its output make
+    it the only conflicted actor, and the other vendor can review."""
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["implementer", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "claude\n"
+
+
+def test_implementer_is_rc_3_without_a_database(tmp_path):
+    assert main(["implementer", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
+
+
 def test_conflicted_is_rc_3_without_a_database(tmp_path):
     assert main(["conflicted", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
 
