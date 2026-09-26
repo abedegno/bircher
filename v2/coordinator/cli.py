@@ -268,6 +268,8 @@ def main(argv=None) -> int:
     cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
     im = subs.add_parser("implementer")
     im.add_argument("--db", required=True); im.add_argument("--run-id", required=True)
+    rr = subs.add_parser("rounds")
+    rr.add_argument("--db", required=True); rr.add_argument("--run-id", required=True)
     sl = subs.add_parser("session-last-item")
     sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
     pn = subs.add_parser("park-notice")
@@ -480,7 +482,7 @@ def main(argv=None) -> int:
 
     # Who started the current implementation: the seat `_seat_vendors` gives
     # back when both vendors are conflicted. Same shape as `conflicted`.
-    if a.mode == "implementer":
+    if a.mode in ("implementer", "rounds"):
         from kernel import back
         from kernel.store import Store
         if not os.path.exists(a.db):
@@ -488,7 +490,10 @@ def main(argv=None) -> int:
             return RC_LOOKUP_FAILED
         store = Store.open(a.db)
         store.run_state(a.run_id)
-        print(back.implementer(store, a.run_id) or "")
+        if a.mode == "rounds":
+            print(back.repair_rounds(store, a.run_id))
+        else:
+            print(back.implementer(store, a.run_id) or "")
         return RC_OK
 
     if a.mode == "session-last-item":

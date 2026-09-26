@@ -4400,7 +4400,11 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
   local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
   _step_loop
   [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
-  [ "$_rev_round" != 0 ] && rounds="$_rev_round"
+  # THE RUN'S rounds, from the journal (spec §2), not this pass's: a run
+  # repaired over five waves reported one, or nothing. This pass's own count
+  # stands in only when the kernel will not answer.
+  rounds=$(_kernel_repair_rounds "$BIRCHER_RUN_ID")
+  [ -z "$rounds" ] && [ "$_rev_round" != 0 ] && rounds="$_rev_round"
   [ "$_step" = merge ] && _merge_step
   elapsed=$(( $(date +%s) - start ))
   _finish_pass "$item" "$f" "$_iss"

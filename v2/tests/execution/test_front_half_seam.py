@@ -229,6 +229,7 @@ _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
 _kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; printf '1' > "{ranoutcome}"; }}
 _kernel_conflicted() {{ _log_call _kernel_conflicted "$@"; printf '%s' "${{T_CONFLICTED-}}"; }}
+_kernel_repair_rounds() {{ _log_call _kernel_repair_rounds "$@"; printf '%s' "${{T_ROUNDS-}}"; }}
 _kernel_dispatch() {{
   _log_call _kernel_dispatch "$@"
   local n; n=$(cat "{gencounter}"); n=$((n+1)); printf '%s' "$n" > "{gencounter}"
@@ -1032,6 +1033,19 @@ def test_a_run_that_died_before_its_output_ends_when_no_pr_exists(tmp_path):
     assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
     assert "_kernel_run_start" not in d.names, "it minted a second run"
     assert d.args_of("_kernel_record_run_outcome")[2] == "timeout", d.calls
+
+
+def test_a_resumed_pass_reports_the_runs_rounds_from_the_journal(tmp_path):
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
+        "T_ROUNDS": "5",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_repair_rounds") == [OPEN_RUN]
+    assert d.args_of("json_row")[10] == "5", d.args_of("json_row")
 
 
 def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):

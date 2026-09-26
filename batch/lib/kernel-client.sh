@@ -1037,6 +1037,16 @@ _kernel_implementer() {  # <run_id>
   printf '%s' "$out"
 }
 
+# _kernel_repair_rounds <run_id> -> how many repairs the run has requested
+# (coordinator.cli rounds), or empty when the kernel would not answer.
+_kernel_repair_rounds() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli rounds \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
 # _kernel_conflicted <run_id> -> the actors the kernel will refuse a review
 # from, comma-separated in sorted order (coordinator.cli conflicted), or empty
 # when the kernel would not answer.

@@ -73,6 +73,12 @@ def conflicted_actors(store, run_id: str) -> set[str]:
     return authz._conflicted_actors(store, run_id)
 
 
+def repair_rounds(store, run_id: str) -> int:
+    """Every repair the run requested, grants or not (spec §2: the rounds
+    the scorecard and the log report)."""
+    return len(store.facts_of_kind(run_id, EventKind.REPAIR_REQUESTED))
+
+
 def implementer(store, run_id: str) -> str | None:
     """Who started the run's current implementation (the last accepted
     start_implementation). Delegates to the rule the kernel enforces, for

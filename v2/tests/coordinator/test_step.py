@@ -284,6 +284,19 @@ def test_implementer_prints_who_started_the_current_implementation(tmp_path, cap
     assert capsys.readouterr().out == "claude\n"
 
 
+def test_rounds_counts_every_repair_the_run_requested(tmp_path, capsys):
+    """closed-loop spec §2: rounds are counted from the journal for the
+    scorecard. A resumed pass knew only its own, so a run repaired over five
+    waves reported `rounds=1` or nothing."""
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["rounds", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "0\n"
+    _repair(s, "r1", evidence=["server (go)"])
+    assert main(["rounds", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "1\n"
+
+
 def test_implementer_is_rc_3_without_a_database(tmp_path):
     assert main(["implementer", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
 
