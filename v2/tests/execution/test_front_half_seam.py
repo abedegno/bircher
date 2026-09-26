@@ -229,6 +229,7 @@ _kernel_request_merge()      {{ _log_call _kernel_request_merge "$@"; }}
 _kernel_record_outcome()     {{ _log_call _kernel_record_outcome "$@"; }}
 _kernel_record_run_outcome() {{ _log_call _kernel_record_run_outcome "$@"; printf '1' > "{ranoutcome}"; }}
 _kernel_conflicted() {{ _log_call _kernel_conflicted "$@"; printf '%s' "${{T_CONFLICTED-}}"; }}
+_kernel_repair_rounds() {{ _log_call _kernel_repair_rounds "$@"; printf '%s' "${{T_ROUNDS-}}"; }}
 _kernel_dispatch() {{
   _log_call _kernel_dispatch "$@"
   local n; n=$(cat "{gencounter}"); n=$((n+1)); printf '%s' "$n" > "{gencounter}"
@@ -236,6 +237,7 @@ _kernel_dispatch() {{
 }}
 observe_outcome() {{
   _log_call observe_outcome "$@"
+  if [ -n "${{T_OBS:-}}" ]; then printf '%s' "$T_OBS"; return 0; fi
   printf '%s' 'ready|codex:pass|derived from the repository|{head_sha}|green|true|1|{pr}|||||'
 }}
 
@@ -325,6 +327,8 @@ def _extracted_script(tmp_path, extra=()):
     step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
     merge_step_src = _extract_function(src_lines, "_merge_step")
     finish_pass_src = _extract_function(src_lines, "_finish_pass")
+    # Every terminal site reads its fact back through this one helper.
+    finish_pass_src = _extract_function(src_lines, "_run_ended") + "\n\n" + finish_pass_src
     resume_back_half_src = _extract_function(src_lines, "_resume_back_half")
     out = tmp_path / "extracted.sh"
     out.write_text(_PREAMBLE + "\n\n".join(helpers) + "\n\n"
@@ -605,6 +609,22 @@ def test_a_genuine_failure_with_nothing_pending_still_records_failed(tmp_path):
     assert not (d.queue_dir / f"{ITEM}.md").exists()
 
 
+def test_a_refused_failed_keeps_the_queue_file(tmp_path):
+    """#768, 2026-09-25: a pass whose generation was superseded asked for
+    `failed` and the kernel refused it. The adapter is advisory, so the pass
+    retired the queue file anyway over a run still open. Read back now."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "1",
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_ENDED": "specified",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was retired over an open run"
+    assert "refused the terminal fact" in d.args_of("json_row")[7]
+    assert "REFUSED the terminal fact" in d.result.stderr
+
+
 # --- the post-loop state read: "cannot tell" is not "not sliced" -------------
 
 def test_an_unreadable_state_after_the_loop_does_not_take_the_planned_path(tmp_path):
@@ -809,6 +829,17 @@ def test_state_other_than_implementing_after_start_is_failed_with_no_session(tmp
     assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
 
 
+def test_a_refused_failed_after_start_keeps_the_queue_file(tmp_path):
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_STATE_AFTER": "plan_submitted",
+        "T_STATE_ENDED": "plan_submitted",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_record_run_outcome")[2] == "failed"
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was retired over an open run"
+    assert "refused the terminal fact" in d.args_of("json_row")[7]
+
+
 # --- 4/5. resumption and the sidecar -----------------------------------------
 
 def _resume_drive(tmp_path, **env):
@@ -985,6 +1016,36 @@ def test_a_run_beyond_the_front_half_is_resumed_not_relaunched(tmp_path):
     # revise_bundle is legal only in the front half and shaping; asked at
     # `implementing` it was refused every wave (2026-09-26, #768's resumes).
     assert "_kernel_revise_bundle" not in d.names, d.names
+
+
+def test_a_run_that_died_before_its_output_ends_when_no_pr_exists(tmp_path):
+    """The sweep now queues an `implementing` run with no output (a pass died
+    mid-implementation). Resumed, it must not wait forever: the derivation
+    finds no PR, `_step_loop` returns before the step function, and the pass
+    records the terminal fact the kernel allows for a run with no output."""
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": "|||",
+        "T_OBS": "timeout|na|no pull request found||na|unknown|||||||",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert "_kernel_run_start" not in d.names, "it minted a second run"
+    assert d.args_of("_kernel_record_run_outcome")[2] == "timeout", d.calls
+
+
+def test_a_resumed_pass_reports_the_runs_rounds_from_the_journal(tmp_path):
+    d = _drive(tmp_path, env_extra={
+        "BIRCHER_HAVE_LOCK": "1", "T_FIND_RUN": OPEN_RUN,
+        "T_PENDING": json.dumps({"halted": False, "pending": []}),
+        "T_STATE_RESUME": "implementing",
+        "T_BACK_STATE": f"{PR}|open|{HEAD_SHA}|{OUT_HASH}",
+        "T_ROUNDS": "5",
+    })
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.args_of("_kernel_repair_rounds") == [OPEN_RUN]
+    assert d.args_of("json_row")[10] == "5", d.args_of("json_row")
 
 
 def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):

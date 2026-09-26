@@ -228,6 +228,8 @@ def _extracted_script(tmp_path):
     step_loop_src = _heredoc_to_herestring(_extract_function(src_lines, "_step_loop"))
     merge_step_src = _extract_function(src_lines, "_merge_step")
     finish_pass_src = _extract_function(src_lines, "_finish_pass")
+    # Every terminal site reads its fact back through this one helper.
+    finish_pass_src = _extract_function(src_lines, "_run_ended") + "\n\n" + finish_pass_src
 
     preamble = '''
 set -uo pipefail

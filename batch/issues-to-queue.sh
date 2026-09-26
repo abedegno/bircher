@@ -121,14 +121,16 @@ for rid in s.all_run_ids():
     # ruling consumes the park, the issue still wears `bircher:running` from
     # the pass that parked, and neither the park clause nor the labels found
     # it -- #768 sat at `specified` after its approval until a person
-    # relabelled it. A `cancelled` run without output is a stop, not work,
-    # and stays out. This clause subsumes the revision-16 unresolved-dispute
+    # relabelled it. A `cancelled` run is swept with or without output: its
+    # terminal fact is owed, `cancel` records it only when nothing fails, and
+    # the `cancelled` case of the resume path records the rest. Past the seam, output is not
+    # asked for: a pass that died between start_implementation and its
+    # output left a run at `implementing` that nothing found. This clause subsumes the revision-16 unresolved-dispute
     # test, which it replaced: a dispute exists only at `shaping`.
     if front.current_park(s, rid) is not None or (
             s.run_state(rid) in FRONT_HALF_STATES | SHAPING_STATES | {"planned"}) or (
             s.run_state(rid) == "sliced" and front.filing_complete(s, rid, front.epoch(s, rid)) is None) or (
-            s.run_state(rid) in ("planned", "implementing", "reviewing", "merge_requested", "merged", "cancelled")
-            and back.implementation_output_recorded(s, rid)):
+            s.run_state(rid) in ("implementing", "reviewing", "merge_requested", "merged", "cancelled")):
         out.append(m.group(1))
 print(" ".join(dict.fromkeys(out)))' 2>"${TMP_SWEEP_ERR:-/dev/null}") || parked_nums=""
   if [ -n "${TMP_SWEEP_ERR:-}" ] && [ -s "$TMP_SWEEP_ERR" ]; then

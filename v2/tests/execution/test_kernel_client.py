@@ -510,3 +510,24 @@ def test_a_run_recorded_with_an_EMPTY_base_reads_back_empty(tmp_path):
 
     assert _run('_kernel_run_base ITEM-7-a',
                 env={"BIRCHER_KERNEL_DB": str(db)}).stdout == ""
+
+
+def test_park_back_keeps_a_free_text_cause_that_would_break_the_json(tmp_path):
+    """A `no_verdict` park now carries the derivation's note as its cause,
+    and the payload is hand-built JSON: a quote, a backslash or a newline in
+    the note would make the kernel refuse the park outright."""
+    from kernel import front
+    from tests.kernel.front import Front
+    db = tmp_path / "kernel.db"
+    store = Store.open(db)
+    f = Front(store, "r-pk")
+    gen = f.to_implementing()
+    cause = 'codex said "no" \\ then\nstopped \u2014 ' + "\u00e9" * 300
+    r = _run(f'_kernel_park_back r-pk {gen} no_verdict "" "" "$CAUSE" ""',
+             env={"BIRCHER_KERNEL_DB": str(db), "CAUSE": cause})
+    assert r.returncode == 0, r.stderr
+    park = front.current_park(Store.open(db), "r-pk")
+    assert park is not None, r.stderr
+    expected = " ".join(cause.split())[:240]
+    assert park.payload["cause"] == expected
+    assert '"no"' in expected and "\\" in expected       # kept, not stripped

@@ -3081,7 +3081,10 @@ EOF
         fi
         # This pass reviewed the head and got no verdict; a person says
         # whether to review again (`retry`) or stop.
-        if _park_back_half "$item" "$code" no_verdict; then
+        # THE CAUSE TRAVELS with the park: the derivation's note says why
+        # there was no verdict (a reviewer error, an empty findings file), and
+        # without it the notice could only say that there was none.
+        if _park_back_half "$item" "$code" no_verdict "$note"; then
           # `review` is not in the returned vocabulary (wait|park|merge|done|
           # none): this pass ended in a park exactly as the `park` case does.
           _step=park; outcome=parked; note="${note:+$note; }parked no_verdict"; return 0
@@ -3132,6 +3135,19 @@ EOF
   done
 }
 
+# _run_ended <outcome>: after `_kernel_record_run_outcome`, did the kernel
+# take it? The adapter is advisory and returns 0 on a refusal, so the only
+# answer is the state read back. 0 when the run is `ended`; 1, with the line
+# a person reads, when it is not -- and then the caller keeps the queue file,
+# because the run is still open and the next wave resumes it. Five sites
+# retired the file on the assumption; #768's hand-run overlap produced
+# exactly such a refusal (2026-09-25).
+_run_ended() {
+  [ "$(_kernel_state "$BIRCHER_RUN_ID")" = ended ] && return 0
+  echo "[batch] ${item:-?}: the kernel REFUSED the terminal fact outcome=$1 for run $BIRCHER_RUN_ID -- the journal still holds this run open; the queue file stays and the next wave resumes it" >&2
+  return 1
+}
+
 # _finish_pass <item> <queue-file> <issue> -- the pass's ending, shared by
 # run_item and _resume_back_half. Reads outcome pr ci_first review
 # resubmissions elapsed note bound_outcome vendor rounds _step merge_rc by
@@ -3155,9 +3171,8 @@ _finish_pass() {  # <item> <queue-file> <issue>
     *)
       # record_run_outcome
       _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$outcome"
-      if [ "$(_kernel_state "$BIRCHER_RUN_ID")" != ended ]; then
+      if ! _run_ended "$outcome"; then
         _terminal_ok=0
-        echo "[batch] $item: the kernel REFUSED the terminal fact outcome=$outcome for run $BIRCHER_RUN_ID -- the journal still holds this run open. NOT retiring the queue file; the next wave resumes it." >&2
         note="${note:+$note; }the kernel refused the terminal fact (outcome=$outcome); the run is still open and the next wave resumes it"
       fi
       ;;
@@ -4279,9 +4294,8 @@ _label_running() {
 # case and seats both roles. An empty or unreadable set is "the journal did
 # not say" -- leave the wave's pick alone rather than guess. BOTH conflicted
 # happens when a pass died between a repair's `start_implementation` and its
-# output, and then NO reviewer is acceptable: say so and leave the seats
-# where they are, so `_step_loop`'s own refusal handling keeps the run moving
-# instead of parking it on a question a person cannot answer.
+# output: the vendor that started it takes the implementer seat again (see
+# below), and only when the journal will not name it are the seats left.
 _seat_vendors() {  # <run_id>
   local _cf _a _cc=0 _cx=0 _oifs
   _cf=$(_kernel_conflicted "$1")
@@ -4291,7 +4305,19 @@ _seat_vendors() {  # <run_id>
   done
   IFS="$_oifs"
   if [ "$_cc" = 1 ] && [ "$_cx" = 1 ]; then
-    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- no reviewer the kernel will accept; leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick) and letting the loop wait rather than parking" >&2
+    # The old producer and the vendor that started the repair. The one who
+    # STARTED it implements again: its output makes it the only conflicted
+    # actor, and the other can review. Left on the wave's pick, every wave
+    # paid for a review the kernel then refused.
+    local _impl; _impl=$(_kernel_implementer "$1")
+    case "$_impl" in
+      claude_code) vendor=claude_code; RECOVERY_REVIEWER=codex ;;
+      codex) vendor=codex; RECOVERY_REVIEWER=claude_code ;;
+      *)
+        echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) and the journal names no implementer -- leaving implementer=$vendor reviewer=$RECOVERY_REVIEWER (this wave's pick)" >&2
+        return 0 ;;
+    esac
+    echo "[batch] ${item:-?}: BOTH vendors are conflicted on run $1 ($_cf) -- $_impl started the implementation and implements again; reviewer=$RECOVERY_REVIEWER" >&2
     return 0
   fi
   if [ "$_cc" = 1 ]; then
@@ -4377,7 +4403,11 @@ _resume_back_half() {  # <item> <code> <queue-file> <issue> <state>
   local _bs; _bs=$(_kernel_back_state "$BIRCHER_RUN_ID"); pr="${_bs%%|*}"
   _step_loop
   [ -n "$_ffile" ] && { rm -f "$_ffile" 2>/dev/null || true; }
-  [ "$_rev_round" != 0 ] && rounds="$_rev_round"
+  # THE RUN'S rounds, from the journal (spec §2), not this pass's: a run
+  # repaired over five waves reported one, or nothing. This pass's own count
+  # stands in only when the kernel will not answer.
+  rounds=$(_kernel_repair_rounds "$BIRCHER_RUN_ID")
+  [ -z "$rounds" ] && [ "$_rev_round" != 0 ] && rounds="$_rev_round"
   [ "$_step" = merge ] && _merge_step
   elapsed=$(( $(date +%s) - start ))
   _finish_pass "$item" "$f" "$_iss"
@@ -5003,9 +5033,10 @@ run_item() {
       fi
       echo "[batch] $item: phases exited $_prc; recording failed" >&2
       _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
+      local _endnote=""; _run_ended failed || _endnote="; the kernel refused the terminal fact, so the run is still open and the next wave resumes it"
       mkdir -p "$(dirname "$SCORECARD")"
-      json_row "$item" "" "failed" "false" "" "" 0 "phases rc=$_prc" "failed" >> "$SCORECARD"
-      mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+      json_row "$item" "" "failed" "false" "" "" 0 "phases rc=$_prc$_endnote" "failed" >> "$SCORECARD"
+      [ -n "$_endnote" ] || { mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"; }
       return 0 ;;
   esac
   rm -f "$QUEUE/$code.parked"
@@ -5052,9 +5083,10 @@ run_item() {
   if [ "$_st_after" != implementing ]; then
     echo "[batch] $item: state after start_implementation is '$_st_after', not implementing; RC_FAILED, no session" >&2
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
+    local _endnote=""; _run_ended failed || _endnote="; the kernel refused the terminal fact, so the run is still open and the next wave resumes it"
     mkdir -p "$(dirname "$SCORECARD")"
-    json_row "$item" "" "failed" "false" "" "" 0 "start_implementation refused at $_st_after" "failed" >> "$SCORECARD"
-    mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+    json_row "$item" "" "failed" "false" "" "" 0 "start_implementation refused at $_st_after$_endnote" "failed" >> "$SCORECARD"
+    [ -n "$_endnote" ] || { mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"; }
     return 0
   fi
   # The implementer's brief: the directives, then the spec and plan the
@@ -5073,8 +5105,9 @@ run_item() {
     # divergence previously waved through as an exemption on the grounds that
     # no generation existed. One now does.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "failed"
-    json_row "$item" "" "failed" "false" "" "" 0 "REST session create failed" "failed" >> "$SCORECARD"
-    mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+    local _endnote=""; _run_ended failed || _endnote="; the kernel refused the terminal fact, so the run is still open and the next wave resumes it"
+    json_row "$item" "" "failed" "false" "" "" 0 "REST session create failed$_endnote" "failed" >> "$SCORECARD"
+    [ -n "$_endnote" ] || { mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"; }
     return 0
   fi
   echo "[batch] $item: session $conv_id (agent $AGENT_ID)"
@@ -5302,10 +5335,11 @@ run_item() {
     # An earlier version of this comment claimed they "agree by construction",
     # which is the unearned-claim shape this change exists to remove.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "noop"
-    json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}" "$bound_outcome" "$vendor" >> "$SCORECARD"
+    local _endnote=""; _run_ended noop || _endnote="; the kernel refused the terminal fact, so the run is still open and the next wave resumes it"
+    json_row "$item" "" "noop" "" "" "" "$elapsed" "${nnote:-already satisfied; no product change needed}$_endnote" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=noop (no change needed)"
     _issue_writeback "$(_item_issue "$prompt")" "noop" "" "" "" ""
-    mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+    [ -n "$_endnote" ] || { mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"; }
     return 0
   fi
 
@@ -5323,10 +5357,11 @@ run_item() {
     # An earlier version of this comment claimed they "agree by construction",
     # which is the unearned-claim shape this change exists to remove.
     _kernel_record_run_outcome "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "escalated"
-    json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}" "$bound_outcome" "$vendor" >> "$SCORECARD"
+    local _endnote=""; _run_ended escalated || _endnote="; the kernel refused the terminal fact, so the run is still open and the next wave resumes it"
+    json_row "$item" "${pr:-}" "escalated" "false" "" "" "$elapsed" "${enote:-coordinator escalated without a PR}$_endnote" "$bound_outcome" "$vendor" >> "$SCORECARD"
     echo "[batch] $item -> outcome=escalated (no PR; reason: ${enote:-n/a})"
     _issue_writeback "$(_item_issue "$prompt")" "escalated" "${pr:-}" "" "" ""
-    mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"
+    [ -n "$_endnote" ] || { mkdir -p "$PROCESSED" && mv -f "$f" "$PROCESSED/"; }
     return 0
   fi
 

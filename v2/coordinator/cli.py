@@ -266,6 +266,13 @@ def main(argv=None) -> int:
     bs.add_argument("--db", required=True); bs.add_argument("--run-id", required=True)
     cf = subs.add_parser("conflicted")
     cf.add_argument("--db", required=True); cf.add_argument("--run-id", required=True)
+    st = subs.add_parser("status")
+    st.add_argument("--db", required=True)
+    st.add_argument("--all", action="store_true", help="include ended runs")
+    im = subs.add_parser("implementer")
+    im.add_argument("--db", required=True); im.add_argument("--run-id", required=True)
+    rr = subs.add_parser("rounds")
+    rr.add_argument("--db", required=True); rr.add_argument("--run-id", required=True)
     sl = subs.add_parser("session-last-item")
     sl.add_argument("--server", required=True); sl.add_argument("--id", required=True)
     pn = subs.add_parser("park-notice")
@@ -346,7 +353,10 @@ def main(argv=None) -> int:
         # `cancel` is ONE gesture: the record first, then the sessions. The
         # other order would stop the run's sessions while the run is still
         # live, and the next pass would derive them again.
-        if a.mode == "cancel":
+        # A run an earlier `cancel` already stopped is finished here, not
+        # refused: cancel_run is illegal from `cancelled`, and the old
+        # command left runs there with no terminal fact (2026-09-26).
+        if a.mode == "cancel" and store.run_state(a.run_id) != "cancelled":
             rc = _human_cmd(store, a.run_id, "cancel_run", {})
             if rc != RC_OK:
                 return rc
@@ -361,6 +371,29 @@ def main(argv=None) -> int:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return RC_FAILED
+        # THE END, when nothing is left for a pass to do. With no
+        # implementation output there is no pull request to read and no
+        # issue to write back, and waves never sweep a front-half cancelled
+        # run -- so the terminal fact was owed forever. A run WITH output
+        # keeps its resume path (closed-loop spec §2), which does both.
+        from kernel import back
+        if a.mode == "cancel" and not back.implementation_output_recorded(store, a.run_id):
+            from kernel.commands import Command, submit
+            try:
+                res = submit(store, Command(name="record_run_outcome", run_id=a.run_id,
+                                            expected_version=store.run_version(a.run_id),
+                                            idempotency_key=f"cancel-end:{a.run_id}", generation=ctx.generation,
+                                            payload={"outcome": "escalated"}))
+                refused = None if res.accepted else "not accepted"
+            except Exception as exc:
+                refused = str(exc)
+            # Read back, like the runner: a shadow-mode refusal returns rather
+            # than raising. Either way the run stays `cancelled`, and the
+            # journal sweep resumes it to record the fact.
+            if refused or store.run_state(a.run_id) != "ended":
+                print(f"cancelled, but the terminal fact was refused ({refused or 'still open'}); "
+                      "the next wave records it", file=sys.stderr)
+                return RC_FAILED
         return RC_OK
 
     # The run's state, for a shell caller that must READ it rather than infer
@@ -455,6 +488,33 @@ def main(argv=None) -> int:
         store = Store.open(a.db)
         store.run_state(a.run_id)
         print(",".join(sorted(back.conflicted_actors(store, a.run_id))))
+        return RC_OK
+
+    # Every open run in one table, for the operator (see coordinator/status.py).
+    if a.mode == "status":
+        from kernel.store import Store
+
+        from coordinator import status as _status
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        print(_status.render(_status.rows(Store.open(a.db), include_ended=a.all)))
+        return RC_OK
+
+    # Who started the current implementation: the seat `_seat_vendors` gives
+    # back when both vendors are conflicted. Same shape as `conflicted`.
+    if a.mode in ("implementer", "rounds"):
+        from kernel import back
+        from kernel.store import Store
+        if not os.path.exists(a.db):
+            print(f"no kernel database at {a.db}", file=sys.stderr)
+            return RC_LOOKUP_FAILED
+        store = Store.open(a.db)
+        store.run_state(a.run_id)
+        if a.mode == "rounds":
+            print(back.repair_rounds(store, a.run_id))
+        else:
+            print(back.implementer(store, a.run_id) or "")
         return RC_OK
 
     if a.mode == "session-last-item":

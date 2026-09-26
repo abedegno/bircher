@@ -289,8 +289,10 @@ def park_notice_body(ctx: Ctx, park) -> str:
     needs = PARK_NEEDS.get(reason, 'Open the session below and reply.')
     if phase == "implementation":
         needs = _BACK_HALF_NEEDS.get(reason, needs)
+    why = park.payload.get("cause") if reason == "no_verdict" else None
     return (f"bircher: parked {reason}\n\n"
-            f"This run is waiting for you at the **{phase}** phase.\n\n"
+            + (f"Why: {why}\n\n" if why else "")
+            + f"This run is waiting for you at the **{phase}** phase.\n\n"
             f"{needs}\n\n"
             f"{where}\n\n"
             f"Run `{ctx.run_id}`. Your reply is read by the next wave, not the moment "

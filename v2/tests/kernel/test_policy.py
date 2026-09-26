@@ -39,8 +39,8 @@ def test_labels_override_project_config():
 
 
 @pytest.mark.parametrize("cfg", [
-    {"grill": "robot"}, {"gates": ["impl"]}, {"max_rounds": 0}, {"max_rounds": 6},
-    {"max_seats": 3}, {"max_seats": 41}, {"max_rounds": "3"}, {"gates": "spec"},
+    {"grill": "robot"}, {"gates": ["impl"]}, {"max_rounds": 0}, {"max_rounds": 21},
+    {"max_seats": 3}, {"max_seats": 121}, {"max_rounds": "3"}, {"gates": "spec"},
     # Falsy non-dicts: only `None` means "unset". `project_config or {}` would
     # coerce these to `{}` and silently accept a wrong type.
     [], "", 0, False,
@@ -116,3 +116,13 @@ def test_a_run_without_policy_frozen_gets_defaults(tmp_path):
     s.create_run(run_id="r-1", base_repo="o/r", base_sha="0" * 40)
     assert policy.policy_of(s, "r-1") == policy.Policy()
     assert policy.policy_version(s, "r-1") is None
+
+
+def test_the_ceilings_admit_a_long_front_half():
+    """2026-09-26: #768's plan needed nine rounds, every one with distinct
+    findings -- real progress the old ceiling of five could only reach
+    through a person's grants. The ceilings are what a project MAY set; the
+    defaults are unchanged."""
+    p = policy.derive([], {"max_rounds": 20, "max_seats": 120})
+    assert (p.max_rounds, p.max_seats) == (20, 120)
+    assert policy.derive([], {}).max_rounds == 3

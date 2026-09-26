@@ -1010,7 +1010,13 @@ _kernel_park_back() {  # <run_id> <generation> <reason> [session_id] [cursor] [c
   local jsid=null jcur=null jcause=null
   [ -n "$sid" ] && jsid="\"$sid\""
   [ -n "$cur" ] && jcur="\"$cur\""
-  [ -n "$cause" ] && jcause="\"$cause\""
+  # FREE TEXT since a `no_verdict` park carries the derivation's note, so it
+  # is ENCODED, not interpolated: a quote, a backslash or a control character
+  # broke this hand-built JSON, and a byte-wise `cut` could split a UTF-8
+  # character. Bounded in characters, because it is a reason, not a log.
+  if [ -n "$cause" ]; then
+    jcause=$("${BIRCHER_PY:-python3}" -c 'import json, sys; print(json.dumps(" ".join(sys.argv[1].split())[:240]))' "$cause") || jcause=null
+  fi
   # park
   _kernel command --run-id "$run_id" --generation "$generation" \
     --name park --payload-json "{\"reason\":\"$reason\",\"session_id\":$jsid,\"cursor_item_id\":$jcur,\"findings_hash\":null,\"verdict\":null,\"reviewer\":null,\"cause\":$jcause,\"evidence\":$arr}"
@@ -1022,6 +1028,27 @@ _kernel_back_state() {  # <run_id>
   local out=""
   out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
          "${BIRCHER_PY:-python3}" -m coordinator.cli back-state \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_implementer <run_id> -> who started the run's current
+# implementation (coordinator.cli implementer), or empty when the kernel would
+# not answer or no implementation has started. Empty is "not said", as above.
+_kernel_implementer() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli implementer \
+           --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
+  printf '%s' "$out"
+}
+
+# _kernel_repair_rounds <run_id> -> how many repairs the run has requested
+# (coordinator.cli rounds), or empty when the kernel would not answer.
+_kernel_repair_rounds() {  # <run_id>
+  local out=""
+  out=$( PYTHONPATH="$(_kernel_pythonpath)" _net_run "$(_kernel_net_cap)" \
+         "${BIRCHER_PY:-python3}" -m coordinator.cli rounds \
            --db "${BIRCHER_KERNEL_DB:-}" --run-id "$1" 2>/dev/null ) || out=""
   printf '%s' "$out"
 }

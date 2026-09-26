@@ -73,6 +73,20 @@ def conflicted_actors(store, run_id: str) -> set[str]:
     return authz._conflicted_actors(store, run_id)
 
 
+def repair_rounds(store, run_id: str) -> int:
+    """Every repair the run requested, grants or not (spec §2: the rounds
+    the scorecard and the log report)."""
+    return len(store.facts_of_kind(run_id, EventKind.REPAIR_REQUESTED))
+
+
+def implementer(store, run_id: str) -> str | None:
+    """Who started the run's current implementation (the last accepted
+    start_implementation). Delegates to the rule the kernel enforces, for
+    the same reason `conflicted_actors` does."""
+    from kernel import authz
+    return authz._implementer_of(store, run_id)
+
+
 def back_verdicts(store, run_id: str) -> list:
     """Implementation-phase verdicts, oldest first."""
     return [f for f in store.facts_for(run_id)
@@ -102,14 +116,6 @@ def repairs_since_grant(store, run_id: str) -> list:
     since = _newest_grant_seq(store, run_id)
     return [f for f in store.facts_for(run_id)
             if f.kind == EventKind.REPAIR_REQUESTED and f.seq > since]
-
-
-def repair_for_head(store, run_id: str, head: str):
-    """The newest repair requested against this head, or None."""
-    for f in reversed(list(store.facts_of_kind(run_id, EventKind.REPAIR_REQUESTED))):
-        if f.payload.get("head_sha") == head:
-            return f
-    return None
 
 
 def would_be_third_identical(store, run_id: str, cause: str, evidence) -> bool:

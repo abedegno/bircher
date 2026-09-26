@@ -14,8 +14,12 @@ from kernel.events import EventKind
 
 GRILLS = ("human", "model")
 PHASES = ("slices", "spec", "plan")
-ROUNDS = range(1, 6)      # 1..5
-SEATS = range(4, 41)      # 4..40
+# The CEILINGS a project may set, not the defaults (3 and 16, below). Raised
+# 2026-09-26 from 1..5 and 4..40: #768's plan took nine rounds of distinct
+# findings, so five cut off a phase that was making progress. What stops a
+# looping author is `identical_resubmission`, not a small number.
+ROUNDS = range(1, 21)     # 1..20
+SEATS = range(4, 121)     # 4..120
 
 
 class PolicyFrozen(Exception):

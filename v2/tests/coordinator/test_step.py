@@ -145,7 +145,7 @@ def test_a_repair_owed_at_planned_is_redispatched_even_when_the_head_moved():
     _repair(s, "r1", evidence=["server (go)"])
     assert s.run_state("r") == "planned"
     moved = "7" * 40
-    assert back.repair_for_head(s, "r", moved) is None
+    assert all(f.payload.get("head_sha") != moved for f in back.repairs_since_grant(s, "r"))
     st = next_step(s, "r", g(head=moved, ci="red", failing_jobs=("server (go)",)))
     assert st.kind == "repair" and st.redispatch is True and st.cause == "ci_red"
 
@@ -273,6 +273,34 @@ def test_conflicted_prints_an_empty_line_before_any_implementation(tmp_path, cap
     assert capsys.readouterr().out == "\n"
 
 
+def test_implementer_prints_who_started_the_current_implementation(tmp_path, capsys):
+    """The both-conflicted seat: a pass died between a repair's
+    start_implementation and its output, so the producer and the new
+    implementer differ. Seating the one who STARTED it lets its output make
+    it the only conflicted actor, and the other vendor can review."""
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["implementer", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "claude\n"
+
+
+def test_rounds_counts_every_repair_the_run_requested(tmp_path, capsys):
+    """closed-loop spec §2: rounds are counted from the journal for the
+    scorecard. A resumed pass knew only its own, so a run repaired over five
+    waves reported `rounds=1` or nothing."""
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    assert main(["rounds", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "0\n"
+    _repair(s, "r1", evidence=["server (go)"])
+    assert main(["rounds", "--db", db, "--run-id", "r"]) == 0
+    assert capsys.readouterr().out == "1\n"
+
+
+def test_implementer_is_rc_3_without_a_database(tmp_path):
+    assert main(["implementer", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
+
+
 def test_conflicted_is_rc_3_without_a_database(tmp_path):
     assert main(["conflicted", "--db", str(tmp_path / "nothing.db"), "--run-id", "r"]) == 3
 
@@ -302,6 +330,17 @@ def test_the_no_progress_notice_names_the_cause_and_the_two_words(tmp_path, caps
     out = capsys.readouterr().out
     assert out.startswith("bircher: parked no_progress")
     assert "ci_red" in out and "server (go)" in out and "`retry`" in out and "`stop`" in out
+
+
+def test_the_no_verdict_notice_says_why(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    _sub(s, "park", "p1", actor="claude", reason="no_verdict", cause="codex round 5 no verdict on d0a8e26..72bc80d",
+         evidence=[], session_id=None, cursor_item_id=None)
+    assert main(["park-notice", "--db", db, "--run-id", "r"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("bircher: parked no_verdict")
+    assert "codex round 5 no verdict on d0a8e26..72bc80d" in out
 
 
 def test_park_notice_without_a_park_is_rc_1(tmp_path):
