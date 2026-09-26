@@ -4899,7 +4899,9 @@ run_item() {
   # person it is waiting on that it is being worked. `_resume_back_half`
   # calls `_label_running` itself, after it has read the park reply.
   [ "$_side" = back ] || _label_running
-  if [ "$resumed" = 1 ]; then
+  # Not on a back-half resume: revise_bundle is legal only in the front half
+  # and shaping, and asked past the seam it was refused on every wave.
+  if [ "$resumed" = 1 ] && [ "$_side" != back ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.
     _kernel_revise_bundle "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_issue_json"

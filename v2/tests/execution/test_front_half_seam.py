@@ -982,6 +982,9 @@ def test_a_run_beyond_the_front_half_is_resumed_not_relaunched(tmp_path):
     assert "which no pass resumes" not in note, note
     assert (d.queue_dir / "processed" / f"{ITEM}.md").exists(), (
         "the resumed pass ran the loop to a merge and should retire the queue file")
+    # revise_bundle is legal only in the front half and shaping; asked at
+    # `implementing` it was refused every wave (2026-09-26, #768's resumes).
+    assert "_kernel_revise_bundle" not in d.names, d.names
 
 
 def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):
