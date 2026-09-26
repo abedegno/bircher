@@ -9734,46 +9734,13 @@ __HELP__
     echo "[batch] WARN: flock not found; running without singleton protection" >&2
   fi
 
-  # Item 2: fail fast if either provider's auth is dead/stale before we launch.
   # BEFORE the provider probes: a run with an unusable kernel performs no
   # effects at all, so there is no point spending two model calls to learn the
   # providers are healthy first.
   preflight_kernel || exit 2
-  preflight_auth || exit 2
-  # ...and that the HARNESS can actually launch a worker for each vendor. Runs
-  # ONCE here, deliberately not from preflight_auth: the per-item quota gate below
-  # re-invokes preflight_auth before every launch, and a real dispatch probe there
-  # would spawn two extra sessions per item.
-  preflight_dispatch || exit 2
 
   # Clear stale no-op signals from any prior run (gap #3).
   mkdir -p "$NOOP_DIR"; rm -f "$NOOP_DIR"/*.noop "$NOOP_DIR"/*.escalated "$NOOP_DIR"/*.pr 2>/dev/null
-
-  # REST launch: upload the agent bundle ONCE to mint a fresh session-scoped
-  # agent (config edits activate here); every item's run session binds to it.
-  local holder
-  holder=$(_upload_bundle "$BUNDLE_DIR" "bircher bundle upload")
-  [ -n "$holder" ] || { echo "[batch] FATAL: bundle upload failed" >&2; exit 3; }
-  AGENT_ID=$(_get_agent_id "$holder")
-  [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
-  echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
-
-  # The two AUTHOR bundles, beside the implementer's. `coordinator.cli phases`
-  # creates the author and reviewer seats itself and needs an agent id per
-  # vendor to create them from; nothing else uploads these, so a run that
-  # started without them would reach the seam and be unable to open a seat at
-  # all. FATAL rather than warn, for the same reason the implementer's is.
-  AGENT_AUTHOR_CLAUDE=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_claude" "v2_author_claude upload")")
-  AGENT_AUTHOR_CODEX=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_codex" "v2_author_codex upload")")
-  [ -n "$AGENT_AUTHOR_CLAUDE" ] && [ -n "$AGENT_AUTHOR_CODEX" ] || { echo "[batch] FATAL: author bundle upload failed" >&2; exit 3; }
-  export AGENT_AUTHOR_CLAUDE AGENT_AUTHOR_CODEX
-  echo "[batch] uploaded author bundles -> claude=$AGENT_AUTHOR_CLAUDE codex=$AGENT_AUTHOR_CODEX"
-
-  # Force the operator commit identity (codex's default Codex author otherwise
-  # becomes a squash Co-authored-by trailer) + install the attribution-strip
-  # commit-msg hook. No AI attribution in muesli/bircher/homelab.
-  _install_work_git_config "$WORKDIR"
-  echo "[batch] work-repo git identity + attribution hook set on $WORKDIR (author=${BIRCHER_GIT_AUTHOR_NAME:-Abedegno})" >&2
 
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then
@@ -9806,6 +9773,45 @@ __HELP__
     items=("$QUEUE"/*.md)
   fi
   if [ ${#items[@]} -eq 0 ]; then echo "[batch] queue empty"; exit 0; fi
+
+  # Item 2: fail fast if either provider's auth is dead/stale before we launch.
+  # AFTER the queue is known to hold work (2026-09-26): a wave fires every
+  # 30 minutes, and each empty one spent two model probes, two dispatch-
+  # probe sessions and three bundle uploads to learn it had nothing to do.
+  # The kernel preflight stays first -- the sweep and the generator read it.
+  preflight_auth || exit 2
+  # ...and that the HARNESS can actually launch a worker for each vendor. Runs
+  # ONCE here, deliberately not from preflight_auth: the per-item quota gate below
+  # re-invokes preflight_auth before every launch, and a real dispatch probe there
+  # would spawn two extra sessions per item.
+  preflight_dispatch || exit 2
+
+  # REST launch: upload the agent bundle ONCE to mint a fresh session-scoped
+  # agent (config edits activate here); every item's run session binds to it.
+  local holder
+  holder=$(_upload_bundle "$BUNDLE_DIR" "bircher bundle upload")
+  [ -n "$holder" ] || { echo "[batch] FATAL: bundle upload failed" >&2; exit 3; }
+  AGENT_ID=$(_get_agent_id "$holder")
+  [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
+  echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
+
+  # The two AUTHOR bundles, beside the implementer's. `coordinator.cli phases`
+  # creates the author and reviewer seats itself and needs an agent id per
+  # vendor to create them from; nothing else uploads these, so a run that
+  # started without them would reach the seam and be unable to open a seat at
+  # all. FATAL rather than warn, for the same reason the implementer's is.
+  AGENT_AUTHOR_CLAUDE=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_claude" "v2_author_claude upload")")
+  AGENT_AUTHOR_CODEX=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_codex" "v2_author_codex upload")")
+  [ -n "$AGENT_AUTHOR_CLAUDE" ] && [ -n "$AGENT_AUTHOR_CODEX" ] || { echo "[batch] FATAL: author bundle upload failed" >&2; exit 3; }
+  export AGENT_AUTHOR_CLAUDE AGENT_AUTHOR_CODEX
+  echo "[batch] uploaded author bundles -> claude=$AGENT_AUTHOR_CLAUDE codex=$AGENT_AUTHOR_CODEX"
+
+  # Force the operator commit identity (codex's default Codex author otherwise
+  # becomes a squash Co-authored-by trailer) + install the attribution-strip
+  # commit-msg hook. No AI attribution in muesli/bircher/homelab.
+  _install_work_git_config "$WORKDIR"
+  echo "[batch] work-repo git identity + attribution hook set on $WORKDIR (author=${BIRCHER_GIT_AUTHOR_NAME:-Abedegno})" >&2
+
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"; : > "$DEFERRED_READY_FILE"
   for f in "${items[@]}"; do
     local halt=0
