@@ -3081,7 +3081,10 @@ EOF
         fi
         # This pass reviewed the head and got no verdict; a person says
         # whether to review again (`retry`) or stop.
-        if _park_back_half "$item" "$code" no_verdict; then
+        # THE CAUSE TRAVELS with the park: the derivation's note says why
+        # there was no verdict (a reviewer error, an empty findings file), and
+        # without it the notice could only say that there was none.
+        if _park_back_half "$item" "$code" no_verdict "$note"; then
           # `review` is not in the returned vocabulary (wait|park|merge|done|
           # none): this pass ended in a park exactly as the `park` case does.
           _step=park; outcome=parked; note="${note:+$note; }parked no_verdict"; return 0

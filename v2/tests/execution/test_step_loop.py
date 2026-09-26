@@ -230,7 +230,9 @@ def test_no_verdict_recorded_this_pass_still_parks():
     silent and a person is the right next step."""
     out, log = _run(_tmp(), [_tuple("escalated", "codex:na", "green")], ["review||||no"], ["reviewing"])
     assert out.startswith("park|parked|42|0|")
-    assert any(l.startswith("park no_verdict") for l in log)
+    # The derivation's note travels as the park's cause, so the notice can
+    # say why there was no verdict (the tuple's note is `n`).
+    assert "park no_verdict n " in log, log
 
 
 # --- F1: the reviewer is seated from the journal, not from the wave's pick ---

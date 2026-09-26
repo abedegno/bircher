@@ -332,6 +332,17 @@ def test_the_no_progress_notice_names_the_cause_and_the_two_words(tmp_path, caps
     assert "ci_red" in out and "server (go)" in out and "`retry`" in out and "`stop`" in out
 
 
+def test_the_no_verdict_notice_says_why(tmp_path, capsys):
+    s, db = _file_store(tmp_path)
+    _to_implementing(s)
+    _sub(s, "park", "p1", actor="claude", reason="no_verdict", cause="codex round 5 no verdict on d0a8e26..72bc80d",
+         evidence=[], session_id=None, cursor_item_id=None)
+    assert main(["park-notice", "--db", db, "--run-id", "r"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("bircher: parked no_verdict")
+    assert "codex round 5 no verdict on d0a8e26..72bc80d" in out
+
+
 def test_park_notice_without_a_park_is_rc_1(tmp_path):
     s, db = _file_store(tmp_path)
     _to_implementing(s)

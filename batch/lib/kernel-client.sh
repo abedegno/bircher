@@ -1006,6 +1006,10 @@ _kernel_request_repair() {  # <run_id> <generation> <cause> <head> [evidence_csv
 _kernel_park_back() {  # <run_id> <generation> <reason> [session_id] [cursor] [cause] [evidence_csv]
   local run_id="$1" generation="$2" reason="$3" sid="${4:-}" cur="${5:-}" cause="${6:-}" ev="${7:-}"
   ev=$(printf '%s' "$ev" | tr -d '"\\')
+  # FREE TEXT since a `no_verdict` park carries the derivation's note: quotes
+  # and backslashes would break this hand-built JSON, and control characters
+  # are invalid in it. Bounded, because it is a reason, not a log.
+  cause=$(printf '%s' "$cause" | tr -d '"\\' | tr '\n\r\t' '   ' | cut -c1-240)
   local arr="[]"; [ -n "$ev" ] && arr="[\"${ev//,/\",\"}\"]"
   local jsid=null jcur=null jcause=null
   [ -n "$sid" ] && jsid="\"$sid\""
