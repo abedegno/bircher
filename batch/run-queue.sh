@@ -2918,14 +2918,17 @@ _park_back_half() {  # <item> <code> <reason> [cause] [evidence_csv]
     echo "[batch] $item: no carrier session for the park; a reply must come through the operator's shell (coordinator.cli grant-round / cancel)" >&2
   fi
   _kernel_park_back "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$reason" "$conv_id" "$cur" "$cause" "$ev"
-  local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _park=""
+  # Through `_coordinator`, which sets PYTHONPATH: called bare, the module did
+  # not import from the wave's cwd, this read always came back empty, and
+  # every back-half park concluded it had not been recorded (2026-09-26).
+  local _park; _park=$(_coordinator parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID") || _park=""
   if [ -z "$_park" ]; then
     echo "[batch] $item: the kernel did NOT record the park ($reason) -> not reporting parked" >&2
     return 1
   fi
   local _pid; _pid=$(printf '%s' "$_park" | _json_get id)
   if [ -n "$_iss" ]; then
-    local _notice; _notice=$("${BIRCHER_PY:-python3}" -m coordinator.cli park-notice --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null) || _notice=""
+    local _notice; _notice=$(_coordinator park-notice --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID") || _notice=""
     [ -n "$_notice" ] && _effect comment "park-notice:$BIRCHER_RUN_ID:$_pid" - gh issue comment "$_iss" --repo "$REPO" --body "$_notice" >/dev/null 2>&1 || true
   fi
   _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$reason"
@@ -4896,7 +4899,9 @@ run_item() {
   # person it is waiting on that it is being worked. `_resume_back_half`
   # calls `_label_running` itself, after it has read the park reply.
   [ "$_side" = back ] || _label_running
-  if [ "$resumed" = 1 ]; then
+  # Not on a back-half resume: revise_bundle is legal only in the front half
+  # and shaping, and asked past the seam it was refused on every wave.
+  if [ "$resumed" = 1 ] && [ "$_side" != back ]; then
     # Re-snapshot the issue; a relevant change re-freezes it (§5). The
     # kernel refuses an irrelevant one, and that refusal is expected.
     _kernel_revise_bundle "$BIRCHER_RUN_ID" "$BIRCHER_GENERATION" "$_issue_json"
@@ -4929,11 +4934,23 @@ run_item() {
       # stays where it is, no terminal outcome is recorded, and the sidecar
       # names the run so the next pass resumes this one instead of minting a
       # second run for the same item.
-      local _park; _park=$("${BIRCHER_PY:-python3}" -m coordinator.cli parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" 2>/dev/null || echo '{}')
+      # Through `_coordinator` (PYTHONPATH): called bare it never imported,
+      # and every parked row read `parked: ` with the reason lost.
+      local _park; _park=$(_coordinator parked --db "$BIRCHER_KERNEL_DB" --run-id "$BIRCHER_RUN_ID" || echo '{}')
       _write_parked_sidecar "$code" "$BIRCHER_RUN_ID" "$(_kernel_state "$BIRCHER_RUN_ID")" "$(printf '%s' "$_park" | _json_get reason)"
       mkdir -p "$(dirname "$SCORECARD")"
       json_row "$item" "" "parked" "false" "" "" 0 "parked: $(printf '%s' "$_park" | _json_get reason)" "parked" >> "$SCORECARD"
       return 0 ;;                                   # the queue file stays where it is
+    6)
+      # SUPERSEDED: another pass fenced a newer generation and owns the run.
+      # Nothing here is this pass's to conclude -- a terminal `failed` over a
+      # live run is what #768 got from a hand-run loop overlapping a wave
+      # (2026-09-26). The queue file stays for whichever pass comes next.
+      rm -f "$QUEUE/$code.parked"
+      echo "[batch] $item: run $BIRCHER_RUN_ID was superseded by another pass; leaving it to its owner" >&2
+      mkdir -p "$(dirname "$SCORECARD")"
+      json_row "$item" "" "superseded" "false" "" "" 0 "phases rc=6: run '$BIRCHER_RUN_ID' is owned by a newer pass" "n/a" >> "$SCORECARD"
+      return 0 ;;
     *)
       # Same reason as the refusal below: whichever way this ends, the run is
       # not PARKED, so a sidecar saying it is would outlive what it describes.
@@ -9717,46 +9734,13 @@ __HELP__
     echo "[batch] WARN: flock not found; running without singleton protection" >&2
   fi
 
-  # Item 2: fail fast if either provider's auth is dead/stale before we launch.
   # BEFORE the provider probes: a run with an unusable kernel performs no
   # effects at all, so there is no point spending two model calls to learn the
   # providers are healthy first.
   preflight_kernel || exit 2
-  preflight_auth || exit 2
-  # ...and that the HARNESS can actually launch a worker for each vendor. Runs
-  # ONCE here, deliberately not from preflight_auth: the per-item quota gate below
-  # re-invokes preflight_auth before every launch, and a real dispatch probe there
-  # would spawn two extra sessions per item.
-  preflight_dispatch || exit 2
 
   # Clear stale no-op signals from any prior run (gap #3).
   mkdir -p "$NOOP_DIR"; rm -f "$NOOP_DIR"/*.noop "$NOOP_DIR"/*.escalated "$NOOP_DIR"/*.pr 2>/dev/null
-
-  # REST launch: upload the agent bundle ONCE to mint a fresh session-scoped
-  # agent (config edits activate here); every item's run session binds to it.
-  local holder
-  holder=$(_upload_bundle "$BUNDLE_DIR" "bircher bundle upload")
-  [ -n "$holder" ] || { echo "[batch] FATAL: bundle upload failed" >&2; exit 3; }
-  AGENT_ID=$(_get_agent_id "$holder")
-  [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
-  echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
-
-  # The two AUTHOR bundles, beside the implementer's. `coordinator.cli phases`
-  # creates the author and reviewer seats itself and needs an agent id per
-  # vendor to create them from; nothing else uploads these, so a run that
-  # started without them would reach the seam and be unable to open a seat at
-  # all. FATAL rather than warn, for the same reason the implementer's is.
-  AGENT_AUTHOR_CLAUDE=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_claude" "v2_author_claude upload")")
-  AGENT_AUTHOR_CODEX=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_codex" "v2_author_codex upload")")
-  [ -n "$AGENT_AUTHOR_CLAUDE" ] && [ -n "$AGENT_AUTHOR_CODEX" ] || { echo "[batch] FATAL: author bundle upload failed" >&2; exit 3; }
-  export AGENT_AUTHOR_CLAUDE AGENT_AUTHOR_CODEX
-  echo "[batch] uploaded author bundles -> claude=$AGENT_AUTHOR_CLAUDE codex=$AGENT_AUTHOR_CODEX"
-
-  # Force the operator commit identity (codex's default Codex author otherwise
-  # becomes a squash Co-authored-by trailer) + install the attribution-strip
-  # commit-msg hook. No AI attribution in muesli/bircher/homelab.
-  _install_work_git_config "$WORKDIR"
-  echo "[batch] work-repo git identity + attribution hook set on $WORKDIR (author=${BIRCHER_GIT_AUTHOR_NAME:-Abedegno})" >&2
 
   shopt -s nullglob
   if [ "${BIRCHER_SOURCE:-queue}" = "issues" ]; then
@@ -9789,6 +9773,45 @@ __HELP__
     items=("$QUEUE"/*.md)
   fi
   if [ ${#items[@]} -eq 0 ]; then echo "[batch] queue empty"; exit 0; fi
+
+  # Item 2: fail fast if either provider's auth is dead/stale before we launch.
+  # AFTER the queue is known to hold work (2026-09-26): a wave fires every
+  # 30 minutes, and each empty one spent two model probes, two dispatch-
+  # probe sessions and three bundle uploads to learn it had nothing to do.
+  # The kernel preflight stays first -- the sweep and the generator read it.
+  preflight_auth || exit 2
+  # ...and that the HARNESS can actually launch a worker for each vendor. Runs
+  # ONCE here, deliberately not from preflight_auth: the per-item quota gate below
+  # re-invokes preflight_auth before every launch, and a real dispatch probe there
+  # would spawn two extra sessions per item.
+  preflight_dispatch || exit 2
+
+  # REST launch: upload the agent bundle ONCE to mint a fresh session-scoped
+  # agent (config edits activate here); every item's run session binds to it.
+  local holder
+  holder=$(_upload_bundle "$BUNDLE_DIR" "bircher bundle upload")
+  [ -n "$holder" ] || { echo "[batch] FATAL: bundle upload failed" >&2; exit 3; }
+  AGENT_ID=$(_get_agent_id "$holder")
+  [ -n "$AGENT_ID" ] || { echo "[batch] FATAL: no agent_id from holder $holder" >&2; _prune_session "$holder"; exit 3; }
+  echo "[batch] uploaded bundle -> agent=$AGENT_ID (holder $holder)"
+
+  # The two AUTHOR bundles, beside the implementer's. `coordinator.cli phases`
+  # creates the author and reviewer seats itself and needs an agent id per
+  # vendor to create them from; nothing else uploads these, so a run that
+  # started without them would reach the seam and be unable to open a seat at
+  # all. FATAL rather than warn, for the same reason the implementer's is.
+  AGENT_AUTHOR_CLAUDE=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_claude" "v2_author_claude upload")")
+  AGENT_AUTHOR_CODEX=$(_get_agent_id "$(_upload_bundle "$BUNDLE_DIR/agents/v2_author_codex" "v2_author_codex upload")")
+  [ -n "$AGENT_AUTHOR_CLAUDE" ] && [ -n "$AGENT_AUTHOR_CODEX" ] || { echo "[batch] FATAL: author bundle upload failed" >&2; exit 3; }
+  export AGENT_AUTHOR_CLAUDE AGENT_AUTHOR_CODEX
+  echo "[batch] uploaded author bundles -> claude=$AGENT_AUTHOR_CLAUDE codex=$AGENT_AUTHOR_CODEX"
+
+  # Force the operator commit identity (codex's default Codex author otherwise
+  # becomes a squash Co-authored-by trailer) + install the attribution-strip
+  # commit-msg hook. No AI attribution in muesli/bircher/homelab.
+  _install_work_git_config "$WORKDIR"
+  echo "[batch] work-repo git identity + attribution hook set on $WORKDIR (author=${BIRCHER_GIT_AUTHOR_NAME:-Abedegno})" >&2
+
   mkdir -p "$(dirname "$DEFERRED_READY_FILE")"; : > "$DEFERRED_READY_FILE"
   for f in "${items[@]}"; do
     local halt=0

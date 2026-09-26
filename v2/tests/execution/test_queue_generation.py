@@ -20,7 +20,12 @@ import pathlib
 import re
 import subprocess
 
+import pytest
+
 from kernel import front
+from kernel.dispatch import Role
+from kernel.store import Store
+from tests.kernel.front import Front
 from tests.kernel.test_reshape import _disagreed
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -134,16 +139,40 @@ def test_a_resumed_run_is_not_withheld_by_a_blocker(tmp_path):
     assert _sweep(tmp_path) == [front.issue_number(s, f.run_id)]
 
 
-def test_a_resolved_dispute_is_not_queued_by_the_third_condition(tmp_path):
-    """The control: a run whose dispute the person already resolved must not
-    be swept in by THIS condition -- it is `queued`, not `shaping`, and
-    `unresolved_disagreement` is False. Without this, a mutation that always
-    took the third `or` (e.g. dropping the `unresolved_disagreement` guard
-    entirely) would still pass the two tests above."""
+def test_a_resolved_dispute_is_still_queued(tmp_path):
+    """The label gap (2026-09-26): the person's ruling moved the run on to
+    `queued` and consumed nothing else -- it is open work, and the issue may
+    still wear `bircher:running` from the pass that parked, so the labels
+    cannot find it. It used to be this module's control for the dispute
+    condition, asserting the opposite; the open-run clause replaced that
+    condition, and the old expectation was the gap itself."""
     s, f = _disagreed(tmp_path)
     f.approve_one_piece()
     assert s.run_state(f.run_id) == "queued"
     assert front.unresolved_disagreement(s, f.run_id) is False
+    assert _sweep(tmp_path) == [front.issue_number(s, f.run_id)]
+
+
+@pytest.mark.parametrize("to", ["queued", "specified", "planned"])
+def test_an_open_run_with_no_park_is_queued_whatever_its_labels(tmp_path, to):
+    """#768: approved at `specified`, park consumed, labelled `running` --
+    no clause selected it and it sat until a person relabelled it."""
+    s = Store.open(str(tmp_path / "d.db"))
+    f = Front(s, "i81-open-1")
+    {"queued": lambda: None, "specified": f.to_specified, "planned": f.to_planned}[to]()
+    assert s.run_state("i81-open-1") == to
+    assert front.current_park(s, "i81-open-1") is None
+    assert _sweep(tmp_path) == [81]
+
+
+def test_a_cancelled_run_without_output_is_not_queued(tmp_path):
+    """The stop the open-run clause must not reach: a person cancelled it
+    before any pull request, and it owes nothing."""
+    s = Store.open(str(tmp_path / "d.db"))
+    f = Front(s, "i82-cancelled-1").to_specified()
+    g = f._dispatch(Role.AUTHOR, "claude")
+    f._cmd(g, "cancel_run", {})
+    assert s.run_state("i82-cancelled-1") == "cancelled"
     assert _sweep(tmp_path) == []
 
 

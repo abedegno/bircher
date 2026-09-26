@@ -251,6 +251,11 @@ _coordinator() {{
   case "$1" in
     step) printf 'merge||||'; return 0 ;;
     park-reply) printf '%s' "${{T_PARK_REPLY:-nopark}}"; return 0 ;;
+    # The park read-back goes through `_coordinator` (it sets PYTHONPATH).
+    # It used to be a bare `python3 -m coordinator.cli parked`, which the fake
+    # interpreter below answered -- so this harness passed while production,
+    # where that bare call could not import the module, always read nothing.
+    parked) if [ -n "${{PARKED_JSON:-}}" ]; then printf '%s' "$PARKED_JSON"; else printf '{{"reason": "gate"}}'; fi; return 0 ;;
     *) printf ''; return 1 ;;
   esac
 }}
@@ -269,15 +274,14 @@ merge_ready_pr()   {{ _log_call merge_ready_pr "$@"; return 0; }}
 _merge_gate() {{ [ -n "${{2:-}}" ] && {{ printf 'pin|%s' {reviewed_sha!r}; return 0; }}; printf 'skip'; }}
 '''
 
-#: `coordinator.cli phases` and `coordinator.cli parked` are reached by name
-#: through `${BIRCHER_PY:-python3}`; every other Python call `run_item` makes is
-#: bare `python3` inside a real helper, so this intercepts exactly those two.
+#: `coordinator.cli phases` is reached by name through `${BIRCHER_PY:-python3}`;
+#: every other Python call `run_item` makes is bare `python3` inside a real
+#: helper, so this intercepts exactly that one. It deliberately does NOT answer
+#: `parked`: a regression back to a bare `parked` call must fail here.
 _FAKE_PY = '''#!/bin/bash
 n=$(cat "@CALLSEQ@"); n=$((n+1)); printf '%s' "$n" > "@CALLSEQ@"
 f="@CALLDIR@/$(printf '%03d' "$n")"
 { printf '%s' BIRCHER_PY; for a in "$@"; do printf '\\0%s' "$a"; done; } > "$f"
-park="${PARKED_JSON:-}"
-[ -n "$park" ] || park='{"reason": "gate"}'
 for a in "$@"; do
   # The sidecar AS IT STANDS WHEN phases RUNS. run_item removes it again when
   # phases exits 0, so a test that looked afterwards could not tell "written
@@ -285,7 +289,6 @@ for a in "$@"; do
   [ "$a" = phases ] && [ -n "${SIDECAR_SNAPSHOT:-}" ] && [ -f "${SIDECAR_SRC:-}" ] \
     && cp "$SIDECAR_SRC" "$SIDECAR_SNAPSHOT"
   [ "$a" = phases ] && exit "${PHASES_RC:-0}"
-  [ "$a" = parked ] && { printf '%s' "$park"; exit 0; }
 done
 exit 0
 '''
@@ -546,6 +549,20 @@ def test_parked_rc_writes_the_sidecar_and_keeps_the_queue_file(tmp_path):
     assert "_create_session" not in d.names, d.names
     # A park is not the end of a run.
     assert "_kernel_record_run_outcome" not in d.names, d.names
+
+
+def test_a_superseded_pass_keeps_the_queue_file_and_records_nothing(tmp_path):
+    """Exit.SUPERSEDED (6): another pass owns the run now. Nothing about it is
+    this pass's to conclude -- no terminal outcome, no sidecar, the queue file
+    stays -- and the row says why, so it is not read as a silent park."""
+    d = _drive(tmp_path, env_extra={"BIRCHER_HAVE_LOCK": "1", "PHASES_RC": "6"})
+    assert "RC=0" in d.result.stdout, (d.result.stdout, d.result.stderr)
+    assert d.outcomes == ["superseded"], d.calls
+    assert "_kernel_record_run_outcome" not in d.names, d.names
+    assert (d.queue_dir / f"{ITEM}.md").exists(), "the queue file was consumed"
+    assert not (d.queue_dir / "processed" / f"{ITEM}.md").exists()
+    assert not d.sidecar.exists()
+    assert "_create_session" not in d.names, d.names
 
 
 def test_a_halt_this_pass_caused_keeps_the_queue_file_and_escalates(tmp_path):
@@ -965,6 +982,9 @@ def test_a_run_beyond_the_front_half_is_resumed_not_relaunched(tmp_path):
     assert "which no pass resumes" not in note, note
     assert (d.queue_dir / "processed" / f"{ITEM}.md").exists(), (
         "the resumed pass ran the loop to a merge and should retire the queue file")
+    # revise_bundle is legal only in the front half and shaping; asked at
+    # `implementing` it was refused every wave (2026-09-26, #768's resumes).
+    assert "_kernel_revise_bundle" not in d.names, d.names
 
 
 def test_planned_with_an_accepted_start_implementation_is_resumed(tmp_path):

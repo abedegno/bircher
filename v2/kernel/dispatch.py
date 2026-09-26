@@ -62,7 +62,8 @@ class PendingEffects(Exception):
 
 
 class SeatsExhausted(Exception):
-    """Front-half dispatches have reached max_seats plus granted rounds."""
+    """Front-half dispatches have reached max_seats plus granted rounds.
+    Never raised past the seam: the back half is bounded by no-progress."""
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,12 @@ def dispatch(store, run_id: str, *, actor: str, role: str) -> Dispatch:
     # for exactly this reason; dispatch was written afterwards and did not.
     did = new_id("dsp")
     with store.transaction():
-        if role in Role.SEATS:
+        # The front half's bound only (2026-09-26). A back-half reviewer
+        # dispatch is a seat too, and counting it against this wall would
+        # refuse a repair loop its review -- #768 reached 42 of 50 -- with no
+        # park to say why. The back half ends on no progress instead.
+        from kernel.authz import BACK_HALF_DERIVING_STATES
+        if role in Role.SEATS and store.run_state(run_id) not in BACK_HALF_DERIVING_STATES:
             from kernel.front import seat_bound, seats_used
             used, bound = seats_used(store, run_id), seat_bound(store, run_id)
             if used >= bound:

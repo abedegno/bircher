@@ -18,8 +18,11 @@ def test_the_cli_and_the_loop_agree_on_the_exit_codes():
     constants the CLI publishes have to BE those values -- two tables naming
     the same codes eventually disagree, and the caller reads the wrong one."""
     from coordinator import cli, phases
-    assert (cli.RC_OK, cli.RC_FAILED, cli.RC_USAGE, cli.RC_PARKED) == (
-        phases.Exit.OK, phases.Exit.FAILED, phases.Exit.USAGE, phases.Exit.PARKED)
+    assert (cli.RC_OK, cli.RC_FAILED, cli.RC_USAGE, cli.RC_PARKED, cli.RC_SUPERSEDED) == (
+        phases.Exit.OK, phases.Exit.FAILED, phases.Exit.USAGE, phases.Exit.PARKED,
+        phases.Exit.SUPERSEDED)
+    # RC_LOOKUP_FAILED (3) is the fallback commands' own and no loop exit.
+    assert cli.RC_LOOKUP_FAILED != phases.Exit.SUPERSEDED
 
 
 def test_phases_requires_a_positive_integer_turn_timeout(tmp_path, capsys):
