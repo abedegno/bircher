@@ -4515,6 +4515,34 @@ _refused_mint_row() {
 # DEPLOYMENT PIN directive in config.yaml -- change both together.
 BIRCHER_CODEX_MODEL="${BIRCHER_CODEX_MODEL:-gpt-5.6-sol}"
 
+# preflight_processes -> rc 1 when the container's process table is nearly
+# full, rc 0 otherwise (including when there is no cgroup limit to read).
+#
+# 2026-09-28: omnigent host's orphan reaper stalled on 16 September, ~35,900
+# zombies filled the pids limit, and every wave from then on died at its
+# first command with a Go "failed to create new OS thread" trace from `gh`
+# that named neither the cause nor the fix. BUILTINS ONLY for the reading:
+# when the table is full, `cat` cannot start either. The zombie count needs
+# `ps` and is best-effort for the same reason.
+preflight_processes() {
+  local root="${BIRCHER_CGROUP_ROOT:-/sys/fs/cgroup}" cur="" max="" pct z=""
+  read -r cur < "$root/pids.current" 2>/dev/null || cur=""
+  read -r max < "$root/pids.max" 2>/dev/null || max=""
+  case "$cur" in ''|*[!0-9]*) echo "[batch] preflight: no process-table limit to read -> skipping"; return 0 ;; esac
+  case "$max" in ''|*[!0-9]*|0) echo "[batch] preflight: process table $cur, no limit -> OK"; return 0 ;; esac
+  pct=$(( cur * 100 / max ))
+  z=$(ps -eo stat= 2>/dev/null | grep -c '^Z') || z="unknown"
+  if [ "$pct" -ge "${BIRCHER_PIDS_REFUSE_PCT:-90}" ]; then
+    echo "[batch] preflight: !!! PROCESS TABLE ${pct}% FULL ($cur of $max; zombie processes: $z) -- a new process may not start, so this wave refuses to begin. Unreaped zombies are the usual cause: restart the runner container (homelab ./omnigent.sh restart omnigent-runner-bircher) and see bircher-pipeline-gotchas." >&2
+    return 1
+  fi
+  if [ "$pct" -ge "${BIRCHER_PIDS_WARN_PCT:-50}" ]; then
+    echo "[batch] preflight: WARN process table ${pct}% full ($cur of $max; zombie processes: $z) -- restart the runner container before it fills" >&2
+    return 0
+  fi
+  echo "[batch] preflight: process table $cur of $max -> OK"
+}
+
 # preflight_kernel -> rc 0 if the kernel is USABLE, rc 1 if it is not.
 #
 # Gap 10. In `kernel` effect mode the kernel is a HARD dependency, not a
@@ -9772,6 +9800,9 @@ __HELP__
   # BEFORE the provider probes: a run with an unusable kernel performs no
   # effects at all, so there is no point spending two model calls to learn the
   # providers are healthy first.
+  # FIRST: every later step starts processes, and a full table fails them
+  # with errors that point anywhere but here.
+  preflight_processes || exit 2
   preflight_kernel || exit 2
 
   # Clear stale no-op signals from any prior run (gap #3).
