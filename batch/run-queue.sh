@@ -2193,7 +2193,8 @@ recover_pr_cmd() {
   # `${VAR:?}` and is swallowed by its own redirect. A live run in that state
   # left an empty kernel database, posted no cross-review status and no comment,
   # and still reported success.
-  local _rec_base; _rec_base=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
+  # origin's head, not the checkout's local branch (see `_run_base_sha`).
+  local _rec_base; _rec_base=$(_run_base_sha)
   : "${_rec_base:=0000000000000000000000000000000000000000}"
   # Adopt as the IMPLEMENTER: the first kernel command this path issues is
   # record_implementation_output, which refuses any other role. The reviewer
@@ -4515,6 +4516,19 @@ _refused_mint_row() {
 # DEPLOYMENT PIN directive in config.yaml -- change both together.
 BIRCHER_CODEX_MODEL="${BIRCHER_CODEX_MODEL:-gpt-5.6-sol}"
 
+# _run_base_sha -> the head of origin's default branch in WORKDIR, fetched now.
+#
+# NOT `rev-parse HEAD` (2026-09-28): nothing moves the checkout's local branch,
+# which sat on 31 August while origin/main was current, and #782's spec and
+# plan were written against month-old code. A failed fetch still answers from
+# origin's last-fetched head, never from the local branch, and says so.
+_run_base_sha() {
+  _net_run "${BIRCHER_NET_TIMEOUT:-60}" git -C "$WORKDIR" fetch -q origin 2>/dev/null \
+    || echo "[batch] WARN: fetch in $WORKDIR failed; basing the run on origin's last-fetched head" >&2
+  local ref; ref=$(git -C "$WORKDIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) || ref=""
+  git -C "$WORKDIR" rev-parse "${ref:-origin/main}" 2>/dev/null
+}
+
 # preflight_processes -> rc 1 when the container's process table is nearly
 # full, rc 0 otherwise (including when there is no cgroup limit to read).
 #
@@ -4829,7 +4843,7 @@ run_item() {
   export BIRCHER_KERNEL_DB
   mkdir -p "$(dirname "$BIRCHER_KERNEL_DB")" 2>/dev/null || true
   local _iss; _iss=$(_item_issue "$prompt")
-  local _base_sha; _base_sha=$(git -C "$WORKDIR" rev-parse HEAD 2>/dev/null)
+  local _base_sha; _base_sha=$(_run_base_sha)
   # Defaulted ONCE, here, rather than at the call below: the verdict binding
   # must present the base the kernel actually recorded, and `validate_review`
   # compares them. Defaulting at the call site left the binding free to send
